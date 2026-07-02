@@ -1,4 +1,4 @@
-.PHONY: all dev dev-zh build build-zh zh-status zh-stamp export format lint test install clean lint_md lint_md_fix lint_prose broken-links broken-links-with-anchors format-check code-snippets test-code-samples check-cross-refs
+.PHONY: all dev dev-zh build build-zh zh-status zh-stamp zh-sync export format lint test install clean lint_md lint_md_fix lint_prose broken-links broken-links-with-anchors format-check code-snippets test-code-samples check-cross-refs
 
 # Default target
 all: help
@@ -30,6 +30,9 @@ zh-status:
 
 zh-stamp:
 	@uv run python -m scripts.zh.overlay stamp $(FILES)
+
+zh-sync:
+	@uv run python -m scripts.zh.sync sync
 
 # Offline zip via Mintlify (https://www.mintlify.com/docs/deploy/export).
 # Must run from build/: docs.json paths are oss/python/... and oss/javascript/... but sources live under src/oss/... until the pipeline emits build/oss/{python,javascript}/...
@@ -175,6 +178,7 @@ help:
 	@echo "  make build-zh           - Build documentation from the Chinese overlay"
 	@echo "  make zh-status          - Show Chinese translation coverage and stale files"
 	@echo "  make zh-stamp           - Record current source hashes for translated files"
+	@echo "  make zh-sync            - Fetch upstream, merge updates, and rebuild the Chinese overlay"
 	@echo "  make export             - Run mint export from ./build (optional: MINT_EXPORT_ARGS)"
 	@echo "  make broken-links       - Check for broken links in built documentation"
 	@echo "  make check-cross-refs   - Check for unresolved @[ref] cross-references"
