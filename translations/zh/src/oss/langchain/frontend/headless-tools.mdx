@@ -1,0 +1,417 @@
+---
+title: Headless tools
+description: 在客户端运行浏览器和设备 API 的无头工具实现
+---
+
+无头工具让你的智能体可以调用一些工具，而这些工具的真实执行必须发生在用户的应用里，而不是服务器上。智能体看到的仍然是正常的工具 schema，但实现位于前端，因此它可以访问 IndexedDB、地理位置、剪贴板、canvas 或文件选择器等浏览器 API。
+
+当数据应该保留在本地设备时，这种模式尤其有用。本页的 playground 示例使用了一个由 IndexedDB 支持的小型浏览器记忆工具包，以及一个完全在客户端运行的地理位置工具。
+
+import { PatternEmbed } from "/snippets/pattern-embed.jsx"
+
+<PatternEmbed pattern="headless-tools" />
+
+## 无头工具如何工作
+
+从高层来看，无头工具把工具 schema 和仅限浏览器的实现分开了。
+
+:::python
+1. 在智能体上注册一个工具，它会立即调用 `interrupt()`，把执行推迟到前端。
+2. 在前端定义中镜像相同的工具名称和参数字段。
+3. 在前端使用 `.implement(...)` 实现对应工具，并把它们传给 `useStream({ tools: [...] })`。
+4. 当智能体调用匹配的工具时，客户端执行这个动作，并带着工具结果恢复被中断的运行。
+:::
+
+:::js
+1. 在智能体上注册一个仅包含 schema 的工具定义。
+2. 在前端使用 `.implement(...)` 实现对应工具。
+3. 把这些实现传给 `useStream({ tools: [...] })`。
+4. 当智能体发出匹配的工具调用时，客户端运行它，并带着工具结果恢复被中断的运行。
+
+<Tip>
+把工具定义和工具实现分开放在不同模块里。让智能体和前端共享同一份定义，这样工具名和 schema 能保持一致；浏览器专用代码则放在客户端模块 `impl` 里。
+</Tip>
+:::
+
+## 在智能体上注册工具
+
+playground 定义了一小组客户端工具，它们都遵循同一种模式：智能体暴露工具 schema，而前端负责真正执行。
+
+:::python
+在服务器上定义正常工具，让它们立即调用 `interrupt()`，然后在前端 `tools.ts` 文件里镜像相同的工具名称和参数字段。
+
+```python agent.py
+from typing import Any
+
+from langchain import create_agent
+from langchain.tools import ToolRuntime, tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt
+from pydantic import BaseModel
+
+
+class MemoryPutInput(BaseModel):
+    key: str
+    value: Any
+
+
+class MemoryGetInput(BaseModel):
+    key: str
+
+
+class GeolocationGetInput(BaseModel):
+    save: bool = True
+
+
+def _interrupt_for_client(
+    tool_name: str,
+    args: dict[str, Any],
+    runtime: ToolRuntime,
+) -> Any:
+    return interrupt({
+        "type": "tool",
+        "tool_call": {
+            "id": runtime.tool_call_id,
+            "name": tool_name,
+            "args": args,
+        },
+    })
+
+
+@tool(
+    "memory_put",
+    description="Store a memory in the user's browser.",
+    args_schema=MemoryPutInput,
+)
+def memory_put(key: str, value: Any, runtime: ToolRuntime) -> Any:
+    return _interrupt_for_client(
+        "memory_put",
+        {"key": key, "value": value},
+        runtime,
+    )
+
+
+@tool(
+    "memory_get",
+    description="Look up a memory stored in the user's browser.",
+    args_schema=MemoryGetInput,
+)
+def memory_get(key: str, runtime: ToolRuntime) -> Any:
+    return _interrupt_for_client("memory_get", {"key": key}, runtime)
+
+
+@tool(
+    "geolocation_get",
+    description="Get the user's current location from the browser.",
+    args_schema=GeolocationGetInput,
+)
+def geolocation_get(runtime: ToolRuntime, save: bool = True) -> Any:
+    return _interrupt_for_client(
+        "geolocation_get",
+        {"save": save},
+        runtime,
+    )
+
+agent = create_agent(
+    model="openai:gpt-5.5",
+    tools=[memory_put, memory_get, geolocation_get],
+    checkpointer=MemorySaver(),
+)
+```
+
+每个工具都会用结构化 payload 中断，供前端处理，然后在运行恢复时返回对应值。在客户端镜像相同的工具名和 schema，前端就能把实现挂上去。
+
+```ts tools.ts
+import * as z from "zod";
+import { tool } from "langchain";
+
+// 在客户端镜像 Python 工具名和 schema。
+export const memoryPut = tool({
+  name: "memory_put",
+  description: "Store a memory in the user's browser.",
+  schema: z.object({
+    key: z.string(),
+    value: z.unknown(),
+  }),
+});
+
+export const memoryGet = tool({
+  name: "memory_get",
+  description: "Look up a memory stored in the user's browser.",
+  schema: z.object({
+    key: z.string(),
+  }),
+});
+
+export const geolocationGet = tool({
+  name: "geolocation_get",
+  description: "Get the user's current location from the browser.",
+  schema: z.object({
+    save: z.boolean().optional(),
+  }),
+});
+```
+
+:::
+
+:::js
+把工具定义一次性放进共享的 `tools.ts` 文件里，并让 agent 和前端都引用这个文件。
+
+<CodeGroup>
+```ts tools.ts
+import * as z from "zod";
+import { tool } from "langchain";
+
+export const memoryPut = tool({
+  name: "memory_put",
+  description: "Store a memory in the user's browser.",
+  schema: z.object({
+    key: z.string(),
+    value: z.unknown(),
+  }),
+});
+
+export const memoryGet = tool({
+  name: "memory_get",
+  description: "Look up a memory stored in the user's browser.",
+  schema: z.object({
+    key: z.string(),
+  }),
+});
+
+export const geolocationGet = tool({
+  name: "geolocation_get",
+  description: "Get the user's current location from the browser.",
+  schema: z.object({
+    save: z.boolean().optional(),
+  }),
+});
+```
+
+```ts agent.ts
+import { createAgent } from "langchain";
+import { MemorySaver } from "@langchain/langgraph";
+
+import { geolocationGet, memoryGet, memoryPut } from "./tools";
+
+export const agent = createAgent({
+  model: "openai:gpt-5.5",
+  tools: [memoryPut, memoryGet, geolocationGet],
+  checkpointer: new MemorySaver(),
+});
+```
+</CodeGroup>
+:::
+
+## 实现浏览器行为
+
+把仅限客户端的行为放进单独的模块，并用 `.implement(...)` 把它挂上去。真实 playground 里包含一个更完整的 IndexedDB 存储，支持搜索、列出、过期和删除等操作。下面这个例子以更高层的方式展示同样的结构：
+
+```ts impl.ts
+import {
+  geolocationGet as geolocationGetDefinition,
+  memoryGet as memoryGetDefinition,
+  memoryPut as memoryPutDefinition,
+} from "./tools";
+
+async function saveMemory(key: string, value: unknown) {
+  localStorage.setItem(`agent-memory:${key}`, JSON.stringify(value));
+}
+
+async function getMemory(key: string) {
+  const value = localStorage.getItem(`agent-memory:${key}`);
+  return value ? JSON.parse(value) : null;
+}
+
+export const memoryPut = memoryPutDefinition.implement(async ({ key, value }) => {
+  await saveMemory(key, value);
+  return { success: true, key };
+});
+
+export const memoryGet = memoryGetDefinition.implement(async ({ key }) => {
+  const value = await getMemory(key);
+  return value === null ? { found: false, key } : { found: true, key, value };
+});
+
+export const geolocationGet = geolocationGetDefinition.implement(
+  async ({ save = true }) => {
+    const position = await new Promise<GeolocationPosition>((resolve, reject) =>
+      navigator.geolocation.getCurrentPosition(resolve, reject),
+    );
+
+    const location = {
+      latitude: position.coords.latitude,
+      longitude: position.coords.longitude,
+      accuracy: position.coords.accuracy,
+    };
+
+    if (save) {
+      await saveMemory("user_location", location);
+    }
+
+    return location;
+  },
+);
+```
+
+## 把实现接到 `useStream`
+
+把已经实现好的工具传给 `useStream`。当智能体发出匹配的工具调用时，hook 会运行客户端实现并替你恢复运行。
+
+:::python
+为你的智能体 state schema 定义一个对应的 TypeScript interface，并把它作为 `useStream` 的类型参数，这样就能安全地访问 state 值：
+
+```ts types.ts
+export interface AgentState {
+  messages: BaseMessage[];
+}
+```
+:::
+
+:::js
+智能体 state 可以从智能体定义里推导出来：
+
+```ts
+import type { myAgent } from "./agent";
+
+export type AgentState = typeof myAgent;
+```
+:::
+
+<CodeGroup>
+```tsx React
+import { useStream } from "@langchain/react";
+
+import { geolocationGet, memoryGet, memoryPut } from "./impl";
+import type { AgentState } from "./types";
+
+const AGENT_URL = "http://localhost:2024";
+
+export function Chat() {
+  const stream = useStream<AgentState>({
+    apiUrl: AGENT_URL,
+    assistantId: "headless_tools",
+    tools: [memoryPut, memoryGet, geolocationGet],
+  });
+
+  return <ChatView messages={stream.messages} toolCalls={stream.toolCalls} />;
+}
+```
+
+```vue Vue
+<script setup lang="ts">
+import { useStream } from "@langchain/vue";
+
+import { geolocationGet, memoryGet, memoryPut } from "./impl";
+import type { AgentState } from "./types";
+
+const AGENT_URL = "http://localhost:2024";
+
+const stream = useStream<AgentState>({
+  apiUrl: AGENT_URL,
+  assistantId: "headless_tools",
+  tools: [memoryPut, memoryGet, geolocationGet],
+});
+</script>
+
+<template>
+  <ChatView
+    :messages="stream.messages.value"
+    :tool-calls="stream.toolCalls.value"
+  />
+</template>
+```
+
+```svelte Svelte
+<script lang="ts">
+  import { useStream } from "@langchain/svelte";
+
+  import { geolocationGet, memoryGet, memoryPut } from "./impl";
+  import type { AgentState } from "./types";
+
+  const AGENT_URL = "http://localhost:2024";
+
+  const { messages, toolCalls } = useStream<AgentState>({
+    apiUrl: AGENT_URL,
+    assistantId: "headless_tools",
+    tools: [memoryPut, memoryGet, geolocationGet],
+  });
+</script>
+
+<ChatView messages={$messages} toolCalls={$toolCalls} />
+```
+
+```ts Angular
+import { Component } from "@angular/core";
+import { useStream } from "@langchain/angular";
+
+import { geolocationGet, memoryGet, memoryPut } from "./impl";
+import type { AgentState } from "./types";
+
+const AGENT_URL = "http://localhost:2024";
+
+@Component({
+  selector: "app-chat",
+  template: `
+    <app-chat-view
+      [messages]="stream.messages()"
+      [toolCalls]="stream.toolCalls()"
+    />
+  `,
+})
+export class ChatComponent {
+  stream = useStream<AgentState>({
+    apiUrl: AGENT_URL,
+    assistantId: "headless_tools",
+    tools: [memoryPut, memoryGet, geolocationGet],
+  });
+}
+```
+
+</CodeGroup>
+
+## 在界面中内联渲染工具活动
+
+playground 会把每次记忆或地理位置操作都渲染成单独的卡片，并在输入框附近放一个小的 memory stats 面板。关键步骤是把 `stream.toolCalls` 里的每个条目和触发它的 AI message 对上：
+
+```tsx
+import type { ToolCallWithResult, DefaultToolCall } from "@langchain/react";
+
+function Message({ message, toolCalls }: {
+  message: AIMessage,
+  toolCalls: ToolCallWithResult[]
+}) {
+  const messageToolCalls = toolCalls.filter((tc) =>
+    message.tool_calls?.some((call) => call.id === tc.call.id),
+  );
+
+  return (
+    <div>
+      {message.text && <p>{message.text}</p>}
+      {messageToolCalls.map((tc) => (
+        <HeadlessToolCard key={tc.call.id} toolCall={tc} />
+      ))}
+    </div>
+  );
+}
+```
+
+这和 [Tool calling](/oss/langchain/frontend/tool-calling) 里的更丰富 UI 模式配合得特别好，因为每个工具结果都可以渲染成专门的卡片，而不是原始 JSON。
+
+## 使用场景
+
+当工作依赖只存在于客户端的 API 或数据时，使用无头工具：
+
+- IndexedDB 或 `localStorage` 里的本地记忆
+- 地理位置、剪贴板、摄像头、文件选择器等设备 API
+- canvas、音频或其他只在浏览器中可用的渲染原语
+- 应该保留在用户设备上的隐私敏感数据
+- 需要直接访问前端内存状态的 UI 操作
+
+## 最佳实践
+
+- 保持工具小而有类型。优先使用多个窄工具，不要做一个泛化的“执行任意浏览器代码”工具。
+- 返回可 JSON 序列化的结果。不要尝试返回 DOM 节点、文件句柄或其他不可序列化的浏览器对象。
+- 共享定义、分离实现。agent 和客户端应当共享工具名和 schema，但只有客户端应加载浏览器 API。
+- 在 UI 里暴露工具状态。使用 `stream.toolCalls` 和 `onTool` 展示待处理、成功和错误状态。
+- 在需要时加审核。对于敏感的客户端动作，最好把这个模式和 [Human-in-the-loop](/oss/langchain/frontend/human-in-the-loop) 结合起来。

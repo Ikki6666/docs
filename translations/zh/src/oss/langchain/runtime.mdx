@@ -1,0 +1,260 @@
+---
+title: Runtime
+---
+
+## 概览
+
+:::python
+LangChain 的 @[`create_agent`] 底层运行在 LangGraph runtime 上。
+:::
+:::js
+LangChain 的 `createAgent` 底层运行在 LangGraph runtime 上。
+:::
+LangGraph 暴露了一个 @[`Runtime`] 对象，其中包含以下信息：
+
+1. **Context**：某次智能体调用的静态信息，例如用户 ID、数据库连接或其他依赖
+2. **Store**：一个 @[BaseStore] 实例，用于 [long-term memory](/oss/langchain/long-term-memory)
+3. **Stream writer**：一个通过 `"custom"` 流模式流式发送信息的对象
+4. **Execution info**：当前执行的身份和重试信息（thread ID、run ID、attempt number）
+5. **Server info**：在 LangGraph Server 上运行时可用的服务器元数据（assistant ID、graph ID、已认证用户）
+
+:::python
+<Tip>
+Runtime context 为你的工具和中间件提供了**依赖注入**。你无需把值写死或放进全局状态，而是可以在调用智能体时注入运行时依赖（例如数据库连接、用户 ID 或配置）。这会让你的工具更可测试、更可复用，也更灵活。
+</Tip>
+:::
+
+:::js
+<Tip>
+Runtime context 是把数据穿过智能体的方式。你不必把东西放进全局状态，而是可以把值（例如数据库连接、用户会话或配置）附加到 context 上，并在工具和中间件内部访问它们。这样可以保持无状态、可测试、可复用。
+</Tip>
+:::
+
+你可以在 [tools](#inside-tools) 和 [middleware](#inside-middleware) 中访问 runtime 信息。
+
+## 访问
+
+:::python
+创建智能体时，你可以指定 `context_schema` 来定义存储在智能体 @[`Runtime`] 中的 `context` 结构。
+:::
+:::js
+创建智能体时，你可以指定 `contextSchema` 来定义存储在智能体 @[`Runtime`] 中的 `context` 结构。
+:::
+
+调用智能体时，请传入 `context` 参数，为本次运行提供相关配置：
+
+:::python
+```python
+from dataclasses import dataclass
+
+from langchain.agents import create_agent
+
+
+@dataclass
+class Context:
+    user_name: str
+
+agent = create_agent(
+    model="gpt-5-nano",
+    tools=[...],
+    context_schema=Context  # [!code highlight]
+)
+
+agent.invoke(
+    {"messages": [{"role": "user", "content": "What's my name?"}]},
+    context=Context(user_name="John Smith")  # [!code highlight]
+)
+```
+:::
+:::js
+```ts
+import * as z from "zod";
+import { createAgent } from "langchain";
+
+const contextSchema = z.object({ // [!code highlight]
+  userName: z.string(), // [!code highlight]
+}); // [!code highlight]
+
+const agent = createAgent({
+  model: "gpt-5.5",
+  tools: [
+    /* ... */
+  ],
+  contextSchema, // [!code highlight]
+});
+
+const result = await agent.invoke(
+  { messages: [{ role: "user", content: "What's my name?" }] },
+  { context: { userName: "John Smith" } } // [!code highlight]
+);
+```
+:::
+
+### 在工具内部
+
+你可以在工具内部访问 runtime 信息，用于：
+
+* 访问 context
+* 读写 long-term memory
+* 向 [custom stream](/oss/langchain/streaming#custom-updates) 写入内容（例如工具进度/更新）
+
+:::python
+使用 `ToolRuntime` 参数在工具内部访问 @[`Runtime`] 对象。
+
+```python
+from dataclasses import dataclass
+from langchain.tools import tool, ToolRuntime  # [!code highlight]
+
+@dataclass
+class Context:
+    user_id: str
+
+@tool
+def fetch_user_email_preferences(runtime: ToolRuntime[Context]) -> str:  # [!code highlight]
+    """从存储中获取用户的邮件偏好。"""
+    user_id = runtime.context.user_id  # [!code highlight]
+
+    preferences: str = "The user prefers you to write a brief and polite email."
+    if runtime.store:  # [!code highlight]
+        if memory := runtime.store.get(("users",), user_id):  # [!code highlight]
+            preferences = memory.value["preferences"]
+
+    return preferences
+```
+:::
+:::js
+使用 `runtime` 参数在工具内部访问 @[`Runtime`] 对象。
+
+```ts
+import * as z from "zod";
+import { tool } from "langchain";
+import { type ToolRuntime } from "@langchain/core/tools"; // [!code highlight]
+
+const contextSchema = z.object({
+  userName: z.string(),
+});
+
+const fetchUserEmailPreferences = tool(
+  async (_, runtime: ToolRuntime<any, typeof contextSchema>) => { // [!code highlight]
+    const userName = runtime.context?.userName; // [!code highlight]
+    if (!userName) {
+      throw new Error("userName is required");
+    }
+
+    let preferences = "The user prefers you to write a brief and polite email.";
+    if (runtime.store) { // [!code highlight]
+      const memory = await runtime.store?.get(["users"], userName); // [!code highlight]
+      if (memory) {
+        preferences = memory.value.preferences;
+      }
+    }
+    return preferences;
+  },
+  {
+    name: "fetch_user_email_preferences",
+    description: "Fetch the user's email preferences.",
+    schema: z.object({}),
+  }
+);
+```
+:::
+
+### 工具内部的执行信息和服务器信息
+
+:::python
+在 LangGraph Server 上运行时，可以通过 `runtime.execution_info` 访问执行身份（thread ID、run ID），通过 `runtime.server_info` 访问服务器特定元数据（assistant ID、已认证用户）：
+
+```python
+from langchain.tools import tool, ToolRuntime
+
+@tool
+def context_aware_tool(runtime: ToolRuntime) -> str:
+    """一个使用执行和服务器信息的工具。"""
+    # 访问 thread 和 run ID
+    info = runtime.execution_info
+    print(f"Thread: {info.thread_id}, Run: {info.run_id}")  # [!code highlight]
+
+    # 访问 server info（仅在 LangGraph Server 上可用）
+    server = runtime.server_info
+    if server is not None:
+        print(f"Assistant: {server.assistant_id}")  # [!code highlight]
+        if server.user is not None:
+            print(f"User: {server.user.identity}")  # [!code highlight]
+
+    return "done"
+```
+
+`server_info` 在非 LangGraph Server 环境（例如本地开发）下为 `None`。
+:::
+
+:::js
+在 LangGraph Server 上运行时，可以通过 `runtime.executionInfo` 访问执行身份（thread ID、run ID），通过 `runtime.serverInfo` 访问服务器特定元数据（assistant ID、已认证用户）：
+
+```ts
+import { tool } from "langchain";
+import * as z from "zod";
+
+const contextAwareTool = tool(
+  async (_input, runtime) => {
+    // 访问 thread 和 run ID
+    const info = runtime.executionInfo;
+    console.log(`Thread: ${info.threadId}, Run: ${info.runId}`);  // [!code highlight]
+
+    // 访问 server info（仅在 LangGraph Server 上可用）
+    const server = runtime.serverInfo;
+    if (server != null) {
+      console.log(`Assistant: ${server.assistantId}`);  // [!code highlight]
+      if (server.user != null) {
+        console.log(`User: ${server.user.identity}`);  // [!code highlight]
+      }
+    }
+
+    return "done";
+  },
+  {
+    name: "context_aware_tool",
+    description: "A tool that uses execution and server info.",
+    schema: z.object({}),
+  }
+);
+```
+
+`serverInfo` 在非 LangGraph Server 环境（例如本地开发）下为 `null`。
+:::
+
+:::python
+<Note>
+访问 `runtime.execution_info` 和 `runtime.server_info` 需要 `deepagents>=0.5.0`（或 `langgraph>=1.1.5`）。
+</Note>
+:::
+
+:::js
+<Note>
+访问 `runtime.executionInfo` 和 `runtime.serverInfo` 需要 `deepagents>=1.9.0`（或 `@langchain/langgraph>=1.2.8`）。
+</Note>
+:::
+
+### 在中间件内部
+
+你可以在中间件中访问 runtime 信息，用它来创建动态提示词、修改消息，或者基于用户上下文控制智能体行为。
+
+:::python
+在 [node-style hooks](/oss/langchain/middleware/custom#node-style-hooks) 中，你可以使用 `Runtime` 参数访问 @[`Runtime`] 对象。对于 [wrap-style hooks](/oss/langchain/middleware/custom#wrap-style-hooks)，`Runtime` 对象可以在 @[`ModelRequest`] 参数里访问。
+
+```python
+from dataclasses import dataclass
+
+from langchain.messages import AnyMessage
+from langchain.agents import create_agent, AgentState
+from langchain.agents.middleware import dynamic_prompt, ModelRequest, before_model, after_model
+from langgraph.runtime import Runtime
+
+
+@dataclass
+class Context:
+    user_name: str
+
+# 动态提示词
+@dynamic_prompt
+def dynamic_system_prompt(request: ModelRequest) -> str:
+    user_name = request.runtime.context.user_name  # [!code highlight]

@@ -1,0 +1,196 @@
+---
+title: 短期记忆
+---
+
+import ShortTermMemoryUsagePy from '/snippets/code-samples/short-term-memory-usage-py.mdx';
+import ShortTermMemoryUsageJs from '/snippets/code-samples/short-term-memory-usage-js.mdx';
+
+## 概览
+
+记忆是一种能记住之前交互信息的系统。对于 AI 智能体来说，记忆非常关键，因为它能让智能体记住之前的交互、从反馈中学习，并适应用户偏好。随着智能体处理的任务变得更复杂、用户交互越来越多，这种能力对于效率和用户满意度都变得至关重要。
+
+短期记忆让你的应用能够记住单个线程或对话中的先前交互。
+
+<Note>
+    一个 thread 会把会话中的多次交互组织起来，类似于电子邮件把消息放在同一个对话里。
+</Note>
+
+对话历史是最常见的短期记忆形式。长对话会给今天的 LLM 带来挑战；完整历史可能放不进 LLM 的上下文窗口，从而造成上下文丢失或报错。
+
+即使你的模型支持完整上下文长度，大多数 LLM 在长上下文上仍然表现不佳。它们会被过时或跑题的内容“分心”，同时还会带来更慢的响应和更高的成本。
+
+聊天模型通过 [messages](/oss/langchain/messages) 接收上下文，其中包括指令（system message）和输入（human messages）。在聊天应用中，消息会在人类输入和模型响应之间交替，随着时间推移列表会越来越长。由于上下文窗口有限，很多应用都可以从删除或“忘记”过时信息的技术中受益。
+
+<Tip>
+    想要在**不同**对话之间记住信息？请使用 [long-term memory](/oss/langchain/long-term-memory)，在不同线程和会话之间存储并回忆用户级或应用级数据。
+</Tip>
+
+## 用法
+
+要给智能体添加短期记忆（线程级持久化），你需要在创建智能体时指定一个 `checkpointer`。
+
+<Info>
+    LangChain 的智能体把短期记忆作为智能体状态的一部分来管理。
+
+    通过把这些内容存进图状态里，智能体就能在保留不同线程隔离的同时，访问某段对话的完整上下文。
+
+    状态会通过 checkpointer 持久化到数据库（或内存），这样线程就能随时恢复。
+
+    短期记忆会在智能体被调用或者某一步（例如工具调用）完成时更新，而状态会在每一步开始时读取。
+</Info>
+
+:::python
+
+<ShortTermMemoryUsagePy />
+
+:::
+:::js
+
+<ShortTermMemoryUsageJs />
+
+:::
+
+### 在生产环境中
+
+在生产环境中，请使用由数据库支持的 checkpointer：
+
+
+:::python
+```shell
+pip install langgraph-checkpoint-postgres
+```
+
+```python
+from langchain.agents import create_agent
+from langgraph.checkpoint.postgres import PostgresSaver  # [!code highlight]
+
+def get_user_info() -> str:
+    """查找当前用户的信息。"""
+    return "No user profile on file."
+
+DB_URI = "postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable"
+with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+    checkpointer.setup() # 在 PostgreSQL 中自动创建表
+    agent = create_agent(
+        "gpt-5.5",
+        tools=[get_user_info],
+        checkpointer=checkpointer,  # [!code highlight]
+    )
+```
+:::
+:::js
+```ts
+import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
+
+const DB_URI = "postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable";
+const checkpointer = PostgresSaver.fromConnString(DB_URI);
+```
+:::
+
+<Note>
+    关于更多 checkpointer 选项，包括 SQLite、Postgres 和 Azure Cosmos DB，请参见 Persistence 文档里的 [checkpointer libraries 列表](/oss/langgraph/checkpointers#checkpointer-libraries)。
+</Note>
+
+## 自定义智能体记忆
+
+:::python
+默认情况下，智能体使用 @[`AgentState`] 来管理短期记忆，具体来说是通过 `messages` 键管理对话历史。
+
+你可以扩展 @[`AgentState`] 来添加更多字段。自定义 state schema 会通过 @[`state_schema`] 参数传给 @[`create_agent`]。
+
+```python
+from langchain.agents import create_agent, AgentState
+from langgraph.checkpoint.memory import InMemorySaver
+
+
+class CustomAgentState(AgentState):  # [!code highlight]
+    user_id: str  # [!code highlight]
+    preferences: dict  # [!code highlight]
+
+agent = create_agent(
+    "gpt-5.5",
+    tools=[get_user_info],
+    state_schema=CustomAgentState,  # [!code highlight]
+    checkpointer=InMemorySaver(),
+)
+
+# 自定义状态可以在 invoke 时传入
+result = agent.invoke(
+    {
+        "messages": [{"role": "user", "content": "Hello"}],
+        "user_id": "user_123",  # [!code highlight]
+        "preferences": {"theme": "dark"}  # [!code highlight]
+    },
+    {"configurable": {"thread_id": "1"}})
+```
+:::
+
+:::js
+你可以通过带 state schema 的自定义 middleware 来扩展智能体状态。自定义 state schema 可以通过 middleware 的 `stateSchema` 参数传入。优先使用 `StateSchema` 类来定义 state（当然也支持普通 Zod 对象）。
+
+```typescript
+import { createAgent, createMiddleware } from "langchain";
+import { StateSchema, MemorySaver } from "@langchain/langgraph";
+import * as z from "zod";
+
+const CustomState = new StateSchema({  // [!code highlight]
+    userId: z.string(),  // [!code highlight]
+    preferences: z.record(z.string(), z.any()),  // [!code highlight]
+});  // [!code highlight]
+
+const stateExtensionMiddleware = createMiddleware({
+    name: "StateExtension",
+    stateSchema: CustomState,  // [!code highlight]
+});
+
+const checkpointer = new MemorySaver();
+const agent = createAgent({
+    model: "gpt-5.5",
+    tools: [],
+    middleware: [stateExtensionMiddleware],  // [!code highlight]
+    checkpointer,
+});
+
+// 自定义状态可以在 invoke 时传入
+const result = await agent.invoke({
+    messages: [{ role: "user", content: "Hello" }],
+    userId: "user_123",  // [!code highlight]
+    preferences: { theme: "dark" },  // [!code highlight]
+});
+```
+:::
+
+## 常见模式
+
+启用 [短期记忆](#usage) 后，长对话可能会超过 LLM 的上下文窗口。常见解决方案有：
+
+<CardGroup cols={2}>
+    <Card title="裁剪消息" icon="scissors" href="#trim-messages" arrow>
+        在调用 LLM 之前，移除最前或最后的 N 条消息
+    </Card>
+    <Card title="删除消息" icon="trash" href="#delete-messages" arrow>
+        永久从 LangGraph state 中删除消息
+    </Card>
+    <Card title="总结消息" icon="stack-2" href="#summarize-messages" arrow>
+        总结历史中的较早消息，并用摘要替换它们
+    </Card>
+    <Card title="自定义策略" icon="adjustments">
+        自定义策略（例如消息过滤等）
+    </Card>
+</CardGroup>
+
+这样智能体就可以在不超出 LLM 上下文窗口的情况下持续跟踪对话。
+
+### 裁剪消息
+
+大多数 LLM 都有一个最大支持的上下文窗口（以 token 计）。
+
+:::python
+一种决定何时截断消息的方法，是统计消息历史中的 token，并在接近上限时进行截断。如果你在使用 LangChain，可以用 trim messages 工具，并指定要保留的 token 数量，以及用于处理边界的 `strategy`（例如保留最后 `max_tokens` 个 token）。
+:::
+:::js
+一种决定何时截断消息的方法，是统计消息历史中的 token，并在接近上限时进行截断。如果你在使用 LangChain，可以用 trim messages 工具，并指定要保留的 token 数量，以及用于处理边界的 `strategy`（例如保留最后 `maxTokens` 个 token）。
+:::
+
+:::python
+要在智能体中裁剪消息历史，请使用 @[`@before_model`] middleware 装饰器：

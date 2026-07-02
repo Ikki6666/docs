@@ -1,0 +1,260 @@
+---
+title: 单元测试
+description: 使用 fake chat model 和内存持久化，在不发 API 调用的情况下测试智能体逻辑。
+---
+
+单元测试会隔离测试智能体中小而确定的部分。通过把真实 LLM 换成内存中的 fake（也就是 fixture），你可以脚本化精确响应（文本、工具调用和错误），这样测试既快、又免费，而且可重复，不需要 API key。
+
+:::python
+
+## 模拟聊天模型
+
+LangChain 提供 @[`GenericFakeChatModel`] 来模拟文本响应。它接收一个响应迭代器（@[`AIMessage`] 对象或字符串），并在每次调用时返回一个。它同时支持普通调用和流式调用。
+
+```python
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+model = GenericFakeChatModel(messages=iter([
+    AIMessage(content="", tool_calls=[ToolCall(name="foo", args={"bar": "baz"}, id="call_1")]),
+    "bar"
+]))
+
+model.invoke("hello")
+# AIMessage(content='', ..., tool_calls=[{'name': 'foo', 'args': {'bar': 'baz'}, 'id': 'call_1', 'type': 'tool_call'}])
+```
+
+如果我们再次调用模型，它会返回迭代器里的下一项：
+
+```python
+model.invoke("hello, again!")
+# AIMessage(content='bar', ...)
+```
+
+## InMemorySaver checkpointer
+
+要在测试中启用持久化，你可以使用 @[`InMemorySaver`] checkpointer。这样你就能模拟多轮对话，测试依赖状态的行为：
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+agent = create_agent(
+    model,
+    tools=[],
+    checkpointer=InMemorySaver()
+)
+
+# 第一次调用
+agent.invoke(
+    {"messages": [HumanMessage(content="I live in Sydney, Australia")]},
+    config={"configurable": {"thread_id": "session-1"}}
+)
+
+# 第二次调用：第一条消息已经持久化（Sydney 位置信息），所以模型会返回 GMT+10 时间
+agent.invoke(
+    {"messages": [HumanMessage(content="What's my local time?")]},
+    config={"configurable": {"thread_id": "session-1"}}
+)
+```
+:::
+
+:::js
+
+## 使用 `fakeModel` 模拟聊天模型
+
+@[`fakeModel`] 是一个 builder 风格的 fake chat model，允许你脚本化精确响应（文本、工具调用、错误）并断言模型收到了什么。它扩展了 @[`BaseChatModel`]，所以可以在任何需要真实模型的地方使用。
+
+```typescript
+import { fakeModel } from "langchain";
+```
+
+### 快速开始
+
+创建模型，用 `.respond()` 排队响应，然后调用。每次 `invoke()` 都会按顺序消费下一个排队的响应：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond(new AIMessage("I can help with that."))
+  .respond(new AIMessage("Here's what I found."))
+  .respond(new AIMessage("You're welcome!"));
+
+const r1 = await model.invoke([new HumanMessage("Can you help?")]);
+// r1.content === "I can help with that."
+
+const r2 = await model.invoke([new HumanMessage("What did you find?")]);
+// r2.content === "Here's what I found."
+
+const r3 = await model.invoke([new HumanMessage("Thanks!")]);
+// r3.content === "You're welcome!"
+```
+
+如果调用次数超过了已排队的响应数量，就会抛出一条描述清楚的错误：
+
+```typescript
+const model = fakeModel()
+  .respond(new AIMessage("only one"));
+
+await model.invoke([new HumanMessage("first")]);  // works
+await model.invoke([new HumanMessage("second")]); // throws: "no response queued for invocation 1"
+```
+
+### 工具调用响应
+
+`.respond()` 通过传入带有 `tool_calls` 的 @[`AIMessage`] 也能支持工具调用：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond(new AIMessage({
+    content: "",
+    tool_calls: [
+      { name: "get_weather", args: { city: "San Francisco" }, id: "call_1", type: "tool_call" },
+    ],
+  }))
+  .respond(new AIMessage("It's 72°F and sunny in San Francisco."));
+
+const r1 = await model.invoke([new HumanMessage("What's the weather in SF?")]);
+console.log(r1.tool_calls[0].name); // "get_weather"
+
+const r2 = await model.invoke([new HumanMessage("Thanks")]);
+console.log(r2.content); // "It's 72°F and sunny in San Francisco."
+```
+
+`.respondWithTools()` 是同样功能的简写。与其构造完整的 `AIMessage`，不如只提供工具名和参数：
+
+```typescript
+// 下面这两个队列条目会生成相同的响应：
+
+model.respond(new AIMessage({
+  content: "",
+  tool_calls: [
+    { name: "get_weather", args: { city: "SF" }, id: "call_1", type: "tool_call" },
+  ],
+}));
+
+// 等价的简写：
+model.respondWithTools([  // [!code highlight]
+  { name: "get_weather", args: { city: "SF" }, id: "call_1" },  // [!code highlight]
+]);  // [!code highlight]
+```
+
+`id` 字段是可选的。如果省略，会自动生成唯一 ID。
+
+<Tip>
+    `.respond()` 和 `.respondWithTools()` 可以按任意顺序自由混用。这对于测试 agentic loop 特别有用，因为模型会在工具调用和文本回复之间交替。
+</Tip>
+
+### 模拟错误
+
+#### 特定轮次出错
+
+把一个 `Error` 传给 `.respond()` 会让模型在那次特定调用时抛错。错误可以出现在序列中的任何位置：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond(new Error("rate limit exceeded"))  // 第 1 轮：抛错  // [!code highlight]
+  .respond(new AIMessage("Recovered!"));      // 第 2 轮：成功
+
+try {
+  await model.invoke([new HumanMessage("first")]);
+} catch (e) {
+  console.log(e.message); // "rate limit exceeded"
+}
+
+const result = await model.invoke([new HumanMessage("retry")]);
+console.log(result.content); // "Recovered!"
+```
+
+#### 每次调用都出错
+
+`.alwaysThrow()` 会让每次调用都抛错，不管队列里有什么。这对于测试错误处理和重试逻辑很有用：
+
+```typescript
+import { fakeModel } from "langchain";
+import { HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel().alwaysThrow(new Error("service unavailable"));
+
+await model.invoke([new HumanMessage("a")]); // throws "service unavailable"
+await model.invoke([new HumanMessage("b")]); // throws "service unavailable"
+```
+
+### 使用工厂函数生成动态响应
+
+`.respond()` 也接受一个基于输入消息计算响应的函数。该函数会接收完整消息数组，并返回一个 @[`BaseMessage`] 或一个 `Error`：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond((messages) => {  // [!code highlight]
+    const last = messages[messages.length - 1].text;  // [!code highlight]
+    return new AIMessage(`You said: ${last}`);  // [!code highlight]
+  });  // [!code highlight]
+
+const result = await model.invoke([new HumanMessage("hello")]);
+console.log(result.content); // "You said: hello"
+```
+
+工厂函数也可以返回错误：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond((messages) => {
+    const content = messages[messages.length - 1].text;
+    if (content.includes("forbidden")) {
+      return new Error("Content policy violation");
+    }
+    return new AIMessage("OK");
+  });
+
+await model.invoke([new HumanMessage("forbidden topic")]); // throws "Content policy violation"
+```
+
+<Note>
+    每个函数都只算一个队列条目，消费一次。如果你想在多轮中复用同样的动态逻辑，就需要排队多个 `respond` 函数调用。
+</Note>
+
+### 结构化输出
+
+对于使用 `.withStructuredOutput()` 的代码，请用 `.structuredResponse()` 配置 fake 返回值：
+
+```typescript
+import { fakeModel } from "langchain";
+import { HumanMessage } from "@langchain/core/messages";
+import { z } from "zod";
+
+const model = fakeModel()
+  .structuredResponse({ temperature: 72, unit: "fahrenheit" });  // [!code highlight]
+
+const structured = model.withStructuredOutput(
+  z.object({
+    temperature: z.number(),
+    unit: z.string(),
+  })
+);
+
+const result = await structured.invoke([new HumanMessage("Weather?")]);
+console.log(result);
+// { temperature: 72, unit: "fahrenheit" }
+```
+
+传给 `.withStructuredOutput()` 的 schema 会被忽略。模型总是返回你通过 `.structuredResponse()` 配置的值。这能让测试聚焦在应用逻辑，而不是解析逻辑上。
+
+### 断言模型收到了什么
+
+`fakeModel` 会记录每次调用，包括传给模型的消息和选项。这就像传统测试框架里的 spy 或 mock：
+
+```typescript
+import { fakeModel } from "langchain";

@@ -1,0 +1,675 @@
+---
+title: 人类在回路中
+---
+
+import HitlDecisionTypesTable from '/snippets/oss/hitl-decision-types-table.mdx';
+
+人类在回路中（HITL）[中间件](/oss/langchain/middleware/built-in#human-in-the-loop) 让你可以为智能体工具调用加入人工审核。
+当模型提出一个可能需要复核的动作时，例如写文件或执行 SQL，中间件可以暂停执行并等待决策。
+
+它的做法是把每个工具调用拿去和可配置策略做比对。如果需要人工介入，中间件就会发出一个 @[interrupt]，从而中止执行。图状态会通过 LangGraph 的 [持久化层](/oss/langgraph/persistence) 保存，因此执行可以安全暂停，并在之后恢复。
+
+人工决策随后决定下一步怎么做：动作可以原样批准（`approve`）、执行前修改（`edit`）、带反馈拒绝（`reject`），或者在 "ask user" 这类工具里直接回复（`respond`）。
+
+## 中断决策类型
+
+[中间件](/oss/langchain/middleware/built-in#human-in-the-loop) 定义了四种人类对中断的内置响应方式：
+
+<HitlDecisionTypesTable />
+
+每个工具可用的决策类型取决于你在 `interrupt_on` 中配置的策略。
+当多个工具调用同时暂停时，每个动作都需要单独决策。
+决策的顺序必须和中断请求里动作出现的顺序一致。
+
+当人类是在拒绝请求的动作时，请使用 `reject`。只有在人工是在充当工具本身时才使用 `respond`，例如回答一个 `ask_user` 提示。不要用 `respond` 去拒绝会产生副作用的工具，因为它的消息会被当作成功的工具结果。
+
+<Tip>
+在**编辑**工具参数时，请尽量保守地修改。对原始参数做大幅更改，可能会让模型重新评估方案，并且可能多次执行工具，或者采取意料之外的动作。
+</Tip>
+
+## 配置中断
+
+要使用 HITL，请在创建智能体时，把 [中间件](/oss/langchain/middleware/built-in#human-in-the-loop) 添加到智能体的 `middleware` 列表中。
+
+你需要用一个工具动作到决策类型的映射来配置它。只要某个工具调用匹配到映射中的动作，中间件就会中断执行。
+
+:::python
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware # [!code highlight]
+from langgraph.checkpoint.memory import InMemorySaver # [!code highlight]
+
+
+agent = create_agent(
+    model="gpt-5.5",
+    tools=[write_file, execute_sql, read_data],
+    middleware=[
+        HumanInTheLoopMiddleware( # [!code highlight]
+            interrupt_on={
+                "write_file": True,  # 允许所有决策（approve、edit、reject、respond）
+                "execute_sql": {"allowed_decisions": ["approve", "reject"]},  # 不允许编辑
+                "read_data": False, # 安全操作，不需要批准
+            },
+            # 中断消息前缀 - 会和工具名及参数一起拼成完整消息
+            # 例如："Tool execution pending approval: execute_sql with query='DELETE FROM...'"
+            # 单个工具可以通过在其中断配置里指定 "description" 来覆盖它
+            description_prefix="Tool execution pending approval",
+        ),
+    ],
+    # Human-in-the-loop 需要 checkpointing 来处理中断。
+    # 在生产环境中，请使用持久化 checkpointer，例如 AsyncPostgresSaver。
+    checkpointer=InMemorySaver(),  # [!code highlight]
+)
+```
+:::
+
+:::js
+```ts
+import { createAgent, humanInTheLoopMiddleware } from "langchain"; // [!code highlight]
+import { MemorySaver } from "@langchain/langgraph"; // [!code highlight]
+
+const agent = createAgent({
+    model: "gpt-5.5",
+    tools: [writeFileTool, executeSQLTool, readDataTool],
+    middleware: [
+        humanInTheLoopMiddleware({
+            interruptOn: {
+                write_file: true, // 允许所有决策（approve、edit、reject、respond）
+                execute_sql: {
+                    allowedDecisions: ["approve", "reject"],
+                    // 不允许编辑
+                    description: "🚨 SQL execution requires DBA approval",
+                },
+                // 安全操作，不需要批准
+                read_data: false,
+            },
+            // 中断消息前缀 - 会和工具名及参数一起拼成完整消息
+            // 例如："Tool execution pending approval: execute_sql with query='DELETE FROM...'"
+            // 单个工具可以通过在其中断配置里指定 "description" 来覆盖它
+            descriptionPrefix: "Tool execution pending approval",
+        }),
+    ],
+    // Human-in-the-loop 需要 checkpointing 来处理中断。
+    // 在生产环境中，请使用持久化 checkpointer，例如 AsyncPostgresSaver。
+    checkpointer: new MemorySaver(), // [!code highlight]
+});
+```
+:::
+
+
+<Info>
+    你必须配置一个 checkpointer，才能在中断之间持久化图状态。
+    在生产环境中，请使用持久化 checkpointer，例如 @[`AsyncPostgresSaver`]。测试或原型阶段可以使用 @[`InMemorySaver`]。
+
+    调用智能体时，请传入包含 **thread ID** 的 `config`，用于把执行关联到某个会话线程。
+    详情请参见 [LangGraph interrupts 文档](/oss/langgraph/interrupts)。
+</Info>
+
+<Accordion title="配置选项">
+
+:::python
+<ParamField body="interrupt_on" type="dict" required>
+    工具名到批准配置的映射。值可以是 `True`（使用默认配置中断）、`False`（自动批准），或者一个 `InterruptOnConfig` 对象。
+</ParamField>
+
+<ParamField body="description_prefix" type="string" default="Tool execution requires approval">
+    动作请求描述的前缀
+</ParamField>
+
+**`InterruptOnConfig` 选项：**
+
+<ParamField body="allowed_decisions" type="list[string]">
+    允许的决策列表：`'approve'`、`'edit'`、`'reject'` 或 `'respond'`
+</ParamField>
+
+<ParamField body="description" type="string | callable">
+    用于自定义描述的静态字符串或可调用函数
+</ParamField>
+
+<ParamField body="when" type="callable">
+    可选谓词，接收一个 @[ToolCallRequest]，并返回 `True` 表示中断，返回 `False` 表示自动批准。可用它按调用参数来控制中断。需要 `langchain>=1.3.3`。
+</ParamField>
+:::
+
+:::js
+<ParamField body="interruptOn" type="object" required>
+    工具名到批准配置的映射
+</ParamField>
+
+**工具批准配置选项：**
+
+<ParamField body="allowAccept" type="boolean" default="false">
+    是否允许批准
+</ParamField>
+
+<ParamField body="allowEdit" type="boolean" default="false">
+    是否允许编辑
+</ParamField>
+
+<ParamField body="allowRespond" type="boolean" default="false">
+    是否允许回复/拒绝
+</ParamField>
+:::
+
+</Accordion>
+
+## 条件中断
+
+默认情况下，`interrupt_on` 中列出的每个工具调用都会暂停等待审查。若只想暂停部分调用，可以给某个工具的 `InterruptOnConfig` 加上 `when` 谓词。这个谓词会接收一个 `ToolCallRequest`，并返回 `True` 表示中断，`False` 表示自动批准，这样你就能按工具参数来控制。
+
+:::python
+<Note>
+条件中断需要 `langchain>=1.3.3`。
+</Note>
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware, ToolCallRequest
+from langgraph.checkpoint.memory import InMemorySaver
+
+
+def writes_outside_workspace(request: ToolCallRequest) -> bool:
+    """暂停写入工作区目录之外的路径。"""
+    path = request.tool_call["args"].get("path", "")
+    return not path.startswith("/workspace/")
+
+
+def is_write_query(request: ToolCallRequest) -> bool:
+    """暂停不是只读 SELECT 的 SQL。"""
+    query = request.tool_call["args"].get("query", "")
+    return not query.lstrip().upper().startswith("SELECT")
+
+
+agent = create_agent(
+    model="gpt-5.5",
+    tools=[write_file, execute_sql, read_data],
+    middleware=[
+        HumanInTheLoopMiddleware(
+            interrupt_on={
+                "write_file": {
+                    "allowed_decisions": ["approve", "edit", "reject"],
+                    "when": writes_outside_workspace,
+                },
+                "execute_sql": {
+                    "allowed_decisions": ["approve", "reject"],
+                    "when": is_write_query,
+                },
+            },
+        ),
+    ],
+    checkpointer=InMemorySaver(),
+)
+```
+
+当 `when` 谓词返回 `False` 时，调用会直接运行而不中断。当它返回 `True`，或者你省略 `when` 时，调用就会像平常一样暂停。评估为 `False` 的调用不会被加入中断批次，因此审查者只会看到需要决策的动作。
+:::
+
+:::js
+条件中断目前只支持 Python。
+:::
+
+## 响应中断
+
+当你调用智能体时，它会一直运行到完成或者触发一个中断。只要某个工具调用匹配到你在 `interrupt_on` 中配置的策略，就会触发中断。使用 `version="v2"` 时，返回结果是一个带有 `interrupts` 属性的 `GraphOutput`，其中包含需要审查的动作。然后你可以把这些动作展示给审查者，并在获得决策后恢复执行。
+
+
+:::python
+```python
+from langgraph.types import Command
+
+# Human-in-the-loop 依赖 LangGraph 的持久化层。
+# 你必须提供 thread ID，把执行关联到某个会话线程，
+# 这样会话才能被暂停和恢复（这也是人工审查所需要的）。
+config = {"configurable": {"thread_id": "some_id"}} # [!code highlight]
+# 运行图，直到触发中断。
+result = agent.invoke(
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Delete old records from the database",
+            }
+        ]
+    },
+    config=config, # [!code highlight]
+    version="v2", # [!code highlight]
+)
+
+# result 是一个带 .value 和 .interrupts 的 GraphOutput
+print(result.interrupts)  # [!code highlight]
+# > (
+# >    Interrupt(
+# >       value={
+# >          'action_requests': [
+# >             {
+# >                'name': 'execute_sql',
+# >                'arguments': {'query': 'DELETE FROM records WHERE created_at < NOW() - INTERVAL \'30 days\';'},
+# >                'description': 'Tool execution pending approval\n\nTool: execute_sql\nArgs: {...}'
+# >             }
+# >          ],
+# >          'review_configs': [
+# >             {
+# >                'action_name': 'execute_sql',
+# >                'allowed_decisions': ['approve', 'reject']
+# >             }
+# >          ]
+# >       }
+# >    ),
+# > )
+
+# 用批准决策恢复
+agent.invoke(
+    Command( # [!code highlight]
+        resume={"decisions": [{"type": "approve"}]}  # 或 "reject" [!code highlight]
+    ), # [!code highlight]
+    config=config, # 相同 thread ID，用于恢复已暂停的会话
+    version="v2",
+)
+```
+:::
+
+:::js
+```typescript
+import { HumanMessage } from "@langchain/core/messages";
+import { Command } from "@langchain/langgraph";
+
+// 你必须提供 thread ID，把执行关联到某个会话线程，
+// 这样会话才能被暂停和恢复（这也是人工审查所需要的）。
+const config = { configurable: { thread_id: "some_id" } }; // [!code highlight]
+
+// 运行图，直到触发中断。
+const result = await agent.invoke(
+    {
+        messages: [new HumanMessage("Delete old records from the database")],
+    },
+    config // [!code highlight]
+);
+
+
+// 中断里包含完整的 HITL 请求，包括 action_requests 和 review_configs
+console.log(result.__interrupt__);
+// > [
+// >    Interrupt(
+// >       value: {
+// >          actionRequests: [
+// >             {
+// >                name: 'execute_sql',
+// >                arguments: { query: 'DELETE FROM records WHERE created_at < NOW() - INTERVAL \'30 days\';' },
+// >                description: 'Tool execution pending approval\n\nTool: execute_sql\nArgs: {...}'
+// >             }
+// >          ],
+// >          reviewConfigs: [
+// >             {
+// >                actionName: 'execute_sql',
+// >                allowedDecisions: ['approve', 'reject']
+// >             }
+// >          ]
+// >       }
+// >    )
+// > ]
+
+// 用批准决策恢复
+await agent.invoke(
+    new Command({ // [!code highlight]
+        resume: { decisions: [{ type: "approve" }] }, // 或 "reject" [!code highlight]
+    }), // [!code highlight]
+    config // 相同 thread ID，用于恢复已暂停的会话
+);
+```
+:::
+
+### 决策类型
+
+<Tabs>
+<Tab title="✅ approve">
+使用 `approve` 可原样批准工具调用，并在不做修改的情况下执行。
+
+:::python
+```python
+agent.invoke(
+    Command(
+        # 决策以列表形式提供，每个待审动作对应一个。
+        # 决策顺序必须和中断请求中动作的顺序一致。
+        resume={
+            "decisions": [
+                {
+                    "type": "approve",
+                }
+            ]
+        }
+    ),
+    config=config,  # 相同 thread ID，用于恢复已暂停的会话
+    version="v2",
+)
+```
+:::
+
+:::js
+```typescript
+await agent.invoke(
+    new Command({
+        // 决策以列表形式提供，每个待审动作对应一个。
+        // 决策顺序必须和中断请求中动作的顺序一致。
+        resume: {
+            decisions: [
+                {
+                    type: "approve",
+                }
+            ]
+        }
+    }),
+    config  // 相同 thread ID，用于恢复已暂停的会话
+);
+```
+:::
+</Tab>
+<Tab title="✏️ edit">
+    使用 `edit` 可以在执行前修改工具调用。
+    需要提供编辑后的动作，包括新的工具名和参数。
+
+    :::python
+    ```python
+    agent.invoke(
+        Command(
+            # 决策以列表形式提供，每个待审动作对应一个。
+            # 决策顺序必须和中断请求中动作的顺序一致。
+            resume={
+                "decisions": [
+                    {
+                        "type": "edit",
+                        # 编辑后的动作，包括工具名和参数
+                        "edited_action": {
+                            # 要调用的工具名。
+                            # 通常会和原动作保持一致。
+                            "name": "new_tool_name",
+                            # 要传给工具的参数。
+                            "args": {"key1": "new_value", "key2": "original_value"},
+                        }
+                    }
+                ]
+            }
+        ),
+        config=config,  # 相同 thread ID，用于恢复已暂停的会话
+        version="v2",
+    )
+    ```
+    :::
+
+    :::js
+    ```typescript
+    await agent.invoke(
+        new Command({
+            // 决策以列表形式提供，每个待审动作对应一个。
+            // 决策顺序必须和中断请求中动作的顺序一致。
+            resume: {
+                decisions: [
+                    {
+                        type: "edit",
+                        // 编辑后的动作，包括工具名和参数
+                        editedAction: {
+                            // 要调用的工具名。
+                            // 通常会和原动作保持一致。
+                            name: "new_tool_name",
+                            // 要传给工具的参数。
+                            args: { key1: "new_value", key2: "original_value" },
+                        }
+                    }
+                ]
+            }
+        }),
+        config  // 相同 thread ID，用于恢复已暂停的会话
+    );
+    ```
+    :::
+
+    <Tip>
+        在**编辑**工具参数时，请尽量保守地修改。对原始参数做大幅更改，可能会让模型重新评估方案，并且可能多次执行工具，或者采取意料之外的动作。
+    </Tip>
+
+</Tab>
+
+<Tab title="❌ reject">
+    使用 `reject` 可以拒绝工具调用，并提供反馈，而不是执行它。工具不会被运行。
+
+    :::python
+    ```python
+    agent.invoke(
+        Command(
+            # 决策以列表形式提供，每个待审动作对应一个。
+            # 决策顺序必须和中断请求中动作的顺序一致。
+            resume={
+                "decisions": [
+                    {
+                        "type": "reject",
+                        # 可选：解释为什么拒绝该动作，
+                        # 以及智能体是否应该尝试不同的方法。
+                        "message": "User rejected this action. Do not retry this tool call.",
+                    }
+                ]
+            }
+        ),
+        config=config,  # 相同 thread ID，用于恢复已暂停的会话
+        version="v2",
+    )
+    ```
+    :::
+
+    :::js
+    ```typescript
+    await agent.invoke(
+        new Command({
+            // 决策以列表形式提供，每个待审动作对应一个。
+            // 决策顺序必须和中断请求中动作的顺序一致。
+            resume: {
+                decisions: [
+                    {
+                        type: "reject",
+                        // 可选：解释为什么拒绝该动作，
+                        // 以及智能体是否应该尝试不同的方法。
+                        message: "User rejected this action. Do not retry this tool call.",
+                    }
+                ]
+            }
+        }),
+        config  // 相同 thread ID，用于恢复已暂停的会话
+    );
+    ```
+    :::
+
+拒绝消息会被加入对话，作为反馈帮助智能体理解为什么该动作被拒绝，以及下一步应该怎么做。如果你省略 `message`，中间件会使用默认的拒绝消息，告诉模型这个工具没有执行，并且除非用户要求，否则不要重复同一个工具调用。对于有副作用的工具，请提供更具体的领域消息，明确说明智能体应该放弃该动作、提出后续问题，还是尝试更安全的替代方案。
+
+</Tab>
+
+<Tab title="💬 respond">
+    当工具本质上是“ask user”这类场景时，请使用 `respond`，此时工具的真实实现就是人类的回复。`message` 内容会直接作为工具结果返回；工具本身不会执行。
+
+    :::python
+    ```python
+    agent.invoke(
+        Command(
+            # 决策以列表形式提供，每个待审动作对应一个。
+            # 决策顺序必须和中断请求中动作的顺序一致。
+            resume={
+                "decisions": [
+                    {
+                        "type": "respond",
+                        # 人类的回复，会直接作为工具结果返回
+                        "message": "Blue.",
+                    }
+                ]
+            }
+        ),
+        config=config,  # 相同 thread ID，用于恢复已暂停的会话
+        version="v2",
+    )
+    ```
+    :::
+
+    :::js
+    ```typescript
+    await agent.invoke(
+        new Command({
+            // 决策以列表形式提供，每个待审动作对应一个。
+            // 决策顺序必须和中断请求中动作的顺序一致。
+            resume: {
+                decisions: [
+                    {
+                        type: "respond",
+                        // 人类的回复，会直接作为工具结果返回
+                        message: "Blue.",
+                    }
+                ]
+            }
+        }),
+        config  // 相同 thread ID，用于恢复已暂停的会话
+    );
+    ```
+    :::
+
+`respond` 适合把 human input 直接作为工具输出的情形，例如问答式工具。消息会被直接传回智能体，并像正常工具结果一样继续流转。
+
+</Tab>
+</Tabs>
+
+---
+
+### 多个决策
+
+当多个动作需要审查时，请按它们在中断中出现的顺序，为每个动作提供一个决策：
+
+:::python
+```python
+{
+    "decisions": [
+        {"type": "approve"},
+        {
+            "type": "edit",
+            "edited_action": {
+                "name": "tool_name",
+                "args": {"param": "new_value"}
+            }
+        },
+        {
+            "type": "reject",
+            "message": "This action is not allowed"
+        }
+    ]
+}
+```
+:::
+
+:::js
+```typescript
+{
+    decisions: [
+        { type: "approve" },
+        {
+            type: "edit",
+            editedAction: {
+                name: "tool_name",
+                args: { param: "new_value" }
+            }
+        },
+        {
+            type: "reject",
+            message: "This action is not allowed"
+        }
+    ]
+}
+```
+:::
+
+## 使用人类在回路中进行流式处理
+
+你可以在智能体运行并处理中断时，使用 `stream_events()` 实时流式获取更新。使用 `stream.messages` 流式获取 LLM token，使用 `stream.values` 检查智能体状态快照里的中断。
+
+:::python
+```python
+from langgraph.types import Command
+
+config = {"configurable": {"thread_id": "some_id"}}
+
+# 流式输出智能体进度和 LLM token，直到中断
+stream = agent.stream_events(
+    {"messages": [{"role": "user", "content": "Delete old records from the database"}]},
+    config=config,
+    version="v3",  # [!code highlight]
+)
+for message in stream.messages:  # [!code highlight]
+    for token in message.text:  # [!code highlight]
+        print(token, end="", flush=True)
+
+# 检查运行是否因人工输入而暂停
+if stream.interrupted:  # [!code highlight]
+    print(f"\n\nInterrupt: {stream.interrupts}")  # [!code highlight]
+
+# 在人工决策后，继续流式恢复
+stream = agent.stream_events(
+    Command(resume={"decisions": [{"type": "approve"}]}),
+    config=config,
+    version="v3",  # [!code highlight]
+)
+for message in stream.messages:  # [!code highlight]
+    for token in message.text:
+        print(token, end="", flush=True)
+```
+:::
+
+:::js
+```typescript
+import { Command } from "@langchain/langgraph";
+
+const config = { configurable: { thread_id: "some_id" } };
+
+// 流式输出智能体进度和 LLM token，直到中断
+const stream = await agent.streamEvents(
+    { messages: [{ role: "user", content: "Delete old records from the database" }] },
+    { ...config, version: "v3" }  // [!code highlight]
+);
+for await (const message of stream.messages) {  // [!code highlight]
+    for await (const token of message.text) {  // [!code highlight]
+        process.stdout.write(token);
+    }
+}
+
+// 检查运行是否因人工输入而暂停
+if (stream.interrupted) {  // [!code highlight]
+    console.log(`\n\nInterrupt: ${JSON.stringify(stream.interrupts)}`);  // [!code highlight]
+}
+
+// 在人工决策后，继续流式恢复
+const resumeStream = await agent.streamEvents(
+    new Command({ resume: { decisions: [{ type: "approve" }] } }),
+    { ...config, version: "v3" }  // [!code highlight]
+);
+for await (const message of resumeStream.messages) {  // [!code highlight]
+    for await (const token of message.text) {
+        process.stdout.write(token);
+    }
+}
+```
+:::
+
+有关 stream modes 的更多细节，请参见 [Streaming](/oss/langchain/streaming) 指南。
+
+## 执行生命周期
+
+中间件定义了一个 `after_model` 钩子，它会在模型生成回复之后、任何工具调用执行之前运行：
+
+1. 智能体调用模型生成回复。
+2. 中间件检查回复中是否有工具调用。
+3. 如果任何调用需要人工输入，中间件会构建一个带有 `action_requests` 和 `review_configs` 的 `HITLRequest`，并调用 @[interrupt]。
+4. 智能体等待人工决策。
+5. 根据 `HITLResponse` 中的决策，中间件会执行已批准或已编辑的调用，为被拒绝的调用合成 @[ToolMessage]，对于 `respond` 决策则直接把人类回复作为 @[ToolMessage] 返回，然后继续执行。
+
+## 自定义 HITL 逻辑
+
+对于更专业的工作流，你可以直接使用 @[interrupt] 原语和 [middleware](/oss/langchain/middleware) 抽象来构建自定义 HITL 逻辑。
+
+请先阅读上面的 [执行生命周期](#execution-lifecycle)，了解如何把中断集成到智能体运行中。
+
+## 其他资源
+
+- [更多示例](/oss/langchain/middleware/built-in#human-in-the-loop) - 在内置中间件中查看更多 HITL 用法。
+- [LangGraph 中断文档](/oss/langgraph/interrupts) - 了解中断与恢复的运行机制。
+- [测试智能体](/oss/langchain/test/) - 练习如何测试中断和恢复流程。

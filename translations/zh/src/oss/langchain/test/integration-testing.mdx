@@ -1,0 +1,260 @@
+---
+title: 集成测试
+description: 通过组织测试、管理密钥、处理不稳定性和控制成本，使用真实 LLM API 测试智能体。
+---
+
+集成测试会验证你的智能体是否能和模型 API 以及外部服务正确协作。不同于使用 fake 和 mock 的 [unit tests](/oss/langchain/test/unit-testing)，集成测试会发起真实网络调用，以确认各组件能协同工作、凭据有效，并且延迟可接受。
+
+由于 LLM 响应并非确定性的，集成测试需要和传统软件测试不同的策略。本指南介绍如何组织、编写和运行智能体的集成测试。关于贡献 LangChain 本身时的一般测试基础设施，请参见 [Contributing to code](/oss/contributing/code#running-tests)。
+
+## 分离单元测试和集成测试
+
+集成测试更慢，而且需要 API 凭据，所以要把它们和单元测试分开。这样你就能在每次改动时运行快速的单元测试，而把集成测试留给 CI 或预发布检查。
+
+:::python
+使用 pytest marker 给集成测试打标签：
+
+```python
+import pytest
+
+@pytest.mark.integration
+def test_agent_with_real_model():
+    agent = create_agent("claude-sonnet-4-6", tools=[get_weather])
+    result = agent.invoke({
+        "messages": [HumanMessage(content="What's the weather in SF?")]
+    })
+    assert len(result["messages"]) > 1
+```
+
+配置 pytest 识别这个 marker，并把集成测试排除在默认运行之外：
+
+<CodeGroup>
+```ini pytest.ini
+[pytest]
+markers =
+    integration: tests that call real LLM APIs
+addopts = -m "not integration"
+```
+```toml pyproject.toml
+[tool.pytest.ini_options]
+markers = [
+  "integration: tests that call real LLM APIs"
+]
+addopts = "-m 'not integration'"
+```
+</CodeGroup>
+
+显式运行集成测试：
+
+```bash
+pytest -m integration
+```
+:::
+
+:::js
+使用文件命名约定把集成测试分开。把集成测试文件命名为 `*.int.test.ts`，并配置 vitest 在默认运行中排除它们：
+
+```ts vitest.config.ts
+import { configDefaults, defineConfig } from "vitest/config";
+
+export default defineConfig((env) => {
+  if (env.mode === "int") {
+    return {
+      test: {
+        testTimeout: 100_000,
+        include: ["**/*.int.test.ts"],
+        setupFiles: ["dotenv/config"],
+      },
+    };
+  }
+
+  return {
+    test: {
+      testTimeout: 30_000,
+      exclude: ["**/*.int.test.ts", ...configDefaults.exclude],
+    },
+  };
+});
+```
+
+在 `package.json` 中添加脚本：
+
+```json
+{
+  "scripts": {
+    "test": "vitest",
+    "test:integration": "vitest --mode int"
+  }
+}
+```
+
+显式运行集成测试：
+
+```bash
+npm run test:integration
+```
+:::
+
+## 管理 API 密钥
+
+集成测试需要真实的 API 凭据。请从环境变量加载它们，避免把密钥放进源码控制。
+
+:::python
+使用 `conftest.py` fixture 来检查所需密钥是否可用：
+
+```python
+import os
+import pytest
+
+@pytest.fixture(autouse=True)
+def check_api_keys():
+    if not os.environ.get("OPENAI_API_KEY"):
+        pytest.skip("OPENAI_API_KEY not set")
+```
+
+在本地开发时，把密钥存进 `.env` 文件，并用 [`python-dotenv`](https://pypi.org/project/python-dotenv/) 加载：
+
+```bash .env
+OPENAI_API_KEY=sk-...
+```
+
+```python conftest.py
+from dotenv import load_dotenv
+
+load_dotenv()
+```
+:::
+
+:::js
+把 `dotenv/config` 加到 vitest setup file，这样环境变量会自动从 `.env` 加载：
+
+```ts vitest.config.ts
+export default defineConfig({
+  test: {
+    setupFiles: ["dotenv/config"],
+  },
+});
+```
+
+```bash .env
+OPENAI_API_KEY=sk-...
+```
+
+在缺少密钥时跳过测试：
+
+```ts
+import { test } from "vitest";
+
+test.skipIf(!process.env.OPENAI_API_KEY)(
+  "agent responds with tool call",
+  async () => {
+    // ...
+  }
+);
+```
+:::
+
+<Warning>
+    把 `.env` 加进 `.gitignore`，避免提交凭据。在 CI 中，请通过你所用平台的密钥管理功能注入 secrets（例如 GitHub Actions secrets）。
+</Warning>
+
+## 断言结构，而不是内容
+
+LLM 响应每次运行都可能不同。与其断言精确输出字符串，不如验证响应的结构属性：消息类型、工具调用名称、参数形状和消息数量。
+
+:::python
+```python
+def test_agent_calls_weather_tool():
+    agent = create_agent("claude-sonnet-4-6", tools=[get_weather])
+    result = agent.invoke({
+        "messages": [HumanMessage(content="What's the weather in SF?")]
+    })
+
+    messages = result["messages"]
+    tool_calls = [
+        tc
+        for msg in messages
+        if hasattr(msg, "tool_calls")
+        for tc in (msg.tool_calls or [])
+    ]
+
+    assert any(tc["name"] == "get_weather" for tc in tool_calls)
+    assert isinstance(messages[-1], AIMessage)
+    assert len(messages[-1].content) > 0
+```
+:::
+
+:::js
+```ts
+test("agent calls weather tool", async () => {
+  const agent = createAgent({ model: "claude-sonnet-4-6", tools: [getWeather] });
+  const result = await agent.invoke({
+    messages: [new HumanMessage("What's the weather in SF?")]
+  });
+
+  const aiMsg = result.messages.find(
+    (m) => AIMessage.isInstance(m) && m.tool_calls?.length
+  );
+  expect(aiMsg).toContainToolCall({ name: "get_weather" });
+  expect(result.messages.at(-1)).toBeAIMessage();
+});
+```
+
+这个示例使用了 [custom test matchers](#use-custom-test-matchers)。关于设置和完整 matcher 参考，请看下面的章节。
+:::
+
+<Tip>
+    如果你需要更严格的轨迹断言，请使用 [AgentEvals](/oss/langchain/test/evals) evaluators，它们支持像 `unordered` 和 `superset` 这样的模糊匹配模式。
+</Tip>
+
+:::js
+
+## 使用自定义测试 matcher
+`langchain` 提供了 [custom vitest matchers](https://vitest.dev/guide/extending-matchers.html)，让结构化断言更易读，并在失败时给出清晰的错误信息。只需要在一个 setup 文件里注册一次，它们就会在每次 `expect()` 调用中可用。
+
+### 设置
+
+添加一个 vitest setup 文件，用 LangChain matchers 扩展 `expect`：
+
+```ts vitest.setup.ts
+import { langchainMatchers } from "@langchain/core/testing";
+
+expect.extend(langchainMatchers);
+```
+
+在 vitest 配置里引用它：
+
+```ts vitest.config.ts
+export default defineConfig({
+  test: {
+    setupFiles: ["vitest.setup.ts"],
+  },
+});
+```
+
+TypeScript 类型会自动包含，因此不需要额外配置自动补全。
+
+### 检查消息类型
+
+每个消息类都有对应的 matcher：`toBeHumanMessage()`、`toBeAIMessage()`、`toBeSystemMessage()` 和 `toBeToolMessage()`。不传参数时只检查类型；传入字符串时也可以匹配内容：
+
+```ts
+const response = await agent.invoke({
+  messages: [new HumanMessage("What's the weather?")]
+});
+const lastMessage = response.messages.at(-1);
+
+expect(lastMessage).toBeAIMessage();
+expect(lastMessage).toBeAIMessage("It's 72°F and sunny.");
+```
+
+传入对象可以匹配特定字段：
+
+```ts
+expect(lastMessage).toBeAIMessage({ name: "weather-bot" });
+expect(toolMsg).toBeToolMessage({ tool_call_id: "call_1" });
+```
+
+### 断言工具调用
+
+三个 matcher 用于对 @[`AIMessage`] 的工具调用做断言：

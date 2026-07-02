@@ -1,0 +1,274 @@
+---
+title: Markdown 消息
+description: 以富文本格式渲染 LLM 响应，并支持正确的流式输出
+---
+
+LLM 天然会生成 markdown 格式文本，包括标题、列表、代码块、表格和行内格式。把这些内容当作纯文本渲染，会浪费模型已经提供的结构。本模式会告诉你如何在消息从智能体流出时，实时解析并渲染 markdown，适用于所有主流前端框架。
+
+import { PatternEmbed } from "/snippets/pattern-embed.jsx"
+import UseStreamTypeInference from '/snippets/oss/use-stream-type-inference.mdx';
+
+<PatternEmbed pattern="markdown-messages" />
+
+## markdown 渲染如何工作
+
+渲染管道有三个步骤：
+
+1. **接收：** @[`useStream`] 会把流式文本累积到每条 AI 消息的 `msg.text` 中，并在新 token 到来时实时更新。
+2. **解析：** markdown 解析器把原始文本转换为 HTML（或 React element tree）。这个过程会在每次更新时运行，但对于聊天长度内容来说速度足够快（5 KB 消息少于 5ms）。
+3. **渲染：** 将解析后的内容渲染到 DOM 中。React 使用 virtual DOM diffing；Vue 和 Svelte 使用 `v-html` / `{@html}`，并配合经过清理的 HTML。
+
+## 设置 `useStream`
+
+这个 markdown 模式使用一个没有特殊配置的简单聊天智能体。只要把 @[`useStream`] 与你的智能体 URL 和 assistant ID 接好即可。
+
+<UseStreamTypeInference />
+
+<CodeGroup>
+```tsx React
+import { useStream } from "@langchain/react";
+import { AIMessage, HumanMessage } from "langchain";
+
+const AGENT_URL = "http://localhost:2024";
+
+export function Chat() {
+  const stream = useStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "simple_agent",
+  });
+
+  return (
+    <div>
+      {stream.messages.map((msg) => {
+        if (AIMessage.isInstance(msg)) {
+          return <Markdown key={msg.id}>{msg.text}</Markdown>;
+        }
+        if (HumanMessage.isInstance(msg)) {
+          return <p key={msg.id}>{msg.text}</p>;
+        }
+      })}
+    </div>
+  );
+}
+```
+
+```vue Vue
+<script setup lang="ts">
+import { useStream } from "@langchain/vue";
+import { AIMessage, HumanMessage } from "langchain";
+
+const AGENT_URL = "http://localhost:2024";
+
+const stream = useStream<typeof myAgent>({
+  apiUrl: AGENT_URL,
+  assistantId: "simple_agent",
+});
+</script>
+
+<template>
+  <div>
+    <template v-for="msg in stream.messages.value" :key="msg.id">
+      <Markdown v-if="AIMessage.isInstance(msg)">{{ msg.text }}</Markdown>
+      <p v-else-if="HumanMessage.isInstance(msg)">{{ msg.text }}</p>
+    </template>
+  </div>
+</template>
+```
+
+```svelte Svelte
+<script lang="ts">
+  import { useStream } from "@langchain/svelte";
+  import { AIMessage, HumanMessage } from "langchain";
+
+  const AGENT_URL = "http://localhost:2024";
+
+  const stream = useStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "simple_agent",
+  });
+</script>
+
+<div>
+  {#each stream.messages as msg (msg.id)}
+    {#if AIMessage.isInstance(msg)}
+      <Markdown content={msg.text} />
+    {:else if HumanMessage.isInstance(msg)}
+      <p>{msg.text}</p>
+    {/if}
+  {/each}
+</div>
+```
+
+```ts Angular
+import { Component } from "@angular/core";
+import { injectStream } from "@langchain/angular";
+
+const AGENT_URL = "http://localhost:2024";
+
+@Component({
+  selector: "app-chat",
+  template: `
+    @for (msg of stream.messages(); track msg.id) {
+      <app-markdown [content]="msg.text" />
+    }
+  `,
+})
+export class ChatComponent {
+  stream = injectStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "simple_agent",
+  });
+}
+```
+</CodeGroup>
+
+## 选择 markdown 库
+
+每个框架都有适合自己的 markdown 渲染方案：
+
+| 框架 | 库 | 输出 | 原因 |
+| --- | --- | --- | --- |
+| React | `react-markdown` + `remark-gfm` | React elements | 基于组件、virtual DOM diffing、不需要 `dangerouslySetInnerHTML` |
+| Vue | `marked` + `dompurify` | 通过 `v-html` 输出的已清理 HTML | 轻量、快速、内置 GFM |
+| Svelte | `marked` + `dompurify` | 通过 `{@html}` 输出的已清理 HTML | 与 Vue 类似，API 一致 |
+| Angular | `marked` + `dompurify` | 通过 `[innerHTML]` 输出的已清理 HTML | 与 Vue/Svelte 相同 |
+
+<Tip>
+React 的 `react-markdown` 会直接把 markdown 转换为 React elements，因此不需要 HTML 清理。这里不会用到 `dangerouslySetInnerHTML`。对于 Vue、Svelte 和 Angular，在渲染前一定要使用 `dompurify` 清理解析后的 HTML。
+</Tip>
+
+## 构建 Markdown 组件
+
+<CodeGroup>
+```tsx React
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+
+export function Markdown({ children }: { children: string }) {
+  return (
+    <div className="markdown-content">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        {children}
+      </ReactMarkdown>
+    </div>
+  );
+}
+```
+
+```vue Vue
+<script setup lang="ts">
+import { computed, useSlots } from "vue";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
+
+marked.setOptions({ gfm: true, breaks: true });
+
+const slots = useSlots();
+
+const html = computed(() => {
+  const slot = slots.default?.();
+  const text = slot
+    ?.map((vnode) =>
+      typeof vnode.children === "string" ? vnode.children : ""
+    )
+    .join("") ?? "";
+  if (!text) return "";
+  return DOMPurify.sanitize(marked.parse(text) as string);
+});
+</script>
+
+<template>
+  <div class="markdown-content" v-html="html" />
+</template>
+```
+
+```svelte Svelte
+<script lang="ts">
+  import { marked } from "marked";
+  import DOMPurify from "dompurify";
+
+  let { content }: { content: string } = $props();
+
+  marked.setOptions({ gfm: true, breaks: true });
+
+  let html = $derived.by(() => {
+    if (!content) return "";
+    return DOMPurify.sanitize(marked.parse(content) as string);
+  });
+</script>
+
+<div class="markdown-content">
+  {@html html}
+</div>
+```
+
+```ts Angular
+import { Component, Input, computed, signal } from "@angular/core";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
+
+marked.setOptions({ gfm: true, breaks: true });
+
+@Component({
+  selector: "app-markdown",
+  template: `<div class="markdown-content" [innerHTML]="html()"></div>`,
+})
+export class MarkdownComponent {
+  @Input() set content(value: string) {
+    this._content.set(value);
+  }
+
+  private _content = signal("");
+
+  html = computed(() => {
+    const text = this._content();
+    if (!text) return "";
+    return DOMPurify.sanitize(marked.parse(text) as string);
+  });
+}
+```
+</CodeGroup>
+
+## 清理 HTML 输出
+
+当把解析后的 markdown 作为原始 HTML 渲染时（`v-html`、`{@html}`、`[innerHTML]`），你必须对输出进行清理，以防止跨站脚本攻击（XSS）。LLM 响应可能包含任意文本，包括 markdown 解析器可能转换成可执行 HTML 的标记。
+
+使用 `dompurify` 去除危险元素：
+
+```ts
+import DOMPurify from "dompurify";
+
+const safeHtml = DOMPurify.sanitize(rawHtml);
+```
+
+`dompurify` 会移除 `<script>` 标签、`onclick` 属性、`javascript:` URL 以及其他 XSS 向量，同时保留标题、列表、代码块、表格和链接等安全的 markdown 输出。
+
+<Note>
+React 的 `react-markdown` 不需要 `dompurify`，因为它会直接生成 React elements，不涉及原始 HTML 注入。
+</Note>
+
+## 流式注意事项
+
+`useStream` 会在每个 token 到来时响应式地更新 `msg.text`。markdown 组件会在每次更新时重新解析。对于常见聊天消息来说，这样的性能是足够的：
+
+- `marked` 的解析速度约为 1 MB/s。5 KB 消息少于 5ms
+- `react-markdown` + remark pipeline 对聊天长度内容也同样很快
+- 浏览器的布局引擎会高效处理 DOM 更新
+
+对于非常长的回复（超过 50 KB），可以考虑这些优化：
+
+- **节流渲染：** 使用 `requestAnimationFrame` 以 60fps 批量更新，而不是每个 token 都重新渲染
+- **增量解析：** 只解析新增内容，并追加到已渲染的缓冲区中（高级做法，聊天 UI 通常不需要）
+
+<Info>
+对于大多数聊天应用来说，每个 token 都重新解析整条消息的简单做法已经足够。只有在你观察到长消息导致滚动卡顿或掉帧时，才需要优化。
+</Info>
+
+## 最佳实践
+
+- **始终清理输出：** 使用 `v-html`、`{@html}` 或 `[innerHTML]` 时，务必把解析后的输出交给 `dompurify` 处理。不要信任来自 LLM 输出的原始 HTML。
+- **启用 GFM：** GitHub Flavored Markdown 增加了表格、删除线、任务列表和自动链接。这些特性经常被 LLM 使用。
+- **处理空内容：** 在解析前检查空字符串，避免渲染空容器。
+- **使用 `breaks: true`：** 开启换行转换，让 LLM 输出中的单个换行渲染为 `<br>`，而不是被忽略。LLM 经常用单换行做视觉分隔。
+- **按聊天场景做样式：** 使用适合聊天气泡的紧凑边距和尺寸，而不是整页文章布局。
+- **用丰富内容测试：** 用标题、嵌套列表、长代码块、宽表格和引用块验证渲染，检查是否有溢出或布局问题。

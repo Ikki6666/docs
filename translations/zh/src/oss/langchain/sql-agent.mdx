@@ -1,0 +1,450 @@
+---
+title: 构建 SQL 智能体
+sidebarTitle: SQL agent
+---
+
+import ChatModelTabsPy from '/snippets/chat-model-tabs.mdx';
+import ChatModelTabsJS from '/snippets/chat-model-tabs-js.mdx';
+import SqlAgentDownloadChinookPy from '/snippets/code-samples/sql-agent-download-chinook-py.mdx';
+import SqlAgentDownloadChinookJs from '/snippets/code-samples/sql-agent-download-chinook-js.mdx';
+import SqlAgentExploreDatabasePy from '/snippets/code-samples/sql-agent-explore-database-py.mdx';
+import SqlAgentToolsPy from '/snippets/code-samples/sql-agent-tools-py.mdx';
+import SqlAgentSystemPromptPy from '/snippets/code-samples/sql-agent-system-prompt-py.mdx';
+import SqlAgentCreateAgentPy from '/snippets/code-samples/sql-agent-create-agent-py.mdx';
+import SqlAgentRunAgentPy from '/snippets/code-samples/sql-agent-run-agent-py.mdx';
+import SqlAgentHitlMiddlewarePy from '/snippets/code-samples/sql-agent-hitl-middleware-py.mdx';
+import SqlAgentHitlRunPy from '/snippets/code-samples/sql-agent-hitl-run-py.mdx';
+import SqlAgentHitlResumePy from '/snippets/code-samples/sql-agent-hitl-resume-py.mdx';
+import SqlAgentRunQueryJs from '/snippets/code-samples/sql-agent-run-query-js.mdx';
+import SqlAgentSanitizeSqlJs from '/snippets/code-samples/sql-agent-sanitize-sql-js.mdx';
+import SqlAgentExecuteSqlJs from '/snippets/code-samples/sql-agent-execute-sql-js.mdx';
+import SqlAgentSystemPromptJs from '/snippets/code-samples/sql-agent-system-prompt-js.mdx';
+import SqlAgentCreateAgentJs from '/snippets/code-samples/sql-agent-create-agent-js.mdx';
+import SqlAgentRunAgentJs from '/snippets/code-samples/sql-agent-run-agent-js.mdx';
+import SqlAgentStudioPy from '/snippets/code-samples/sql-agent-studio-py.mdx';
+import SqlAgentStudioJs from '/snippets/code-samples/sql-agent-studio-js.mdx';
+import SqlAgentHitlMiddlewareJs from '/snippets/code-samples/sql-agent-hitl-middleware-js.mdx';
+import SqlAgentHitlRunJs from '/snippets/code-samples/sql-agent-hitl-run-js.mdx';
+import SqlAgentHitlResumeJs from '/snippets/code-samples/sql-agent-hitl-resume-js.mdx';
+
+## 概览
+
+在本教程中，你会学习如何构建一个能用 LangChain [agents](/oss/langchain/agents) 回答 SQL 数据库问题的智能体。
+
+从高层来看，这个智能体会：
+
+1. 从数据库中获取可用表和 schema
+1. 判断哪些表与问题相关
+1. 获取相关表的 schema
+1. 根据问题和 schema 信息生成查询
+1. 用 LLM 对查询做常见错误检查
+1. 执行查询并返回结果
+1. 在数据库引擎报错后修正错误，直到查询成功
+1. 基于结果组织回答
+
+<Warning>
+构建 SQL 数据库问答系统需要执行模型生成的 SQL 查询，这本身有风险。务必让数据库连接权限尽可能最小化，只给智能体完成任务所需的权限。这能缓解风险，但不能完全消除基于模型的系统风险。
+</Warning>
+
+### 概念
+
+本教程会涉及以下概念：
+
+- [Tools](/oss/langchain/tools) 用于读取 SQL 数据库
+- LangChain [agents](/oss/langchain/agents)
+- [Human-in-the-loop](/oss/langchain/human-in-the-loop) 流程
+
+## 设置
+
+<Steps>
+<Step title="安装依赖">
+
+:::python
+<CodeGroup>
+```bash pip
+pip install langchain langgraph
+```
+</CodeGroup>
+:::
+:::js
+<CodeGroup>
+```bash npm
+npm i langchain @langchain/core sqlite3 zod
+```
+```bash yarn
+yarn add langchain @langchain/core sqlite3 zod
+```
+```bash pnpm
+pnpm add langchain @langchain/core sqlite3 zod
+```
+</CodeGroup>
+:::
+
+</Step>
+<Step title="设置 LangSmith">
+
+使用 [LangSmith](https://smith.langchain.com) 来查看链或智能体内部发生了什么。然后设置下面这些环境变量：
+
+```shell
+export LANGSMITH_TRACING="true"
+export LANGSMITH_API_KEY="..."
+```
+
+</Step>
+</Steps>
+
+## 构建 SQL 智能体
+
+<Steps>
+<Step title="选择 LLM">
+
+:::python
+选择一个支持 [tool-calling](/oss/integrations/providers/overview) 的模型：
+
+<ChatModelTabsPy />
+:::
+:::js
+
+选择一个支持 [tool-calling](/oss/integrations/providers/overview) 的模型：
+<ChatModelTabsJS />
+:::
+
+下面示例里展示的输出使用的是 OpenAI。
+
+</Step>
+<Step title="配置数据库">
+
+本教程会创建一个 [SQLite database](https://www.sqlitetutorial.net/sqlite-sample-database/)。SQLite 是一种轻量级数据库，易于设置和使用。我们会加载 `chinook` 数据库，它是一个代表数字媒体商店的样例数据库。
+
+为方便起见，我们把数据库（`Chinook.db`）托管在了公共 GCS bucket 中。
+
+:::python
+
+<SqlAgentDownloadChinookPy />
+
+:::
+:::js
+
+<SqlAgentDownloadChinookJs />
+
+:::
+:::python
+我们会使用 Python 内置的 `sqlite3` 模块与数据库交互：
+
+<SqlAgentExploreDatabasePy />
+```
+Dialect: sqlite
+Available tables: ['Album', 'Artist', 'Customer', 'Employee', 'Genre', 'Invoice', 'InvoiceLine', 'MediaType', 'Playlist', 'PlaylistTrack', 'Track']
+Sample output: [(1, 'AC/DC'), (2, 'Accept'), (3, 'Aerosmith'), (4, 'Alanis Morissette'), (5, 'Alice In Chains')]
+```
+:::
+
+</Step>
+<Step title="为数据库交互添加工具">
+
+<Warning>
+下面这些数据库工具只是用于演示的最小包装，不适合也不打算用于生产环境。请使用权限范围尽可能小的数据库权限，并在执行模型生成的 SQL 之前加入应用级校验。
+</Warning>
+
+:::python
+我们可以用 `langchain.tools` 里的 `@tool` 装饰器，把数据库 [tools](/oss/langchain/tools) 实现成很薄的一层封装：
+
+<SqlAgentToolsPy />
+```
+sql_db_query: Input to this tool is a detailed and correct SQL query, output is a result from the database.
+    If the query is not correct, an error message will be returned.
+    If an error is returned, rewrite the query, check the query, and try again.
+    If you encounter an issue with Unknown column 'xxxx' in 'field list', use sql_db_schema to query the correct table fields.
+
+sql_db_schema: Input to this tool is a comma-separated list of tables, output is the schema and sample rows for those tables.
+    Be sure that the tables actually exist by calling sql_db_list_tables first!
+    Example Input: table1, table2, table3
+
+sql_db_list_tables: Input is an empty string, output is a comma-separated list of tables in the database.
+
+sql_db_query_checker: Use this tool to double check if your query is correct before executing it.
+    Always use this tool before executing a query with sql_db_query!
+```
+:::
+:::js
+
+我们会使用 `sqlite3` 库来查询数据库并获取 schema：
+
+<SqlAgentRunQueryJs />
+
+:::
+
+</Step>
+<Step title="创建智能体">
+
+:::python
+使用 @[`create_agent`] 来用最少代码构建一个 [ReAct agent](https://arxiv.org/pdf/2210.03629)。智能体会理解请求并生成 SQL 命令，然后由工具去执行。如果命令有误，错误信息会返回给模型。模型随后可以检查原始请求和新的错误信息，再生成一个新命令。这个过程会持续，直到 LLM 成功生成命令或者达到结束次数为止。让模型根据错误信息得到反馈，这种模式非常强大。
+
+先给智能体配置一个描述性的系统提示词来定制行为：
+
+<SqlAgentSystemPromptPy />
+
+然后用模型、工具和提示词创建智能体：
+
+<SqlAgentCreateAgentPy />
+
+:::
+:::js
+在运行命令前，先在 `_safe_sql` 中做一次检查，确认 LLM 生成的命令是安全的：
+
+<SqlAgentSanitizeSqlJs />
+
+然后使用 `execute_sql` 工具执行命令：
+
+<SqlAgentExecuteSqlJs />
+
+使用 `createAgent` 来用最少代码构建一个 [ReAct agent](https://arxiv.org/pdf/2210.03629)。智能体会理解请求并生成 SQL 命令。工具会检查命令是否安全，然后尝试执行。如果命令出错，错误信息会返回给模型。模型随后可以检查原始请求和新的错误信息，再生成一个新命令。这个过程会持续，直到 LLM 成功生成命令或者达到结束次数为止。让模型根据错误信息得到反馈，这种模式非常强大。
+
+先给智能体配置一个描述性的系统提示词来定制行为：
+
+<SqlAgentSystemPromptJs />
+
+然后用模型、工具和提示词创建智能体：
+
+<SqlAgentCreateAgentJs />
+:::
+
+</Step>
+<Step title="运行智能体">
+
+:::python
+在一个示例查询上运行智能体，观察它的行为：
+
+<SqlAgentRunAgentPy />
+
+```
+================================ Human Message =================================
+
+Which genre on average has the longest tracks?
+================================== Ai Message ==================================
+Tool Calls:
+  sql_db_list_tables (call_BQsWg8P65apHc8BTJ1NPDvnM)
+ Call ID: call_BQsWg8P65apHc8BTJ1NPDvnM
+  Args:
+================================= Tool Message =================================
+Name: sql_db_list_tables
+
+Album, Artist, Customer, Employee, Genre, Invoice, InvoiceLine, MediaType, Playlist, PlaylistTrack, Track
+================================== Ai Message ==================================
+Tool Calls:
+  sql_db_schema (call_i89tjKECFSeERbuACYm4w0cU)
+ Call ID: call_i89tjKECFSeERbuACYm4w0cU
+  Args:
+    table_names: Track, Genre
+================================= Tool Message =================================
+Name: sql_db_schema
+```
+
+...
+
+INTERRUPTED:
+Tool execution pending approval
+
+Tool: sql_db_query
+Args: {'query': 'SELECT g.Name AS Genre, AVG(t.Milliseconds) AS AvgTrackLength FROM Track t JOIN Genre g ON t.GenreId = g.GenreId GROUP BY g.Name ORDER BY AvgTrackLength DESC LIMIT 1;'}
+```
+然后我们可以用 [Command](/oss/langgraph/use-graph-api#combine-control-flow-and-state-updates-with-command) 恢复执行，这里选择接受该查询：
+
+<SqlAgentHitlResumePy />
+```
+================================== Ai Message ==================================
+Tool Calls:
+  sql_db_query (call_7oz86Epg7lYRqi9rQHbZPS1U)
+ Call ID: call_7oz86Epg7lYRqi9rQHbZPS1U
+  Args:
+    query: SELECT Genre.Name, AVG(Track.Milliseconds) AS AvgDuration FROM Track JOIN Genre ON Track.GenreId = Genre.GenreId GROUP BY Genre.Name ORDER BY AvgDuration DESC LIMIT 5;
+================================= Tool Message =================================
+Name: sql_db_query
+
+[('Sci Fi & Fantasy', 2911783.0384615385), ('Science Fiction', 2625549.076923077), ('Drama', 2575283.78125), ('TV Shows', 2145041.0215053763), ('Comedy', 1585263.705882353)]
+================================== Ai Message ==================================
+
+The genre with the longest average track length is "Sci Fi & Fantasy" with an average duration of about 2,911,783 milliseconds, followed by "Science Fiction" and "Drama."
+```
+
+更多细节请查看 [human-in-the-loop guide](/oss/langchain/human-in-the-loop)。
+:::
+
+:::js
+运行智能体并观察其行为：
+
+<SqlAgentRunAgentJs />
+
+```
+human: Which genre, on average, has the longest tracks?
+ai:
+tool: [{"Genre":"Sci Fi & Fantasy","AvgMilliseconds":2911783.0384615385}]
+ai: Sci Fi & Fantasy — average track length ≈ 48.5 minutes (about 2,911,783 ms).
+```
+
+智能体正确地编写了查询、检查了查询，并执行查询，以此来生成最终回答。
+
+<Note>
+    你可以在这个 [LangSmith trace](https://smith.langchain.com/public/653d218b-af67-4854-95ca-6abecb9b2520/r) 中查看这次运行的所有细节，包括执行步骤、调用的工具、LLM 看到了什么提示词等。
+</Note>
+
+:::
+
+</Step>
+<Step title="（可选）在 Studio 中使用">
+
+:::python
+[Studio](/langsmith/studio) 还提供了一个“客户端侧”的循环和记忆，因此你可以把它作为聊天界面来运行，并查询数据库。你可以问它“告诉我数据库的 schema”或者“展示前 5 个客户的发票”。你会看到生成的 SQL 命令以及结果。下面是启动方式。
+<Accordion title="在 Studio 中运行智能体">
+
+除了前面提到的包之外，你还需要：
+
+```shell
+pip install -U langgraph-cli[inmem]>=0.4.0
+```
+
+在你要运行的目录里，需要一个 `langgraph.json` 文件，内容如下：
+
+```json
+{
+  "dependencies": ["."],
+  "graphs": {
+      "agent": "./sql_agent.py:agent",
+      "graph": "./sql_agent_langgraph.py:graph"
+  },
+  "env": ".env"
+}
+```
+
+创建一个名为 `sql_agent.py` 的文件，并填入下面内容：
+
+<SqlAgentStudioPy />
+</Accordion>
+:::
+
+:::js
+[Studio](/langsmith/studio) 还提供了一个“客户端侧”的循环和记忆，因此你可以把它作为聊天界面来运行，并查询数据库。你可以问它“告诉我数据库的 schema”或者“展示前 5 个客户的发票”。你会看到生成的 SQL 命令以及结果。下面是启动方式。
+<Accordion title="在 Studio 中运行智能体">
+
+除了前面提到的包之外，你还需要：
+
+```shell
+npm i -g @langchain/langgraph-cli@latest
+```
+
+在你要运行的目录里，需要一个 `langgraph.json` 文件，内容如下：
+
+```json
+{
+  "dependencies": ["."],
+  "graphs": {
+      "agent": "./sqlAgent.ts:agent",
+      "graph": "./sqlAgentLanggraph.ts:graph"
+  },
+  "env": ".env"
+}
+```
+
+创建一个名为 `sqlAgent.ts` 的文件，并填入下面内容：
+
+<SqlAgentStudioJs />
+</Accordion>
+:::
+
+</Step>
+<Step title="实现 human-in-the-loop 审核">
+
+:::python
+在执行之前先检查智能体生成的 SQL 查询，通常是个好主意，这样可以避免意外动作或低效查询。
+
+LangChain agents 内置支持 [human-in-the-loop middleware](/oss/langchain/human-in-the-loop)，可以给 agent tool 调用加上人工审核。我们来配置智能体：在调用 `sql_db_query` 工具时暂停并等待人工审核：
+
+<SqlAgentHitlMiddlewarePy />
+<Note>
+我们还给智能体加了一个 [checkpointer](/oss/langchain/short-term-memory)，以便可以暂停和恢复执行。关于这一点以及可用的 middleware 配置，请参阅 [human-in-the-loop guide](/oss/langchain/human-in-the-loop)。
+</Note>
+
+运行后，智能体现在会在执行 `sql_db_query` 之前暂停等待审核：
+
+<SqlAgentHitlRunPy />
+```
+...
+
+INTERRUPTED:
+Tool execution pending approval
+
+Tool: sql_db_query
+Args: {'query': 'SELECT g.Name AS Genre, AVG(t.Milliseconds) AS AvgTrackLength FROM Track t JOIN Genre g ON t.GenreId = g.GenreId GROUP BY g.Name ORDER BY AvgTrackLength DESC LIMIT 1;'}
+```
+我们可以用 [Command](/oss/langgraph/use-graph-api#combine-control-flow-and-state-updates-with-command) 恢复执行，这里同意该查询：
+
+<SqlAgentHitlResumePy />
+```
+================================== Ai Message ==================================
+Tool Calls:
+  sql_db_query (call_7oz86Epg7lYRqi9rQHbZPS1U)
+ Call ID: call_7oz86Epg7lYRqi9rQHbZPS1U
+  Args:
+    query: SELECT Genre.Name, AVG(Track.Milliseconds) AS AvgDuration FROM Track JOIN Genre ON Track.GenreId = Genre.GenreId GROUP BY Genre.Name ORDER BY AvgDuration DESC LIMIT 5;
+================================= Tool Message =================================
+Name: sql_db_query
+
+[('Sci Fi & Fantasy', 2911783.0384615385), ('Science Fiction', 2625549.076923077), ('Drama', 2575283.78125), ('TV Shows', 2145041.0215053763), ('Comedy', 1585263.705882353)]
+================================== Ai Message ==================================
+
+The genre with the longest average track length is "Sci Fi & Fantasy" with an average duration of about 2,911,783 milliseconds, followed by "Science Fiction" and "Drama."
+```
+
+请参阅 [human-in-the-loop guide](/oss/langchain/human-in-the-loop) 了解更多详情。
+:::
+
+:::js
+在执行之前先检查智能体生成的 SQL 查询，通常是个好主意，这样可以避免意外动作或低效查询。
+
+LangChain agents 内置支持 [human-in-the-loop middleware](/oss/langchain/human-in-the-loop)，可以给 agent tool 调用加上人工审核。我们来配置智能体：在调用 `execute_sql` 工具时暂停并等待人工审核：
+
+<SqlAgentHitlMiddlewareJs />
+<Note>
+我们还给智能体加了一个 [checkpointer](/oss/langchain/short-term-memory)，以便可以暂停和恢复执行。关于这一点以及可用的 middleware 配置，请参阅 [human-in-the-loop guide](/oss/langchain/human-in-the-loop)。
+</Note>
+
+运行后，智能体现在会在执行 `execute_sql` 之前暂停等待审核：
+
+<SqlAgentHitlRunJs />
+```
+...
+
+INTERRUPTED:
+Tool execution pending approval
+
+Tool: execute_sql
+Args: {'query': 'SELECT g.Name AS Genre, AVG(t.Milliseconds) AS AvgTrackLength FROM Track t JOIN Genre g ON t.GenreId = g.GenreId GROUP BY g.Name ORDER BY AvgTrackLength DESC LIMIT 1;'}
+```
+我们可以用 [Command](/oss/langgraph/use-graph-api#combine-control-flow-and-state-updates-with-command) 恢复执行，这里同意该查询：
+
+<SqlAgentHitlResumeJs />
+```
+================================== Ai Message ==================================
+Tool Calls:
+  execute_sql (call_7oz86Epg7lYRqi9rQHbZPS1U)
+ Call ID: call_7oz86Epg7lYRqi9rQHbZPS1U
+  Args:
+    query: SELECT Genre.Name, AVG(Track.Milliseconds) AS AvgDuration FROM Track JOIN Genre ON Track.GenreId = Genre.GenreId GROUP BY Genre.Name ORDER BY AvgDuration DESC LIMIT 5;
+================================= Tool Message =================================
+Name: execute_sql
+
+[('Sci Fi & Fantasy', 2911783.0384615385), ('Science Fiction', 2625549.076923077), ('Drama', 2575283.78125), ('TV Shows', 2145041.0215053763), ('Comedy', 1585263.705882353)]
+================================== Ai Message ==================================
+
+The genre with the longest average track length is "Sci Fi & Fantasy" with an average duration of about 2,911,783 milliseconds, followed by "Science Fiction" and "Drama."
+```
+
+请参阅 [human-in-the-loop guide](/oss/langchain/human-in-the-loop) 了解更多详情。
+:::
+
+</Step>
+</Steps>
+
+## 下一步
+
+如需更深度的定制，请查看 [这个教程](/oss/langgraph/sql-agent)，学习如何直接使用 LangGraph 原语实现 SQL 智能体。

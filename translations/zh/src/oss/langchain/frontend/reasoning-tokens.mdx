@@ -1,0 +1,331 @@
+---
+title: 推理 token
+description: 以可折叠块显示模型思考和推理过程
+---
+
+推理 token 会暴露 OpenAI GPT-5 和带扩展思考的 Anthropic Claude 等高级模型的内部思考过程。这些模型会生成结构化 content block，把推理和最终答案分开，让你可以构建出展示模型“如何”得出答案的 UI。
+
+import { PatternEmbed } from "/snippets/pattern-embed.jsx"
+import UseStreamTypeInference from '/snippets/oss/use-stream-type-inference.mdx';
+
+<PatternEmbed pattern="reasoning-tokens" />
+
+## 什么是推理 token？
+
+当具备推理能力的模型处理提示词时，它们会生成两种不同类型的内容：
+
+1. **推理块**：模型的内部思维链、问题分解和逐步分析
+2. **文本块**：呈现给用户的最终、润色后的回复
+
+这些内容会以类型化的 content block 形式出现在 `AIMessage` 中，可通过 `contentBlocks` 属性访问：
+
+```ts
+// 推理块
+{ type: "reasoning", reasoning: "Let me think about this step by step..." }
+
+// 文本块
+{ type: "text", text: "The answer is 42." }
+```
+
+<Note>
+并不是所有模型都会产生推理 token。这个模式专门适用于支持扩展思考或 chain-of-thought 输出的模型。标准聊天模型只会返回文本块。
+</Note>
+
+## 使用场景
+
+- **透明性**：向用户展示模型的推理过程，以建立对答案的信任
+- **调试**：检查模型的思考过程，找出出错位置
+- **教育工具**：通过展示 AI 如何解题来教学生解决问题
+- **决策支持**：让领域专家验证推荐背后的推理
+- **质量保证**：在受监管行业中审核推理链是否合规
+
+## 提取推理块和文本块
+
+`AIMessage` 上的 `contentBlocks` 数组包含按生成顺序排列的所有块。按 `type` 过滤，就能把推理和文本分开：
+
+```ts
+import { AIMessage } from "langchain";
+
+function extractBlocks(msg: AIMessage) {
+  const reasoningBlocks = msg.contentBlocks
+    .filter((b) => b.type === "reasoning")
+    .map((b) => b.reasoning);
+
+  const textBlocks = msg.contentBlocks
+    .filter((b) => b.type === "text")
+    .map((b) => b.text);
+
+  return {
+    reasoning: reasoningBlocks.join(""),
+    text: textBlocks.join(""),
+  };
+}
+```
+
+一条消息可能包含多个推理块，例如模型先暂停推理、产生部分文本，然后继续推理。把它们连接起来，就能得到完整思考过程。
+
+## 从 `useStream` 访问消息
+
+把 @[`useStream`] 连接到支持推理的智能体，然后在聊天 UI 中遍历 `stream.messages`。根据 `HumanMessage.isInstance` 和 `AIMessage.isInstance` 分支处理，再把每条 assistant 消息传给一个组件，由它读取 `contentBlocks` 并把推理和文本分开。在 `stream.isLoading` 为 true 时，把最后一条消息设为 `isStreaming`，这样思考块就会随着 token 到来而更新。
+
+<UseStreamTypeInference />
+
+<CodeGroup>
+
+```tsx React
+import { useStream } from "@langchain/react";
+import { AIMessage, HumanMessage } from "langchain";
+
+function Chat() {
+  const stream = useStream<typeof myAgent>({
+    apiUrl: "http://localhost:2024",
+    assistantId: "reasoning",
+  });
+
+  return (
+    <div className="messages">
+      {stream.messages.map((msg, i) => {
+        if (HumanMessage.isInstance(msg)) {
+          return <HumanBubble key={i} text={msg.text} />;
+        }
+        if (AIMessage.isInstance(msg)) {
+          return (
+            <AIResponse
+              key={i}
+              message={msg}
+              isStreaming={stream.isLoading && i === stream.messages.length - 1}
+            />
+          );
+        }
+        return null;
+      })}
+    </div>
+  );
+}
+```
+
+```vue Vue
+<script setup lang="ts">
+import { useStream } from "@langchain/vue";
+import { AIMessage, HumanMessage } from "langchain";
+
+const stream = useStream<typeof myAgent>({
+  apiUrl: "http://localhost:2024",
+  assistantId: "reasoning",
+});
+</script>
+
+<template>
+  <div class="messages">
+    <template v-for="(msg, i) in stream.messages.value" :key="i">
+      <HumanBubble v-if="HumanMessage.isInstance(msg)" :text="msg.text" />
+      <AIResponse
+        v-else-if="AIMessage.isInstance(msg)"
+        :message="msg"
+        :isStreaming="stream.isLoading.value && i === stream.messages.value.length - 1"
+      />
+    </template>
+  </div>
+</template>
+```
+
+```svelte Svelte
+<script lang="ts">
+  import { useStream } from "@langchain/svelte";
+  import { AIMessage, HumanMessage } from "langchain";
+
+  const stream = useStream<typeof myAgent>({
+    apiUrl: "http://localhost:2024",
+    assistantId: "reasoning",
+  });
+</script>
+
+<div class="messages">
+  {#each stream.messages as msg, i}
+    {#if HumanMessage.isInstance(msg)}
+      <HumanBubble text={msg.text} />
+    {:else if AIMessage.isInstance(msg)}
+      <AIResponse
+        message={msg}
+        isStreaming={stream.isLoading && i === stream.messages.length - 1}
+      />
+    {/if}
+  {/each}
+</div>
+```
+
+```ts Angular
+import { Component } from "@angular/core";
+import { injectStream } from "@langchain/angular";
+import { AIMessage, HumanMessage } from "langchain";
+
+@Component({
+  selector: "app-chat",
+  template: `
+    <div class="messages">
+      @for (msg of stream.messages(); track $index) {
+        @if (isHuman(msg)) {
+          <human-bubble [text]="msg.text" />
+        } @else if (isAI(msg)) {
+          <ai-response
+            [message]="msg"
+            [isStreaming]="stream.isLoading() && $index === stream.messages().length - 1"
+          />
+        }
+      }
+    </div>
+  `,
+})
+export class ChatComponent {
+  stream = injectStream<typeof myAgent>({
+    apiUrl: "http://localhost:2024",
+    assistantId: "reasoning",
+  });
+
+  isHuman = HumanMessage.isInstance;
+  isAI = AIMessage.isInstance;
+}
+```
+
+</CodeGroup>
+
+## 构建 ThinkingBubble 组件
+
+`ThinkingBubble` 会把推理 token 放进一个视觉上明显不同、可折叠的容器中。用户可以展开它查看完整思考过程，或者折叠起来只看最终答案。
+
+```tsx
+import { useState } from "react";
+
+function ThinkingBubble({
+  reasoning,
+  isStreaming,
+}: {
+  reasoning: string;
+  isStreaming: boolean;
+}) {
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  const charCount = reasoning.length;
+  const previewLength = 120;
+  const preview =
+    reasoning.length > previewLength
+      ? reasoning.slice(0, previewLength) + "..."
+      : reasoning;
+
+  return (
+    <div className="thinking-bubble">
+      <button
+        className="thinking-header"
+        onClick={() => setIsExpanded(!isExpanded)}
+      >
+        <span className="thinking-icon">
+          {isStreaming ? (
+            <span className="thinking-spinner" />
+          ) : (
+            "💭"
+          )}
+        </span>
+        <span className="thinking-label">
+          {isStreaming ? "Thinking..." : `Thought process (${charCount} chars)`}
+        </span>
+        <span className={`chevron ${isExpanded ? "expanded" : ""}`}>▶</span>
+      </button>
+
+      {isExpanded && (
+        <div className="thinking-content">
+          <pre>{reasoning}</pre>
+        </div>
+      )}
+
+      {!isExpanded && !isStreaming && (
+        <div className="thinking-preview">{preview}</div>
+      )}
+    </div>
+  );
+}
+```
+
+## 渲染完整 AI 回复
+
+把 `ThinkingBubble` 和标准文本气泡组合成一个单独的 `AIResponse` 组件：
+
+```tsx
+function AIResponse({
+  message,
+  isStreaming,
+}: {
+  message: AIMessage;
+  isStreaming: boolean;
+}) {
+  const reasoningBlocks = message.contentBlocks
+    .filter((b) => b.type === "reasoning")
+    .map((b) => b.reasoning)
+    .join("");
+
+  const textBlocks = message.contentBlocks
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+
+  const hasReasoning = reasoningBlocks.length > 0;
+  const hasText = textBlocks.length > 0;
+
+  const isReasoningPhase = isStreaming && !hasText;
+  const isTextPhase = isStreaming && hasText;
+
+  return (
+    <div className="ai-response">
+      {hasReasoning && (
+        <ThinkingBubble
+          reasoning={reasoningBlocks}
+          isStreaming={isReasoningPhase}
+        />
+      )}
+      {hasText && (
+        <div className="ai-text-bubble">
+          <p>{textBlocks}</p>
+          {isTextPhase && <span className="cursor-blink">▊</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+## 处理边界情况
+
+### 没有推理的消息
+
+并不是每条 AI 消息都会包含推理块。当 `contentBlocks` 只有文本块时，请渲染标准消息气泡，不要显示 ThinkingBubble。
+
+### 空推理块
+
+有些模型会生成空的推理块作为占位符。过滤掉它们：
+
+```ts
+const meaningfulReasoning = message.contentBlocks
+  .filter((b) => b.type === "reasoning" && b.reasoning.trim().length > 0);
+```
+
+### 多轮推理-文本循环
+
+一条消息可能在推理块和文本块之间交替。如果你需要保留这种交错顺序，请按顺序遍历 `contentBlocks`，而不是按类型分组：
+
+```ts
+message.contentBlocks.forEach((block) => {
+  if (block.type === "reasoning") {
+    // 渲染 ThinkingBubble
+  } else if (block.type === "text") {
+    // 渲染文本段落
+  }
+});
+```
+
+## 最佳实践
+
+- **默认折叠显示**：默认隐藏推理内容，按需展示
+- **显示字符数**：让用户快速感知模型在回答中投入了多少思考
+- **视觉上加以区分**：使用不同颜色、边框或背景，确保推理不会被误认为最终答案
+- **动画过渡**：平滑的展开/折叠动画会提升感知质量
+- **考虑可访问性**：在切换按钮上使用适当的 ARIA 属性（`aria-expanded`、`aria-controls`）
+- **在预览中截断**：折叠时显示一小段推理预览，让用户决定是否展开

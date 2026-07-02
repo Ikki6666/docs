@@ -1,0 +1,209 @@
+---
+title: 消息队列
+description: 让用户可以排队发送多条消息，同时智能体按顺序处理
+---
+
+消息排队允许用户在不等待智能体完成当前处理的情况下，快速连续发送多条消息。每条消息都会立即被接收、加入当前线程队列，并按顺序处理，从而让你能完整看到并控制待处理工作。
+
+import { PatternEmbed } from "/snippets/pattern-embed.jsx"
+
+<PatternEmbed pattern="message-queues" />
+
+import RequiresLanggraphServer from '/snippets/oss/requires-langgraph-server.mdx';
+import UseStreamTypeInference from '/snippets/oss/use-stream-type-inference.mdx';
+
+<RequiresLanggraphServer />
+
+## 为什么需要消息队列？
+
+在典型聊天界面中，用户必须等智能体完成当前回复后，才能发送下一条消息。这会在以下场景中造成阻力：
+
+- **批量提问**：用户想一次提出五个相关问题，而不是每次都等一个答案
+- **连续追问**：智能体还在处理时，用户继续补充澄清或上下文
+- **自动化测试序列**：通过程序连续发送一系列提示词来验证智能体行为
+- **数据录入流程**：一条接一条地输入结构化内容供系统处理
+
+消息队列通过立即接受所有提交并按顺序处理来解决这个问题。
+
+这是一种智能体 UX 原语，而不只是一个外观上的聊天功能。SDK 会把队列作为 stream controller 的一部分进行跟踪，因此你的 UI 可以显示待处理工作、取消过期请求，并在当前运行继续时保持 composer 可用。
+
+## 工作方式
+
+当你希望某次提交排在当前运行的请求后面时，请传入 `multitaskStrategy: "enqueue"`。在智能体处理期间，排队提交会被加入当前线程的队列。当前运行完成后，下一条排队消息会自动分发。
+
+使用对应框架的 queue helper 读取队列状态：
+
+| 属性 | 类型 | 说明 |
+|---|---|---|
+| `queue.entries` | `SubmissionQueueEntry[]` | 所有待处理队列项的数组 |
+| `queue.size` | `number` | 当前队列中的条目数 |
+| `queue.cancel(id)` | `(id: string) => Promise<void>` | 按 ID 取消某个排队项 |
+| `queue.clear()` | `() => Promise<void>` | 取消所有排队项 |
+
+每个 @[SubmissionQueueEntry] 对象包含：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | `string` | 该队列项的唯一标识符 |
+| `values` | `object` | 提交的输入值（包括消息） |
+| `options` | `object` | 随提交一起传入的额外选项 |
+| `createdAt` | `string` | 队列项创建时的 ISO 时间戳 |
+
+## 设置 `useStream`
+
+先把 @[`useStream`] 连接到智能体后端，再为你的框架配上 submission queue helper。在运行进行时调用 `stream.submit()` 发送消息；对应该排到当前请求后面的提交，传入 `multitaskStrategy: "enqueue"`。读取 `queue.entries` 和 `queue.size` 来渲染待处理工作，并使用 `queue.cancel()` 或 `queue.clear()` 在它们开始处理前移除。
+
+<UseStreamTypeInference />
+
+<CodeGroup>
+
+```tsx React
+import { useStream, useSubmissionQueue } from "@langchain/react";
+
+function Chat() {
+  const stream = useStream<typeof myAgent>({
+    apiUrl: "http://localhost:2024",
+    assistantId: "simple_agent",
+  });
+  const queue = useSubmissionQueue(stream);
+
+  const handleSubmit = (text: string) => {
+    stream.submit({
+      messages: [{ type: "human", content: text }],
+    });
+  };
+
+  const pendingCount = queue.size;
+  const entries = queue.entries;
+
+  return (
+    <div>
+      <MessageList messages={stream.messages} />
+      {pendingCount > 0 && <QueueList entries={entries} queue={queue} />}
+      <ChatInput onSubmit={handleSubmit} />
+    </div>
+  );
+}
+```
+
+```vue Vue
+<script setup lang="ts">
+import { useStream, useSubmissionQueue } from "@langchain/vue";
+import { computed } from "vue";
+
+const stream = useStream<typeof myAgent>({
+  apiUrl: "http://localhost:2024",
+  assistantId: "simple_agent",
+});
+const queue = useSubmissionQueue(stream);
+
+function handleSubmit(text: string) {
+  stream.submit({
+    messages: [{ type: "human", content: text }],
+  });
+}
+
+const pendingCount = computed(() => queue.size.value);
+const entries = computed(() => queue.entries.value);
+</script>
+
+<template>
+  <div>
+    <MessageList :messages="stream.messages" />
+    <QueueList v-if="pendingCount > 0" :entries="entries" :queue="queue" />
+    <ChatInput @submit="handleSubmit" />
+  </div>
+</template>
+```
+
+```svelte Svelte
+<script lang="ts">
+  import { useStream, useSubmissionQueue } from "@langchain/svelte";
+
+  const stream = useStream<typeof myAgent>({
+    apiUrl: "http://localhost:2024",
+    assistantId: "simple_agent",
+  });
+  const queue = useSubmissionQueue(stream);
+
+  function handleSubmit(text: string) {
+    stream.submit({
+      messages: [{ type: "human", content: text }],
+    });
+  }
+</script>
+
+<div>
+  <MessageList messages={stream.messages} />
+  {#if queue.size > 0}
+    <QueueList entries={queue.entries} {queue} />
+  {/if}
+  <ChatInput on:submit={(e) => handleSubmit(e.detail)} />
+</div>
+```
+
+```ts Angular
+import { Component } from "@angular/core";
+import { injectStream, injectSubmissionQueue } from "@langchain/angular";
+
+@Component({
+  selector: "app-chat",
+  template: `
+    <message-list [messages]="stream.messages()" />
+    @if (queue.size() > 0) {
+      <queue-list [entries]="queue.entries()" [queue]="queue" />
+    }
+    <chat-input (onSubmit)="handleSubmit($event)" />
+  `,
+})
+export class ChatComponent {
+  stream = injectStream<typeof myAgent>({
+    apiUrl: "http://localhost:2024",
+    assistantId: "simple_agent",
+  });
+  queue = injectSubmissionQueue(this.stream);
+
+  handleSubmit(text: string) {
+    this.stream.submit({
+      messages: [{ type: "human", content: text }],
+    });
+  }
+}
+```
+
+</CodeGroup>
+
+## 显示队列
+
+构建一个 `QueueList` 组件，显示每条待处理消息并提供取消按钮。这样用户就能看见哪些内容在排队，也能移除不再需要的条目。
+
+```tsx
+function QueueList({ entries, queue }) {
+  return (
+    <div className="queue-panel">
+      <div className="queue-header">
+        <span>Queued messages ({entries.length})</span>
+        <button onClick={() => queue.clear()}>Clear all</button>
+      </div>
+      <ul className="queue-entries">
+        {entries.map((entry) => {
+          const text = entry.values?.messages?.at(-1)?.content ?? "Pending...";
+          return (
+            <li key={entry.id} className="queue-entry">
+              <span className="queue-text">{text}</span>
+              <span className="queue-time">
+                {new Date(entry.createdAt).toLocaleTimeString()}
+              </span>
+              <button
+                className="queue-cancel"
+                onClick={() => queue.cancel(entry.id)}
+              >
+                Cancel
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}

@@ -1,0 +1,272 @@
+---
+title: 分支聊天
+description: 通过从检查点分叉来编辑消息并重新生成回复
+---
+
+与 AI 智能体的对话很少是线性的。你可能想改写一个问题、重新生成一个你不满意的回复，或者探索不同的对话路径，同时不丢失检查点历史。分支聊天把 LangGraph 检查点当作分叉点：每次编辑或重新生成都会从所选消息的父检查点提交一个新运行。
+
+import { PatternEmbed } from "/snippets/pattern-embed.jsx"
+
+<PatternEmbed pattern="branching-chat" />
+
+import RequiresLanggraphServer from '/snippets/oss/requires-langgraph-server.mdx';
+import UseStreamTypeInference from '/snippets/oss/use-stream-type-inference.mdx';
+
+<RequiresLanggraphServer />
+
+## 什么是分支聊天？
+
+分支聊天把对话看作一条带检查点的时间线，而不是一个平坦列表。每条消息都有元数据，指向它创建之前的检查点。编辑消息或重新生成回复时，会从那个检查点提交一个新运行。
+
+关键能力：
+
+- **编辑任意用户消息：** 改写之前的提示词，并从那个位置重新运行智能体
+- **重新生成任意 AI 回复：** 让智能体针对同一个输入给出不同答案
+- **检查历史：** 当你需要分支时间线时，使用 LangGraph 客户端加载检查点
+
+## 设置 stream 元数据
+
+对消息使用根 stream，然后在渲染每条消息的组件中读取逐消息的检查点元数据。元数据中包含要分叉的父检查点 ID。
+
+<UseStreamTypeInference />
+
+<CodeGroup>
+```tsx React
+import { useStream } from "@langchain/react";
+
+const AGENT_URL = "http://localhost:2024";
+
+export function Chat() {
+  const stream = useStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "simple_agent",
+  });
+
+  return (
+    <div>
+      {stream.messages.map((msg) => (
+        <MessageWithForkControls key={msg.id} stream={stream} message={msg} />
+      ))}
+    </div>
+  );
+}
+```
+
+```vue Vue
+<script setup lang="ts">
+import { useStream } from "@langchain/vue";
+
+const AGENT_URL = "http://localhost:2024";
+
+const stream = useStream<typeof myAgent>({
+  apiUrl: AGENT_URL,
+  assistantId: "simple_agent",
+});
+</script>
+
+<template>
+  <div>
+    <MessageWithForkControls
+      v-for="msg in stream.messages.value"
+      :key="msg.id"
+      :stream="stream"
+      :message="msg"
+    />
+  </div>
+</template>
+```
+
+```svelte Svelte
+<script lang="ts">
+  import { useStream } from "@langchain/svelte";
+
+  const AGENT_URL = "http://localhost:2024";
+
+  const stream = useStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "simple_agent",
+  });
+</script>
+
+<div>
+  {#each stream.messages as msg (msg.id)}
+    <Message
+      message={msg}
+      {stream}
+    />
+  {/each}
+</div>
+```
+
+```ts Angular
+import { Component } from "@angular/core";
+import { injectStream } from "@langchain/angular";
+
+const AGENT_URL = "http://localhost:2024";
+
+@Component({
+  selector: "app-chat",
+  template: `
+    @for (msg of stream.messages(); track msg.id) {
+      <app-message
+        [message]="msg"
+        [stream]="stream"
+      />
+    }
+  `,
+})
+export class ChatComponent {
+  stream = injectStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "simple_agent",
+  });
+}
+```
+</CodeGroup>
+
+## 理解消息元数据
+
+`useMessageMetadata(stream, messageId)` helper 会返回某条消息的 @[MessageMetadata]。请在渲染每条消息的组件中使用它，这样元数据就会限制在该消息 ID 范围内：
+
+```tsx
+import type { BaseMessage } from "langchain";
+import { useState } from "react";
+import { useMessageMetadata, useStream } from "@langchain/react";
+
+function Chat() {
+  const stream = useStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "simple_agent",
+  });
+
+  return stream.messages.map((message) => (
+    <MessageWithForkControls
+      key={message.id}
+      stream={stream}
+      message={message}
+    />
+  ));
+}
+
+function MessageWithForkControls({
+  stream,
+  message,
+}: {
+  stream: ReturnType<typeof useStream>;
+  message: BaseMessage;
+}) {
+  const metadata = useMessageMetadata(stream, message.id);
+  const checkpointId = metadata?.parentCheckpointId;
+  const [editedText, setEditedText] = useState(message.text);
+
+  return (
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!checkpointId) return;
+
+        stream.submit(
+          { messages: [{ type: "human", content: editedText }] },
+          { forkFrom: { checkpointId } }
+        );
+      }}
+    >
+      <textarea
+        value={editedText}
+        onChange={(event) => setEditedText(event.target.value)}
+      />
+      <button disabled={!checkpointId || editedText === message.text}>
+        提交编辑后的分支
+      </button>
+    </form>
+  );
+}
+```
+
+`parentCheckpointId` 就是该消息之前的那个检查点。把它作为编辑和重新生成的分叉点。
+
+## 编辑消息
+
+要编辑一个用户消息并分叉对话：
+
+1. 从消息元数据中获取 `parentCheckpointId`
+2. 使用 `forkFrom: { checkpointId }` 提交编辑后的消息
+3. 智能体会从该位置重新运行
+
+```ts
+function handleEdit(
+  stream: ReturnType<typeof useStream>,
+  originalMsg: HumanMessage,
+  metadata: MessageMetadata | undefined,
+  newText: string
+) {
+  if (!metadata?.parentCheckpointId) return;
+
+  stream.submit(
+    {
+      messages: [{ type: "human", content: newText }],
+    },
+    { forkFrom: { checkpointId: metadata.parentCheckpointId } }
+  );
+}
+```
+
+编辑之后：
+
+- 智能体会从分叉点重新运行，并使用更新后的消息
+- 原始路径仍然保留在线程历史中
+
+## 重新生成回复
+
+如果你想在不修改输入的情况下重新生成 AI 回复：
+
+1. 从 AI 消息的元数据中获取 `parent_checkpoint`
+2. 传入空输入，并使用 `forkFrom: { checkpointId }`
+3. 智能体会从该位置生成新的回复
+
+```ts
+function handleRegenerate(
+  stream: ReturnType<typeof useStream>,
+  metadata: MessageMetadata | undefined
+) {
+  if (!metadata?.parentCheckpointId) return;
+
+  stream.submit(undefined, {
+    forkFrom: { checkpointId: metadata.parentCheckpointId },
+  });
+}
+```
+
+每次重新生成都会在该位置为 AI 消息创建一条新的路径。
+
+<Tip>
+重新生成对非确定性智能体很有用。由于 LLM 输出会随 temperature 变化，同一个提示词重新生成后，通常会得到明显不同的结果。
+</Tip>
+
+## 底层工作方式
+
+LangGraph 会把每次状态转换都持久化为一个**检查点**。当你使用 `forkFrom` 提交时，后端会从那个位置开启一条新的执行路径，而不是继续追加到当前对话里。结果就是一棵树状结构：
+
+```
+User: "What is React?"
+  └─ AI: "React is a JavaScript library..." (branch A)
+  └─ AI: "React is a UI framework..." (branch B, regenerated)
+
+User: "Tell me about hooks" (branch A)
+  └─ AI: "Hooks are functions..."
+
+User: "Tell me about JSX" (edited from branch A)
+  └─ AI: "JSX is a syntax extension..."
+```
+
+每条路径都会保存在检查点存储中。当你想构建单独的时间线视图时，可以使用
+`stream.client.threads.getHistory(threadId)`。
+
+## 最佳实践
+
+- **在消息附近读取元数据**：在渲染消息控制项的组件中调用 `useMessageMetadata`
+- **把分叉控制放到 hover 时显示**：编辑和重新生成按钮最好在 hover 时出现，以保持 UI 简洁
+- **按需刷新历史**：只有在渲染时间线或分叉完成后，才调用 `client.threads.getHistory()`
+- **流式输出时禁用控制项**：当智能体正在流式返回时，不要允许编辑或重新生成。在启用这些操作前检查 `stream.isLoading`
+- **取消编辑时保留输入**：如果用户开始编辑又取消，将 textarea 重置回原始消息内容
+- **用深层检查点树测试**：频繁编辑和重新生成的用户可能会创建很多路径。确保时间线渲染仍然保持高性能
