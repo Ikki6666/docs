@@ -70,8 +70,8 @@ async def dev_command(
     # Check if we should skip the initial build
     skip_build = getattr(args, "skip_build", False) if args else False
 
-    src_dir = Path("src")
-    build_dir = Path("build")
+    src_dir = Path(getattr(args, "src_dir", "src"))
+    build_dir = Path(getattr(args, "build_dir", "build"))
 
     if skip_build:
         logger.info("Skipping initial build (using existing build directory)")

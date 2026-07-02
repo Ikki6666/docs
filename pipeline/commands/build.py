@@ -10,9 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 def build_command(
-    args: Any,  # noqa: ARG001, ANN401
-    src_dir: str = "src",
-    build_dir: str = "build",
+    args: Any,  # noqa: ANN401
+    src_dir: str | None = None,
+    build_dir: str | None = None,
 ) -> int:
     """Build documentation from source to build directory.
 
@@ -37,8 +37,8 @@ def build_command(
         Progress messages and error messages to stdout.
     """
     logger.debug("Building documentation...")
-    src_dir_path = Path(src_dir)
-    build_dir_path = Path(build_dir)
+    src_dir_path = Path(src_dir or getattr(args, "src_dir", "src"))
+    build_dir_path = Path(build_dir or getattr(args, "build_dir", "build"))
 
     if not src_dir_path.exists():
         logger.error("Error: src directory not found")

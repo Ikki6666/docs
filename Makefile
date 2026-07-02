@@ -1,4 +1,4 @@
-.PHONY: all dev build export format lint test install clean lint_md lint_md_fix lint_prose broken-links broken-links-with-anchors format-check code-snippets test-code-samples check-cross-refs
+.PHONY: all dev dev-zh build build-zh zh-status zh-stamp export format lint test install clean lint_md lint_md_fix lint_prose broken-links broken-links-with-anchors format-check code-snippets test-code-samples check-cross-refs
 
 # Default target
 all: help
@@ -8,10 +8,28 @@ dev:
 	npm install
 	PYTHONPATH=$(CURDIR) uv run pipeline dev
 
+dev-zh:
+	@echo "Starting Chinese development mode..."
+	npm install
+	uv run python -m scripts.zh.overlay build
+	PYTHONPATH=$(CURDIR) uv run pipeline dev --src-dir .generated/zh/src --build-dir build
+
 build:
 	@echo "Building documentation..."
 	npm install
 	PYTHONPATH=$(CURDIR) uv run pipeline build
+
+build-zh:
+	@echo "Building Chinese documentation overlay..."
+	npm install
+	uv run python -m scripts.zh.overlay build
+	PYTHONPATH=$(CURDIR) uv run pipeline build --src-dir .generated/zh/src --build-dir build
+
+zh-status:
+	@uv run python -m scripts.zh.overlay status
+
+zh-stamp:
+	@uv run python -m scripts.zh.overlay stamp $(FILES)
 
 # Offline zip via Mintlify (https://www.mintlify.com/docs/deploy/export).
 # Must run from build/: docs.json paths are oss/python/... and oss/javascript/... but sources live under src/oss/... until the pipeline emits build/oss/{python,javascript}/...
@@ -152,7 +170,11 @@ check-cross-refs:
 help:
 	@echo "Available commands:"
 	@echo "  make dev                - Start development mode with file watching and mint dev"
+	@echo "  make dev-zh             - Start development mode from the Chinese overlay"
 	@echo "  make build              - Build documentation to ./build directory"
+	@echo "  make build-zh           - Build documentation from the Chinese overlay"
+	@echo "  make zh-status          - Show Chinese translation coverage and stale files"
+	@echo "  make zh-stamp           - Record current source hashes for translated files"
 	@echo "  make export             - Run mint export from ./build (optional: MINT_EXPORT_ARGS)"
 	@echo "  make broken-links       - Check for broken links in built documentation"
 	@echo "  make check-cross-refs   - Check for unresolved @[ref] cross-references"

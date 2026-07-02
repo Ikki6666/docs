@@ -258,6 +258,16 @@ def main() -> None:
         action="store_true",
         help="Skip initial build and use existing build directory",
     )
+    dev_parser.add_argument(
+        "--src-dir",
+        default="src",
+        help="Source directory to build and watch",
+    )
+    dev_parser.add_argument(
+        "--build-dir",
+        default="build",
+        help="Output directory for built documentation",
+    )
     dev_parser.set_defaults(func=dev_command)
 
     # Build command
@@ -266,6 +276,16 @@ def main() -> None:
         "--watch",
         action="store_true",
         help="Watch for file changes",
+    )
+    build_parser.add_argument(
+        "--src-dir",
+        default="src",
+        help="Source directory to build",
+    )
+    build_parser.add_argument(
+        "--build-dir",
+        default="build",
+        help="Output directory for built documentation",
     )
     build_parser.set_defaults(func=build_command)
 
