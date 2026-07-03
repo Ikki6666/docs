@@ -1,0 +1,74 @@
+---
+title: 将 LangSmith telemetry 导出到你的可观测性后端
+sidebarTitle: 将 LangSmith telemetry 导出到你的可观测性后端
+---
+
+<Warning>
+**本节仅适用于 Kubernetes 部署。**
+</Warning>
+
+自托管 LangSmith 实例会产生日志、指标和 traces 形式的 telemetry 数据。本节介绍如何访问这些数据，并将其导出到可观测性采集器或后端。
+
+本节假设已经搭建好了监控基础设施，或者正准备搭建这套基础设施，并希望了解如何配置 LangSmith 以从中采集数据。
+
+这里的基础设施包括：
+
+* 采集器，例如 [OpenTelemetry](https://opentelemetry.io/docs/collector/)、[FluentBit](https://docs.fluentbit.io/manual) 或 [Prometheus](https://prometheus.io/)。
+* 可观测性后端，例如 [Datadog](https://www.datadoghq.com/) 或 [Grafana](https://grafana.com/) 生态系统。
+
+## 日志
+
+参考配置请参阅 [OTel collector 示例](/langsmith/langsmith-collector#logs)。
+
+LangSmith 自托管部署中的所有服务都会将日志写入所在节点的文件系统以及 stdout。要访问这些日志，需要将采集器配置为从文件系统或 stdout 读取。大多数主流采集器都支持从文件系统读取日志。
+
+* **OpenTelemetry**：[File Log Receiver](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/filelogreceiver)
+* **FluentBit**：[Tail Input](https://docs.fluentbit.io/manual/pipeline/inputs/tail)
+* **Datadog**：[Kubernetes Log Collection](https://docs.datadoghq.com/containers/kubernetes/log/?tab=datadogoperator)
+
+## 指标
+
+参考配置请参阅 [OTel collector 示例](/langsmith/langsmith-collector#metrics)。
+
+### LangSmith 服务
+
+以下 LangSmith 服务会在 endpoint 上以 Prometheus metrics 格式暴露指标。前端当前不会暴露指标。
+
+* **Backend**：`http://<langsmith_release_name>-backend.<namespace>.svc.cluster.local:1984/metrics`
+* **Platform Backend**：`http://<langsmith_release_name>-platform-backend.<namespace>.svc.cluster.local:1986/metrics`
+* **Playground**：`http://<langsmith_release_name>-playground.<namespace>.svc.cluster.local:1988/metrics`
+* **（仅 LangSmith Control Plane）Host Backend**：`http://<langsmith_release_name>-host-backend.<namespace>.svc.cluster.local:1985/metrics`
+
+可以使用 [Prometheus](https://prometheus.io/docs/prometheus/latest/getting_started/#configure-prometheus-to-monitor-the-sample-targets) 或 [OpenTelemetry](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/prometheusreceiver) 采集器抓取这些 endpoints，并将指标导出到你选择的后端。
+
+### Frontend Nginx
+
+前端服务会在以下 endpoint 暴露其 Nginx 指标：`langsmith-frontend.langsmith.svc.cluster.local:80/nginx_status`。可以自行抓取这些指标，或者部署一个 [Prometheus Nginx exporter](https://github.com/prometheus-community/helm-charts/tree/main/charts/prometheus-nginx-exporter)。
+
+<Warning>
+**以下部分仅适用于集群内数据库。如果使用的是外部数据库，则需要自行配置指标暴露与抓取。**
+</Warning>
+
+### Postgres + Redis
+
+如果使用的是集群内 Postgres 或 Redis 实例，可以使用 Prometheus exporter 来暴露实例指标。可以部署 [Postgres exporter](https://github.com/prometheus-community/helm-charts/tree/main/charts/prometheus-postgres-exporter) 和/或 [Redis exporter](https://github.com/prometheus-community/helm-charts/tree/main/charts/prometheus-redis-exporter)。
+
+### Clickhouse
+
+集群内 Clickhouse 已配置为直接暴露指标，无需额外 exporter。可以让采集器从 `http://<langsmith_release_name>-clickhouse.<namespace>.svc.cluster.local:9363/metrics` 抓取指标。
+
+## Traces
+
+参考配置请参阅 [OTel collector 示例](/langsmith/langsmith-collector#traces)。
+
+LangSmith Backend、Platform Backend、Playground 和 LangSmith Queue 部署都已完成 instrumentation，可发出 [Otel](https://opentelemetry.io/docs/concepts/signals/traces/) traces。Tracing 默认关闭，可以在 `langsmith_config.yaml`（或等效）文件中加入以下配置，为所有 LangSmith 服务启用：
+
+```yaml
+config:
+  tracing:
+    enabled: true
+    endpoint: "<your_collector_endpoint>"
+    useTls: true # / false
+    env: "ls_self_hosted" # This value will be set as an "env" attribute in your spans
+    exporter: "http" # must be either http or grpc
+```

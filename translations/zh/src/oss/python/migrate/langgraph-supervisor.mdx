@@ -1,0 +1,144 @@
+---
+title: 从 langgraph-supervisor 迁移
+sidebarTitle: langgraph-supervisor
+description: 从 langgraph-supervisor 包迁移到使用 create_agent 和 tool 包装 subagent 的 subagents 模式。
+---
+
+import MigrateLanggraphSupervisorBasicPy from '/snippets/code-samples/migrate-langgraph-supervisor-basic-py.mdx';
+import MigrateLanggraphSupervisorInterruptPy from '/snippets/code-samples/migrate-langgraph-supervisor-interrupt-py.mdx';
+import MigrateLanggraphSupervisorNestedPy from '/snippets/code-samples/migrate-langgraph-supervisor-nested-py.mdx';
+
+[`langgraph-supervisor`](https://github.com/langchain-ai/langgraph-supervisor-py) 包已经不再积极维护。请改用 [subagents](/oss/langchain/multi-agent/subagents) 模式：由一个主智能体通过把专用 worker 当作 [tools](/oss/langchain/tools) 来调用，从而完成协调工作。
+
+本指南介绍如何从 `create_supervisor` 迁移到 @[`create_agent`]，包括使用 @[`interrupt`] 和外部 API callback 的场景。
+
+## 变更摘要
+
+| langgraph-supervisor | Recommended replacement |
+|--------------------|-------------------------|
+| `create_supervisor` with worker agents as graph nodes | 使用 @[`create_agent`]，并把 subagent 包装为 @[`@tool`] 函数 |
+| `output_mode` for message history | 在 tool wrapper 中格式化 subagent 输出（见 [subagent outputs](/oss/langchain/multi-agent/subagents#subagent-outputs)） |
+| `create_handoff_tool` for custom routing | 自定义一个调用 `subagent.invoke(...)` 的 @[`@tool`] |
+| Nested supervisors (`create_supervisor` of supervisors) | 将一个会调用其他 subagent 的 subagent，包装成 @[`@tool`] |
+
+## 基础迁移
+
+在 `langgraph-supervisor` 中，worker 智能体是图节点，supervisor 通过 handoff tools 在它们之间进行路由：
+
+```python
+from langgraph_supervisor import create_supervisor
+from langgraph.prebuilt import create_react_agent
+
+research_agent = create_react_agent(
+    model=model,
+    tools=[web_search],
+    name="research_expert",
+    prompt="You are a research expert.",
+)
+
+math_agent = create_react_agent(
+    model=model,
+    tools=[add, multiply],
+    name="math_expert",
+    prompt="You are a math expert.",
+)
+
+workflow = create_supervisor(
+    [research_agent, math_agent],
+    model=model,
+    prompt="Route research questions to research_expert and math to math_expert.",
+)
+app = workflow.compile(checkpointer=checkpointer)
+```
+
+迁移到 subagents 模式时，需要把每个 worker 包装成主智能体上的一个 tool：
+
+<MigrateLanggraphSupervisorBasicPy />
+
+完整示例可参阅 [Build a personal assistant with subagents](/oss/langchain/multi-agent/subagents-personal-assistant)。
+
+## 迁移 interrupt 和 resume 流程
+
+一种常见的 `langgraph-supervisor` 用法，是在 worker 智能体的 tool 中使用 @[`interrupt`]，暂停执行直到外部服务完成：
+
+```python
+# Before: create_supervisor with a subgraph node
+#
+# Supervisor (create_supervisor)
+#   └── ResearchAgent (subgraph node)
+#         └── preview_tool
+#               ├── fire_external_api()      # kicks off async job
+#               ├── result = interrupt(...)  # pauses graph, waits for callback
+#               └── render_results(result)   # runs after resume
+```
+
+在 subagents 模式下，同样的流程仍然成立。subagent tool 内部的 @[`interrupt`] 会沿着被 tool 包装的 @[`create_agent`] 层层向上传播，直到最外层图。你的外部 callback 仍然可以通过 `Command(resume=result)` 来恢复执行。
+
+<MigrateLanggraphSupervisorInterruptPy />
+
+```python
+from langgraph.types import Command
+
+# Invoke — preview_tool calls interrupt() and the graph pauses
+response = supervisor.invoke(
+    {"messages": [{"role": "user", "content": "Preview enrichment for doc-123"}]},
+    config=config,
+)
+# response contains __interrupt__
+
+# External service completes and calls back into your app
+supervisor.invoke(Command(resume=external_result), config=config)
+```
+
+### interrupt 传播的要求
+
+为了让 @[`interrupt`] 能穿过嵌套的 @[`create_agent`] 层向上传播，请遵守以下规则：
+
+1. **只在最外层图上使用带 checkpointer 的 compile。** 不要给 subagent 传 `checkpointer=...`，让它们使用 [per-invocation persistence](/oss/langgraph/use-subgraphs#per-invocation-default)，并在运行时继承父级 checkpointer。
+2. **在 `configurable` 中传入 `thread_id`。** 最外层的 `invoke()` 或 `stream_events()` 调用必须包含 `thread_id`，这样图才能进行 checkpoint 和 resume。
+
+这些规则适用于任意层级的嵌套场景。比如：最外层是自定义 @[`StateGraph`]，中间层是 @[`create_agent`] supervisor，最内层是 @[`create_agent`] subagent，它们都遵循同一套机制：
+
+```txt
+Custom StateGraph (outer, with checkpointer)
+  └── prospecting_agent (create_agent, no checkpointer)
+        └── call_powerup_agent tool → powerup_agent.invoke(...)
+              └── powerup_agent (create_agent, no checkpointer)
+                    └── preview_tool → interrupt(...)
+```
+
+当 `preview_tool` 调用 @[`interrupt`] 时，异常会穿过这两层 @[`create_agent`]，最终以 `__interrupt__` 的形式出现在最外层 @[`StateGraph`] 的 invoke 结果中。你现有的 `Command(resume=result)` callback 路径仍然可以继续使用。
+
+关于 interrupt 如何通过子图传播的更多信息，请参阅 [Subgraph persistence: Interrupts](/oss/langgraph/use-subgraphs#per-invocation-default) 和 [Checkpointing and state inspection](/oss/langchain/multi-agent/subagents#checkpointing-and-state-inspection)。
+
+## 何时改用自定义 StateGraph
+
+当你需要把确定性步骤和 agentic 步骤混合在一起时，请使用自定义 @[`StateGraph`]。例如：固定路由、校验逻辑、外部 API 调用，与 @[`create_agent`] 节点组合在同一个工作流中。
+
+## 迁移嵌套 supervisor
+
+`langgraph-supervisor` 支持多层级结构，你可以先 compile supervisor，再把它传给另一个 `create_supervisor`。在 subagents 模式下，你有两种选择：
+
+1. **拍平成一个 supervisor**，每个叶子智能体对应一个 tool。当各个 worker 相互独立时，这是最简单的做法。
+2. **嵌套 tool 调用**。如果你仍然需要中间层协调，就把一个中间层智能体（它本身也是一个带有 subagent tools 的 @[`create_agent`]）包装成顶层 supervisor 上的 tool。
+
+<MigrateLanggraphSupervisorNestedPy />
+
+如果你需要静态子图发现、分层 checkpoint namespace，或者层级之间共享 state key，请改用带有 [subgraph nodes](/oss/langgraph/use-subgraphs#add-a-subgraph-as-a-node) 的自定义 @[`StateGraph`]。
+
+## 迁移消息历史选项
+
+`create_supervisor` 提供 `output_mode` 来控制 worker 消息如何出现在对话历史中：
+
+- `full_history`：包含 worker 智能体的全部消息。
+- `last_message`：只包含 worker 的最终回复。
+
+在 subagents 模式下，这个行为由 tool wrapper 控制。要实现 `last_message`，只返回最终消息即可；要实现 `full_history`，则返回整个对话的格式化摘要。可以参阅 [Subagent outputs](/oss/langchain/multi-agent/subagents#subagent-outputs) 中那些把额外 state 返回给 supervisor 的模式。
+
+## 另请参阅
+
+- [Subagents](/oss/langchain/multi-agent/subagents)：模式概览与设计决策
+- [Build a personal assistant with subagents](/oss/langchain/multi-agent/subagents-personal-assistant)：逐步讲解的 supervisor 教程
+- [Use subgraphs](/oss/langgraph/use-subgraphs)：子图持久化、interrupt 和 state inspection
+- [Interrupts](/oss/langgraph/interrupts)：暂停与恢复图执行
+- [LangGraph v1 migration guide](/oss/migrate/langgraph-v1)：从 `create_react_agent` 迁移到 `create_agent`

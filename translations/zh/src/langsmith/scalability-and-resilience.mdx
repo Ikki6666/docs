@@ -1,0 +1,38 @@
+---
+title: 可扩展性与韧性
+sidebarTitle: 可扩展性与韧性
+---
+
+LangSmith 在设计上可以随着你的工作负载进行水平扩展。服务的每个实例都是无状态的，不会在内存中保留资源。系统能够平滑地处理新实例的加入和移除，包括硬关闭场景。
+
+## 服务器扩展性
+
+随着你为服务添加更多实例，只要前面放置了合适的负载均衡机制，这些实例就会共同分摊 HTTP 流量。在大多数部署模式中，我们会自动为服务配置负载均衡器；而在“self-hosted without control plane”这种模式下，则需要你自己添加负载均衡器。由于所有实例都是无状态的，任何负载均衡策略都可以使用，不需要，也不建议使用 session stickiness。任意服务器实例都可以通过 Redis PubSub 与任意队列实例通信，这意味着，取消一个进行中的 run，或对其进行流式输出的请求，都可以由任意实例来处理。
+
+## 队列扩展性
+
+随着你为服务增加更多实例，run 吞吐量会线性提高，因为每个实例都被配置为处理固定数量的并发 runs（默认为 10）。每个 run 的每一次 attempt 都会由单个实例处理，并通过 Postgres 的 MVCC 模型保证 exactly-once 语义（关于崩溃恢复细节，请参见下文）。对于因瞬时数据库错误而失败的 attempts，系统最多会重试 3 次。我们不会使用长生命周期事务或锁，这让我们能够更高效地利用 Postgres 资源。
+
+## 韧性
+
+当某个队列实例正在处理某个 run 时，该队列 worker 会定期把 heartbeat 时间戳写入 Redis。
+
+当服务收到优雅关闭请求（SIGINT）时，实例会进入 shutdown 模式，此时会：
+
+* 停止接收新的 HTTP 请求
+* 给正在执行的 runs 一个有限的秒数去完成，如果未能完成，就会被重新放回队列
+* 阻止该实例继续从队列中拾取新的 runs
+
+如果由于服务器崩溃或基础设施故障而发生硬关闭，那么所有正在执行中的 runs 都会由一个内部 sweeper task 接管。它会寻找那些已经超出 heartbeat 窗口的 in-progress runs。Sweeper 每 2 分钟运行一次，并把这些 runs 重新放回队列，供其他实例接手。
+
+## Postgres 韧性
+
+对于我们托管 Postgres 数据库的部署模式，我们会定期备份，并维护持续复制的 standby 副本，以便自动故障切换。这套 Postgres 配置仅在 [Cloud deployment option](/langsmith/cloud) 中的 [`Production` deployment types](/langsmith/cloud-platform-features#deployment-types) 可用。
+
+所有与 Postgres 的通信都会对可重试错误进行重试。如果 Postgres 只是短暂不可用，例如数据库重启期间，大多数甚至全部流量都应能继续成功。若 Postgres 长时间故障，则 Agent Server 将不可用。
+
+## Redis 韧性
+
+所有需要持久化存储的数据都保存在 Postgres 中，而不是 Redis。Redis 仅用于临时元数据和实例之间的通信。因此，我们对 Redis 不要求持久化能力。
+
+所有与 Redis 的通信也都会对可重试错误执行重试。如果 Redis 只是短暂不可用，例如数据库重启期间，大多数甚至全部流量都应能继续成功。若 Redis 长时间故障，则 Agent Server 将不可用。

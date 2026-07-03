@@ -1,0 +1,325 @@
+---
+title: 基于属性的访问控制
+sidebarTitle: 基于属性的访问控制
+---
+
+本参考文档介绍 LangSmith 的基于属性的访问控制（ABAC）系统。它通过资源属性实现细粒度访问控制，可与 [RBAC](/langsmith/rbac) 互补使用。若要自动把用户 provision 到角色中，请参见 [SCIM](/langsmith/user-management#set-up-scim-for-your-organization)。
+
+<Note>
+ABAC（Attribute-Based Access Control）是一个 Enterprise 功能，用于实现细粒度访问控制。如果你对该功能感兴趣，请[联系销售团队](https://www.langchain.com/contact-sales)。其他方案默认所有用户都使用 Admin 角色。
+</Note>
+
+ABAC 通过给访问决策增加基于标签的条件，来补充[基于角色的访问控制（RBAC）](/langsmith/rbac)。RBAC 根据用户角色授予一揽子权限，例如“可以读取所有项目”；而 ABAC 允许你根据资源标签进一步限制或授予访问，例如“只能读取带有 `Environment=Development` 标签的项目”。
+
+<Note>
+角色和资源标签都可以通过 UI 或 API 管理。ABAC 策略可通过 [API](https://api.smith.langchain.com/docs#/access_policies) 配置。配置完成后，策略会在 API 和 UI 中自动生效。
+</Note>
+
+## 开始前准备
+
+* 先在工作区中[设置资源标签](/langsmith/set-up-resource-tags)。
+* 当前 ABAC 在策略中仅支持把 `resource_tag_key` 作为 `attribute_name`，也就是只支持基于资源标签来评估。暂不支持其他属性。
+
+## 为自托管部署启用 ABAC
+
+1. ABAC 需要运行 Helm chart 0.11.28 或更高版本（应用版本 0.12.1）的[self-hosted](/langsmith/self-hosted) LangSmith 部署。升级后，可使用以下任一方式启用 ABAC：
+
+    - **为单个组织启用：** 对你的 LangSmith PostgreSQL 数据库执行如下语句，并把 `<organization_id>` 替换成从 UI 中组织设置页面复制的 ID：
+
+        ```sql
+        UPDATE organizations SET config = config || '{"can_use_abac": true}' WHERE id = '<organization_id>' AND NOT is_personal;
+        ```
+
+    - **为所有组织启用：** 在 `values.yaml` 的 `commonEnv` 中加入如下环境变量：
+
+        ```yaml
+        DEFAULT_ORG_FEATURE_CAN_USE_ABAC: "true"
+        ```
+
+        <Note>
+        该环境变量对 personal organizations 不生效，因为 personal organizations 不启用 [RBAC](/langsmith/rbac)。
+        </Note>
+
+1. 配置认证。若要通过 API 管理访问策略，你需要使用来自 [Organization Admin](/langsmith/rbac#organization-admin) 用户的 Personal Access Token（PAT），或一个拥有 Organization Admin 权限的组织范围 service key。在运行任何脚本之前，请设置以下环境变量：
+
+    ```bash
+    export LANGSMITH_API_KEY="your_admin_api_key"
+    # Required for self-hosted or regional SaaS deployments:
+    # export LANGCHAIN_ENDPOINT="https://eu.api.smith.langchain.com"
+    # export LANGCHAIN_ENDPOINT="https://aws.api.smith.langchain.com"
+    # export LANGCHAIN_ENDPOINT="https://apac.api.smith.langchain.com"
+    # export LANGCHAIN_ENDPOINT="https://langsmith.yourdomain.com/api"
+    ```
+
+## 访问策略结构
+
+访问策略定义了在什么条件下允许或拒绝访问。结构如下：
+
+```json
+{
+  "name": "Policy Name",
+  "description": "Optional description",
+  "effect": "allow | deny",
+  "condition_groups": [
+    {
+      "permission": "projects:read",
+      "resource_type": "project",
+      "conditions": [
+        {
+          "attribute_name": "resource_tag_key",
+          "attribute_key": "Environment",
+          "operator": "equals",
+          "attribute_value": "Production"
+        }
+      ]
+    }
+  ],
+  "role_ids": ["<role-uuid>"]
+}
+```
+
+### Effect
+
+`effect` 决定在条件匹配时会发生什么：
+
+- **`allow`** - 条件匹配时授予访问
+- **`deny`** - 条件匹配时拒绝访问
+
+<Note>
+Deny 策略始终优先。如果 allow 和 deny 策略同时匹配，最终结果一定是拒绝访问。
+</Note>
+
+### Condition groups
+
+`condition_groups` 数组中包含一个或多个条件组。多个条件组之间使用 **OR 逻辑** 评估，也就是说，只要任意一个组匹配，策略就会生效。
+
+每个条件组都指定：
+- **`permission`** - 该组适用的权限
+- **`resource_type`** - 要匹配的资源类型
+- **`conditions`** - 条件数组（组内采用 **AND 逻辑** 评估）
+
+#### 资源类型与权限
+
+| 资源类型 | 支持的权限 |
+| --- | --- |
+| `project` | `projects:read`, `projects:update`, `projects:delete`, `runs:read`, `runs:share`, `runs:delete`, `projects:increase-trace-tier`, `projects:decrease-trace-tier` |
+| `prompt` | `prompts:read`, `prompts:update`, `prompts:delete`, `prompts:share`, `prompts:tag` |
+| `dataset` | `datasets:read`, `datasets:update`, `datasets:delete`, `datasets:share` |
+| `deployment` | `deployments:read`, `deployments:update`, `deployments:delete` |
+| `mcp_server` | `mcp-servers:read`, `mcp-servers:invoke`, `mcp-servers:update`, `mcp-servers:delete`。详见 [Fleet 工具访问控制](/langsmith/fleet/access-and-oversight#tool-access-control)。 |
+| `fleet_integration` | `mcp-servers:read`, `mcp-servers:invoke`。详见 [Fleet 工具访问控制](/langsmith/fleet/access-and-oversight#tool-access-control)。 |
+
+<Note>
+Runs 本身没有独立标签。Run 权限（`runs:read`、`runs:create`、`runs:share`、`runs:delete`）是基于其父 project 的标签来评估的。
+</Note>
+
+#### Conditions
+
+`conditions` 数组中的每个条件都指定：
+- **`attribute_name`** - 当前仅支持 `resource_tag_key`
+- **`attribute_key`** - 要匹配的标签 key，例如 `Environment`、`Team`
+- **`operator`** - 比较运算符
+- **`attribute_value`** - 要比较的值
+
+##### 运算符
+
+| 运算符 | 说明 |
+| --- | --- |
+| `equals` | 精确匹配（区分大小写） |
+| `not_equals` | 值不同（区分大小写） |
+| `equals_ignore_case` | 精确匹配（不区分大小写） |
+| `not_equals_ignore_case` | 值不同（不区分大小写） |
+| `matches` | 使用 `*` 和 `?` 通配符的 glob 模式匹配 |
+| `not_matches` | 当值不匹配 glob 模式时匹配 |
+
+##### `_if_exists` 变体
+
+每个运算符都提供一个 `_if_exists` 变体：如果标签 key 不存在，则默认视为匹配；如果标签存在，则按正常条件计算：
+
+| 运算符 | 说明 |
+| --- | --- |
+| `equals_if_exists` | 精确匹配（区分大小写），或标签 key 不存在 |
+| `not_equals_if_exists` | 值不同（区分大小写），或标签 key 不存在 |
+| `equals_ignore_case_if_exists` | 精确匹配（不区分大小写），或标签 key 不存在 |
+| `not_equals_ignore_case_if_exists` | 值不同（不区分大小写），或标签 key 不存在 |
+| `matches_if_exists` | glob 模式匹配，或标签 key 不存在 |
+| `not_matches_if_exists` | 值不匹配 glob 模式时匹配，或标签 key 不存在 |
+
+<Tip>
+在 **allow** 策略中，`_if_exists` 变体会允许访问那些要么满足条件、要么根本没有该标签 key 的资源。在 **deny** 策略中，它们会阻止那些要么满足条件、要么缺少该标签 key 的资源。
+</Tip>
+
+### Roles
+
+`role_ids` 数组指定策略适用于哪些工作区角色。当某个拥有该角色的用户访问资源时，就会对其执行策略条件评估。
+
+策略可以在创建时直接绑定到角色，也可以稍后通过 API 再附加上去。
+
+## 管理访问策略
+
+访问策略由 [Organization Admins](/langsmith/rbac#organization-admin) 通过 LangSmith API 管理。在创建策略之前，请先在工作区中[设置资源标签](/langsmith/set-up-resource-tags)。
+
+## ABAC 与 RBAC 如何协同工作
+
+在决定是否允许访问资源时，系统会同时考虑 [RBAC](/langsmith/rbac) 权限和 ABAC 策略：
+
+- ABAC **deny** 策略会覆盖 RBAC 权限
+- ABAC **allow** 策略即使在没有 RBAC 权限的情况下，也可以授予访问
+- 如果没有任何 ABAC 策略匹配，系统就会回退到 RBAC
+
+### 策略评估结果
+
+**功能组合：**
+
+| RBAC enabled | ABAC enabled | 行为 |
+| --- | --- | --- |
+| ✗ | ✗ | 所有工作区成员都拥有 Admin 级访问 |
+| ✓ | ✗ | 标准 RBAC，根据角色权限决定访问 |
+| ✓ | ✓ | RBAC + ABAC，提供基于标签的细粒度访问控制 |
+
+**当 RBAC 和 ABAC 同时启用时：**
+
+| RBAC permits | Allow policy matches | Deny policy matches | 结果 |
+| --- | --- | --- | --- |
+| ✓ | ✓ | ✗ | **允许** |
+| ✓ | ✗ | ✗ | **允许**（RBAC 回退） |
+| ✓ | ✓ | ✓ | **拒绝**（deny 优先） |
+| ✓ | ✗ | ✓ | **拒绝**（deny 优先） |
+| ✗ | ✓ | ✗ | **允许**（ABAC 授权） |
+| ✗ | ✗ | ✗ | **拒绝** |
+| ✗ | ✓ | ✓ | **拒绝**（deny 优先） |
+
+## 示例场景
+
+### 1. 标注团队分配
+
+只允许 annotators 访问标记给自己团队的数据集：
+
+```json
+{
+  "name": "Annotator Team A Access",
+  "effect": "allow",
+  "condition_groups": [{
+    "permission": "datasets:read",
+    "resource_type": "dataset",
+    "conditions": [{
+      "attribute_name": "resource_tag_key",
+      "attribute_key": "Annotation-Team",
+      "operator": "equals",
+      "attribute_value": "Team-A"
+    }]
+  }]
+}
+```
+
+### 2. 阻止敏感数据
+
+拒绝访问包含 PII 的 datasets。由于 deny 策略会覆盖 allow 策略，因此即便用户已经拥有 RBAC 权限，也仍然会被挡住：
+
+```json
+{
+  "name": "Block PII Datasets",
+  "effect": "deny",
+  "condition_groups": [{
+    "permission": "datasets:read",
+    "resource_type": "dataset",
+    "conditions": [{
+      "attribute_name": "resource_tag_key",
+      "attribute_key": "Contains-PII",
+      "operator": "equals",
+      "attribute_value": "true"
+    }]
+  }]
+}
+```
+
+### 3. 基于应用家族的访问（通配符）
+
+允许工程师访问属于 “chatbot” 家族的任意应用项目，使用 glob 模式匹配：
+
+```json
+{
+  "name": "Chatbot Apps Access",
+  "effect": "allow",
+  "condition_groups": [{
+    "permission": "projects:read",
+    "resource_type": "project",
+    "conditions": [{
+      "attribute_name": "resource_tag_key",
+      "attribute_key": "Application",
+      "operator": "matches",
+      "attribute_value": "chatbot-*"
+    }]
+  }]
+}
+```
+
+### 4. 客户与用途双重隔离（AND 逻辑）
+
+只有在同时满足两个条件时才允许访问，也就是该 dataset 既用于训练，又属于某个特定客户：
+
+```json
+{
+  "name": "Client Training Data Access",
+  "effect": "allow",
+  "condition_groups": [{
+    "permission": "datasets:read",
+    "resource_type": "dataset",
+    "conditions": [
+      {
+        "attribute_name": "resource_tag_key",
+        "attribute_key": "Purpose",
+        "operator": "equals",
+        "attribute_value": "Training"
+      },
+      {
+        "attribute_name": "resource_tag_key",
+        "attribute_key": "Client",
+        "operator": "equals",
+        "attribute_value": "Acme-Corp"
+      }
+    ]
+  }]
+}
+```
+
+### 5. 客户数据 + 没有 `Client` 标签的资源（使用 `_if_exists`）
+
+假设 consultants 没有 RBAC 的 `datasets:read` 权限，但这条策略可以授予他们访问 `Client=Acme-Corp` 的 datasets，以及根本没有 `Client` 标签的 datasets。那些标记为其他客户的 datasets，例如 `Client=Other-Corp`，仍然会被阻止：
+
+```json
+{
+  "name": "Acme Consultant Access",
+  "effect": "allow",
+  "condition_groups": [{
+    "permission": "datasets:read",
+    "resource_type": "dataset",
+    "conditions": [{
+      "attribute_name": "resource_tag_key",
+      "attribute_key": "Client",
+      "operator": "equals_if_exists",
+      "attribute_value": "Acme-Corp"
+    }]
+  }]
+}
+```
+
+## 故障排查
+
+**访问被意外拒绝？**
+- 检查是否命中了 deny 策略（deny 永远优先）
+- 检查用户是否拥有 RBAC 权限，或命中了某条 allow 策略
+- 验证资源是否真的带有预期标签和值
+- 带 `_if_exists` 的 deny 策略会阻止缺失该标签 key 的资源
+- 对于区分大小写的运算符（`equals`、`not_equals`），检查是否存在大小写不一致
+- 如果一个条件组内有多个条件，则它们必须全部匹配（AND 逻辑）
+
+**访问被意外放行？**
+- 检查 RBAC 权限（用户可能是通过角色本身获得访问）
+- 检查 allow 策略是否过于宽泛，例如使用了通配符
+- `_if_exists` 运算符会匹配缺失该标签 key 的资源
+
+**策略没有生效？**
+- 确认策略附加到了正确的角色上
+- 验证用户在该工作区中确实拥有这个角色
+- 检查 `resource_type` 和 `permission` 是否与实际访问的资源一致

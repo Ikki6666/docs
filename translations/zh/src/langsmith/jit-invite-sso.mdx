@@ -1,0 +1,220 @@
+---
+title: 在 SSO 组织中管理用户访问
+sidebarTitle: SSO 组织中的用户访问
+---
+
+在使用[单点登录（SSO）认证](/langsmith/authentication-methods)时，LangSmith 提供了灵活的控制项，用于管理用户如何加入你的[组织](/langsmith/administration-overview#organizations)。你可以分别启用或禁用 Just-In-Time（JIT）provisioning 和用户邀请，以匹配组织的安全与入职要求。
+
+启用 SSO 后，你会有两个彼此独立的设置：[JIT provisioning](#jit-provisioning) 会在用户通过 SSO 登录时自动把他们加入组织，而 [invites](#invites) 则允许管理员在用户获得组织访问权限之前手动发出邀请。你可以按任意组合来[配置这些设置](#configuration-scenarios)，从而控制用户的入组流程。
+
+本页解释这些设置的工作方式，以及如何进行配置。
+
+## 设置
+
+你可以分别控制以下两个设置，以管理用户如何加入组织。
+
+### JIT provisioning
+
+`jit_provisioning_enabled` 设置控制自动用户开通。启用后，通过 SSO 提供方完成认证的用户会被自动加入你的[组织](/langsmith/administration-overview#organizations)，并以默认[角色](/langsmith/rbac)加入默认[工作区](/langsmith/administration-overview#workspaces)。更多细节请参见[配置默认 SSO 设置](#configure-default-sso-settings)。禁用后，用户必须先被显式邀请，或通过 [SCIM](#scim-integration) 添加，之后才能访问组织。
+
+### Invites
+
+`invites_enabled` 设置控制手动邀请。启用后，[组织管理员](/langsmith/administration-overview#organization-roles)可以在用户登录前向其发送邀请。受邀用户在通过 SSO 登录时可以领取该邀请。禁用后，不允许手动邀请，用户只能通过 JIT provisioning 或 [SCIM](#scim-integration) 加入。
+
+### 更新设置
+
+你可以在 LangSmith UI 中更新这些设置，也可以通过 LangSmith API 更新：
+
+<Tabs>
+<Tab title="UI" icon="layout">
+
+在 [LangSmith UI](https://smith.langchain.com) 中：
+
+1. 前往 **Settings** → **Organization** → **Access and Security** → **General**。
+1. 根据需要切换 **Enable JIT provisioning** 和 **Allow invites**。
+1. 在 **Settings** → **Organization** → **SSO Configuration** 中[配置 SSO 默认工作区和角色](#configure-default-sso-settings)。
+
+</Tab>
+<Tab title="API" icon="code">
+
+使用 [Update organization info](/langsmith/smith-api/orgs/update-current-organization-info) 端点，以编程方式更新组织设置：
+
+```bash
+curl -X PATCH https://api.smith.langchain.com/api/v1/organizations/current/info \
+  -H "Authorization: Bearer $LANGSMITH_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jit_provisioning_enabled": true,
+    "invites_enabled": true
+  }'
+```
+
+响应中会包含更新后的当前组织配置：
+
+```json
+{
+  "id": "org-uuid",
+  "display_name": "My Organization",
+  "jit_provisioning_enabled": true,
+  "invites_enabled": true,
+  "sso_login_slug": "my-org",
+  ...
+}
+```
+
+</Tab>
+</Tabs>
+
+<Note>
+如果你使用的是[LangSmith 自托管版](/langsmith/self-hosted)，请注意以下几点：
+
+- JIT provisioning 和 invites 设置只适用于默认组织（通过 `default_sso_provision=true` 标识）。在自托管环境中，其他组织必须使用邀请机制。
+- 环境变量 `SELF_HOSTED_JIT_PROVISIONING_ENABLED` 可以全局覆盖 JIT provisioning 设置。当它被设为 `false` 时，无论各组织自身配置如何，所有组织的 JIT provisioning 都会被禁用。
+- 关于更多自托管用户管理定制，请参见[自定义用户管理](/langsmith/self-host-user-management)。
+</Note>
+
+## 用户访问如何工作
+
+当用户尝试通过 SSO 登录时，LangSmith 会遵循以下决策流程：
+
+1. 用户通过 SSO 提供方完成认证。
+1. LangSmith 检查该用户是否已经拥有组织访问权限：
+    ```
+    ├─ YES → User is signed in
+    └─ NO → Continue to step 3
+    ```
+1. 检查是否启用了 invites，且**存在待领取邀请**：
+    ```
+   ├─ YES → Provision into organization with invite's organization role; provision into workspaces if invite included workspaces
+   └─ NO → Continue to step 4
+    ```
+1. 检查是否启用了 JIT provisioning：
+    ```
+   ├─ YES → Automatically provision user with default SSO workspaces/role
+   └─ NO → Deny access (user must be added via SCIM or by administrator)
+    ```
+
+<Note>
+当 JIT provisioning 和 invites 同时启用时，**邀请优先**。如果用户存在待领取邀请，则会按邀请中的配置加入，而不是使用默认 SSO 设置。
+</Note>
+
+## 配置场景
+
+### 开放访问（两者都启用）
+
+**配置：**
+- ✓ 启用 JIT Provisioning
+- ✓ 启用 invites
+
+**行为：**
+- 用户可直接通过 SSO 登录并被自动开通。
+- 管理员可以发送邀请，为用户指定特定角色或工作区。
+- 已受邀用户使用邀请配置，未受邀用户使用默认 SSO 配置。
+
+**示例：**
+```
+用户 alex@company.com 通过 SSO 登录：
+  - 不存在邀请 → 以 Viewer 角色加入默认工作区
+
+用户 billy@company.com 通过 SSO 登录：
+  - 存在一条邀请，指定其以 Editor 角色加入 "Production" 工作区 → 仅加入 "Production" 工作区，并使用 Editor 角色（邀请优先）
+```
+
+### 仅启用 JIT（禁用 invites）
+
+**配置：**
+- ✓ 启用 JIT Provisioning
+- ✗ 禁用 invites
+
+**行为：**
+- 所有通过 SSO 完成认证的用户都会被自动开通。
+- 管理员不能发送邀请。
+- 所有新用户都会获得相同的默认工作区和角色。
+
+### 仅启用邀请（禁用 JIT）
+
+**配置：**
+- ✗ 禁用 JIT Provisioning
+- ✓ 启用 invites
+
+**行为：**
+- 用户必须先收到邀请，之后才能访问组织。
+- 没有邀请的用户即使拥有有效的 SSO 凭证，也会被拒绝访问。
+- 你可以更细粒度地控制谁能进入组织。
+
+**示例：**
+```
+用户 alex@company.com 通过 SSO 登录：
+  - 有待领取邀请 → 成功加入组织
+
+用户 billy@company.com 通过 SSO 登录：
+  - 没有邀请 → 拒绝访问（必须向管理员申请邀请）
+```
+
+### 封闭访问（两者都禁用）
+
+**配置：**
+- ✗ 禁用 JIT Provisioning
+- ✗ 禁用 invites
+
+**行为：**
+- SSO 用户不会自动加入组织。
+- 不能发送邀请。
+- 用户必须通过 SCIM 被开通，或者先通过 SCIM 成为组织成员后，再由管理员直接管理。
+
+## 用户访问速查表
+
+| JIT enabled | Invites enabled | Pending invite | Result |
+| --- | --- | --- | --- |
+| ✓ | ✓ | Yes | 领取邀请（使用邀请配置） |
+| ✓ | ✓ | No | 自动开通（使用默认 SSO 配置） |
+| ✓ | ✗ | N/A | 自动开通（使用默认 SSO 配置） |
+| ✗ | ✓ | Yes | 领取邀请 |
+| ✗ | ✓ | No | **拒绝访问**，必须先被邀请 |
+| ✗ | ✗ | N/A | **拒绝访问**，必须通过 [SCIM](#scim-integration) 或管理员处理 |
+
+## 配置默认 SSO 设置
+
+启用 [JIT provisioning](#jit-provisioning) 后，请为新用户配置默认设置：
+
+1. 默认工作区角色。选择用户在自动开通时获得的[工作区角色](/langsmith/rbac#workspace-roles)。各角色具体能力请参见[组织与工作区操作](/langsmith/organization-workspace-operations)。可选项包括：
+
+    - **[Viewer](/langsmith/rbac#workspace-viewer)**：只读访问
+    - **[User](/langsmith/rbac#organization-user)**：标准访问
+    - **[Editor](/langsmith/rbac#workspace-editor)**：可以修改资源
+    - **[Admin](/langsmith/rbac#workspace-admin)**：对工作区拥有完整控制权
+
+1. 默认工作区。选择一个或多个工作区，用户会被自动加入这些工作区，并在所有选中的工作区中获得相同角色。配置步骤如下：
+
+    1. 前往 **Settings** → **Organization** → **SSO Configuration**。
+    1. 设置 **Default workspace role**。
+    1. 选择 **Default workspaces**。
+    1. 保存配置。
+
+## SCIM 集成
+
+如果你的组织使用 [SCIM](/langsmith/user-management#set-up-scim-for-your-organization)（System for Cross-domain Identity Management），则可以通过你的身份提供方自动开通和管理用户。SCIM 提供了另一种用户管理机制，可以与 JIT 和 invites 设置并行存在。
+
+<Note>
+SCIM 组成员关系会覆盖手动分配的角色，以及通过 JIT provisioning 分配的角色。如果你正在使用 SCIM，建议关闭 JIT provisioning，以避免冲突。
+</Note>
+
+## SSO Groups Sync
+
+[SSO Groups Sync](/langsmith/user-management#sso-groups-sync-alternative) 是 SCIM 的替代方案。它会在登录时从 SSO token 中读取组成员关系，并使用 SCIM 的命名规则来分配组织和工作区角色。该同步会在每次登录时，在 JIT 和邀请处理完成之后运行，并且只管理它自己创建的成员关系。
+
+**与 JIT、invites 和 SCIM 的优先级关系：**
+
+- **来自 SCIM 的成员关系** 永远不会被 SSO Groups Sync 修改。
+- **来自 SSO Groups Sync 的成员关系** 会在每次登录时根据 token 中的组成员关系被完整替换。
+- **手动添加和 JIT provisioning 添加的成员关系** 不会被 SSO Groups Sync 修改。
+
+建议每个组织在 SCIM 和 SSO Groups Sync 之间二选一，而不是两者同时使用，以避免令人困惑的优先级行为。关于配置和取舍，请参见 [SSO Groups Sync](/langsmith/user-management#sso-groups-sync-alternative)。
+
+## 相关文档
+
+- [使用 OAuth2.0 和 OIDC 设置 SSO](/langsmith/self-host-sso)（自托管）
+- [设置 SAML SSO](/langsmith/user-management#set-up-saml-sso-for-your-organization)（Cloud）
+- [设置 SCIM](/langsmith/user-management#set-up-scim-for-your-organization)
+- [用户管理](/langsmith/user-management)
+- [基于角色的访问控制](/langsmith/rbac)

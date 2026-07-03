@@ -1,0 +1,379 @@
+---
+title: 使用 OAuth2.0 和 OIDC 设置 SSO
+sidebarTitle: 使用 OAuth2.0 和 OIDC 设置 SSO
+---
+
+LangSmith Self-Hosted 通过 OAuth2.0 和 OIDC 提供 SSO。这样会将身份验证委托给你的 Identity Provider, IdP，由它来管理对 LangSmith 的访问。
+
+我们的实现支持几乎所有符合 OIDC 标准的方案，但有少数例外。配置完成后，你会看到如下登录界面：
+
+![启用 OAuth SSO 的 LangSmith UI](/langsmith/images/langsmith-ui-sso.png)
+
+## 概览
+
+<Note>
+你可以将一个 [basic auth](/langsmith/self-host-basic-auth) 安装升级到这种模式，但不能从 [none auth](/langsmith/authentication-methods#none) 安装升级。升级时，只需移除 basic auth 配置，并添加下方所示的必需配置参数。之后，用户将**只能**通过 OAuth 登录。**为了在升级后继续保持访问权限，你必须能使用一个此前通过 basic auth 登录过的邮箱地址通过 OAuth 登录。**
+</Note>
+
+<Warning>
+目前 LangSmith 不支持在 self-hosted 场景下从 SSO 切回 basic auth 模式。我们也不支持从带 client secret 的 OAuth 模式切换到不带 client secret 的 OAuth 模式，或反向切换。最后，我们也不支持同时启用 basic auth 和 OAuth。启用 OAuth 时，请确保已经禁用 basic auth 配置。
+</Warning>
+
+## 带 client secret（推荐）
+
+默认情况下，LangSmith Self-Hosted 支持带 `Client Secret` 的 `Authorization Code` 流程。在这个流程中，你的 client secret 会安全地存储在 LangSmith 中，而不是前端，并用于身份验证和建立认证会话。
+
+### 前置条件
+
+* 你必须使用 self-hosted，并且处于 Enterprise 套餐
+* 你的 IdP 必须支持带 `Client Secret` 的 `Authorization Code` 流程
+* 你的 IdP 必须支持使用外部 discovery 或 issuer URL。LangSmith 会用它来获取必要的路由和密钥
+* 你必须向 LangSmith 提供 `OIDC`、`email` 和 `profile` scopes。LangSmith 会用它们来获取所需的用户信息和邮箱地址
+<Note>
+
+LangSmith SSO 仅支持通过 `https` 使用。
+</Note>
+
+### 配置
+
+* 你需要在 IdP 中将回调 URL 设置为 `https://<host>/api/v1/oauth/custom-oidc/callback`，其中 `host` 是为 LangSmith 实例分配的域名或 IP。IdP 会在用户完成身份验证后重定向到此处
+* 如果你希望用户退出登录时一并终止 IdP 会话，迫使其再次重新认证，请在 IdP 中把你的 LangSmith URL，例如 `https://<host>`，注册为 **post-logout redirect URI**，有时也叫 **Sign-out redirect URI**，然后在环境中设置 `OAUTH_IDP_LOGOUT_ENABLED=true`，Helm 下通过 `commonEnv`，Docker Compose 下通过 `.env`
+* 你需要在 `values.yaml` 中提供 `oauthClientId`、`oauthClientSecret`、`hostname` 和 `oauthIssuerUrl`，这些配置会用于设置 LangSmith 实例
+* 如果你**尚未**配置过带 client secret 的 OAuth，或者你目前只有 personal orgs，那么必须提供一个邮箱地址，用于作为新建 SSO 组织的初始 org admin。如果你是从 basic auth 升级，则会复用现有组织
+
+<CodeGroup>
+
+```yaml Helm
+config:
+  authType: mixed
+  hostname: https://langsmith.example.com
+  initialOrgAdminEmail: test@email.com # Set this if required
+  oauth:
+    enabled: true
+    oauthClientId: <YOUR CLIENT ID>
+    oauthClientSecret: <YOUR CLIENT SECRET>
+    oauthIssuerUrl: <YOUR DISCOVERY URL>
+    oauthScopes: "email,profile,openid"
+```
+
+```bash Docker
+# In your .env file
+AUTH_TYPE=mixed
+INITIAL_ORG_ADMIN_EMAIL=test@email.com
+LANGSMITH_URL=https://langsmith.example.com
+OAUTH_CLIENT_ID=your-client-id
+OAUTH_CLIENT_SECRET=your-client-secret
+OAUTH_ISSUER_URL=https://your-issuer-url
+OAUTH_SCOPES=email,profile,openid
+```
+
+</CodeGroup>
+
+### 会话时长控制
+
+<Note>
+本节中的所有环境变量都用于 `platform-backend` 服务，在 Helm 中可以通过 `platformBackend.deployment.extraEnv` 添加。
+</Note>
+
+* 默认情况下，会话时长由 identity provider 返回的 identity token 过期时间决定
+* 大多数配置都应使用 refresh token，这样可以在 identity token 过期后继续延长会话，最长可达 `OAUTH_SESSION_MAX_SEC`。这通常要求把 `offline_access` 加入 `oauthScopes`，或 Docker 下的 `OAUTH_SCOPES`
+* `OAUTH_SESSION_MAX_SEC` 默认值为 1 天，可覆盖到最多一周，即 `604800`
+* 对于不支持 refresh token 的 identity provider，可以设置 `OAUTH_OVERRIDE_TOKEN_EXPIRY="true"`，这样系统会忽略 identity token 的过期时间，直接用 `OAUTH_SESSION_MAX_SEC` 作为会话长度
+
+### 严格型 identity provider 的 scope 编码
+
+默认情况下，LangSmith 会把授权请求中 `oauthScopes` 之间的空格编码为 `+`，即 `application/x-www-form-urlencoded` 的常见约定。大多数 identity provider 都能接受，但有些不行，例如 CA SiteMinder，它不会把 `+` 解码为空格，从而以 `invalid_scope` 错误拒绝登录。如果你的 IdP 因此拒绝多 scope 登录，请设置 `urlEncodeScopeSpaces: true`，或 Docker 下的 `OAUTH_URL_ENCODE_SCOPE_SPACES=true`，这样会把空格编码为 `%20`，这是所有 OIDC 兼容提供商都能接受的形式。这个配置仅适用于 `authType: mixed` 且使用 OAuth client secret 的场景，默认关闭。
+
+<CodeGroup>
+
+```yaml Helm
+config:
+  authType: mixed
+  hostname: https://langsmith.example.com
+  oauth:
+    enabled: true
+    oauthClientId: <YOUR CLIENT ID>
+    oauthClientSecret: <YOUR CLIENT SECRET>
+    oauthIssuerUrl: <YOUR DISCOVERY URL>
+    oauthScopes: "email,profile,openid"
+    urlEncodeScopeSpaces: true
+```
+
+```bash Docker
+# In your .env file
+AUTH_TYPE=mixed
+LANGSMITH_URL=https://langsmith.example.com
+OAUTH_CLIENT_ID=your-client-id
+OAUTH_CLIENT_SECRET=your-client-secret
+OAUTH_ISSUER_URL=https://your-issuer-url
+OAUTH_SCOPES=email,profile,openid
+OAUTH_URL_ENCODE_SCOPE_SPACES=true
+```
+
+</CodeGroup>
+
+### 覆盖 sub claim
+
+在某些场景下，可能需要覆盖 identity provider 中哪个 claim 被当作 `sub` claim 使用。
+例如，在 SCIM 中，解析出的 `sub` claim 必须与 SCIM 的 `externalId` 一致，登录才能成功。
+如果 `sub` claim 的来源属性和 SCIM `externalId` 的来源属性存在限制，请设置 `ISSUER_SUB_CLAIM_OVERRIDES` 环境变量，用来选择哪个 OIDC JWT claim 被作为 `sub`。
+
+如果 issuer URL **以**该配置中的某个 URL 开头，那么 `sub` claim 会取对应字段名中的值。
+例如，使用如下配置时，issuer 为 `https://idp.yourdomain.com/application/uuid` 的 token 会把 `customClaim` 的值作为 `sub`：
+
+```
+ISSUER_SUB_CLAIM_OVERRIDES='{"https://idp.yourdomain.com": "customClaim"}'
+```
+
+如果未设置，该配置默认会在 Azure Entra ID 作为 identity provider 时使用 `oid` claim：
+
+```
+ISSUER_SUB_CLAIM_OVERRIDES='{"https://login.microsoftonline.com/": "oid", "https://sts.windows.net/": "oid", "https://login.microsoftonline.us/": "oid", "https://login.partner.microsoftonline.cn/": "oid"}'
+```
+
+### SSO Groups Sync
+
+<Note>
+self-hosted 上的 SSO Groups Sync 需要 LangSmith chart 版本 **0.15.0-rc.3**，也就是应用版本 **0.15.2rc1**，或更高版本。
+</Note>
+
+[SSO Groups Sync](/langsmith/user-management#sso-groups-sync-alternative) 允许 LangSmith 根据 OIDC token 中的 group membership claim 来分配 org 和 workspace 角色，这是相较于 [SCIM](/langsmith/user-management#set-up-scim-for-your-organization) 更简单的一种方案。在 self-hosted 中，你必须先在 IdP 中配置，让 OIDC ID token 包含 groups 信息，LangSmith 才能读取它们。
+
+**IdP 侧配置，不同提供商实现不同：**
+
+1. 配置你的 IdP 应用，在 OIDC ID token 中发出 group membership claim。来源属性和最终 claim 名称取决于不同 IdP，常见示例包括 `groups`、`roles` 或自定义 claim 名称。LangSmith 不会规定来源属性
+2. 取决于你的 IdP，你可能需要把额外的 scope，常见是 `groups`，加入 `oauthScopes`，才能收到该 claim。请查阅 IdP 文档，确认所需 scope 及其额外配置
+3. 组名必须遵循 [SCIM naming convention](/langsmith/user-management#group-naming-convention)，例如 `LS:Organization Admin`、`LS:Organization User:prod:Editor`。该分隔符与 SCIM 共用，由 [`scim_group_name_separator`](/langsmith/user-management#configure-custom-separator) 控制
+
+**Helm 配置：**
+
+如果你的 IdP 需要额外的 OIDC scope 才会把 groups 加入 token，常见为 `groups`，请把它加入 `oauthScopes`：
+
+<CodeGroup>
+
+```yaml Helm
+config:
+  authType: mixed
+  hostname: https://langsmith.example.com
+  oauth:
+    enabled: true
+    oauthClientId: <YOUR CLIENT ID>
+    oauthClientSecret: <YOUR CLIENT SECRET>
+    oauthIssuerUrl: <YOUR DISCOVERY URL>
+    oauthScopes: "email,profile,openid,groups"
+```
+
+```bash Docker
+# In your .env file
+AUTH_TYPE=mixed
+LANGSMITH_URL=https://langsmith.example.com
+OAUTH_CLIENT_ID=your-client-id
+OAUTH_CLIENT_SECRET=your-client-secret
+OAUTH_ISSUER_URL=https://your-issuer-url
+OAUTH_SCOPES=email,profile,openid,groups
+```
+
+</CodeGroup>
+
+具体的 scope 名称，例如 `groups`、`roles` 等，取决于你的 IdP。请查阅对应 OIDC 文档。
+
+**LangSmith 侧配置：**
+
+按提供商区分的 SSO Groups Sync 设置存储在 SSO provider 记录中，需要通过 [LangSmith UI](https://smith.langchain.com) 或 [API](/langsmith/reference) 开关控制，而不是通过 Helm values。一旦你的 IdP 已经发出了 groups claim，请在 UI 中通过 **Settings** → **Members and roles** → **SSO Configuration** → **SSO Groups Sync** 完成配置。或者，按[主 SSO Groups Sync 文档](/langsmith/user-management#sso-groups-sync-alternative) 所述使用 API。配置在 **Groups claim field** 中的 claim 名称必须与你的 IdP 发出的 claim 一致。
+
+### Google Workspace IdP 设置
+
+你可以使用 Google Workspace 作为单点登录提供商，通过[OAuth2.0 和 OIDC](https://developers.google.com/identity/openid-connect/openid-connect) 来实现，不使用 PKCE。
+
+<Note>
+你必须对组织的 Google Cloud Platform, GCP, 账户拥有管理员级访问权限，才能创建新项目，或者至少拥有为现有项目创建并配置 OAuth 2.0 凭证的权限。建议新建一个专门的项目来管理访问，因为每个 GCP 项目只有一个 OAuth consent screen。
+</Note>
+
+1. 创建一个新的 GCP 项目，参见 Google 文档中的 [creating and managing projects](https://cloud.google.com/resource-manager/docs/creating-managing-projects)
+2. 创建项目后，打开 Google API Console 中的 [Credentials](https://console.developers.google.com/apis/credentials) 页面，确保左上角项目选择正确
+3. 创建新的凭证：`Create Credentials → OAuth client ID`
+4. 在 `Application type` 中选择 `Web application`，并为应用填写名称，例如 `LangSmith`
+5. 在 `Authorized Javascript origins` 中填写 LangSmith 实例的域名，例如 `https://langsmith.yourdomain.com`
+6. 在 `Authorized redirect URIs` 中填写 LangSmith 实例域名并追加 `/api/v1/oauth/custom-oidc/callback`，例如 `https://langsmith.yourdomain.com/api/v1/oauth/custom-oidc/callback`
+7. 点击 `Create`，然后下载 JSON，或复制并妥善保存 `Client ID`，它以 `.apps.googleusercontent.com` 结尾，以及 `Client secret`。**如果需要，之后仍可再次查看这些值**
+8. 从左侧导航中选择 `OAuth consent screen`
+
+   1. 将 Application type 选择为 `Internal`。**如果选择 `Public`，任何拥有 Google 账户的人都可以登录**
+   2. 填写一个描述性的 `Application name`。用户在 consent screen 登录时会看到这个名称，例如 `LangSmith` 或 `<organization_name> SSO for LangSmith`
+   3. 确认 Google APIs 的 Scopes 仅包含 email、profile 和 openid。单点登录只需要这些 scopes。授予额外 scopes 会增加敏感数据暴露的风险
+
+9. 可选，控制组织内哪些人可以访问 LangSmith：[https://admin.google.com/ac/owl/list?tab=configuredApps](https://admin.google.com/ac/owl/list?tab=configuredApps)。更多细节见 [Google 文档](https://support.google.com/a/answer/7281227?hl=en\&fl=1\&sjid=9554153972856467090-NA)
+10. 配置 LangSmith 使用该 OAuth 应用。以下是 Kubernetes 配置中会使用的 `config` 值示例：
+
+    1. `oauthClientId`：`Client ID`，以 `.apps.googleusercontent.com` 结尾
+    2. `oauthClientSecret`：`Client secret`
+    3. `hostname`：LangSmith 实例域名，例如 `https://langsmith.yourdomain.com`，不要带末尾斜杠
+    4. `oauthIssuerUrl`：`https://accounts.google.com`
+    5. `oauth.enabled`：`true`
+    6. `authType`：`mixed`
+
+### Okta IdP 设置
+
+#### 支持的功能
+
+* IdP 发起的 SSO
+* SP 发起的 SSO
+* Just-In-Time provisioning，参见[在 SSO 组织中管理用户访问](/langsmith/jit-invite-sso)
+
+#### 配置步骤
+
+更多信息请参阅 Okta [documentation](https://help.okta.com/en-us/content/topics/apps/apps_app_integration_wizard_oidc.htm)。
+如有问题，请通过 [support.langchain.com](https://support.langchain.com) 联系支持团队。
+
+<div id="via-okta-integration-network">
+    <b>通过 Okta Integration Network，推荐</b>
+</div>
+
+<Info>有关 SCIM 设置的细节，请参阅[为你的组织设置 SCIM](/langsmith/user-management#set-up-scim-for-your-organization)。</Info>
+
+<Note>
+如果要在 Okta 中配合 SCIM 使用，必须采用这种配置方式。
+</Note>
+
+1. 登录 [Okta](https://login.okta.com/)
+1. 在右上角选择 Admin。该按钮在 Admin 区域中不可见
+1. 选择 `Browse App Integration Catalog`
+1. 搜索并选择 LangSmith 应用
+1. 在应用概览页选择 Add Integration
+1. 填写 `ApiUrlBase`：
+   * 填写你的 LangSmith API URL，**不要带协议头**，即不要包含 `https://`，格式为 `<langsmith_domain>/api/v1`，例如 `langsmith.yourdomain.com/api/v1`
+   * 如果你的安装配置了子域名或路径前缀，也需要把它包含在 URL 中，例如 `langsmith.yourdomain.com/prefix/api/v1`
+1. 将 `AuthHost` 保持为空
+1. 可选，如果还计划同时使用 [SCIM](/langsmith/user-management#set-up-scim-for-your-organization)，填写 `LangSmithUrl`，即上文中的 `<langsmith_url>` 部分，例如 `langsmith.yourdomain.com`
+1. 在 Application Visibility 下保持复选框不勾选
+1. 选择 Next
+1. 选择 `OpenID Connect`
+1. 填写 `Sign-On Options`：
+   * `Application username format`：`Email`
+   * `Update application username on`：`Create and update`
+   * `Allow users to securely see their password`：保持**不勾选**
+1. 点击 **Save**
+1. 配置 LangSmith 使用该 OAuth 应用，关于 `initialOrgAdminEmail` 的细节请参见[通用配置部分](#configuration)：
+
+<CodeGroup>
+
+```yaml Helm
+config:
+  authType: mixed
+  hostname: https://langsmith.example.com # the domain of your instance (note no trailing slash)
+  initialOrgAdminEmail: test@email.com # Set this if required
+  oauth:
+    enabled: true
+    oauthClientId: "Client ID" # (starts with `0o`)
+    oauthClientSecret: "Client secret"
+    oauthIssuerUrl: "https://company-7422949.okta.com" # the URL of your Okta instance
+    oauthScopes: "email,profile,openid"
+```
+
+```bash Docker
+# In your .env file
+AUTH_TYPE=mixed
+INITIAL_ORG_ADMIN_EMAIL=test@email.com # Set this if required
+LANGSMITH_URL=https://langsmith.example.com # the domain of your instance (note no trailing slash)
+OAUTH_CLIENT_ID="Client ID" # (starts with `0o`)
+OAUTH_CLIENT_SECRET="Client secret"
+OAUTH_ISSUER_URL="https://company-7422949.okta.com" # the URL of your Okta instance
+OAUTH_SCOPES=email,profile,openid
+```
+
+</CodeGroup>
+
+<Info>有关 SCIM 设置的细节，请参阅[为你的组织设置 SCIM](/langsmith/user-management#set-up-scim-for-your-organization)。</Info>
+
+<div id="via-okta-custom-app-integration">
+    <b>通过 Custom App Integration</b>
+</div>
+
+<Warning>
+SCIM 与这种配置方式不兼容。请改用 [**通过 Okta Integration Network**](#via-okta-integration-network)。
+</Warning>
+
+1. 以管理员身份登录 Okta，并进入 **Okta Admin console**
+1. 在 **Applications** > **Applications** 下点击 **Create App Integration**
+1. 将 Sign-in method 选择为 **OIDC - OpenID Connect**，将 Application type 选择为 **Web Application**，然后点击 **Next**
+1. 输入 `App integration name`，例如 `LangSmith`
+1. 推荐勾选 **Core grants > Refresh Token**，参见[会话时长控制](#session-length-controls)
+1. 在 **Sign-in redirect URIs** 中填写 LangSmith 实例域名并追加 `/api/v1/oauth/custom-oidc/callback`，例如 `https://langsmith.yourdomain.com/api/v1/oauth/custom-oidc/callback`。如果安装配置了子域名或路径前缀，也需要把它包含在 URL 中，例如 `https://langsmith.yourdomain.com/prefix/api/v1/oauth/custom-oidc/callback`
+1. 在 **Sign-out redirect URIs** 中，把值设置为你的 LangSmith URL，例如 `https://langsmith.yourdomain.com`。这样用户从 LangSmith 登出时，IdP 会话也会被一并终止
+1. 在 **Trusted Origins > Base URIs** 下，加入你的 LangSmith URL，并带上协议头，例如 `https://langsmith.yourdomain.com`
+1. 在 **Assignments > Controlled access** 中选择所需访问策略：
+    * 允许组织内所有人访问
+    * 仅允许选定群组访问
+    * 暂时跳过群组分配
+1. 点击 **Save**
+1. 在 **Sign On > OpenID Connect ID Token** 中，把 **Issuer** 设置为 **Okta URL**
+1. 可选，在 **General > Login** 中将 **Login initiated by** 设为 `Either Okta or App`，以启用 IdP 发起登录
+1. 推荐，在 **General > Login > Email verification experience** 中，将 **Callback URI** 填为 LangSmith URL，例如 `https://langsmith.yourdomain.com`
+1. 配置 LangSmith 使用该 OAuth 应用，关于 `initialOrgAdminEmail` 的细节请参见[通用配置部分](#configuration)：
+
+<CodeGroup>
+
+```yaml Helm
+config:
+  authType: mixed
+  hostname: https://langsmith.example.com # the domain of your instance (note no trailing slash)
+  initialOrgAdminEmail: test@email.com # Set this if required
+  oauth:
+    enabled: true
+    oauthClientId: "Client ID" # (starts with `0o`)
+    oauthClientSecret: "Client secret"
+    oauthIssuerUrl: "https://company-7422949.okta.com" # the URL of your Okta instance
+    oauthScopes: "email,profile,openid"
+```
+
+```bash Docker
+# In your .env file
+AUTH_TYPE=mixed
+INITIAL_ORG_ADMIN_EMAIL=test@email.com # Set this if required
+LANGSMITH_URL=https://langsmith.example.com # the domain of your instance (note no trailing slash)
+OAUTH_CLIENT_ID="Client ID" # (starts with `0o`)
+OAUTH_CLIENT_SECRET="Client secret"
+OAUTH_ISSUER_URL="https://company-7422949.okta.com" # the URL of your Okta instance
+OAUTH_SCOPES=email,profile,openid
+```
+
+</CodeGroup>
+
+#### SP 发起的 SSO
+
+用户可以通过 LangSmith 首页上的 **Login via SSO** 按钮登录。
+
+## 不带 client secret，PKCE，已弃用
+
+如果可以，我们建议尽量使用带 `Client Secret` 的方式，之前 LangSmith 不支持，现在已经支持。如果你的 IdP 不支持这一方案，你可以改用 `Authorization Code with PKCE` 流程。
+
+这个流程**不需要** `Client Secret`。如需另一种工作流，请参阅前面的[带 client secret](#with-client-secret-recommended)部分。
+
+### 要求
+
+在 LangSmith 中使用 OAuth SSO 需要满足以下几个条件：
+
+* 你的 IdP 必须支持带 `Authorization Code with PKCE` 的 [flow](https://www.oauth.com/oauth2-servers/pkce)。例如 Google 就不支持这个流程，不过可以参考上文的[带 client secret](#with-client-secret-recommended)配置来实现
+* 你的 IdP 必须支持使用外部 discovery 或 issuer URL。LangSmith 会借此获取所需的路由和密钥
+* 你必须向 LangSmith 提供 `OIDC`、`email` 和 `profile` scopes。LangSmith 会用它们来获取所需的用户信息和邮箱地址
+* 你需要在 IdP 中把回调 URL 设置为 `http://<host>/oauth-callback`，其中 `host` 是为 LangSmith 实例分配的域名或 IP。用户身份验证完成后，IdP 会重定向到这里
+* 你需要在 `values.yaml` 中提供 `oauthClientId` 和 `oauthIssuerUrl`，在这里完成 LangSmith 实例配置
+
+<CodeGroup>
+
+```yaml Helm
+config:
+  oauth:
+    enabled: true
+    oauthClientId: <YOUR CLIENT ID>
+    oauthIssuerUrl: <YOUR DISCOVERY URL>
+```
+
+```bash Docker
+# In your .env file
+AUTH_TYPE=oauth
+OAUTH_CLIENT_ID=your-client-id
+OAUTH_ISSUER_URL=https://your-issuer-url
+```
+
+</CodeGroup>

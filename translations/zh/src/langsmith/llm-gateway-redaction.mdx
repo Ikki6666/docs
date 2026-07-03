@@ -1,0 +1,110 @@
+---
+title: PII 和 secrets 脱敏
+description: 在 LLM 请求到达 provider 之前，扫描并脱敏其中的 PII 和 secrets。
+---
+
+<Note>
+**Private beta:** LLM Gateway 当前处于私有 [beta](/langsmith/release-stages) 阶段。你可以[加入候补名单](https://www.langchain.com/langsmith-llm-gateway-waitlist)申请访问权限。
+</Note>
+
+当启用了 PII 或 secrets 脱敏策略后，gateway 会在出站请求到达 LLM provider 之前先扫描请求内容。一旦检测到敏感数据，就会把它从请求中脱敏。agent 本身仍会收到响应。
+
+被脱敏的内容在 LangSmith trace 中也会以脱敏形式展示，因此敏感数据也不会持久化到你的 observability 数据中。
+
+## PII 检测
+
+Gateway 会检测并脱敏以下几类个人身份信息：
+
+| 类别 | 示例 |
+| --- | --- |
+| **Names** | 自然语言中的人名 |
+| **Nationality, religion, or political affiliation** | 国籍 |
+| **Locations** | 地址、城市、国家 |
+
+检测机制对命名实体（人名、地点和 NRP）使用 Presidio，对结构化标识符使用基于模式的规则。
+
+## Secrets 检测
+
+Gateway 会针对广泛的 provider 和格式，检测并脱敏 API keys、tokens 和 credentials：
+
+| 类别 | 检测到的模式 |
+| --- | --- |
+| **Social Security Numbers** | 美国社会安全号模式，例如 123-45-6789 |
+| **Phone numbers** | 美国电话号码模式 |
+| **LangSmith** | Personal tokens、service keys |
+| **AWS** | Access tokens |
+| **GitHub** | Personal access tokens、fine-grained PATs、OAuth tokens、app tokens |
+| **GitLab** | Personal access tokens |
+| **AI providers** | OpenAI API keys、Anthropic API keys |
+| **Cloud platforms** | GCP API keys、Azure AD client secrets |
+| **Collaboration tools** | Slack bot/user/app tokens、Datadog access tokens |
+| **Package registries** | PyPI upload tokens、npm access tokens |
+| **Cryptographic** | Private keys |
+| **Stripe** | Access tokens |
+
+## 启用脱敏策略
+
+<Warning>
+创建和管理策略需要 `organization:manage` 权限。
+</Warning>
+
+1. 前往 **Settings → Gateway → LLM Gateway**。
+1. 点击 **Create policy**。
+1. 选择 **PII redaction** 或 **Secrets redaction** 作为策略类型。
+1. 配置要检测的类别，或直接启用全部类别。
+1. 保存。
+
+脱敏策略会作用于其配置范围内所有经过 gateway 的请求，并立即生效。
+
+## 脱敏后内容的表现形式
+
+当检测到 PII 或某个 secret 时，内容会在发往 provider 的请求以及 LangSmith trace 中，都被替换成占位符。例如：
+
+**原始请求：**
+
+```
+Please process the refund for John Smith, SSN 123-45-6789.
+```
+
+**上游脱敏后：**
+
+```
+Please process the refund for [SAFE_TO_USE:PERSON_kbqdjxyz], SSN [SAFE_TO_USE:US_SSN_abqxlmwp]
+```
+
+占位符格式如下：`[SAFE_TO_USE:<CATEGORY>_<suffix>]`
+
+- **SAFE_TO_USE:** 固定前缀，用于标记该值为脱敏占位符。
+- **\<CATEGORY\>:** 检测到的类型。例如：`PERSON`、`LOCATION`、`US_SSN`、`US_PHONE_NUMBER`、`OPENAI_API_KEY`、`GITHUB_PAT`、`LANGSMITH_PERSONAL_TOKEN`。
+- **\<suffix\>:** 一个 8 个字符的随机标记。
+
+LangSmith 中的 trace 会展示脱敏后的版本，并附带 metadata，说明发生了脱敏以及检测到了哪些类别。
+
+**下游去脱敏后的响应：**
+
+当上游 provider 返回响应时，gateway 会把脱敏占位符替换回调用者原始值。例如，你的 agent 可能会看到这样的响应：
+
+```
+Checking Confirming John Smith's SSN to be 123-45-6789.... Okay! I will process the full refund.
+```
+
+## 脱敏覆盖范围
+
+**它覆盖的内容：**
+
+- 发往 LLM provider 的出站请求内容，会在离开 gateway 前先被扫描和脱敏。
+- LangSmith traces 中展示的是脱敏后的版本。
+
+**它不覆盖的内容：**
+
+- **来自 LLM provider 的响应：** 如果模型在响应中生成敏感数据，这部分内容不会被脱敏。针对 streaming response 的脱敏正在开发中。
+- **已经存在于 traces 中的数据：** 脱敏只作用于经过 gateway 的请求。若 traces 直接写入 LangSmith API（绕过 gateway），则不会被扫描。
+- **平台级摄取：** 如果你的要求是无论数据如何进入系统，都必须确保 PII 永远不会进入 LangSmith，例如出于数据驻留合规要求，那么仅依赖 gateway 脱敏是不够的。这需要在摄取层做脱敏，那是另一项能力。
+- **Prompt 扫描：** system prompts、developer prompts 和 tool-call arguments 不会被扫描。
+**Scanner failures are fail-close**：如果 PII 或 secrets 扫描器不可达、过慢或报错，则该阶段会直接阻止请求继续执行。
+
+这一点很重要。如果你的安全模型要求敏感数据绝不能到达任何系统，而不仅仅是不应到达 LLM provider，那么你必须清楚 gateway 覆盖的是哪些面，以及哪些面还需要额外控制。
+
+## 下一步
+
+- [Spend policies](/langsmith/llm-gateway-spend-policies)：在数据保护之外，再叠加成本控制。

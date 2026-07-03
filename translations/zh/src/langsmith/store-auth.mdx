@@ -1,0 +1,253 @@
+---
+title: 按用户隔离 store 数据
+sidebarTitle: 按用户隔离 store
+description: 在 LangSmith Deployment 中使用 auth 处理器，将长期 store 数据限定到每个已验证用户。
+---
+
+每个 [LangSmith Deployment](/langsmith/deployment) 都包含一个由 Postgres 支持的 [store](/oss/langgraph/stores)，用于长期记忆和跨线程数据。默认情况下，store namespace 由所有调用方共享。若要让每个用户都拥有隔离的 store，需要配置[自定义身份验证](/langsmith/custom-auth)，并添加一个 store [授权处理器](/langsmith/auth#authorization)，通过重写 namespace 将已验证用户的 identity 纳入其中。
+
+本指南介绍如何在 LangSmith Deployment 中配置这种隔离方式。同样的模式也适用于启用了自定义 auth 的[自托管](/langsmith/self-hosted)部署。
+
+## 工作原理
+
+Store 项按 **namespace** 元组组织，例如 `("memories", "preferences")`，以及一个 **key**。与 threads 和 assistants 不同，store namespace 由你的应用自行定义，因此授权工作方式也不同：
+
+1. 你的 `@auth.authenticate` 处理器负责校验调用方，并为每个用户返回唯一的 `identity`
+2. 你的 `@auth.on.store` 处理器要么**校验** namespace 是否以该 identity 开头，要么**重写** namespace，在前面添加它
+3. 服务器会使用校验后或重写后的 namespace 执行实际的读写操作
+
+如果某个用户向逻辑 namespace `("memories",)` 写入数据，并使用了自动前缀重写，那么实际存储的位置会变成 `("user-123", "memories")`。另一个用户无法读取或覆盖这些数据，因为对方的请求会被限定到 `("user-456", ...)` 作用域中。
+
+<Note>
+Store 授权处理器接收的是一个**可变的** `value` 字典。对 `value["namespace"]` 的修改会直接作用于本次操作。这里不会像 thread 那样返回元数据过滤器。
+</Note>
+
+## 前置条件
+
+- 已配置好[自定义身份验证](/langsmith/set-up-custom-auth)的 LangSmith Deployment
+- 一个 `@auth.authenticate` 处理器，并且它会为每个终端用户返回稳定且唯一的 `identity`
+
+## 在 LangSmith Deployment 中配置 auth
+
+在 [`langgraph.json`](/langsmith/application-structure#configuration-file-concepts) 中，让部署指向你的 auth 模块：
+
+```json
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./src/agent/graph.py:graph"
+  },
+  "auth": {
+    "path": "./src/security/auth.py:auth"
+  }
+}
+```
+
+`auth` 对象必须导出一个 `langgraph_sdk.Auth` 实例，通常名称就是 `auth`。
+
+## 选择一种 store 授权模式
+
+Store 隔离需要一个 `@auth.on.store` 处理器。下面有两种常见模式都很适用，可以根据你希望用户作用域落在哪一层来选择。
+
+| Pattern | Where user scope is set | Best when |
+| --- | --- | --- |
+| **Explicit namespace + deny** | 应用代码在每个 namespace 的首位放入 `user_id` | 你已经在图代码中传入用户 identity，或者你希望 namespace 直接反映完整存储路径 |
+| **Automatic prefix rewriting** | Auth 处理器把 `ctx.user.identity` 前置到逻辑 namespace | 你希望 agent 代码更简单，并让 API 层透明地完成隔离 |
+
+这两种模式都使用同一个 `@auth.on.store` 处理器来覆盖所有 store 操作，包括 `put`、`get`、`search`、`delete` 和 `list_namespaces`。只有当你想对不同操作施加不同规则时，才需要使用像 `@auth.on.store.put` 这样的 action 专用处理器。
+
+<Tip>
+如果你使用了一个会拒绝未处理请求的全局 `@auth.on` 处理器，请显式注册 `@auth.on.store`，这样 store 操作才会被允许。关于 action 专用处理器名称，请参阅 [Auth reference](https://reference.langchain.com/python/langgraph-sdk/auth/Auth)。
+</Tip>
+
+### 显式 namespace + 拒绝
+
+你的应用代码会把用户 identity 作为每个 namespace 的第一段，例如 `("user-123", "memories")`。auth 处理器负责校验调用方与此前缀一致，否则拒绝：
+
+```python
+from langgraph_sdk import Auth
+
+auth = Auth()
+
+# ... your @auth.authenticate handler ...
+
+@auth.on.store
+async def authorize_store(
+    ctx: Auth.types.AuthContext,
+    value: Auth.types.on.store.value,
+):
+    """Require the user identity as the first namespace segment."""
+    namespace = tuple(value["namespace"])
+    if not namespace or namespace[0] != ctx.user.identity:
+        raise Auth.exceptions.HTTPException(
+            status_code=403,
+            detail="Not authorized to access this namespace.",
+        )
+```
+
+这种模式会让存储布局在图代码中清晰可见。如果某个针对 namespace `("user-456", "memories")` 的请求来自已验证用户 `user-123`，它会立刻失败。代价是 agent 中每一次 store 调用都必须包含用户前缀，通常这个前缀来自运行时上下文，例如 `config["configurable"]["langgraph_auth_user_id"]`。
+
+### 自动前缀重写
+
+你的应用代码使用不带用户前缀的逻辑 namespace，例如 `("memories", "preferences")`。auth 处理器会在每次 store 操作时自动把已验证用户 identity 前置进去：
+
+```python
+from langgraph_sdk import Auth
+
+auth = Auth()
+
+# ... your @auth.authenticate handler ...
+
+@auth.on.store
+async def scope_store(
+    ctx: Auth.types.AuthContext,
+    value: Auth.types.on.store.value,
+):
+    """Isolate store data per user by rewriting namespaces."""
+    namespace = tuple(value["namespace"]) if value.get("namespace") else ()
+    if not namespace or namespace[0] != ctx.user.identity:
+        namespace = (ctx.user.identity, *namespace)
+    value["namespace"] = namespace
+```
+
+当客户端在没有前缀的情况下调用 `list_namespaces` 时，`value["namespace"]` 为空。上面的处理器会把空 namespace 视为 `(ctx.user.identity,)`，这样用户只能看到自己的 namespaces。
+
+这种模式让 agent 代码更简单，因为 auth 层会透明地处理用户隔离。代价是应用代码不能再自己添加用户前缀，否则会造成双重作用域，进而导致读取失败。只选择一种作用域层：要么由 auth 重写，要么由应用级 namespace 负责，不能同时使用。
+
+## 在 agent 代码中使用 namespace
+
+如果你使用自动前缀重写，图代码中应使用不带用户前缀的逻辑 namespace。auth 层会在请求时自动添加用户作用域。把下面的代码放到图节点或工具中，例如 `graph.py`：
+
+```python
+from langgraph.store.base import BaseStore
+
+async def save_preference(state: State, *, store: BaseStore):
+    await store.aput(
+        ("memories", "preferences"),  # logical namespace
+        "settings",
+        {"theme": "dark"},
+    )
+
+async def load_preference(state: State, *, store: BaseStore):
+    item = await store.aget(
+        ("memories", "preferences"),
+        "settings",
+    )
+    return item.value if item else {}
+```
+
+当用户 A 调用 store API 时，服务器实际会把数据持久化到 `("user-a", "memories", "preferences")`。用户 B 的请求永远无法到达这个 namespace。
+
+如果你使用的是**显式 namespace + 拒绝**模式，那么应在图代码中为每个 namespace 手动包含用户 identity：
+
+```python
+from langchain_core.runnables import RunnableConfig
+from langgraph.store.base import BaseStore
+
+async def save_preference(state: State, *, store: BaseStore, config: RunnableConfig):
+    user_id = config["configurable"]["langgraph_auth_user_id"]
+    await store.aput(
+        (user_id, "memories", "preferences"),
+        "settings",
+        {"theme": "dark"},
+    )
+```
+
+### Deep Agents 和 StoreBackend
+
+如果你在 [Deep Agents](/oss/deepagents/overview) 中配合 @[`StoreBackend`] 使用，请让 namespace 工厂与 auth 作用域布局保持一致。如果 auth 会前置 `ctx.user.identity`，那么在 backend 中就应使用逻辑 namespace，让 auth 负责用户隔离：
+
+:::python
+```python
+from deepagents.backends import StoreBackend
+
+StoreBackend(
+    namespace=lambda rt: ("memories",),  # auth adds user identity
+)
+```
+:::
+
+:::js
+```typescript
+import { StoreBackend } from "deepagents";
+
+new StoreBackend({
+  namespace: () => ["memories"],  // auth adds user identity
+});
+```
+:::
+
+或者，如果你选择在图内部按用户做作用域，例如使用 `rt.server_info.user.identity`，请确保 auth 处理器不要再重复添加前缀。只选择一种作用域层：要么 auth 重写，要么应用级 namespace，不能两者同时使用。
+
+关于 namespace 设计的更多内容，请参阅 [Deep Agents backends](/oss/deepagents/backends#namespace-factories) 和 [user-scoped memory](/oss/deepagents/memory#user-scoped-memory)。
+
+## 测试 store 隔离
+
+在 `langgraph dev` 运行，并且 auth 处理器中配置了两个测试用户的前提下，验证 store 数据不会在用户之间泄漏：
+
+```python
+import asyncio
+
+from langgraph_sdk import get_client
+
+
+async def main():
+    alice = get_client(
+        url="http://localhost:60058",
+        headers={"Authorization": "Bearer user1-token"},
+    )
+    bob = get_client(
+        url="http://localhost:60058",
+        headers={"Authorization": "Bearer user2-token"},
+    )
+
+    # Alice writes a store item
+    await alice.store.put_item(
+        ["memories"],
+        key="note",
+        value={"text": "Alice private note"},
+    )
+
+    # Bob cannot read Alice's item
+    bob_item = await bob.store.get_item(["memories"], key="note")
+    if bob_item is None or bob_item["value"]["text"] != "Alice private note":
+        print("✅ Bob correctly denied access to Alice's item")
+    else:
+        print("❌ Bob should not see Alice's store item")
+
+    # Bob writes his own item at the same logical namespace
+    await bob.store.put_item(
+        ["memories"],
+        key="note",
+        value={"text": "Bob private note"},
+    )
+
+    alice_item = await alice.store.get_item(["memories"], key="note")
+    bob_item = await bob.store.get_item(["memories"], key="note")
+    assert alice_item["value"]["text"] == "Alice private note"
+    assert bob_item["value"]["text"] == "Bob private note"
+    print("✅ Each user sees only their own store data")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+## 与 thread 隔离一起使用
+
+Store 隔离与 [thread 隔离](/langsmith/resource-auth) 解决的是不同问题：
+
+| Concern | Mechanism | Scopes |
+| --- | --- | --- |
+| Conversation history | Thread metadata filters (`owner`) | Per-thread checkpoints and messages |
+| Long-term memory | Store namespace rewriting | Cross-thread memories, preferences, and documents |
+
+对于多用户 agent，请同时配置这两者。关于 thread 和 run 的作用域划分，请参阅[让对话私有化](/langsmith/resource-auth)。
+
+## 另请参阅
+
+- [身份验证与访问控制](/langsmith/auth)
+- [设置自定义身份验证](/langsmith/set-up-custom-auth)
+- [让对话私有化](/langsmith/resource-auth)
+- [在部署中进行语义搜索](/langsmith/semantic-search)
+- [LangGraph stores](/oss/langgraph/stores)

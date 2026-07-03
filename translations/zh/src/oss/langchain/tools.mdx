@@ -50,132 +50,130 @@ def search_database(query: str, limit: int = 10) -> str:
 类型注解是**必须的**，因为它们定义了 tool 的输入 schema。docstring 应该简洁且信息充足，帮助模型理解 tool 的用途。
 :::
 
-    这种方式最适合：
-    - 所有可能的工具在编译/启动时就已知
-    - 你想根据权限、功能开关或对话状态来过滤工具
-    - 工具是静态的，但可用性是动态的
+:::js
+创建 tool 最简单的方式是从 `langchain` package 导入 `tool` 函数。你可以使用 [zod](https://zod.dev/) 定义 tool 的输入 schema：
 
-    更多示例请见 [Dynamically selecting tools](/oss/langchain/middleware/custom#dynamically-selecting-tools)。
+```ts
+import * as z from "zod"
+import { tool } from "langchain"
 
-  </Tab>
+const searchDatabase = tool(
+  ({ query, limit }) => `Found  results for ''`,
+  {
+    name: "search_database",
+    description: "Search the customer database for records matching the query.",
+    schema: z.object({
+      query: z.string().describe("Search terms to look for"),
+      limit: z.number().describe("Maximum number of results to return"),
+    }),
+  }
+);
+```
 
-  <Tab title="Runtime tool registration">
+:::
 
-    当工具是在运行时发现或创建的，例如从 MCP server 加载、根据用户数据生成，或从远程 registry 拉取时，你需要同时注册这些工具并动态处理它们的执行。
+<Note>
+    **服务端工具使用：** 有些 chat model 提供内置工具，例如 web search 和 code interpreter，并在服务端执行这些工具。更多信息请参见 [Server-side tool use](#server-side-tool-use)。
+</Note>
 
-    这需要两个 middleware hook：
-    1. `wrap_model_call` - 把动态工具加入 request
-    2. `wrap_tool_call` - 处理这些动态加入的工具的执行
+<Warning>
+    工具名建议使用 `snake_case`，例如使用 `web_search`，不要使用 `Web Search`。有些模型提供商会因为工具名包含空格或特殊字符而报错或拒绝请求。坚持使用字母数字字符、下划线和连字符，有助于提升跨提供商兼容性。
+</Warning>
 
-    :::python
+:::python
 
-    ```python
-    from langchain.tools import tool
-    from langchain.agents import create_agent
-    from langchain.agents.middleware import AgentMiddleware, ModelRequest, ToolCallRequest
+### 自定义工具属性
 
-    # A tool that will be added dynamically at runtime
-    @tool
-    def calculate_tip(bill_amount: float, tip_percentage: float = 20.0) -> str:
-        """Calculate the tip amount for a bill."""
-        tip = bill_amount * (tip_percentage / 100)
-        return f"Tip: ${tip:.2f}, Total: ${bill_amount + tip:.2f}"
+#### 自定义工具名称
 
-    class DynamicToolMiddleware(AgentMiddleware):
-        """Middleware that registers and handles dynamic tools."""
+默认情况下，工具名称来自函数名。需要更有描述性的名称时，可以覆盖它：
 
-        def wrap_model_call(self, request: ModelRequest, handler):
-            # Add dynamic tool to the request
-            # This could be loaded from an MCP server, database, etc.
-            updated = request.override(tools=[*request.tools, calculate_tip])
-            return handler(updated)
+```python
+@tool("web_search")  # Custom name
+def search(query: str) -> str:
+    """Search the web for information."""
+    return f"Results for: {query}"
 
-        def wrap_tool_call(self, request: ToolCallRequest, handler):
-            # Handle execution of the dynamic tool
-            if request.tool_call["name"] == "calculate_tip":
-                return handler(request.override(tool=calculate_tip))
-            return handler(request)
+print(search.name)  # web_search
+```
 
-    agent = create_agent(
-        model="gpt-4o",
-        tools=[get_weather],  # Only static tools registered here
-        middleware=[DynamicToolMiddleware()],
-    )
+#### 自定义工具描述
 
-    # The agent can now use both get_weather AND calculate_tip
-    result = agent.invoke({
-        "messages": [{"role": "user", "content": "Calculate a 20% tip on $85"}]
-    })
+覆盖自动生成的工具描述，让模型指引更清晰：
+
+```python
+@tool("calculator", description="Performs arithmetic calculations. Use this for any math problems.")
+def calc(expression: str) -> str:
+    """Evaluate mathematical expressions."""
+    return str(eval(expression))
+```
+
+### 高级 schema 定义
+
+使用 Pydantic model 或 JSON schema 定义复杂输入：
+
+<CodeGroup>
+    ```python Pydantic model
+    from pydantic import BaseModel, Field
+    from typing import Literal
+
+    class WeatherInput(BaseModel):
+        """Input for weather queries."""
+        location: str = Field(description="City name or coordinates")
+        units: Literal["celsius", "fahrenheit"] = Field(
+            default="celsius",
+            description="Temperature unit preference"
+        )
+        include_forecast: bool = Field(
+            default=False,
+            description="Include 5-day forecast"
+        )
+
+    @tool(args_schema=WeatherInput)
+    def get_weather(location: str, units: str = "celsius", include_forecast: bool = False) -> str:
+        """Get current weather and optional forecast."""
+        temp = 22 if units == "celsius" else 72
+        result = f"Current weather in {location}: {temp} degrees {units[0].upper()}"
+        if include_forecast:
+            result += "\nNext 5 days: Sunny"
+        return result
     ```
 
-    :::
+    ```python JSON Schema
+    weather_schema = {
+        "type": "object",
+        "properties": {
+            "location": {"type": "string"},
+            "units": {"type": "string"},
+            "include_forecast": {"type": "boolean"}
+        },
+        "required": ["location", "units", "include_forecast"]
+    }
 
-    :::js
-
-    ```typescript
-    import { createAgent, createMiddleware, tool } from "langchain";
-    import * as z from "zod";
-
-    // A tool that will be added dynamically at runtime
-    const calculateTip = tool(
-      ({ billAmount, tipPercentage = 20 }) => {
-        const tip = billAmount * (tipPercentage / 100);
-        return `Tip: $${tip.toFixed(2)}, Total: $${(billAmount + tip).toFixed(2)}`;
-      },
-      {
-        name: "calculate_tip",
-        description: "Calculate the tip amount for a bill",
-        schema: z.object({
-          billAmount: z.number().describe("The bill amount"),
-          tipPercentage: z.number().default(20).describe("Tip percentage"),
-        }),
-      }
-    );
-
-    const dynamicToolMiddleware = createMiddleware({
-      name: "DynamicToolMiddleware",
-      wrapModelCall: (request, handler) => {
-        // Add dynamic tool to the request
-        // This could be loaded from an MCP server, database, etc.
-        return handler({
-          ...request,
-          tools: [...request.tools, calculateTip],
-        });
-      },
-      wrapToolCall: (request, handler) => {
-        // Handle execution of the dynamic tool
-        if (request.toolCall.name === "calculate_tip") {
-          return handler({ ...request, tool: calculateTip });
-        }
-        return handler(request);
-      },
-    });
-
-    const agent = createAgent({
-      model: "gpt-4o",
-      tools: [getWeather], // Only static tools registered here
-      middleware: [dynamicToolMiddleware],
-    });
-
-    // The agent can now use both getWeather AND calculateTip
-    const result = await agent.invoke({
-      messages: [{ role: "user", content: "Calculate a 20% tip on $85" }],
-    });
+    @tool(args_schema=weather_schema)
+    def get_weather(location: str, units: str = "celsius", include_forecast: bool = False) -> str:
+        """Get current weather and optional forecast."""
+        temp = 22 if units == "celsius" else 72
+        result = f"Current weather in {location}: {temp} degrees {units[0].upper()}"
+        if include_forecast:
+            result += "\nNext 5 days: Sunny"
+        return result
     ```
+</CodeGroup>
 
-    :::
+### 保留参数名
 
-    这个方式最适合：
-    - 工具是在运行时发现的，例如来自 MCP server
-    - 工具根据用户数据或配置动态生成
-    - 你正在对接外部 tool registry
+以下参数名是保留名，不能用作工具参数。使用这些名称会导致运行时错误。
 
-    <Note>
-    `wrap_tool_call` hook 对运行时注册的工具是必须的，因为 agent 需要知道如何执行那些原始工具列表里不存在的工具。没有它，agent 就不知道如何调用动态加入的工具。
-    </Note>
+| Parameter name | Purpose |
+|----------------|---------|
+| `config` | Reserved for passing `RunnableConfig` to tools internally |
+| `runtime` | Reserved for `ToolRuntime` parameter (accessing state, context, store) |
 
-  </Tab>
-</Tabs>
+如需访问运行时信息，请使用 @[`ToolRuntime`] 参数，而不是把自己的参数命名为 `config` 或 `runtime`。
+
+如果你使用 `InjectedState`、`InjectedStore`、`get_runtime()` 或 `InjectedToolCallId`，请参见 [Migrate from older injection patterns](#migrate-from-older-injection-patterns)。
+:::
 
 ## 无头工具
 

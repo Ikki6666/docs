@@ -1,0 +1,65 @@
+---
+title: 在 serverless 环境中追踪 JS functions
+sidebarTitle: 在 serverless 环境中追踪 JS functions
+---
+
+<Note>
+本节适用于使用 LangSmith JS SDK 0.2.0 及以上版本的用户。如果你是在 serverless 环境中使用 LangChain.js 或 LangGraph.js 进行 tracing，请参阅[这份指南](https://js.langchain.com/docs/how_to/callbacks_serverless)。
+</Note>
+
+在追踪 JavaScript functions 时，LangSmith 默认会在后台追踪 runs，以避免额外增加延迟。但在 serverless 环境中，执行上下文可能会被突然终止，因此必须确保在函数完成前，所有 tracing 数据都已经正确 flush。
+
+要确保这一点，你可以采用以下任一方法：
+
+* 设置名为 `LANGSMITH_TRACING_BACKGROUND` 的环境变量为 `"false"`。这样一来，traced functions 会在 tracing 完成后再返回。
+  * 请注意，这个变量名与 LangChain.js 中的[环境变量](https://js.langchain.com/docs/how_to/callbacks_serverless)不同，因为 LangSmith 可以在不依赖 LangChain 的情况下单独使用。
+* 向 traced runs 传入一个自定义 client，并 `await` `client.awaitPendingTraceBatches();` 方法。
+
+下面是一个结合 [`traceable`](/langsmith/annotate-code) 方法使用 `awaitPendingTraceBatches` 的示例：
+
+```typescript
+import { Client } from "langsmith";
+import { traceable } from "langsmith/traceable";
+const langsmithClient = new Client({});
+const tracedFn = traceable(
+  async () => {
+    return "Some return value";
+  },
+  {
+    client: langsmithClient,
+  }
+);
+const res = await tracedFn();
+await langsmithClient.awaitPendingTraceBatches();
+```
+
+## Rate limits at high concurrency[ ](#rate-limits-at-high-concurrency "Direct link to rate limits at high concurrency")
+
+默认情况下，LangSmith client 会在 traced run 执行过程中对操作进行批处理，并每隔几毫秒发送一个新的 batch。
+
+这在大多数情况下都很有效，但如果 traced function 运行时间较长且并发度非常高，你也可能会触发与总请求数相关的 rate limits。
+
+如果你遇到了这类 rate limit 错误，可以尝试在 client 中设置 `manualFlushMode: true`，如下所示：
+
+```typescript
+import { Client } from "langsmith";
+const langsmithClient = new Client({  manualFlushMode: true,});
+const myTracedFunc = traceable(
+  async () => {
+    // Your logic here...
+  },
+  { client: langsmithClient }
+);
+```
+
+然后，在 serverless function 关闭前手动调用 `client.flush()`：
+
+```typescript
+try {
+  await myTracedFunc();
+} finally {
+  await langsmithClient.flush();
+}
+```
+
+请注意，这会导致 runs 在你调用 `.flush()` 之前不会出现在 LangSmith UI 中。

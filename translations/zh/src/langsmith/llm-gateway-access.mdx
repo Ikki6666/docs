@@ -1,0 +1,91 @@
+---
+title: Traces、Engine 与访问控制
+description: 了解 gateway traces 会写到哪里、策略违规如何出现在 LangSmith Engine 中，以及谁可以查看和配置哪些内容。
+hidden: true
+---
+
+<Note>
+**Private beta:** LLM Gateway 当前处于私有 [beta](/langsmith/release-stages) 阶段。你可以[加入候补名单](https://www.langchain.com/langsmith-llm-gateway-waitlist)申请访问权限。
+</Note>
+
+每一次经过 LLM Gateway 的调用都会被追踪到 LangSmith，而策略违规则会作为问题出现在 [LangSmith Engine](/langsmith/engine) 中，供你后续分诊。
+
+## Gateway traces 会出现在哪里
+
+默认情况下，所有通过 gateway 代理的调用都会被追踪到两个项目中：一是与调用者 API key 所属[工作区](/langsmith/administration-overview#workspaces)关联的名为 `gateway` 的项目；二是一个按 API key 区分的项目，命名规则为 `gateway-<short_api_key>-<api_key_id>`。
+
+你可以使用 [RBAC](/langsmith/rbac) 和 [ABAC](/langsmith/abac) 来控制对这些 tracing projects 的访问。
+
+### Trace metadata
+
+Gateway 代理的调用可以通过它们落入的项目，以及附加在 spans 上的 metadata，与直接的 LLM 调用区分开来：
+
+- **Gateway project:** 所有 gateway 流量都会写入每个工作区中的中心 gateway project，同时还会写入一个固定的 LangSmith 项目 `gateway`，并为每个 API key 复制一份到 `gateway-<short_api_key>-<api_key_id>`，以实现 UI 隔离。你可以通过项目过滤，或通过检测 `langsmith.metadata.gateway.*` span attributes，来查找 gateway 代理调用。
+- **Policy evaluation results:** 每个 gateway span 都会通过 `langsmith.metadata.gateway.policy.matched_ids/_names`、`passed_ids/_names` 和 `violated_ids/_names` 记录被评估的策略及其结果，因此无论是通过还是拦截都会留下记录。
+- **Guard rule matches:** 当 redaction 策略生效时，guard pipeline 会生成一个 `rule_id → count` 映射，并把它写入 span 的 `policy.matched_rules`、`passed_rules` 和 `violated_rules` 中。这里记录的是规则 ID，而不是 PII 或 secret 的类别标签。
+- **Cost data:** token 数量和成本会在内联过程中计算，并喂给支出累计器，而支出上限策略正是基于这套累计结果进行强制执行。
+
+## LangSmith Engine 集成
+
+当某条治理策略被触发时，例如命中了支出上限、检测并脱敏了 PII，或拦截了某个 secret，该事件都会作为 metadata 记录在 trace 上。这些策略违规随后会作为问题出现在 LangSmith Engine 中。
+
+从一个 Engine 问题出发，你可以：
+
+1. **查看违规内容：** 哪条策略被触发，什么内容被拦截或脱敏。
+1. **点击跳转到 trace：** 查看 agent 在策略触发时到底在做什么。
+1. **诊断根因：** 例如是否是一个正在烧预算的重试循环、某个用户把凭证粘贴进了 prompt，或是一个正常工作负载已经超出了既有上限。
+1. **采取行动：** 更新 agent 配置、调整策略，或者上报进一步处理。
+
+## 审计日志
+
+Gateway 会记录两类事件：
+
+| 类别 | 记录内容 |
+| --- | --- |
+| **Administrative changes** | 策略的创建、修改和删除；与 gateway 访问相关的角色与权限变更。 |
+| **Gateway invocations** | 每一次代理调用，包括调用者身份和命中的策略 ID。 |
+
+[审计日志](/langsmith/audit-logs)仅对 [Enterprise 方案](/langsmith/pricing-plans)中的组织管理员开放。
+
+## 权限
+
+### 所需权限
+
+| 操作 | 所需权限 | 默认拥有者 |
+| --- | --- | --- |
+| 通过 gateway 发起调用 | `gateway:invoke` + `workspaces:read` | 仅 `WORKSPACE_ADMIN` |
+| 创建、编辑或删除策略 | `organization:manage` | 组织管理员 |
+| 查看 gateway traces | `projects:read` + `runs:read` | `WORKSPACE_ADMIN`、`WORKSPACE_USER`、`WORKSPACE_VIEWER` |
+| 查看审计日志 | `organization:manage` | 组织管理员 |
+
+内置的 `WORKSPACE_USER` 和 `WORKSPACE_VIEWER` 角色**不包含** `gateway:invoke`，并且不可编辑。若要在不授予完整 workspace-admin 权限的情况下给用户开通 gateway 访问，请创建一个包含 `gateway:invoke` 和 `workspaces:read` 的自定义工作区角色（要求方案已启用 RBAC）。具体操作请参见 [Admin setup](/langsmith/llm-gateway-admin-setup)。
+
+### API key 作用域
+
+Gateway 调用应始终使用工作区范围的 API keys。组织范围的 keys 不支持用于调用 gateway。
+
+### 集中管理 provider 凭证
+
+Gateway 会把 provider API keys 集中保存在 LangSmith 的工作区 secrets 中。单个开发者和 agents 使用自己的 [LangSmith API key](/langsmith/create-account-api-key) 完成认证，而不需要直接接触 provider keys。
+
+这意味着：
+
+- **Credential control:** provider keys 只保存在一个位置，由管理员统一管理。撤销访问时，只需撤销对应的 LangSmith API key，而不需要回收散落在各处的 provider keys 副本。
+- **Policy enforcement:** 因为所有调用都会流经 gateway，策略可以被一致地强制执行。只要开发者手中没有直接的 provider key，他们就无法通过绕过 gateway 来规避成本限制。
+
+要让这套机制按预期工作，请不要在授予 gateway 访问的同时，也把 provider API keys 分发给开发者。默认情况下，gateway 会把 provider credentials 集中管理。对于类似 Claude Code Max 这类基于 OAuth 的流程，也存在一种 pass-through 模式，如果你的组织想启用或限制该模式，请联系我们。
+
+### 限制 trace 可见性
+
+Gateway traces 作为 runs 写入工作区项目，并遵循 LangSmith 标准的工作区成员模型。任何在该工作区中拥有 `runs:read` 权限的用户，都可以查看该工作区 gateway project 中的 traces；若要看到项目本身，还需要 `projects:read`。内置角色 `WORKSPACE_ADMIN`、`WORKSPACE_USER` 和 `WORKSPACE_VIEWER` 默认都包含这两个权限。
+
+如果你需要限制谁可以看到 gateway traces，有两种方式：
+
+- **使用独立工作区**（适用于任意[方案](/langsmith/pricing-plans)）：创建一个成员受限的工作区，以及一个供开发者 coding agents 使用、成员更宽松的工作区。每个工作区都会有各自的 provider secrets 和 trace projects。
+- **使用项目级访问策略**（需要 [Enterprise 方案](/langsmith/pricing-plans)）：编写一条 ABAC 策略，将 gateway project 上的 `projects:read` 和 `runs:read` 限定为仅特定用户或角色可访问。
+
+## 下一步
+
+- [Admin setup](/langsmith/llm-gateway-admin-setup)：配置这些能力的分步指南。
+- [Spend policies](/langsmith/llm-gateway-spend-policies)：为 API keys 和 users 绑定成本限制。
+- [PII 和 secrets 脱敏](/langsmith/llm-gateway-redaction)：配置数据保护策略。
