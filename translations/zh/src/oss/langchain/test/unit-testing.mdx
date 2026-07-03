@@ -258,3 +258,149 @@ console.log(result);
 
 ```typescript
 import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond(new AIMessage("first"))
+  .respond(new AIMessage("second"));
+
+await model.invoke([new HumanMessage("question 1")]);
+await model.invoke([new HumanMessage("question 2")]);
+
+console.log(model.callCount); // 2
+
+console.log(model.calls[0].messages[0].content); // "question 1"
+console.log(model.calls[1].messages[0].content); // "question 2"
+```
+
+即使模型抛出错误，调用记录也会保留：
+
+```typescript
+import { fakeModel } from "langchain";
+import { HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel().respond(new Error("boom"));
+
+try {
+  await model.invoke([new HumanMessage("will fail")]);
+} catch {
+  // 错误已处理
+}
+
+console.log(model.callCount); // 1
+console.log(model.calls[0].messages[0].content); // "will fail"
+```
+
+### 与 `bindTools` 一起使用
+
+LangChain agent 和 LangGraph 这类 agent 框架会在内部调用 `model.bindTools(tools)`。`fakeModel` 会自动处理这一点。绑定后的模型与原始模型共享同一条响应队列和调用记录，因此不需要额外设置：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+
+const searchTool = tool(async ({ query }) => `Results for: ${query}`, {
+  name: "search",
+  description: "Search the web",
+  schema: z.object({ query: z.string() }),
+});
+
+const model = fakeModel()
+  .respondWithTools([{ name: "search", args: { query: "weather" }, id: "1" }])
+  .respond(new AIMessage("The weather is sunny."));
+
+const bound = model.bindTools([searchTool]);
+
+const r1 = await bound.invoke([new HumanMessage("weather?")]);
+console.log(r1.tool_calls[0].name); // "search"
+
+const r2 = await bound.invoke([new HumanMessage("thanks")]);
+console.log(r2.content); // "The weather is sunny."
+
+// 调用记录与原始模型共享。通过原始 model 查看即可。
+console.log(model.callCount); // 2
+```
+
+<Accordion title="完整示例：使用 vitest 测试一个工具调用智能体">
+
+```typescript
+import { describe, test, expect } from "vitest";
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+
+const getWeather = tool(
+  async ({ city }) => `72°F and sunny in ${city}`,
+  {
+    name: "get_weather",
+    description: "Get weather for a city",
+    schema: z.object({ city: z.string() }),
+  }
+);
+
+async function runAgent(
+  model: ReturnType<typeof fakeModel>,
+  input: string
+) {
+  const messages: any[] = [new HumanMessage(input)];
+  const bound = model.bindTools([getWeather]);
+
+  while (true) {
+    const response = await bound.invoke(messages);
+    messages.push(response);
+
+    if (!response.tool_calls?.length) {
+      return { messages, finalResponse: response };
+    }
+
+    for (const tc of response.tool_calls) {
+      const result = await getWeather.invoke(tc.args);
+      messages.push(new ToolMessage({
+        content: result as string,
+        tool_call_id: tc.id!,
+      }));
+    }
+  }
+}
+
+describe("weather agent", () => {
+  test("calls get_weather and returns a final answer", async () => {
+    const model = fakeModel()
+      .respondWithTools([
+        { name: "get_weather", args: { city: "SF" }, id: "call_1" },
+      ])
+      .respond(new AIMessage("It's 72°F and sunny in SF!"));
+
+    const { finalResponse } = await runAgent(model, "Weather in SF?");
+
+    expect(finalResponse.content).toBe("It's 72°F and sunny in SF!");
+    expect(model.callCount).toBe(2);
+
+    const secondCall = model.calls[1].messages;
+    const toolMsg = secondCall.find((m: any) => m._getType() === "tool");
+    expect(toolMsg?.content).toContain("72°F and sunny in SF");
+  });
+
+  test("handles model errors gracefully", async () => {
+    const model = fakeModel()
+      .respond(new Error("rate limit"));
+
+    await expect(
+      runAgent(model, "Weather?")
+    ).rejects.toThrow("rate limit");
+
+    expect(model.callCount).toBe(1);
+  });
+});
+```
+
+</Accordion>
+
+:::
+
+## 下一步
+
+了解如何在真实模型提供商 API 上测试你的智能体，请参见 [集成测试](/oss/langchain/test/integration-testing)。

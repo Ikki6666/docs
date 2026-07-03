@@ -258,3 +258,178 @@ expect(toolMsg).toBeToolMessage({ tool_call_id: "call_1" });
 ### 断言工具调用
 
 三个 matcher 用于对 @[`AIMessage`] 的工具调用做断言：
+
+:::js
+```ts
+const response = await agent.invoke({
+  messages: [new HumanMessage("Weather in SF and NYC?")]
+});
+const aiMsg = response.messages.find(
+  (m) => AIMessage.isInstance(m) && m.tool_calls?.length
+);
+
+// 检查是否包含特定工具调用（不要求顺序）
+expect(aiMsg).toHaveToolCalls([
+  { name: "get_weather", args: { city: "San Francisco" } },
+  { name: "get_weather", args: { city: "New York" } },
+]);
+
+// 只检查数量
+expect(aiMsg).toHaveToolCallCount(2);
+
+// 检查是否至少包含一个匹配的 tool call（支持 .not）
+expect(aiMsg).toContainToolCall({ name: "get_weather" });
+expect(aiMsg).not.toContainToolCall({ name: "send_email" });
+```
+
+### 断言工具消息
+
+`toHaveToolMessages()` 会接收完整的消息数组，并按顺序检查其中的 @[`ToolMessage`] 实例：
+
+```ts
+expect(response.messages).toHaveToolMessages([
+  { content: "San Francisco 的天气是 72°F 且晴朗" },
+  { content: "New York 的天气是 68°F 且多云" },
+]);
+```
+
+### 断言中断和结构化响应
+
+`toHaveBeenInterrupted()` 会检查 [LangGraph interrupt](/oss/langchain/human-in-the-loop) 结果中是否存在 `__interrupt__` 字段。你可以传入一个值来匹配中断 payload：
+
+```ts
+const result = await graph.invoke(input);
+
+expect(result).toHaveBeenInterrupted();
+expect(result).toHaveBeenInterrupted("confirm_action");
+```
+
+`toHaveStructuredResponse()` 会检查结果中是否存在 `structuredResponse` 字段。你可以传入对象来匹配特定字段：
+
+```ts
+expect(result).toHaveStructuredResponse();
+expect(result).toHaveStructuredResponse({ name: "Alice", age: 30 });
+```
+
+### Matcher 参考
+
+| Matcher | 说明 |
+| --- | --- |
+| `toBeHumanMessage(expected?)` | 检查值是否为 `HumanMessage`。可选地匹配内容（字符串）或字段（对象）。 |
+| `toBeAIMessage(expected?)` | 检查值是否为 `AIMessage`。可选地匹配内容或字段。 |
+| `toBeSystemMessage(expected?)` | 检查值是否为 `SystemMessage`。可选地匹配内容或字段。 |
+| `toBeToolMessage(expected?)` | 检查值是否为 `ToolMessage`。可选地匹配内容或诸如 `tool_call_id` 之类的字段。 |
+| `toHaveToolCalls(expected)` | 检查 `AIMessage` 是否恰好包含给定的 tool call（不要求顺序）。 |
+| `toHaveToolCallCount(n)` | 检查 `AIMessage` 是否恰好包含 `n` 个 tool call。 |
+| `toContainToolCall(expected)` | 检查 `AIMessage` 是否至少包含一个匹配的 tool call。支持 `.not`。 |
+| `toHaveToolMessages(expected)` | 检查消息数组是否按顺序包含给定的 `ToolMessage`。 |
+| `toHaveBeenInterrupted(value?)` | 检查结果是否具有 `__interrupt__`。可选地匹配中断值。 |
+| `toHaveStructuredResponse(expected?)` | 检查结果是否具有 `structuredResponse`。可选地匹配特定字段。 |
+
+:::
+
+## 降低成本和延迟
+
+调用 LLM API 的集成测试会产生真实成本。下面这些做法可以帮助你让测试套件更快、更省钱：
+
+- **使用更小的模型**：比如 `gemini-3.1-flash-lite`，或其他只需要验证工具调用和响应结构的等价模型。
+- **设置 `maxTokens`**：限制输出长度，避免生成又长又贵的完成结果。
+- **缩小测试范围**：每个测试只验证一个行为。只要单轮测试就能说明问题，就不要写要串很多 LLM 调用的端到端场景。
+- **选择性运行**：使用上面的测试分离方式，让集成测试只在 CI 或发布前运行，而不是每次保存文件都跑。
+
+:::python
+```python
+agent = create_agent(
+    "gemini-3.1-flash-lite",
+    tools=[get_weather],
+    model_kwargs={"max_tokens": 256},
+)
+```
+:::
+
+:::js
+```ts
+const agent = createAgent({
+  model: "gemini-3.1-flash-lite",
+  tools: [getWeather],
+  modelArgs: { maxTokens: 256 },
+});
+```
+:::
+
+:::python
+
+## 记录和回放 HTTP 调用
+
+对于在 CI 中高频运行的测试，你可以在第一次运行时录制 HTTP 交互，然后在后续运行中直接回放，而不再发起真实 API 调用。这样在初次录制后就能消除成本和延迟。
+
+[`vcrpy`](https://pypi.org/project/vcrpy/1.5.2/) 会把 HTTP 请求/响应对记录到 YAML “cassette” 文件中。[`pytest-recording`](https://pypi.org/project/pytest-recording/) 插件可以把它集成到 pytest 里。
+
+在 `conftest.py` 中配置对 cassette 的敏感信息过滤：
+
+```py conftest.py
+import pytest
+
+@pytest.fixture(scope="session")
+def vcr_config():
+    return {
+        "filter_headers": [
+            ("authorization", "XXXX"),
+            ("x-api-key", "XXXX"),
+        ],
+        "filter_query_parameters": [
+            ("api_key", "XXXX"),
+            ("key", "XXXX"),
+        ],
+    }
+```
+
+在项目里配置 `vcr` marker：
+
+<CodeGroup>
+```ini pytest.ini
+[pytest]
+markers =
+    vcr: record/replay HTTP via VCR
+addopts = --record-mode=once
+```
+```toml pyproject.toml
+[tool.pytest.ini_options]
+markers = [
+  "vcr: record/replay HTTP via VCR"
+]
+addopts = "--record-mode=once"
+```
+</CodeGroup>
+
+<Info>
+    `--record-mode=once` 会在第一次运行时录制 HTTP 交互，后续运行则直接回放。
+</Info>
+
+给测试加上 `vcr` marker：
+
+```python
+@pytest.mark.vcr()
+def test_agent_trajectory():
+    agent = create_agent("claude-sonnet-4-6", tools=[get_weather])
+    result = agent.invoke({
+        "messages": [HumanMessage(content="What's the weather in SF?")]
+    })
+    assert any(
+        tc["name"] == "get_weather"
+        for msg in result["messages"]
+        if hasattr(msg, "tool_calls")
+        for tc in (msg.tool_calls or [])
+    )
+```
+
+第一次运行会发起真实网络调用，并在 `tests/cassettes/` 中生成 cassette 文件。后续运行会回放这些已记录的响应。
+
+<Warning>
+    当你修改 prompt、添加新工具，或者改变预期轨迹时，保存下来的 cassette 会过期，你现有的测试**会失败**。删除对应的 cassette 文件并重新运行测试，录制新的交互即可。
+</Warning>
+:::
+
+## 下一步
+
+了解如何在 [Evals](/oss/langchain/test/evals) 中使用确定性匹配或 LLM-as-judge evaluator 来评估智能体轨迹。

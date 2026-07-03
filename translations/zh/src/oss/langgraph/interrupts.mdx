@@ -1,0 +1,195 @@
+---
+title: Interrupts
+---
+
+import LanggraphInterruptsResumeV2Py from '/snippets/code-samples/langgraph-interrupts-resume-v2-py.mdx';
+import LanggraphInterruptsMultiplePy from '/snippets/code-samples/langgraph-interrupts-multiple-py.mdx';
+import LanggraphInterruptsHitlStreamPy from '/snippets/code-samples/langgraph-interrupts-hitl-stream-py.mdx';
+import LanggraphInterruptsHitlStreamJs from '/snippets/code-samples/langgraph-interrupts-hitl-stream-js.mdx';
+import LanggraphInterruptsApprovalPy from '/snippets/code-samples/langgraph-interrupts-approval-py.mdx';
+import LanggraphInterruptsReviewPy from '/snippets/code-samples/langgraph-interrupts-review-py.mdx';
+import LanggraphInterruptsValidatePy from '/snippets/code-samples/langgraph-interrupts-validate-py.mdx';
+import LanggraphInterruptsValidateConditionalEdgePatternPy from '/snippets/code-samples/langgraph-interrupts-validate-conditional-edge-pattern-py.mdx';
+import LanggraphInterruptsValidateConditionalEdgePatternJs from '/snippets/code-samples/langgraph-interrupts-validate-conditional-edge-pattern-js.mdx';
+import LanggraphInterruptsValidateConditionalEdgeJs from '/snippets/code-samples/langgraph-interrupts-validate-conditional-edge-js.mdx';
+import LanggraphInterruptsValidateConditionalEdgePy from '/snippets/code-samples/langgraph-interrupts-validate-conditional-edge-py.mdx';
+
+Interrupts 允许你在特定点暂停图执行，并在继续之前等待外部输入。这使得需要外部输入才能继续的人机交互模式成为可能。当触发 interrupt 时，LangGraph 会使用其 [持久化](/oss/langgraph/persistence) 层保存图状态，并一直等待到你恢复执行。
+
+Interrupt 的工作方式是在图节点中的任意位置调用 `interrupt()` 函数。该函数接受任意 JSON 可序列化的值，并把它暴露给调用方。准备好继续时，你可以通过重新调用图并传入 `Command` 来恢复执行，而这个值就会成为节点内部 `interrupt()` 调用的返回值。
+
+与静态断点（在特定节点前后暂停）不同，interrupt 是**动态**的：它们可以放在代码中的任意位置，也可以根据应用逻辑有条件地触发。
+
+:::python
+- **Checkpointing 会帮你记住位置：** checkpointer 会写入精确的图状态，因此你之后可以恢复，即使当时处于错误状态。
+- **`thread_id` 是你的指针：** 通过设置 `config={"configurable": {"thread_id": ...}}` 告诉 checkpointer 要加载哪个状态。
+- **Interrupt payload 会通过 `stream.interrupts` 暴露：** 使用[事件流式传输](/oss/langgraph/event-streaming)（`graph.stream_events(..., version="v3")`）时，传给 `interrupt()` 的值会出现在 `stream.interrupts` 上，而当运行暂停等待输入时，`stream.interrupted` 会变成 `True`。
+:::
+:::js
+- **Checkpointing 会帮你记住位置：** checkpointer 会写入精确的图状态，因此你之后可以恢复，即使当时处于错误状态。
+- **`thread_id` 是你的指针：** 使用 `{ configurable: { thread_id: ... } }` 作为 `invoke` 方法的 options，告诉 checkpointer 要加载哪个状态。
+- **Interrupt payload 会以 `__interrupt__` 暴露：** 传给 `interrupt()` 的值会通过 `__interrupt__` 字段返回给调用方，这样你就能知道图在等待什么。
+:::
+
+你选择的 `thread_id` 实际上就是你的持久游标。复用同一个值会恢复同一个 checkpoint；使用新值则会创建一个全新的、状态为空的 thread。
+
+## 使用 `interrupt` 暂停
+
+@[`interrupt`] 函数会暂停图执行，并向调用方返回一个值。当你在节点内调用 @[`interrupt`] 时，LangGraph 会保存当前图状态，并等待你用输入恢复执行。
+
+使用 @[`interrupt`] 时，你需要：
+1. 一个 **checkpointer** 来持久化图状态（生产环境应使用持久化 checkpointer）
+2. 配置中的一个 **thread ID**，这样运行时才知道要从哪个状态恢复
+3. 在你希望暂停的位置调用 `interrupt()`（payload 必须是 JSON 可序列化的）
+
+:::python
+```python
+from langgraph.types import interrupt
+
+def approval_node(state: State):
+    # 暂停并请求批准
+    approved = interrupt("Do you approve this action?")
+
+    # 恢复后，Command(resume=...) 会把这个值返回到这里
+    return {"approved": approved}
+```
+:::
+
+:::js
+```typescript
+import { interrupt } from "@langchain/langgraph";
+
+async function approvalNode(state: State) {
+    // 暂停并请求批准
+    const approved = interrupt("Do you approve this action?");
+
+    // Command({ resume: ... }) 会把值返回到这里
+    return { approved };
+}
+```
+:::
+
+当你调用 @[`interrupt`] 时，会发生下面这些事：
+
+1. **图执行在调用 interrupt 的精确位置暂停**
+2. **状态使用 checkpointer 保存**，这样之后就可以恢复；生产环境中应使用持久化 checkpointer（例如数据库支持的）
+:::python
+3. **值会返回给调用方**，在使用[事件流式传输](/oss/langgraph/event-streaming)（`graph.stream_events(..., version="v3")`）时出现在 `stream.interrupts` 上，或者在默认 `invoke()` API 中出现在 `result["__interrupt__"]` 下；它可以是任意 JSON 可序列化值（字符串、对象、数组等）
+:::
+:::js
+3. **值会返回给调用方**，出现在 `__interrupt__` 下；它可以是任意 JSON 可序列化值（字符串、对象、数组等）
+:::
+4. **图会一直等待**，直到你传入响应并恢复执行
+5. **响应会在恢复时传回**节点中，成为 `interrupt()` 的返回值
+
+## 恢复 interrupts
+
+interrupt 暂停执行后，你可以再次调用图，并传入包含 resume 值的 `Command` 来恢复。resume 值会传回给 `interrupt` 调用，让节点可以继续执行，并使用外部输入。
+
+:::python
+推荐通过[事件流式传输](/oss/langgraph/event-streaming)来驱动可能会 interrupt 的图。它会通过 `stream.interrupts` 和 `stream.interrupted` 暴露 interrupt，并通过 `stream.output` 暴露最终状态。
+
+<LanggraphInterruptsResumeV2Py />
+
+<Note>
+默认的 `graph.invoke(...)` API 仍然可用，并会把 interrupt 暴露在 `result["__interrupt__"]` 下。只有在你不需要流式投影时才使用它；否则更推荐 `graph.stream_events(..., version="v3")`。
+</Note>
+
+**恢复时的关键点：**
+
+- 恢复时必须使用和 interrupt 发生时相同的 **thread ID**
+- 传给 `Command(resume=...)` 的值会成为 @[`interrupt`] 调用的返回值
+- 恢复时，节点会从调用 @[`interrupt`] 的那个节点的开头重新运行，因此 `interrupt` 之前的代码会再次执行
+- resume 值可以是任意 JSON 可序列化值
+
+<Warning>
+
+`Command(resume=...)` 是作为 `invoke()`/`stream()`/`stream_events()` 输入时**唯一**被设计支持的 `Command` 形式。其他 `Command` 参数（`update`、`goto`、`graph`）是给[从节点函数返回](/oss/langgraph/graph-api#command)时使用的。不要把 `Command(update=...)` 当作继续多轮对话的输入——应该改用普通输入字典。
+
+</Warning>
+
+:::
+
+:::js
+```typescript
+import { Command } from "@langchain/langgraph";
+
+// 首次运行 - 触发 interrupt 并暂停
+// thread_id 是回到已保存 checkpoint 的持久指针
+const config = { configurable: { thread_id: "thread-1" } };
+const result = await graph.invoke({ input: "data" }, config);
+
+// 查看被 interrupt 的内容
+// __interrupt__ 会镜像你传给 interrupt() 的所有 payload
+console.log(result.__interrupt__);
+// [{ value: 'Do you approve this action?', ... }]
+
+// 用人工响应恢复
+// Command({ resume }) 会把该值作为 interrupt() 的返回值传回节点
+await graph.invoke(new Command({ resume: true }), config);
+```
+
+**恢复时的关键点：**
+
+- 恢复时必须使用和 interrupt 发生时相同的 **thread ID**
+- 传给 `new Command({ resume: ... })` 的值会成为 @[`interrupt`] 调用的返回值
+- 恢复时，节点会从调用 @[`interrupt`] 的那个节点的开头重新运行，因此 `interrupt` 之前的代码会再次执行
+- resume 值可以是任意 JSON 可序列化值
+
+<Warning>
+
+`new Command({ resume: ... })` 是作为 `invoke()`/`stream()`/`stream_events()` 输入时**唯一**被设计支持的 `Command` 形式。其他 `Command` 参数（`update`、`goto`、`graph`）是给[从节点函数返回](/oss/langgraph/graph-api#command)时使用的。不要把 `new Command({ update: ... })` 当作继续多轮对话的输入——应该改用普通输入对象。
+
+</Warning>
+
+:::
+
+## 常见模式
+
+interrupt 能带来的核心能力，就是可以暂停执行并等待外部输入。这对很多用例都很有用，包括：
+
+- <Icon icon="circle-check" /> [审批工作流](#approve-or-reject)：在执行关键动作前暂停（API 调用、数据库变更、金融交易）
+- <Icon icon="link" /> [处理多个 interrupts](#handling-multiple-interrupts)：在一次调用中同时有多个 interrupt 时，将 interrupt ID 与 resume 值配对
+- <Icon icon="pencil" /> [审阅并编辑](#review-and-edit-state)：让人类在继续前审阅并修改 LLM 输出或工具调用
+- <Icon icon="tool" /> [中断工具调用](#interrupts-in-tools)：在执行工具调用前暂停，先审阅并编辑工具调用
+- <Icon icon="shield-check" /> [验证人类输入](#validating-human-input)：在进入下一步前暂停，以验证人工输入
+
+### 使用人机协同（HITL）interrupt 的流式传输
+
+当构建带有人机协同工作流的交互式智能体时，你可以使用[事件流式传输](/oss/langgraph/event-streaming)在处理 interrupt 的同时，持续消费消息片段和状态快照。
+
+在循环中使用 `graph.stream_events(..., version="v3")` 返回的类型化投影，直到运行结束：
+- 通过 `stream.messages` 逐 token 流式接收 AI 响应
+- 通过 `stream.values` 观察每一步的状态快照
+- 通过 `stream.interrupted` 检测 interrupt，并从 `stream.interrupts` 读取其 payload
+- 通过再次调用 `stream_events` 并传入 `Command(resume=...)` 来恢复执行，然后循环直到 `stream.interrupted` 为 false
+
+:::python
+<LanggraphInterruptsHitlStreamPy />
+
+- **`stream.messages`**：以 content block 的形式呈现 chat model 输出；遍历每个 `message.text` 以获取 token 增量。对于嵌套子图，消息片段从 `stream.subgraphs[*].messages` 读取。
+- **`stream.values`**：每一步后的完整状态快照
+- **`stream.interrupted` / `stream.interrupts`**：每次运行后检查图是否暂停；从 `stream.interrupts` 读取 payload
+- **`Command(resume=...)`**：作为下一次 `stream_events` 的输入来恢复；循环直到运行完成且不再 interrupt
+:::
+
+:::js
+<LanggraphInterruptsHitlStreamJs />
+
+- **`stream.messages`**：以 content block 的形式呈现 chat model 输出；遍历 `message.text` 以获取 token 增量。对于嵌套子图，消息片段从 `stream.subgraphs[*].messages` 读取。
+- **`stream.values`**：每一步后的完整状态快照
+- **`stream.interrupted` / `stream.interrupts`**：每次运行后检查图是否暂停；从 `stream.interrupts` 读取 payload
+- **`Command(resume=...)`**：作为下一次 `streamEvents` 的输入来恢复；循环直到运行完成且不再 interrupt
+:::
+
+### 处理多个 interrupts
+
+当并行分支同时触发 interrupt（例如 fan-out 到多个节点，而这些节点都调用 `interrupt()`）时，你可能需要在一次调用中恢复多个 interrupt。
+当使用一次调用恢复多个 interrupts 时，把每个 interrupt ID 映射到它对应的 resume 值。
+这样可以确保每个响应在运行时都能和正确的 interrupt 配对。
+
+:::python
+
+<LanggraphInterruptsMultiplePy />
+
+:::

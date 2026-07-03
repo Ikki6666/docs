@@ -1,0 +1,363 @@
+---
+title: 自定义流通道
+description: 将自定义服务器端数据流式传输到前端，并通过 useExtension 和 useChannel 读取
+---
+
+LangGraph 智能体流式传输的不只是消息和工具调用。服务器端的 **stream transformer** 可以在协议流向客户端时检查或重写协议，并把自己的结构化数据发布到一个命名的 **custom channel** 上。前端通过两个 selector 读取该通道：@[`useExtension`] 用于获取最新载荷，@[`useChannel`] 则是一个原始事件的逃生口。
+
+下面的示例展示了一个客户支持智能体，它的 transformer 会在每个事件到达浏览器之前移除 PII（邮箱、电话号码、SSN、卡号、IP），并在 `redaction-stats` 通道上发布实时的脱敏计数。侧边栏会实时渲染这些计数。
+
+import { PatternEmbed } from "/snippets/pattern-embed.jsx"
+import UseStreamTypeInference from '/snippets/oss/use-stream-type-inference.mdx';
+
+<PatternEmbed pattern="custom-stream-channel" />
+
+## 自定义通道如何工作
+
+一个自定义通道有两端。服务器端的 @[`StreamTransformer`] 会打开一个命名的 @[`StreamChannel`] 并把 payload 推送到其中。客户端的 selector 会订阅匹配的 `custom:<name>` 通道，并把这些 payload 暴露为响应式状态。
+
+transformer 的 `process` 方法会在每个协议事件上运行。它可以原地修改事件（这里会从 `messages`、`tools` 和 `values` 数据中清理 PII），并在有内容可报告时推送 side-channel 更新。
+
+客户端 selector（`useExtension`、`useChannel`）随 v1 前端 SDK 包一起提供（`@langchain/react`、`@langchain/vue`、`@langchain/svelte`、`@langchain/angular`）。
+
+:::python
+
+<Note>
+Stream transformers 和 `StreamChannel` 需要 `langgraph>=1.2`。
+</Note>
+
+:::
+
+:::js
+
+<Note>
+Stream transformers 和 `StreamChannel` 需要 `@langchain/langgraph>=1.3.1`。
+</Note>
+
+:::
+
+:::python
+
+```python
+import time
+
+from langgraph.stream import ProtocolEvent, StreamChannel, StreamTransformer
+
+
+class RedactionStatsTransformer(StreamTransformer):
+    def __init__(self, scope: tuple[str, ...] = ()) -> None:
+        super().__init__(scope)
+        # 打开一个名为 "redaction-stats" 的通道。
+        self.redaction_stats = StreamChannel("redaction-stats")
+        self.counts = empty_counts()
+
+    def init(self) -> dict[str, StreamChannel]:
+        return {"redactionStats": self.redaction_stats}
+
+    def process(self, event: ProtocolEvent) -> bool:
+        # 原地清理 event["params"]["data"]，并统计命中的内容。
+        delta = redact_in_place(event, self.counts)
+        if delta:
+            # 在通道上发布 payload。
+            self.redaction_stats.push(
+                {
+                    "kind": "update",
+                    "at": int(time.time() * 1000),
+                    "delta": delta,
+                    "counts": dict(self.counts),
+                    "total": sum(self.counts.values()),
+                }
+            )
+        return True  # 保留（已清理后的）事件继续流向下游。
+
+
+def create_redaction_stats_transformer() -> RedactionStatsTransformer:
+    return RedactionStatsTransformer()
+```
+
+在构建智能体时附加这个 transformer：
+
+```python
+from langchain.agents import create_agent
+
+agent = create_agent(
+    model="anthropic:claude-haiku-4-5",
+    tools=[...],
+    transformers=[create_redaction_stats_transformer],
+)
+```
+
+:::
+
+:::js
+
+```ts
+import { StreamChannel } from "@langchain/langgraph";
+import type { ProtocolEvent, StreamTransformer } from "@langchain/langgraph";
+
+export const createRedactionStatsTransformer = (): StreamTransformer<{
+  redactionStats: StreamChannel<RedactionStatsEvent>;
+}> => {
+  // 打开一个名为 "redaction-stats" 的远程通道。
+  const redactionStats = StreamChannel.remote<RedactionStatsEvent>("redaction-stats");
+  const counts = emptyCounts();
+
+  return {
+    init: () => ({ redactionStats }),
+
+    process(event: ProtocolEvent): boolean {
+      // 原地清理 event.params.data，并统计命中的内容。
+      const delta = redactInPlace(event, counts);
+      if (Object.keys(delta).length > 0) {
+        // 在通道上发布 payload。
+        redactionStats.push({
+          kind: "update",
+          at: Date.now(),
+          delta,
+          counts: { ...counts },
+          total: totalRedactions(counts),
+        });
+      }
+      return true; // 保留（已清理后的）事件继续流向下游。
+    },
+  };
+};
+```
+
+在构建智能体时附加这个 transformer：
+
+```ts
+import { createAgent } from "langchain";
+
+const agent = createAgent({
+  model: "anthropic:claude-haiku-4-5",
+  tools: [...],
+  streamTransformers: [createRedactionStatsTransformer],
+});
+```
+
+:::
+
+payload 的类型由 transformer 推送的内容决定。下面的客户端示例使用的是这个结构：
+
+```ts
+type PiiType = "email" | "phone" | "ssn" | "credit_card" | "ip_address";
+
+type RedactionStatsEvent = {
+  kind: "update";
+  at: number;
+  delta: Partial<Record<PiiType, number>>;
+  counts: Record<PiiType, number>;
+  total: number;
+};
+```
+
+## 设置 `useStream`
+
+像平常一样接好 @[`useStream`]。自定义通道 selector 会使用这里返回的同一个 `stream` handle。
+
+<UseStreamTypeInference />
+
+<CodeGroup>
+```tsx React
+import { useStream } from "@langchain/react";
+
+const AGENT_URL = "http://localhost:2024";
+
+export function RedactionChat() {
+  const stream = useStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "custom_stream_channel",
+  });
+
+  return <RedactionStatsPanel stream={stream} />;
+}
+```
+
+```vue Vue
+<script setup lang="ts">
+import { useStream } from "@langchain/vue";
+
+const AGENT_URL = "http://localhost:2024";
+
+const stream = useStream<typeof myAgent>({
+  apiUrl: AGENT_URL,
+  assistantId: "custom_stream_channel",
+});
+</script>
+
+<template>
+  <RedactionStatsPanel :stream="stream" />
+</template>
+```
+
+```svelte Svelte
+<script lang="ts">
+  import { useStream } from "@langchain/svelte";
+
+  const AGENT_URL = "http://localhost:2024";
+
+  const stream = useStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "custom_stream_channel",
+  });
+</script>
+
+<RedactionStatsPanel {stream} />
+```
+
+```ts Angular
+import { Component } from "@angular/core";
+import { injectStream } from "@langchain/angular";
+
+const AGENT_URL = "http://localhost:2024";
+
+@Component({
+  selector: "app-redaction-chat",
+  template: `<app-redaction-stats-panel [stream]="stream" />`,
+})
+export class RedactionChatComponent {
+  stream = injectStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "custom_stream_channel",
+  });
+}
+```
+</CodeGroup>
+
+## 使用 `useExtension` 读取最新 payload
+
+`useExtension` 会订阅一个 `custom:<name>` 通道，并返回 transformer 推送的最近 payload，已经解包并带有类型信息。当前 UI 只需要最新值时，这是最合适的选择，例如实时计数器、进度百分比或状态徽标。
+
+传入裸通道名（`"redaction-stats"`），不要带 `custom:` 前缀：
+
+<CodeGroup>
+```tsx React
+import { useExtension } from "@langchain/react";
+
+const latest = useExtension<RedactionStatsEvent>(stream, "redaction-stats");
+// latest?.total, latest?.counts.email, latest?.delta
+```
+
+```vue Vue
+import { useExtension } from "@langchain/vue";
+
+const latest = useExtension<RedactionStatsEvent>(stream, "redaction-stats");
+// latest.value?.total
+```
+
+```svelte Svelte
+import { useExtension } from "@langchain/svelte";
+
+const latest = useExtension<RedactionStatsEvent>(stream, "redaction-stats");
+// latest?.total
+```
+
+```ts Angular
+import { injectExtension } from "@langchain/angular";
+
+const latest = injectExtension<RedactionStatsEvent>(stream, "redaction-stats");
+// latest()?.total
+```
+</CodeGroup>
+
+返回值遵循各自框架的响应式模型：React 和 Svelte 中是普通值，Vue 中是 `Ref`（`latest.value`），Angular 中是 signal（`latest()`）。在第一个 payload 到达之前，该值为 `undefined`。
+
+可选的第三个 `target` 参数用于限定到某个 namespace，方式与 `useMessages(stream, node)` 将消息限定到已发现的图节点相同。有关命名空间定位，请参阅 [Graph execution](/oss/langgraph/frontend/graph-execution)。
+
+## 使用 `useChannel` 缓冲原始事件
+
+`useChannel` 是原始事件的逃生口。它会订阅一个或多个通道，并返回底层 protocol events 的有界缓冲区，而不是单个解包后的值。当你需要历史记录而不是最新值时，例如事件日志或审计轨迹，或者需要某个更高层 selector 没有覆盖的通道时，可以使用它。
+
+传入完整通道 ID（`"custom:redaction-stats"`）：
+
+<CodeGroup>
+```tsx React
+import { useChannel } from "@langchain/react";
+
+const rawEvents = useChannel(stream, ["custom:redaction-stats"]);
+```
+
+```vue Vue
+import { useChannel } from "@langchain/vue";
+
+const rawEvents = useChannel(stream, ["custom:redaction-stats"]);
+// rawEvents.value
+```
+
+```svelte Svelte
+import { useChannel } from "@langchain/svelte";
+
+const rawEvents = useChannel(stream, ["custom:redaction-stats"]);
+```
+
+```ts Angular
+import { injectChannel } from "@langchain/angular";
+
+const rawEvents = injectChannel(stream, ["custom:redaction-stats"]);
+// rawEvents()
+```
+</CodeGroup>
+
+每个条目都是一条原始 protocol event，所以 payload 位于 `event.params.data` 下。你需要自己解包：
+
+```ts
+function parseRedactionStatsEvents(rawEvents: Event[]): RedactionStatsEvent[] {
+  const out: RedactionStatsEvent[] = [];
+  for (const event of rawEvents) {
+    const data = event.params?.data;
+    const payload = data?.payload ?? data;
+    if (payload?.kind === "update") out.push(payload);
+  }
+  return out;
+}
+```
+
+使用 options 参数来控制缓冲区：
+
+```ts
+const rawEvents = useChannel(
+  stream,
+  ["custom:redaction-stats"],
+  undefined, // target namespace
+  { bufferSize: 200, replay: true },
+);
+```
+
+| 选项 | 默认值 | 作用 |
+| --- | --- | --- |
+| `bufferSize` | `"default"` | 缓冲事件的最大数量。超过上限后，旧事件会被丢弃。 |
+| `replay` | `true` | selector 挂载时，重放通道中已经见过的事件，而不是只看实时事件。 |
+
+<Note>
+常见场景优先使用更高层的 selector（`useExtension`、`useMessages`、`useToolCalls`、`useValues`）。它们返回类型化、已解包的值，只跟踪你实际渲染的内容。只有当你明确需要原始事件流时，才使用 `useChannel`。
+</Note>
+
+## 在 `useExtension` 和 `useChannel` 之间选择
+
+两者都读取同一个自定义通道，但返回内容不同：
+
+| | `useExtension` | `useChannel` |
+| --- | --- | --- |
+| **返回** | 最新 payload（`T \| undefined`） | 有界缓冲的原始事件（`Event[]`） |
+| **形态** | 已解包、类型化的 payload | 原始 protocol events；需要自己解包 `event.params.data` |
+| **订阅方式** | 通道名（`"redaction-stats"`） | 完整通道 ID（`["custom:redaction-stats"]`） |
+| **适用场景** | 你需要当前值 | 你需要历史、日志或多个通道 |
+| **选项** | — | `bufferSize`、`replay` |
+
+一个常见模式是在同一个通道上同时使用两者：`useExtension` 驱动实时摘要（当前总数），`useChannel` 则支撑一个滚动事件日志，显示线程中的每次更新。
+
+## 使用场景
+
+Custom channel 适用于任何不能直接映射到消息、工具调用或 graph state 的服务器端信号：
+
+- **合规和脱敏统计**：例如上面示例中的已清理 PII 计数、被阻止内容或策略命中。
+- **进度报告**：长时间运行的工具发出的完成百分比或步骤标签。
+- **实时指标**：运行过程中累积的 token 使用量、延迟或成本。
+- **来源和引用**：在智能体回答时把检索到的文档推送到侧边栏。
+- **领域事件**：后端希望展示出来、但不想更改消息转录的任何结构化更新。
+
+## 相关内容
+
+- [概览](/oss/langgraph/frontend/overview) - LangGraph 前端 stream API 和架构。
+- [Graph execution](/oss/langgraph/frontend/graph-execution) - 面向多节点流程的 namespace 作用域 selector。

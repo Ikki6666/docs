@@ -1,0 +1,606 @@
+---
+title: Deep Agents 中的上下文工程
+sidebarTitle: 上下文工程
+description: 控制你的 deep agent 可以访问哪些上下文，以及这些上下文如何在长时间任务中被管理
+---
+
+上下文工程是把正确的信息和工具以正确的形式提供给 deep agent，让它更可靠地完成任务。
+
+deep agent 可以访问多种上下文。
+有些上下文来源会在启动时提供给 agent；另一些则会在运行时出现，例如用户输入。
+deep agents 还内置了用于在长会话中管理上下文的机制。
+
+本页概述了 deep agent 可以访问和管理的不同类型上下文。
+
+<Tip>
+如果你刚接触上下文工程，可以先看 [概念概览](/oss/concepts/context)，了解不同类型的上下文以及适用场景。
+</Tip>
+
+## 上下文类型
+
+| 上下文类型 | 你能控制什么 | 作用域 |
+|--------------|------------------|-------|
+| **[输入上下文](#input-context)** | 启动时进入 agent prompt 的内容（system prompt、memory、skills） | 静态，每次运行都应用 |
+| **[运行时上下文](#runtime-context)** | 在 invoke 时传入的静态配置（用户元数据、API key、连接） | 每次运行，向 subagent 传播 |
+| **[上下文压缩](#context-compression)** | 内置的卸载和总结机制，用于让上下文保持在窗口限制内 | 当接近限制时自动执行 |
+| **[上下文隔离](#context-isolation-with-subagents)** | 使用 subagent 隔离重活，只把结果返回给主 agent | 每个 subagent，委派时 |
+| **[长期记忆](#long-term-memory)** | 通过虚拟文件系统实现跨 thread 的持久存储 | 跨会话持久化 |
+
+## 输入上下文
+
+输入上下文是指在启动时提供给 deep agent 的信息，它会成为 system prompt 的一部分。最终 prompt 由几部分组成：
+
+<CardGroup cols={2}>
+  <Card title="System prompt" icon="message-2" href="#system-prompt">
+    你提供的自定义指令，加上内置的 agent 指南。
+  </Card>
+  <Card title="Memory" icon="database" href="#memory">
+    配置后始终加载的持久化 `AGENTS.md` 文件。
+  </Card>
+  <Card title="Skills" icon="tool" href="#skills">
+    在相关时按需加载的能力（渐进式披露）。
+  </Card>
+  <Card title="Tool prompts" icon="list" href="#tool-prompts">
+    用于使用内置工具或自定义工具的指令。
+  </Card>
+</CardGroup>
+
+### System prompt
+
+你的自定义 system prompt 会被追加到内置 system prompt 前面，而内置 prompt 包含关于规划、文件系统工具和 subagent 的指导。你可以用它来定义 agent 的角色、行为和知识：
+
+:::python
+```python
+from deepagents import create_deep_agent
+
+agent = create_deep_agent(
+    model="google_genai:gemini-3.5-flash",
+    system_prompt=(
+        "You are a research assistant specializing in scientific literature. "
+        "Always cite sources. Use subagents for parallel research on different topics."
+    ),
+)
+```
+:::
+
+:::js
+```typescript
+import { createDeepAgent } from "deepagents";
+
+const agent = await createDeepAgent({
+  model: "google_genai:gemini-3.5-flash",
+  systemPrompt: `You are a research assistant specializing in scientific literature.
+  Always cite sources. Use subagents for parallel research on different topics.`,
+});
+```
+:::
+
+:::python
+`system_prompt` 参数是静态的，这意味着它不会在每次调用时变化。
+在某些场景下，你可能希望使用动态 prompt：例如，告诉模型“你有管理员权限”或“你只有只读权限”，或者从 [长期记忆](#long-term-memory) 中注入诸如“用户偏好简洁回答”之类的偏好。
+如果你的 prompt 依赖上下文或 `runtime.store`，请使用 `@dynamic_prompt` 构建上下文感知的指令。你的 middleware 可以读取 `request.runtime.context` 和 `request.runtime.store`。
+参见 [Customization](/oss/deepagents/customization#middleware) 里的 [默认 middleware 栈](/oss/deepagents/customization#default-stack-main-agent) 以及如何添加 [custom middleware](/oss/langchain/middleware)。
+另外还可以参考 [LangChain context engineering](/oss/langchain/context-engineering#system-prompt) 指南中的示例。
+
+你**不需要**为了让工具单独使用上下文或 `runtime.store` 而加入 middleware；工具会直接接收 @[ToolRuntime] 对象（包括 `runtime.context` 和 `runtime.store`）。只有当工具的使用方式需要配合 system prompt 一起更新时，才需要添加 middleware。
+:::
+
+:::js
+`systemPrompt` 参数是静态的，这意味着它不会在每次调用时变化。
+在某些场景下，你可能希望使用动态 prompt：例如，告诉模型“你有管理员权限”或“你只有只读权限”，或者从 [长期记忆](#long-term-memory) 中注入诸如“用户偏好简洁回答”之类的偏好。
+如果你的 prompt 依赖上下文或 `runtime.store`，请使用 `dynamicSystemPromptMiddleware` 构建上下文感知的指令。
+你的 middleware 可以读取 `request.runtime.context` 和 `request.runtime.store`。
+参见 [Customization](/oss/deepagents/customization#middleware) 里的 [默认 middleware 栈](/oss/deepagents/customization#default-stack-main-agent) 以及如何添加 [custom middleware](/oss/langchain/middleware)。
+另外还可以参考 [LangChain context engineering](/oss/langchain/context-engineering#system-prompt) 指南中的示例。
+
+你**不需要**为了让工具单独使用上下文或 `runtime.store` 而加入 middleware；工具会直接接收 `runtime` 对象（包括 `runtime.context` 和 `runtime.store`）。只有当 system prompt 本身需要按请求变化时，才需要添加 middleware。
+:::
+
+<Tip>
+    如果你想为特定 provider 或 model 调整组装后的 system prompt，可以使用 [harness profile](/oss/deepagents/profiles#harness-profiles)：`base_system_prompt` 会直接替换基础 prompt，而 `system_prompt_suffix` 会把内容追加到后面。
+</Tip>
+
+### Memory
+
+Memory 文件（[`AGENTS.md`](https://agents.md/)）提供始终加载到 system prompt 中的持久上下文。可把 memory 用于项目约定、用户偏好，以及应该适用于每次对话的关键指南：
+
+:::python
+```python
+agent = create_deep_agent(
+    model="google_genai:gemini-3.5-flash",
+    memory=["/project/AGENTS.md", "~/.deepagents/preferences.md"],
+)
+```
+:::
+
+:::js
+```typescript
+const agent = await createDeepAgent({
+  model: "google_genai:gemini-3.5-flash",
+  memory: ["/project/AGENTS.md", "~/.deepagents/preferences.md"],
+});
+```
+:::
+
+与 skills 不同，memory 会始终注入 - 没有渐进式披露。保持 memory 尽量精简，避免上下文过载；把详细流程和领域内容放到 [skills](/oss/deepagents/skills) 中。配置细节见 [Memory](/oss/deepagents/customization#memory)。
+
+### Skills
+
+Skills 提供 **按需** 能力。agent 会在启动时读取每个 `SKILL.md` 的 frontmatter，然后只在判断该 skill 相关时才加载完整内容。这样既能减少 token 使用，又能保留专门化流程：
+
+:::python
+```python
+agent = create_deep_agent(
+    model="google_genai:gemini-3.5-flash",
+    skills=["/skills/research/", "/skills/web-search/"],
+)
+```
+:::
+
+:::js
+```typescript
+const agent = await createDeepAgent({
+  model: "google_genai:gemini-3.5-flash",
+  skills: ["/skills/research/", "/skills/web-search/"],
+});
+```
+:::
+
+让每个 skill 都只聚焦一个工作流或领域；过宽或重叠的 skill 会降低相关性，并在加载时膨胀上下文。在 skill 内，保持主体内容简洁，把详细参考材料放到通过 skill 文件引用的单独文件里。把始终相关的约定放到 [memory](#memory) 中。技能编写与配置见 [Skills](/oss/deepagents/skills)。
+
+### Tool prompts
+
+[Tool](/oss/langchain/tools) prompts 是影响模型如何使用工具的指令。所有工具都会暴露模型在 prompt 中能看到的元数据，通常是 schema 和 description。你通过 `tools` 参数传入的工具，会把这些元数据（schema 和 descriptions）提供给模型。deep agent 的内置工具被封装在 [默认 middleware 栈](/oss/deepagents/customization#default-stack-main-agent) 中，并通常也会在 system prompt 里加入更多使用说明。
+
+**内置工具** - 自动添加 harness 能力（规划、文件系统、subagent）的 middleware 会把工具专用指令附加到 system prompt 中，形成 tool prompts，解释如何高效使用这些工具。完整列表见 [Customization](/oss/deepagents/customization#middleware)：
+- Planning prompt - 为 `write_todos` 提供维护结构化任务列表的指令
+- Filesystem prompt - 说明 `ls`、`read_file`、`write_file`、`edit_file`、`glob`、`grep` 的使用方法（以及 sandbox backend 下的 `execute`）
+- Subagent prompt - 关于使用 `task` tool 委派工作的指导
+- Human-in-the-loop prompt - 在指定 tool call 前暂停的使用说明（当设置了 `interrupt_on` 时）
+- Local context prompt - 当前目录和项目信息（仅 CLI）
+
+**你提供的工具** - 通过 `tools` 参数传入的工具，会把它们的 description（来自 tool schema）发送给模型。你也可以添加 [custom middleware](/oss/langchain/middleware)，让它增加工具并附带自己的 system prompt 指令。
+
+对于你提供的工具，请务必给出清晰的名称、描述和参数说明。这些信息会引导模型判断何时以及如何使用该工具。在 description 里写清楚 **什么时候** 该用这个工具，并说明每个参数的作用。
+
+:::python
+```python
+@tool(parse_docstring=True)
+def search_orders(
+    user_id: str,
+    status: str,
+    limit: int = 10
+) -> str:
+    """按状态搜索用户订单。
+
+    当用户询问订单历史或想检查订单状态时使用这个工具。始终按提供的状态进行筛选。
+
+    Args:
+        user_id: 用户的唯一标识
+        status: 订单状态：'pending'、'shipped' 或 'delivered'
+        limit: 返回结果的最大数量
+    """
+    # Implementation here
+    ...
+```
+:::
+
+:::js
+```typescript
+const searchOrders = tool(
+  async ({ userId, status, limit }) => { /* ... */ },
+  {
+    name: "search_orders",
+    description: `按状态搜索用户订单。
+
+当用户询问订单历史或想检查订单状态时使用这个工具。始终按提供的状态进行筛选。`,
+    schema: z.object({
+      userId: z.string().describe("用户的唯一标识"),
+      status: z.enum(["pending", "shipped", "delivered"]).describe("要筛选的订单状态"),
+      limit: z.number().default(10).describe("返回结果的最大数量"),
+    }),
+  }
+);
+```
+:::
+
+<Tip>
+    如果你想为特定 provider 或 model 覆盖内置工具或用户提供工具的描述，可以使用 [harness profile](/oss/deepagents/profiles#harness-profiles) 中按工具名配置的 `tool_description_overrides`。`excluded_tools` 可以把某个工具从可见工具集里完全移除。
+</Tip>
+
+参见 [Overview](/oss/deepagents/overview#execution-environment) 了解内置能力，参见 [Customization](/oss/deepagents/customization#tools) 了解如何直接传入工具。
+
+### 完整 system prompt
+
+deep agent 的 system message - 也就是模型在一次运行开始时收到的组装后 system prompt - 由以下部分组成：
+
+1. 自定义 `system_prompt`（如果提供）
+1. [Base agent prompt](https://github.com/langchain-ai/deepagents/blob/e18e9dcd0e6edc72c0a4a5b76ae752c4bc539752/libs/deepagents/deepagents/graph.py#L37)
+1. To-do list prompt：如何使用待办列表进行规划的指令
+1. Memory prompt：`AGENTS.md` + memory 使用指南（仅在提供 `memory` 时）
+1. Skills prompt：skills 位置 + 带 frontmatter 信息的 skill 列表 + 使用说明（仅在提供 skills 时）
+1. Virtual filesystem prompt：文件系统 + execute 工具文档（如适用）
+1. Subagent prompt：task tool 的使用方式
+1. 用户提供的 middleware prompts（如果提供了 custom middleware）
+1. Human-in-the-loop prompt（当设置了 `interrupt_on` 时）
+
+## 运行时上下文
+
+运行时上下文是你在 invoke agent 时传入的每次运行配置。它不会自动包含在模型 prompt 中；只有当某个工具、middleware 或其他逻辑读取它并把它加入 messages 或 system prompt 时，模型才会看到它。请把运行时上下文用于用户元数据（ID、偏好、角色）、API key、数据库连接、功能标记，或其他工具和 harness 需要的值。
+
+:::python
+通过 `context_schema` 定义这份数据的结构：可以使用 `dataclasses.dataclass` 或 `typing.TypedDict` 类。把值通过传给 `invoke` / `ainvoke` 的 **`context`** 参数传入。完整细节见 [Runtime](/oss/langchain/runtime) 和 [LangGraph runtime context](/oss/langgraph/graph-api#runtime-context)。
+
+在工具内部，从注入的 @[ToolRuntime] 中读取 context：
+
+```python
+from dataclasses import dataclass
+
+from deepagents import create_deep_agent
+from langchain.tools import tool, ToolRuntime
+
+@dataclass
+class Context:
+    user_id: str
+    api_key: str
+
+@tool
+def fetch_user_data(query: str, runtime: ToolRuntime[Context]) -> str:
+    """获取当前用户的数据。"""
+    user_id = runtime.context.user_id
+    return f"用户 {user_id} 的数据：{query}"
+
+agent = create_deep_agent(
+    model="google_genai:gemini-3.5-flash",
+    tools=[fetch_user_data],
+    context_schema=Context,
+)
+
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "Get my recent activity"}]},
+    context=Context(user_id="user-123", api_key="sk-..."),
+)
+```
+:::
+
+:::js
+通过 `contextSchema` 定义这份数据的结构，通常使用 Zod object schema（例如 `z.object({ ... })`）。把运行时值放到传给 `invoke` / `ainvoke` 的 options object 的 **`context`** 字段中。完整细节见 [Runtime](/oss/langchain/runtime) 和 [LangGraph runtime context](/oss/langgraph/graph-api#runtime-context)。
+
+在工具内部，从传给 tool handler 的 `runtime` 参数中提供的 `ToolRuntime` 实例读取 `runtime.context`：
+
+```typescript
+import { createDeepAgent } from "deepagents";
+import { tool } from "langchain";
+import type { ToolRuntime } from "@langchain/core/tools";
+import { z } from "zod";
+
+const contextSchema = z.object({
+  userId: z.string(),
+  apiKey: z.string(),
+});
+
+const fetchUserData = tool(
+  async (input, runtime: ToolRuntime<unknown, typeof contextSchema>) => {
+    const userId = runtime.context?.userId;
+    return `用户 ${userId} 的数据：${input.query}`;
+  },
+  {
+    name: "fetch_user_data",
+    description: "获取当前用户的数据",
+    schema: z.object({ query: z.string() }),
+  }
+);
+
+const agent = await createDeepAgent({
+  model: "google_genai:gemini-3.5-flash",
+  tools: [fetchUserData],
+  contextSchema,
+});
+
+const result = await agent.invoke(
+  { messages: [{ role: "user", content: "Get my recent activity" }] },
+  { context: { userId: "user-123", apiKey: "sk-..." } },
+);
+```
+:::
+
+运行时上下文会 **传播到所有 subagent**。当 subagent 运行时，它会收到与父 agent 相同的运行时上下文。关于 per-subagent context（命名空间化 key），请参见 [Subagents](/oss/deepagents/subagents#context-management)。
+
+:::python
+## 自定义 state schema
+
+<Note>
+    自定义 state schema 需要 `deepagents>=0.6.6`。
+</Note>
+
+当数据必须成为 agent 可变 graph state 的一部分、需要跟随 thread checkpoint，或者需要通过 `runtime.state` 访问时，请使用 `state_schema`。对于像用户 ID、凭据或功能标记这类每次运行都不变的输入，请优先使用 [runtime context](#runtime-context)。
+
+自定义 state schema 必须继承 @[DeepAgentState]。这样可以保留 `messages` 上内置的 `DeltaChannel` reducer，随着对话增长保持 checkpoint 增长近似线性。
+
+```python
+from deepagents import DeepAgentState, create_deep_agent
+from langchain.tools import ToolRuntime, tool
+
+
+class ResearchState(DeepAgentState):
+    page_url: str
+    file_urls: list[str]
+
+
+@tool
+def cite_page(runtime: ToolRuntime) -> str:
+    """返回当前页面 URL。"""
+    return runtime.state["page_url"]
+
+
+agent = create_deep_agent(
+    model="anthropic:claude-sonnet-4-6",
+    tools=[cite_page],
+    state_schema=ResearchState,
+)
+
+result = agent.invoke(
+    {
+        "messages": [{"role": "user", "content": "Cite the current page"}],
+        "page_url": "https://example.com/report",
+        "file_urls": [],
+    }
+)
+```
+
+该 schema 会与 middleware 提供的 state schemas 合并。传给 `subagents=` 的声明式 @[SubAgent] 规格在 Deep Agents 为 `task` tool 编译它们时，会继承父级 `state_schema`。@[CompiledSubAgent] runnable 和远程 @[AsyncSubAgent] 规格不会继承它，因为它们的 graph 已经被编译或者是独立托管的。如果它们也需要相同的 state 字段，请用兼容的 schema 编译这些 graph。
+:::
+
+## 上下文压缩
+
+每次 `create_deep_agent` 调用都会包含内置的上下文压缩。你不需要额外添加 middleware 来实现卸载或总结。
+
+长时间运行的任务会产生大量工具输出和较长的对话历史。
+上下文压缩会在保留与任务相关的细节的同时，减少 agent 工作记忆中的信息量。
+下面这些技术是内置机制，用来确保传给 LLM 的上下文保持在其窗口限制内：
+
+<CardGroup cols={2}>
+  <Card title="Offloading" icon="file-export" href="#offloading">
+    大型工具输入和结果会存储到文件系统中，并被引用所替代。
+  </Card>
+  <Card title="Summarization" icon="article" href="#summarization">
+    当接近限制时，旧消息会被压缩成 LLM 生成的摘要。
+  </Card>
+</CardGroup>
+
+### Offloading
+
+Deep Agents 会使用 [内置文件系统工具](/oss/deepagents/overview#virtual-filesystem-access) 自动卸载内容，并在需要时搜索和取回这些已卸载内容。
+当工具调用输入或结果超过 token 阈值（默认 20,000）时，会触发内容卸载：
+
+1. **工具调用输入超过 20,000 tokens**：文件写入和编辑操作会在 agent 的对话历史里留下包含完整文件内容的 tool call。
+    由于这些内容已经持久化到了文件系统，通常是冗余的。
+    当会话上下文超过模型可用窗口的 85% 时，deep agents 会截断较旧的 tool call，把它们替换成指向磁盘文件的引用，并减少活动上下文的大小。
+
+    ![一个展示卸载输入的示例：大输入被保存到磁盘，tool call 变成了截断版本](/oss/images/deepagents/offloading-inputs.png)
+
+2. **工具调用结果超过 20,000 tokens**：发生这种情况时，deep agent 会把响应卸载到配置的 backend，并用文件路径引用加前 10 行预览来替代它。之后 agent 可以按需重新读取或搜索这些内容。
+
+    ![一个展示卸载结果的示例：较大的工具响应被替换为结果位置说明和前 10 行预览](/oss/images/deepagents/offloading-results.png)
+
+<Note>
+内置上下文压缩不会缩放图片、降低图像分辨率或生成视觉 embedding。关于多模态输入、工具输出，以及压缩如何与媒体交互，请参见 [Multimodal](/oss/deepagents/multimodal)。
+</Note>
+
+### Summarization
+
+:::js
+<Note>
+当前的总结行为（通过 `wrapModelCall` 在模型内进行总结、准确的 token 计数，以及自动 `ContextOverflowError` 兜底）需要 `deepagents>=1.6.0`。
+</Note>
+:::
+
+每次 `create_deep_agent` 调用都会在 [默认 middleware 栈](/oss/deepagents/customization#default-stack-main-agent) 中包含 @[SummarizationMiddleware]。当上下文大小接近模型的上下文窗口限制（例如 `max_input_tokens` 的 85%）时，并且没有更多可供卸载的上下文时，deep agent 会自动总结消息历史。
+
+这个过程有两个部分：
+
+- **上下文内摘要**：LLM 会生成一份结构化的会话摘要，包含会话意图、已创建的产物和下一步，这份摘要会替换 agent 工作记忆中的完整对话历史。
+- **文件系统保留**：原始对话消息的文本表示会被写入文件系统，作为规范记录。
+
+这种双重方式可以确保 agent 既能通过摘要保持对目标和进展的感知，又能在需要时通过文件系统搜索恢复文本细节。
+
+![一个展示总结过程的示例：agent 的对话历史中，多步内容被压缩](/oss/images/deepagents/summarization.png)
+
+**配置：**
+- 当达到模型 [model profile](/oss/langchain/models#model-profiles) 中 `max_input_tokens` 的 85% 时触发
+- 保留 10% 的 token 作为最近上下文
+- 如果 model profile 不可用，则退回到 170,000 token 触发阈值 / 保留 6 条消息
+- 如果任何模型调用抛出标准 @[ContextOverflowError]，deep agent 会立即回退到总结，并使用摘要 + 最近保留消息重试
+- 更旧的消息由模型总结
+
+:::python
+<Tip>
+[流式 token](/oss/deepagents/streaming#llm-tokens) 通常会包含由总结步骤生成的 token。你可以使用其关联的 metadata 把这些 token 过滤掉：
+```python
+for chunk in agent.stream(
+    {"messages": [...]},
+    stream_mode="messages",
+    version="v2",
+):
+    token, metadata = chunk["data"]
+    if metadata.get("lc_source") == "summarization":  # [!code highlight]
+        continue
+    else:
+        ...
+```
+</Tip>
+:::
+
+:::js
+<Tip>
+[流式 token](/oss/deepagents/streaming#llm-tokens) 通常会包含由总结步骤生成的 token。你可以使用其关联的 metadata 把这些 token 过滤掉：
+```typescript
+for await (const [namespace, chunk] of await agent.stream(
+  { messages: [...] },
+  { streamMode: "messages" },
+)) {
+  const [message, metadata] = chunk;
+  if (metadata?.lcSource === "summarization") {  // [!code highlight]
+    continue;
+  } else {
+    ...
+  }
+}
+```
+</Tip>
+:::
+
+:::python
+##### 按需压缩工具
+
+
+默认情况下，当上下文阈值达到时会自动执行总结。
+另外，你也可以给 agent 一个 `compact_conversation` [tool](/oss/langchain/tools)，让它可以按需触发压缩，例如在任务之间，而不是等到 85% 阈值再执行。
+
+通过在 `create_deep_agent` 的 `middleware` 参数中传入 @[create_summarization_tool_middleware] 来启用该工具。自定义 middleware 会被插入到 [默认栈](/oss/deepagents/customization#default-stack-main-agent) 中，并位于 @[PatchToolCallsMiddleware] 之后：
+
+```python
+from deepagents import create_deep_agent
+from deepagents.backends import StateBackend
+from deepagents.middleware.summarization import (
+    create_summarization_tool_middleware,
+)
+
+backend = StateBackend  # if using default backend
+
+model = "google_genai:gemini-3.5-flash"
+agent = create_deep_agent(
+    model=model,
+    middleware=[  # [!code highlight]
+        create_summarization_tool_middleware(model, backend),  # [!code highlight]
+    ],  # [!code highlight]
+)
+```
+
+添加压缩工具不会关闭在模型上下文限制 85% 处的自动总结。两者共用同一个总结引擎和状态。
+
+详情请参见 API reference 中的 @[SummarizationToolMiddleware] 和 @[create_summarization_tool_middleware]。
+
+:::
+
+## 使用 subagent 进行上下文隔离
+
+Subagent 解决的是 **上下文膨胀问题**。当主 agent 使用大量输出的工具（web search、文件读取、数据库查询）时，上下文窗口会很快被填满。Subagent 会把这些工作隔离出去 - 主 agent 只会收到最终结果，而不会收到产生这些结果的几十次 tool call。你还可以把每个 subagent 单独配置成和主 agent 不同的设置（例如 model、tools、system prompt 和 skills）。
+
+**工作方式：**
+
+- 主 agent 拥有一个 `task` tool 来委派工作
+- Subagent 使用自己全新的上下文运行
+- Subagent 会自主执行直到完成
+- Subagent 会向主 agent 返回单个最终报告
+- 主 agent 的上下文保持干净
+
+**最佳实践：**
+
+1. **委派复杂任务**：把会弄乱主 agent 上下文的多步骤工作交给 subagent。
+2. **让 subagent 的输出保持简洁**：让 subagent 返回摘要，而不是原始数据：
+
+    :::python
+    ```python
+    research_subagent = {
+        "name": "researcher",
+        "description": "Conducts research on a topic",
+        "system_prompt": """You are a research assistant.
+        IMPORTANT: Return only the essential summary (under 500 words).
+        Do NOT include raw search results or detailed tool outputs.""",
+        "tools": [web_search],
+    }
+    ```
+    :::
+
+    :::js
+    ```typescript
+    const researchSubagent = {
+    name: "researcher",
+    description: "Conducts research on a topic",
+    systemPrompt: `You are a research assistant.
+    IMPORTANT: Return only the essential summary (under 500 words).
+    Do NOT include raw search results or detailed tool outputs.`,
+    tools: [webSearch],
+    };
+    ```
+    :::
+
+3. **对大数据使用文件系统**：Subagent 可以把结果写到文件里；主 agent 只读取它需要的部分。
+
+参见 [Subagents](/oss/deepagents/subagents) 了解配置，参见 [context management](/oss/deepagents/subagents#context-management) 了解运行时上下文传播和 per-subagent 命名空间。
+
+## 长期记忆
+
+在使用默认文件系统时，deep agent 会把工作记忆文件存储在 agent state 中，而这些 state 只会在单个 thread 内持久化。
+长期记忆让 deep agent 可以跨不同 thread 和会话持久保存信息。
+Deep agents 可把长期记忆用于保存用户偏好、累积知识、研究进展，或任何应该跨 session 保留的信息。
+
+要使用长期记忆，你必须使用一个 `CompositeBackend`，把特定路径（通常是 `/memories/`）路由到 LangGraph Store，从而提供跨 thread 的持久化。
+`CompositeBackend` 是一种混合存储系统，其中有些文件会永久保留，而另一些文件仍然只属于单个 thread。
+
+:::python
+```python
+from deepagents import create_deep_agent
+from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
+from langgraph.store.memory import InMemoryStore
+
+def make_backend(runtime):
+    return CompositeBackend(
+        default=StateBackend(runtime),
+        routes={"/memories/": StoreBackend(runtime)},
+    )
+
+agent = create_deep_agent(
+    model="google_genai:gemini-3.5-flash",
+    store=InMemoryStore(),
+    backend=make_backend,
+    system_prompt="""当用户告诉你他们的偏好时，把它们保存到
+    /memories/user_preferences.txt，这样你就能在未来的对话中记住它们。""",
+)
+```
+:::
+
+:::js
+```typescript
+import { createDeepAgent, CompositeBackend, StateBackend, StoreBackend } from "deepagents";
+import { InMemoryStore } from "@langchain/langgraph-checkpoint";
+
+const agent = await createDeepAgent({
+  model: "google_genai:gemini-3.5-flash",
+  store: new InMemoryStore(),
+  backend: new CompositeBackend(
+    new StateBackend(),
+    { "/memories/": new StoreBackend() },
+  ),
+  systemPrompt: `当用户告诉你他们的偏好时，把它们保存到 /memories/user_preferences.txt，这样你就能在未来的对话中记住它们。`,
+});
+```
+:::
+
+你不需要事先把文件预填充到 `/memories/` 中。
+你提供 backend 配置、store，以及告诉 agent **保存什么**、**保存到哪里** 的 system prompt 指令。
+例如，你可以提示 agent 把偏好存到 `/memories/preferences.txt`。
+路径开始时是空的，agent 会在用户分享值得记住的信息时，使用自己的文件系统工具（`write_file`、`edit_file`）按需创建文件。
+
+如果要预先写入记忆，请在部署到 LangSmith 时使用 [Store API](/langsmith/custom-store)。
+关于设置和使用场景，请参见 [Long-term memory](/oss/deepagents/memory)。
+
+## 最佳实践
+
+1. **从正确的输入上下文开始** - 对于始终相关的约定，把 memory 保持得尽量精简；对任务专用能力则使用聚焦的 skills。
+2. **把重活交给 subagent** - 委派多步骤、输出量大的任务，以保持主 agent 上下文整洁。
+3. **在配置中调整 subagent 输出** - 如果你在调试时发现 subagent 输出很长，可以在 subagent 的 `system_prompt` 中加入指引，让它生成摘要和综合结论。
+4. **使用文件系统** - 把大输出持久化到文件中（例如 subagent 的写入或 [automatic offloading](#offloading)），这样活动上下文就能保持较小；模型需要细节时，可以用 `read_file` 和 `grep` 按片段取回。
+5. **记录长期记忆结构** - 告诉 agent `/memories/` 里存放什么，以及应该如何使用它。
+6. **为工具传入运行时上下文** - 使用 `context` 传递用户元数据、API key 和工具需要的其他静态配置。
+
+## 相关资源
+
+- [Harness](/oss/deepagents/overview) - 上下文管理概览、offloading、summarization
+- [Multimodal](/oss/deepagents/multimodal) - 图像、音频、视频和多模态工具输出
+- [Subagents](/oss/deepagents/subagents) - 上下文隔离、运行时上下文传播
+- [Long-term memory](/oss/deepagents/memory) - 跨 thread 持久化
+- [Skills](/oss/deepagents/skills) - 渐进式披露和 skill 编写
+- [Backends](/oss/deepagents/backends) - 文件系统 backend 和 CompositeBackend
+- [Context conceptual overview](/oss/concepts/context) - 上下文类型与生命周期

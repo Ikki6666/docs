@@ -1,0 +1,126 @@
+---
+title: 持久化
+description: LangGraph 的持久化层通过 checkpointer 提供短期记忆，通过 store 提供长期记忆。
+---
+
+{/* 向后兼容的深链锚点 */}
+<a id="checkpoints" />
+<a id="threads" />
+<a id="memory-store" />
+<a id="checkpointer-libraries" />
+<a id="pending-writes" />
+<a id="durability-modes" />
+
+持久化让 LangGraph 应用可以在单次图运行之外保留有用信息。它在智能体需要继续对话、在中断后恢复、从故障中恢复，或在多次交互之间记住信息时都很重要。
+
+LangGraph 提供两套互补的持久化系统：
+
+- **[Checkpointer](/oss/langgraph/checkpointers)** 会把 thread 的图状态持久化为 checkpoints。它适用于短期、thread 作用域的记忆，包括对话连续性、人机交互工作流、时间旅行和容错。
+- **[Store](/oss/langgraph/stores)** 会把图状态之外、由应用定义的数据持久化。它适用于长期、跨 thread 的记忆，包括用户偏好、事实和共享知识。
+
+大多数应用可以同时使用两者：[checkpointer](/oss/langgraph/checkpointers) 追踪当前 thread，[store](/oss/langgraph/stores) 追踪跨 thread 的持久化信息。
+
+## 快速开始
+
+用 checkpointer、store 或两者一起编译你的图：
+
+:::python
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
+
+checkpointer = InMemorySaver()
+store = InMemoryStore()
+
+graph = builder.compile(checkpointer=checkpointer, store=store)
+
+result = graph.invoke(
+    {"messages": [{"role": "user", "content": "Hi, my name is Bob."}]},
+    {"configurable": {"thread_id": "thread-1"}},
+)
+```
+:::
+
+:::js
+```typescript
+import { MemorySaver, MemoryStore } from "@langchain/langgraph";
+
+const checkpointer = new MemorySaver();
+const store = new MemoryStore();
+
+const graph = builder.compile({ checkpointer, store });
+
+const result = await graph.invoke(
+  { messages: [{ role: "user", content: "Hi, my name is Bob." }] },
+  { configurable: { thread_id: "thread-1" } }
+);
+```
+:::
+
+<Info>
+**Agent Server 会自动处理持久化**
+在使用 [Agent Server](/langsmith/agent-server) 时，你不需要手动实现或配置 checkpointer 或 store。服务会在后台处理持久化基础设施。
+</Info>
+
+## Checkpointer vs. store
+
+| | Checkpointer | Store |
+| ---- | ---- | ---- |
+| 持久化内容 | 图状态快照 | 应用定义的键值数据 |
+| 作用域 | 单个 thread | 跨 thread |
+| 记忆类型 | 短期、thread 作用域记忆 | 长期、跨 thread 记忆 |
+| 适用场景 | 对话连续性、人机交互、时间旅行和容错 | 用户偏好、事实和共享知识 |
+| 访问方式 | 在图配置中传入 `thread_id` | 从节点或应用代码读写 item |
+| 完整指南 | [Checkpointers](/oss/langgraph/checkpointers) | [Stores](/oss/langgraph/stores) |
+
+## 常见问题排查
+
+### PostgresSaver: `thread_id` 太长
+
+使用 `PostgresSaver`（或 `AsyncPostgresSaver`）时，`thread_id` 会存到一个长度有限的列里。如果你的 `thread_id` 超过列长度，就会看到数据库错误。
+
+**修复方法：** 把 `thread_id` 控制在 255 个字符以内。如果需要确定性 ID，可以使用 UUID 或 hash：
+
+:::python
+```python
+import uuid
+
+config = {"configurable": {"thread_id": str(uuid.uuid4())[:255]}}
+```
+:::
+
+### `MemorySaver` 在重启后不持久化
+
+`MemorySaver` 和 `InMemorySaver` 把 checkpoints 存在内存里。进程重启后，所有 checkpoints 都会丢失。
+
+**修复方法：** 在生产环境中使用持久化 checkpointer：
+
+- `PostgresSaver`：支持异步的 PostgreSQL
+- `SqliteSaver`：适合开发环境的本地文件存储
+
+### Checkpoints 无限增长
+
+在较长的对话中，checkpoint 会持续累积。这会增加延迟和存储成本。
+
+**修复方法：** 定期清理旧 checkpoint，或者设置保留策略：
+
+:::python
+```python
+from langgraph.checkpoint.postgres import PostgresSaver
+
+checkpointer = PostgresSaver.from_conn_string("postgresql://...")
+checkpointer.setup()  # 创建带索引的表
+# 可以考虑加一个 cron job，删除 N 天以前的 checkpoints
+```
+:::
+
+### 父图到子图的状态访问
+
+当子图更新状态时，父图可能不会立刻看到这些变化。这是因为每个子图都管理自己的 checkpoint 命名空间。
+
+**修复方法：** 对于需要跨图边界传递的数据，使用 [通过 Store 共享状态](/oss/langgraph/stores)，或者配置子图把数据写到父图的 checkpoint。
+
+## 下一步
+
+- [使用 checkpointers](/oss/langgraph/checkpointers) 来持久化并检查 thread 状态。
+- [使用 stores](/oss/langgraph/stores) 来跨 thread 持久化持久数据。

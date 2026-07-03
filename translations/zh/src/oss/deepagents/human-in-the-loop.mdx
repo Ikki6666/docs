@@ -1,0 +1,641 @@
+---
+title: 人在回路中
+description: 了解如何为敏感工具操作配置人工批准
+---
+
+import HitlBasicConfigPy from '/snippets/code-samples/hitl-basic-config-py.mdx';
+import HitlBasicConfigJs from '/snippets/code-samples/hitl-basic-config-js.mdx';
+import HitlConditionalInterruptsPy from '/snippets/code-samples/hitl-conditional-interrupts-py.mdx';
+import HitlDecisionTypesTable from '/snippets/oss/hitl-decision-types-table.mdx';
+
+某些工具操作可能比较敏感，需要在执行前获得人工批准。Deep Agents 通过 LangGraph 的 interrupt 能力支持 human-in-the-loop 工作流。你可以使用 `interrupt_on` 参数配置哪些工具需要批准。设置 `interrupt_on` 后，`HumanInTheLoopMiddleware` 会被添加到[默认 middleware 堆栈](/oss/deepagents/customization#default-stack-main-agent)中。如果在工具返回结果之前运行被取消或中断，堆栈中的 @[PatchToolCallsMiddleware] 会自动修复消息历史。
+
+```mermaid
+graph LR
+    Agent[Agent] --> Check{Interrupt?}
+    Check --> |no| Execute[Execute]
+    Check --> |yes| Human{Human}
+
+    Human --> |approve| Execute
+    Human --> |edit| Execute
+    Human --> |reject| ToolMessage[ToolMessage]
+    Human --> |respond| ToolMessage
+
+    Execute --> Agent
+    ToolMessage --> Agent
+
+    classDef trigger fill:#F6FFDB,stroke:#6E8900,stroke-width:2px,color:#2E3900
+    classDef process fill:#E5F4FF,stroke:#006DDD,stroke-width:2px,color:#030710
+    classDef decision fill:#FDF3FF,stroke:#7E65AE,stroke-width:2px,color:#504B5F
+    classDef alert fill:#F8E8E6,stroke:#B27D75,stroke-width:2px,color:#634643
+
+    class Agent trigger
+    class Check,Human decision
+    class Execute process
+    class ToolMessage process
+```
+
+## 基本配置
+
+`interrupt_on` 参数接收一个字典，把工具名映射到 interrupt 配置。每个工具可以配置为：
+
+- **`True`**：使用默认行为启用中断（允许 approve、edit、reject、respond）
+- **`False`**：为这个工具禁用中断
+- **`InterruptOnConfig`**：自定义配置。设置 `allowed_decisions` 来控制审核选项。
+  :::python
+  在 Python 中，你还可以添加一个可选 `when` 谓词，只对特定调用中断（见[条件中断](#conditional-interrupts)）。
+  :::
+
+:::python
+<HitlBasicConfigPy />
+:::
+
+:::js
+<HitlBasicConfigJs />
+:::
+
+## 决策类型
+
+`allowed_decisions` 列表控制人工在审查 tool call 时可以执行哪些动作：
+
+<HitlDecisionTypesTable />
+
+当人工拒绝某个拟执行动作时，使用 `reject`。只有当人工是在充当工具时才使用 `respond`，比如回答 `ask_user` 提示时。不要用 `respond` 来拒绝有副作用的工具，因为模型可能会把这条消息当成成功的 tool result。
+
+<Tip>
+在**编辑**工具参数时，请尽量保守。对原始参数做大幅修改，可能会让模型重新评估自己的方案，并可能多次执行该工具，或者做出意外动作。
+</Tip>
+
+你可以为每个工具自定义可用决策：
+
+:::python
+```python
+interrupt_on = {
+    # 敏感操作：允许所有选项
+    "delete_file": {"allowed_decisions": ["approve", "edit", "reject"]},
+
+    # 中等风险：只允许批准或拒绝
+    "write_file": {"allowed_decisions": ["approve", "reject"]},
+
+    # 必须批准（不允许拒绝）
+    "critical_operation": {"allowed_decisions": ["approve"]},
+}
+```
+:::
+
+:::js
+```typescript
+const interruptOn = {
+  // Sensitive operations: allow all options
+  delete_file: { allowedDecisions: ["approve", "edit", "reject"] },
+
+  // Moderate risk: approval or rejection only
+  write_file: { allowedDecisions: ["approve", "reject"] },
+
+  // Must approve (no rejection allowed)
+  critical_operation: { allowedDecisions: ["approve"] },
+};
+```
+:::
+
+:::python
+## 条件中断
+
+默认情况下，`interrupt_on` 中列出的每个 tool call 都会暂停等待审查。若只想让部分调用暂停，可以给某个工具的 `InterruptOnConfig` 添加 `when` 谓词。该谓词接收一个 @[ToolCallRequest]，并返回 `True` 表示中断、`False` 表示自动批准，因此你可以根据工具参数进行拦截。
+
+<Note>
+条件中断需要 `langchain>=1.3.3`。
+</Note>
+
+<HitlConditionalInterruptsPy />
+
+当 `when` 谓词返回 `False` 时，调用会直接执行，不会中断。返回 `True`，或者省略 `when` 时，调用都会像平常一样暂停。计算结果为 `False` 的调用不会加入 interrupt batch，因此审查者只会看到需要决策的动作。
+
+更多配置选项和示例请参见 [LangChain human-in-the-loop documentation](/oss/langchain/human-in-the-loop#conditional-interrupts)。
+:::
+
+## 处理 interrupts
+
+当触发 interrupt 时，agent 会暂停执行并返回控制权。请在结果中检查 interrupts，并据此处理。如果用户拒绝某个动作，请提供清晰的 `message`，告诉 agent 该工具未执行，以及下一步应该做什么。
+
+:::python
+```python
+from langchain_core.utils.uuid import uuid7
+from langgraph.types import Command
+
+# 创建包含 thread_id 的 config，用于状态持久化
+config = {"configurable": {"thread_id": str(uuid7())}}
+
+# 调用 agent
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "Delete the file temp.txt"}]},
+    config=config,
+    version="v2",  # [!code highlight]
+)
+
+# 检查是否被中断
+if result.interrupts:  # [!code highlight]
+    # 提取 interrupt 信息
+    interrupt_value = result.interrupts[0].value  # [!code highlight]
+    action_requests = interrupt_value["action_requests"]
+    review_configs = interrupt_value["review_configs"]
+
+    # 从工具名创建 review config 查找表
+    config_map = {cfg["action_name"]: cfg for cfg in review_configs}
+
+    # 向用户展示待处理动作
+    for action in action_requests:
+        review_config = config_map[action["name"]]
+        print(f"Tool: {action['name']}")
+        print(f"Arguments: {action['args']}")
+        print(f"Allowed decisions: {review_config['allowed_decisions']}")
+
+    # 获取用户决策（与 action_request 一一对应，按顺序）
+    decisions = [
+        {
+            "type": "reject",
+            "message": "用户拒绝删除 temp.txt。不要重试删除。",
+        }
+    ]
+
+    # 用决策恢复执行
+    result = agent.invoke(
+        Command(resume={"decisions": decisions}),
+        config=config,
+        version="v2",
+    )
+```
+:::
+
+:::js
+```typescript
+const config = { configurable: { thread_id: uuid7() } };
+
+let result = await agent.invoke({
+  messages: [{
+    role: "user",
+    content: "Delete temp.txt and send an email to admin@example.com"
+  }]
+}, config);
+
+if (result.__interrupt__) {
+  const interrupts = result.__interrupt__[0].value;
+  const actionRequests = interrupts.actionRequests;
+
+  // 需要批准两个工具
+  console.assert(actionRequests.length === 2);
+
+  // 按 actionRequests 的顺序提供决策
+  const decisions = [
+    { type: "approve" },  // 第一个工具：delete_file
+    {
+      type: "reject",
+      message: "用户拒绝该动作。不要重试这个 tool call。",
+    }  // 第二个工具：send_email
+  ];
+
+  result = await agent.invoke(
+    new Command({ resume: { decisions } }),
+    config
+  );
+}
+```
+:::
+
+## 拒绝消息
+
+当审查者返回 `reject` 决策时，Deep Agents 会跳过该 tool call，并把拒绝反馈发回给 agent。如果你省略 `message`，默认反馈会告诉模型该工具没有执行，并且除非用户要求，否则不要重试同一个 tool call。
+
+对于敏感或有副作用的工具，请随决策提供一个领域相关的 `message`。要明确说明 agent 是应该放弃该动作、发起后续问题，还是尝试一个更安全的替代方案。
+
+:::python
+```python
+decisions = [
+    {
+        "type": "reject",
+        "message": "用户拒绝删除这个文件。不要重试删除。请改为询问要归档哪个文件。",
+    }
+]
+```
+:::
+
+:::js
+```typescript
+const decisions = [
+  {
+    type: "reject",
+    message: "用户拒绝删除这个文件。不要重试删除。请改为询问要归档哪个文件。",
+  },
+];
+```
+:::
+
+## 编辑工具参数
+
+当 `allowed_decisions` 中包含 `"edit"` 时，你可以在执行前修改工具参数：
+
+:::python
+```python
+if result.interrupts:  # [!code highlight]
+    interrupt_value = result.interrupts[0].value  # [!code highlight]
+    action_request = interrupt_value["action_requests"][0]
+
+    # 来自 agent 的原始参数
+    print(action_request["args"])  # {"to": "everyone@company.com", ...}
+
+    # 用户决定编辑收件人
+    decisions = [{
+        "type": "edit",
+        "edited_action": {
+            "name": action_request["name"],  # 必须包含工具名
+            "args": {"to": "team@company.com", "subject": "...", "body": "..."}
+        }
+    }]
+
+    result = agent.invoke(
+        Command(resume={"decisions": decisions}),
+        config=config,
+        version="v2",
+    )
+```
+:::
+
+:::js
+```typescript
+if (result.__interrupt__) {
+  const interrupts = result.__interrupt__[0].value;
+  const actionRequest = interrupts.actionRequests[0];
+
+  // 来自 agent 的原始参数
+  console.log(actionRequest.args);  // { to: "everyone@company.com", ... }
+
+  // 用户决定编辑收件人
+  const decisions = [{
+    type: "edit",
+    editedAction: {
+      name: actionRequest.name,  // Must include the tool name
+      args: { to: "team@company.com", subject: "...", body: "..." }
+    }
+  }];
+
+  result = await agent.invoke(
+    new Command({ resume: { decisions } }),
+    config
+  );
+}
+```
+:::
+
+## 子 agent interrupts
+
+使用 subagent 时，你既可以在 [tool call 上](#interrupts-on-tool-calls) 使用 interrupts，也可以在 [tool 内部](#interrupts-within-tool-calls) 使用 interrupts。
+
+### Tool call 上的 interrupts
+
+每个 subagent 都可以有自己的 `interrupt_on` 配置，用来覆盖主 agent 的设置：
+
+:::python
+```python
+agent = create_deep_agent(
+    model="google_genai:gemini-3.5-flash",
+    tools=[delete_file, read_file],
+    interrupt_on={
+        "delete_file": True,
+        "read_file": False,
+    },
+    subagents=[{
+        "name": "file-manager",
+        "description": "Manages file operations",
+        "system_prompt": "You are a file management assistant.",
+        "tools": [delete_file, read_file],
+        "interrupt_on": {
+            # Override: require approval for reads in this subagent
+            "delete_file": True,
+            "read_file": True,  # Different from main agent!
+        }
+    }],
+    checkpointer=checkpointer
+)
+```
+:::
+
+:::js
+```typescript
+const agent = createDeepAgent({
+  tools: [deleteFile, readFile],
+  interruptOn: {
+    delete_file: true,
+    read_file: false,
+  },
+  subagents: [{
+    name: "file-manager",
+    description: "Manages file operations",
+    systemPrompt: "You are a file management assistant.",
+    tools: [deleteFile, readFile],
+    interruptOn: {
+      // Override: require approval for reads in this subagent
+      delete_file: true,
+      read_file: true,  // Different from main agent!
+    }
+  }],
+  checkpointer
+});
+```
+:::
+
+当 subagent 触发 interrupt 时，处理方式相同：检查结果中的 `interrupts`，然后用 `Command` 恢复。
+
+### Tool 内部的 interrupts
+
+subagent 工具可以直接调用 `interrupt()` 来暂停执行并等待批准：
+
+:::python
+
+```python
+from langchain.agents import create_agent
+from langchain_anthropic import ChatAnthropic
+from langchain.messages import HumanMessage
+from langchain.tools import tool
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command, interrupt
+
+from deepagents.graph import create_deep_agent
+from deepagents.middleware.subagents import CompiledSubAgent
+
+
+@tool(description="Request human approval before proceeding with an action.")
+def request_approval(action_description: str) -> str:
+    """Request human approval using the interrupt() primitive."""
+    # interrupt() 会暂停执行，并返回传给 Command(resume=...) 的值
+    approval = interrupt({
+        "type": "approval_request",
+        "action": action_description,
+        "message": f"Please approve or reject: {action_description}",
+    })
+
+    if approval.get("approved"):
+        return f"Action '{action_description}' was APPROVED. Proceeding..."
+    else:
+        return f"Action '{action_description}' was REJECTED. Reason: {approval.get('reason', 'No reason provided')}"
+
+
+def main():
+    checkpointer = InMemorySaver()
+    model = ChatAnthropic(
+        model_name="claude-sonnet-4-6",
+        max_tokens=4096,
+    )
+
+    compiled_subagent = create_agent(
+        model=model,
+        tools=[request_approval],
+        name="approval-agent",
+    )
+
+    parent_agent = create_deep_agent(
+        model="google_genai:gemini-3.5-flash",
+        checkpointer=checkpointer,
+        subagents=[
+            CompiledSubAgent(
+                name="approval-agent",
+                description="An agent that can request approvals",
+                runnable=compiled_subagent,
+            )
+        ],
+    )
+
+    thread_id = "test_interrupt_directly"
+    config = {"configurable": {"thread_id": thread_id}}
+
+    print("Invoking agent - sub-agent will use request_approval tool...")
+
+    result = parent_agent.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content="Use the task tool to launch the approval-agent sub-agent. "
+                    "Tell it to use the request_approval tool to request approval for 'deploying to production'."
+                )
+            ]
+        },
+        config=config,
+        version="v2",  # [!code highlight]
+    )
+```
+:::
+
+:::js
+```typescript
+import { createAgent, tool } from "langchain";
+import { ChatOpenAI } from "@langchain/openai";
+import { HumanMessage } from "@langchain/core/messages";
+import { MemorySaver, Command, interrupt } from "@langchain/langgraph";
+import { createDeepAgent } from "deepagents";
+import { z } from "zod";
+
+const requestApproval = tool(
+  async ({ actionDescription }: { actionDescription: string }) => {
+    const approval = interrupt({
+      type: "approval_request",
+      action: actionDescription,
+      message: `Please approve or reject: ${actionDescription}`,
+    }) as { approved?: boolean; reason?: string };
+
+    if (approval.approved) {
+      return `Action '${actionDescription}' was APPROVED. Proceeding...`;
+    } else {
+      return `Action '${actionDescription}' was REJECTED. Reason: ${
+        approval.reason || "No reason provided"
+      }`;
+    }
+  },
+  {
+    name: "request_approval",
+    description: "Request human approval before proceeding with an action.",
+    schema: z.object({
+      actionDescription: z
+        .string()
+        .describe("The action that requires approval"),
+    }),
+  }
+);
+
+async function main() {
+  const checkpointer = new MemorySaver();
+  const model = new ChatOpenAI({
+    model: "gpt-4o-mini",
+    maxTokens: 4096,
+  });
+
+  const compiledSubagent = createAgent({
+    model: model,
+    tools: [requestApproval],
+    name: "approval-agent",
+  });
+
+  const parentAgent = await createDeepAgent({
+    checkpointer: checkpointer,
+    subagents: [
+      {
+        name: "approval-agent",
+        description: "An agent that can request approvals",
+        runnable: compiledSubagent as any,
+      },
+    ],
+  });
+
+  const threadId = "test_interrupt_directly";
+  const config = { configurable: { thread_id: threadId } };
+
+  console.log("Invoking agent - sub-agent will use request_approval tool...");
+
+  let result = await parentAgent.invoke(
+    {
+      messages: [
+        new HumanMessage({
+          content:
+            "Use the task tool to launch the approval-agent sub-agent. " +
+            "Tell it to use the request_approval tool to request approval for 'deploying to production'.",
+        }),
+      ],
+    },
+    config
+    );
+
+    # 检查是否有 interrupt
+    if result.interrupts:  # [!code highlight]
+        interrupt_value = result.interrupts[0].value  # [!code highlight]
+        print(f"\nInterrupt received!")
+        print(f"  Type: {interrupt_value.get('type')}")
+        print(f"  Action: {interrupt_value.get('action')}")
+        print(f"  Message: {interrupt_value.get('message')}")
+
+        print("\nResuming with Command(resume={'approved': True})...")
+        result2 = parent_agent.invoke(
+            Command(resume={"approved": True}),
+            config=config,
+            version="v2",  # [!code highlight]
+        )
+
+        if not result2.interrupts:  # [!code highlight]
+            print("\nExecution completed!")
+            # 查找 tool 返回值
+            tool_msgs = [m for m in result2.value.get("messages", []) if m.type == "tool"]  # [!code highlight]
+            if tool_msgs:
+                print(f"  Tool result: {tool_msgs[-1].content}")
+        else:
+            print("\nAnother interrupt occurred")
+    else:
+        print("\n  No interrupt - the model may not have called request_approval")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行时，输出如下：
+
+```text
+Invoking agent - sub-agent will use request_approval tool...
+
+Interrupt received!
+  Type: approval_request
+  Action: deploying to production
+  Message: Please approve or reject: deploying to production
+
+Resuming with Command(resume={'approved': True})...
+
+Execution completed!
+  Tool result: Great! The approval request has been processed. The action **"deploying to production"** was **APPROVED**. You can now proceed with the production deployment.
+```
+
+:::
+
+:::js
+```typescript
+import { v7 as uuid7 } from "uuid";
+import { Command } from "@langchain/langgraph";
+
+// 创建包含 thread_id 的 config，用于状态持久化
+const config = { configurable: { thread_id: uuid7() } };
+
+// 调用 agent
+let result = await agent.invoke({
+  messages: [{ role: "user", content: "Delete the file temp.txt" }],
+}, config);
+
+// 检查是否被中断
+if (result.__interrupt__) {
+  // 提取 interrupt 信息
+  const interrupts = result.__interrupt__[0].value;
+  const actionRequests = interrupts.actionRequests;
+  const reviewConfigs = interrupts.reviewConfigs;
+
+  // 从工具名创建 review config 查找表
+  const configMap = Object.fromEntries(
+    reviewConfigs.map((cfg) => [cfg.actionName, cfg])
+  );
+
+  // 向用户展示待处理动作
+  for (const action of actionRequests) {
+    const reviewConfig = configMap[action.name];
+    console.log(`Tool: ${action.name}`);
+    console.log(`Arguments: ${JSON.stringify(action.args)}`);
+    console.log(`Allowed decisions: ${reviewConfig.allowedDecisions}`);
+  }
+
+  // 获取用户决策（与 actionRequest 一一对应，按顺序）
+  const decisions = [
+    {
+      type: "reject",
+      message: "用户拒绝删除 temp.txt。不要重试删除。",
+    }
+  ];
+
+  // 用决策恢复执行
+  result = await agent.invoke(
+    new Command({ resume: { decisions } }),
+    config  // 必须使用同一个 config！
+  );
+}
+
+// 处理最终结果
+console.log(result.messages[result.messages.length - 1].content);
+```
+:::
+
+## 多个 tool call
+
+当 agent 调用多个需要批准的工具时，所有 interrupts 会一起打包进一个 interrupt。你必须按顺序为每个工具提供决策。
+
+:::python
+```python
+config = {"configurable": {"thread_id": str(uuid7())}}
+
+result = agent.invoke(
+    {"messages": [{
+        "role": "user",
+        "content": "Delete temp.txt and send an email to admin@example.com"
+    }]},
+    config=config,
+    version="v2",  # [!code highlight]
+)
+
+if result.interrupts:  # [!code highlight]
+    interrupt_value = result.interrupts[0].value  # [!code highlight]
+    action_requests = interrupt_value["action_requests"]
+
+    # 需要批准两个工具
+    assert len(action_requests) == 2
+
+    # 按 action_requests 的顺序提供决策
+    decisions = [
+        {"type": "approve"},  # 第一个工具：delete_file
+        {
+            "type": "reject",
+            "message": "用户拒绝该动作。不要重试这个 tool call。",
+        }  # 第二个工具：send_email
+    ]
+
+    result = agent.invoke(
+        Command(resume={"decisions": decisions}),

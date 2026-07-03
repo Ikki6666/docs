@@ -1,0 +1,259 @@
+---
+title: 解释器
+description: 在 Deep Agents 中运行轻量级代码，用于组合工具、编排子 agent，以及转换结构化数据
+tag: "Beta"
+---
+
+import InterpretersQuickstartPy from '/snippets/code-samples/interpreters-quickstart-py.mdx';
+import InterpretersQuickstartJs from '/snippets/code-samples/interpreters-quickstart-js.mdx';
+import InterpretersTotalsEvalJs from '/snippets/code-samples/interpreters-totals-eval-js.mdx';
+import InterpretersPtcCallEvalJs from '/snippets/code-samples/interpreters-ptc-call-eval-js.mdx';
+import InterpretersEnablePtcPy from '/snippets/code-samples/interpreters-enable-ptc-py.mdx';
+import InterpretersEnablePtcJs from '/snippets/code-samples/interpreters-enable-ptc-js.mdx';
+import InterpretersPtcParallelEvalJs from '/snippets/code-samples/interpreters-ptc-parallel-eval-js.mdx';
+import InterpretersTaskFanoutEvalJs from '/snippets/code-samples/interpreters-task-fanout-eval-js.mdx';
+import InterpretersPersistenceDefaultPy from '/snippets/code-samples/interpreters-persistence-default-py.mdx';
+import InterpretersPersistenceCheckpointerPy from '/snippets/code-samples/interpreters-persistence-checkpointer-py.mdx';
+
+解释器会在 agent 循环内部为 agent 提供一个可编程的、**内存中的**工作区。agent 会写代码来完成任务，runtime 执行这段代码，并只把相关结果返回回来。中间结果不会进入模型上下文。
+
+如果说 [sandbox](/oss/deepagents/sandboxes) 是一种面向环境执行动作的代码优先方式，比如运行命令、安装依赖和编辑文件，那么解释器就是一种面向组合工具、保留状态，以及决定哪些信息返回给模型的代码优先方式。
+
+<Warning>
+    解释器处于 [**beta**](/oss/versioning) 阶段。API 和生命周期行为可能会在不同版本之间变化。
+</Warning>
+
+:::python
+<Note>
+    解释器需要 `langchain-quickjs>=0.2.0` 和 Python `>=3.11`。
+</Note>
+:::
+
+:::js
+<Note>
+    解释器需要 `@langchain/quickjs`。
+</Note>
+:::
+
+## 为什么要用解释器？
+
+大多数 agent 工作都在模型推理和工具调用之间来回切换。模型一次可以发出多个工具调用，但这一批调用在发出时就固定了。若没有新的 model turn，代码就无法循环、基于结果分支、重试失败，或者把一个调用的输出喂给下一个调用；而且每个结果都会回到模型上下文。模型还要决定要发多少次调用，所以让它一次分发几百项工作并不可靠，它往往只会覆盖样本，而不是逐项覆盖。
+
+解释器把这些编排逻辑移到代码里，这样模型只需要思考“要做什么”，而不是每一个中间步骤。
+
+<CardGroup cols={2}>
+  <Card title="程序化工具调用（PTC）" icon="tool" href="#programmatic-tool-calling-ptc">
+    从解释器代码里调用选定工具，包括循环、重试、分支和并行批次。
+  </Card>
+  <Card title="动态 subagent" icon="arrows-split" href="/oss/deepagents/dynamic-subagents">
+    从代码里派发 subagent，用于 fan-out、验证，以及针对大输入的递归工作流。
+  </Card>
+  <Card title="有状态工作" icon="database" href="#how-interpreters-work">
+    把中间值保存在 runtime state 中，而不会压垮模型上下文。
+  </Card>
+  <Card title="确定性转换" icon="code" href="#how-interpreters-work">
+    在不再触发 model turn 的情况下，对结构化数据进行排序、分组、解析、校验、打分和聚合。
+  </Card>
+</CardGroup>
+
+## 选择一种模式
+
+在 agent 循环内部需要代码时，用解释器：组合工具、保留状态，以及控制哪些内容返回给模型。
+
+在需要对环境运行代码时，用 [sandbox](/oss/deepagents/sandboxes)：shell 命令、包安装、测试、文件系统编辑，以及操作系统级执行。
+
+| 需求 | 选择 |
+| --- | --- |
+| 一两个简单的外部调用 | 普通 tool calling |
+| 纯内存 JavaScript：循环、分支、重试或数据转换（不需要外部工具） | 解释器 |
+| 需要从代码里编排大量外部工具调用（需要 [PTC](#programmatic-tool-calling-ptc)） | 带 [程序化工具调用（PTC）](#programmatic-tool-calling-ptc) 的解释器 |
+| 多个独立工作单元、多个视角，或对大输入做递归分析 | 带 [动态 subagent](/oss/deepagents/dynamic-subagents) 的解释器 |
+| shell 命令、包安装、测试，或完整的操作系统文件系统访问 | [Sandbox](/oss/deepagents/sandboxes) |
+
+## 快速开始
+
+:::python
+先安装 QuickJS middleware package，然后通过 `create_deep_agent` 的 `middleware` 参数传入解释器 middleware。
+:::
+
+:::js
+先安装 QuickJS middleware package，然后通过 `createDeepAgent` 的 `middleware` 参数传入解释器 middleware。
+:::
+
+:::python
+<CodeGroup>
+```bash pip
+pip install -U "deepagents[quickjs]"
+```
+
+```bash uv
+uv add "deepagents[quickjs]"
+```
+</CodeGroup>
+
+<InterpretersQuickstartPy />
+:::
+
+:::js
+<CodeGroup>
+```bash npm
+npm install deepagents @langchain/quickjs
+```
+
+```bash pnpm
+pnpm add deepagents @langchain/quickjs
+```
+
+```bash yarn
+yarn add deepagents @langchain/quickjs
+```
+</CodeGroup>
+
+<InterpretersQuickstartJs />
+:::
+
+## 解释器如何工作
+
+middleware 会给 agent 添加一个 `eval` 工具。需要时，agent 会编写 JavaScript 并调用 `eval`；你不会直接调用 interpreter。这个工具会在 QuickJS context 中运行代码，变量是否能跨 `eval` 调用保留，取决于 persistence `mode`。它会捕获 `console.log`、`console.warn` 和 `console.error`，并返回最后一个表达式的结果。
+
+agent 可以写出这样的代码：
+
+<InterpretersTotalsEvalJs />
+
+:::python
+默认情况下（`mode="thread"`），interpreter state 会在同一个 thread 的多轮之间持续保留。有关 `mode` 选项和 snapshot 生命周期，请参见[持久化](#persistence)。
+:::
+
+代码运行在 [**QuickJS**](https://github.com/quickjs-ng/quickjs) 上，这是一个轻量级 JavaScript runtime。默认情况下，解释器代码不能访问主机文件系统、网络、shell、包管理器或时钟。它可以计算、保存状态，并写入 `console.log`、`console.warn` 或 `console.error`，除此之外什么也不能做。
+
+有两个显式桥接会扩展它的能力：
+
+- **工具**，通过 [程序化工具调用（PTC）](#programmatic-tool-calling-ptc)。你可以把要允许的工具作为 async 函数放到 `tools` namespace 里。这些工具可以是 agent 自己的工具，也可以是你单独定义后传入的工具。
+- **Subagent**，通过 [动态 subagent](/oss/deepagents/dynamic-subagents)。当 agent 配置了 subagent 时，解释器会暴露 `task()` global，用来从代码中派发它们。
+
+程序化工具调用默认关闭，直到你[启用它](#enable-ptc)。只要 agent 有 subagent，`task()` 的 subagent 派发默认就会开启；你也可以把它关掉。除此之外，没有任何东西会跨越 QuickJS 边界。
+
+## 程序化工具调用（PTC）
+
+程序化工具调用（PTC）会把选定的 agent 工具暴露到解释器的 `tools` namespace 中。与其让模型发出一次 tool call、等待结果、再决定下一次调用，不如让 agent 用代码来调用工具，实现循环、分支、重试或并行批次。
+
+当中间结果只是下一步的输入时，这种方式尤其有用：解释器可以先过滤或聚合结果，再把任何内容返回给模型，从而让多步骤工作流更节省 token。它与 provider 无关，是通过 middleware 实现的，而不是某个 provider-specific tool-calling API。
+
+middleware 会把每个允许调用的工具暴露成 `tools` 下的 async 函数。agent 用 `await` 调用它，在代码里处理结果，而模型只会看到最终的解释器输出，不会看到每个中间值。工具名会转换成 camelCase，但输入对象仍然遵循工具 schema，所以名为 `web_search` 的工具会变成 `tools.webSearch(...)`：
+
+<InterpretersPtcCallEvalJs />
+
+### 启用 PTC
+
+通过显式 allowlist 启用 PTC：
+
+:::python
+<InterpretersEnablePtcPy />
+:::
+
+:::js
+<InterpretersEnablePtcJs />
+:::
+
+启用 PTC 后，agent 就可以从解释器代码中调用允许的工具。下面这个示例会并行搜索多个主题，并把结果合并后再返回给模型：
+
+<InterpretersPtcParallelEvalJs />
+
+:::python
+<Warning>
+    当前 PTC 调用是通过 interpreter bridge 执行的，不会走正常的 tool calling 路径。因此，`interrupt_on` 审批流程不会对每一次由 PTC 触发的 tool call 单独生效。
+</Warning>
+:::
+:::js
+<Warning>
+    当前 PTC 调用是通过 interpreter bridge 执行的，不会走正常的 tool calling 路径。因此，`interruptOn` 审批流程不会对每一次由 PTC 触发的 tool call 单独生效。
+</Warning>
+:::
+
+## 动态 subagent
+
+下面这段概述说明什么时候该用动态 subagent，以及一个最小 `task()` 模式。有关配置、编排示例、工作流触发器和安全注意事项，请参见 [动态 subagent](/oss/deepagents/dynamic-subagents)。
+
+动态 subagent 允许 interpreter 使用内置的 `task()` global，从代码中派发已配置的 [subagent](/oss/deepagents/subagents)。像检查目录中的每个文件、或者分拣一批工单这样跨越许多独立单元的任务，会变成一个 fan-out 工作并综合结果的循环。
+
+动态 subagent 适用于：
+
+- **Fan-out 并综合**：把同一类工作并行分发到很多条目上，再把结果合并起来。
+- **验证**：把 findings 交给独立 verifier subagent，只保留经过确认的结果。
+- **递归工作流**：把工作集保存在 interpreter 变量里，选择切片，调用 subagent，再逐步细化结果。
+
+<InterpretersTaskFanoutEvalJs />
+
+:::python
+## 持久化
+
+通过 `CodeInterpreterMiddleware` 的 `mode` 参数控制跨轮次状态：
+
+- **`"thread"`**（默认）：状态会跨 `eval` 调用和 agent turn 保留。middleware 会在每次 agent turn 结束后对 interpreter state 做 snapshot，并在下一轮之前恢复。
+- **`"turn"`**：状态会在同一 agent turn 内的多次 `eval` 调用之间保留，但会在下一轮重置。
+- **`"call"`**：每次 `eval` 调用都会在全新的 REPL 中运行，不会继承上一次调用的状态。
+
+在 `mode="thread"` 下，snapshot 是 interpreter 内存中 JavaScript state 的序列化副本，包括 globals、变量、函数，以及 agent 完成代码运行时存在的已导入模块。跨对话轮次时，生命周期如下：
+
+1. 一轮开始，middleware 恢复该 thread 最近一次的 interpreter snapshot。
+2. agent 调用一次或多次 `eval`。这些调用共享同一个活动 context；middleware 不会在它们之间做 snapshot。
+3. 这一轮结束，middleware 会把更新后的 snapshot 写回 graph state。
+4. 下一轮会从这个 snapshot 恢复，而不是从空 runtime 开始。
+
+<Note>
+    snapshot 只保留可序列化数据。函数、类和其他不可序列化的 runtime 对象在恢复后会变成不可访问的工件。访问它们时会抛出类似这样的错误：`Value for 'fn' was not restored because it is not serializable (type: function).`
+</Note>
+
+snapshot 保留的是 interpreter memory，不是外部世界的副作用。如果 interpreter 代码通过 PTC 调用工具，那么恢复之前的 interpreter snapshot 不会撤销那个工具调用的副作用。它只会恢复记录或处理结果时所用的 interpreter 变量。
+
+跨轮次持久化不需要 checkpointer：
+
+<InterpretersPersistenceDefaultPy />
+
+因为 interpreter snapshot 存在于 graph state 中，所以 checkpointer 也会把它们捕获到 checkpoint history 里。在你需要持久化 thread 或[时间回溯](/oss/langgraph/use-time-travel) 时再加上它：
+
+<InterpretersPersistenceCheckpointerPy />
+
+把 `mode="turn"` 设为只在一轮内保留 interpreter state，或者把 `mode="call"` 设为每次 `eval` 都使用新的 REPL。
+:::
+
+## 安全性
+
+解释器使用 QuickJS 以严格的默认隔离来运行不受信任的 JavaScript。要把它当作一个有作用域限制的 interpreter runtime，而不是完整的生产 sandbox backend。
+
+你通过 PTC 暴露的每个工具，都是 interpreter code 可以使用的外部能力。请把 PTC allowlist 当成权限边界：只暴露 agent 需要的工具，避免桥接那些能够访问敏感系统、花钱、修改数据或调用不受限制网络的宽泛工具，除非这是你有意为之。
+
+:::python
+| 能力 | 默认可用 | 暴露方式 |
+| --- | --- | --- |
+| JavaScript 执行 | 是 | 添加 interpreter middleware |
+| 顶层 `await` | 是 | 在 interpreter 代码中使用 promises |
+| `console.log`、`warn`、`error` 捕获 | 是 | 设为 `capture_console=False` 关闭 |
+| Agent 工具 | 否 | 添加 PTC allowlist |
+| 文件系统访问 | 否 | 通过 PTC allowlist 添加 [内置文件系统工具](/oss/deepagents/overview#virtual-filesystem-access) |
+| 网络访问 | 否 | 通过 PTC 暴露某个特定网络工具 |
+| 实时时钟或日期时间访问 | 否 | 如果需要，暴露一个显式的时间工具 |
+| shell 命令、包安装、测试、操作系统级执行 | 否 | 使用 [sandbox backend](/oss/deepagents/sandboxes) |
+:::
+:::js
+| 能力 | 默认可用 | 暴露方式 |
+| --- | --- | --- |
+| JavaScript 执行 | 是 | 添加 interpreter middleware |
+| 顶层 `await` | 是 | 在 interpreter 代码中使用 promises |
+| `console.log`、`warn`、`error` 捕获 | 是 | 设为 `captureConsole: false` 关闭 |
+| Agent 工具 | 否 | 添加 PTC allowlist |
+| 文件系统访问 | 否 | 通过 PTC allowlist 添加 [内置文件系统工具](/oss/deepagents/overview#virtual-filesystem-access) |
+| 网络访问 | 否 | 通过 PTC 暴露某个特定网络工具 |
+| 实时时钟或日期时间访问 | 否 | 如果需要，暴露一个显式的时间工具 |
+| shell 命令、包安装、测试、操作系统级执行 | 否 | 使用 [sandbox backend](/oss/deepagents/sandboxes) |
+:::
+
+:::python
+<Note>
+    **代码执行是如何工作的**
+
+    interpreter 代码运行在嵌入式 QuickJS context 中，而不是独立的 VM 或进程。Python 中，这个 runtime 由 [`quickjs-rs`](https://github.com/langchain-ai/quickjs-rs) 提供，它在 [Security guide](https://github.com/langchain-ai/quickjs-rs#security) 中也说明了同样的同进程执行边界。
+
+    请把解释器当作一种能力受限的执行层，而不是主机内存隔离边界。对于不可信或半可信代码，请把 agent 运行在隔离的 worker process 或容器中，并把 PTC allowlist 保持得足够窄。
+</Note>
+:::

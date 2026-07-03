@@ -1,0 +1,284 @@
+---
+title: 上下文概览
+sidebarTitle: Context
+---
+
+**上下文工程**是指构建动态系统，以合适的格式提供合适的信息和工具，使 AI 应用能够完成任务。上下文可以从两个关键维度来理解：
+
+1. 按**可变性**划分：
+   * **静态上下文**：执行期间不会变化的不可变数据（例如用户元数据、数据库连接、工具）
+   * **动态上下文**：会随着应用运行而变化的可变数据（例如对话历史、中间结果、工具调用观察结果）
+2. 按**生命周期**划分：
+   * **运行时上下文**：限定在单次运行或调用范围内的数据
+   * **跨对话上下文**：跨多个对话或会话持续存在的数据
+
+<Tip>
+    运行时上下文指的是本地上下文，也就是代码运行所需的数据与依赖。它**不是**指：
+
+    * LLM 上下文，也就是传入 LLM prompt 的数据。
+    * “上下文窗口”，也就是可以传入 LLM 的最大 token 数量。
+
+    :::python
+    运行时上下文是一种依赖注入形式，也可以用来优化 LLM 上下文。它让你在运行时把数据库连接、用户 ID 或 API client 这类依赖提供给工具和节点，而不是把它们硬编码进去。举例来说，你可以利用运行时上下文中的用户元数据获取用户偏好，再把这些偏好送入上下文窗口。
+    :::
+
+    :::js
+    运行时上下文是你在智能体内部传递数据的方式。与其把数据放进全局状态，不如把数据库连接、用户会话或配置之类的值附着在上下文上，再在工具和中间件中访问它们。这样可以让系统保持无状态、可测试和可复用。举例来说，你可以利用运行时上下文中的用户元数据获取用户偏好，再把这些偏好送入上下文窗口。
+    :::
+
+</Tip>
+
+LangGraph 提供了三种管理上下文的方式，它们是可变性与生命周期这两个维度的组合：
+
+:::python
+| Context type                                                                                | Description                                            | Mutability | Lifetime           | Access method                           |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------ | ---------- | ------------------ | --------------------------------------- |
+| [**Static runtime context**](#static-runtime-context)                                       | User metadata, tools, db connections passed at startup | Static     | Single run         | `context` argument to `invoke`/`stream` |
+| [**Dynamic runtime context (state)**](#dynamic-runtime-context)                             | Mutable data that evolves during a single run          | Dynamic    | Single run         | LangGraph state object                  |
+| [**Dynamic cross-conversation context (store)**](#dynamic-cross-conversation-context)       | Persistent data shared across conversations            | Dynamic    | Cross-conversation | LangGraph store                         |
+
+## 静态运行时上下文
+
+**静态运行时上下文**表示那些通过 `invoke`/`stream` 的 `context` 参数，在一次运行开始时传入应用的不可变数据，例如用户元数据、工具和数据库连接。这些数据在执行期间不会改变。
+
+```python
+@dataclass
+class ContextSchema:
+    user_name: str
+
+graph.invoke(
+    {"messages": [{"role": "user", "content": "hi!"}]},
+    context={"user_name": "John Smith"}  # [!code highlight]
+)
+```
+
+<Tabs>
+    <Tab title="Agent prompt">
+    ```python
+    from dataclasses import dataclass
+    from langchain.agents import create_agent
+    from langchain.agents.middleware import dynamic_prompt, ModelRequest
+
+
+    @dataclass
+    class ContextSchema:
+        user_name: str
+
+    @dynamic_prompt  # [!code highlight]
+    def personalized_prompt(request: ModelRequest) -> str:  # [!code highlight]
+        user_name = request.runtime.context.user_name
+        return f"You are a helpful assistant. Address the user as {user_name}."
+
+    agent = create_agent(
+        model="claude-sonnet-4-6",
+        tools=[get_weather],
+        middleware=[personalized_prompt],
+        context_schema=ContextSchema
+    )
+
+    agent.invoke(
+        {"messages": [{"role": "user", "content": "what is the weather in sf"}]},
+        context=ContextSchema(user_name="John Smith")  # [!code highlight]
+    )
+```
+
+    详见 [Agents](/oss/langchain/agents)。
+    </Tab>
+    <Tab title="Workflow node">
+    ```python
+    from langgraph.runtime import Runtime
+
+    def node(state: State, runtime: Runtime[ContextSchema]):  # [!code highlight]
+        user_name = runtime.context.user_name
+        ...
+```
+
+    * 详见 [the Graph API](/oss/langgraph/use-graph-api#add-runtime-configuration)。
+    </Tab>
+    <Tab title="In a tool">
+    ```python
+    from langchain.tools import tool, ToolRuntime
+
+    @tool
+    def get_user_email(runtime: ToolRuntime[ContextSchema]) -> str:
+        """Retrieve user information based on user ID."""
+        # simulate fetching user info from a database
+        email = get_user_email_from_db(runtime.context.user_name)  # [!code highlight]
+        return email
+```
+
+    详见 [tool calling guide](/oss/langchain/tools#context)。
+    </Tab>
+</Tabs>
+
+<Tip>
+    `Runtime` 对象可用于访问静态上下文，以及 active store、stream writer 等其他工具。
+    详见 @[`Runtime`] 文档。
+</Tip>
+:::
+
+:::js
+| Context type                                                                                | Description                                   | Mutability | Lifetime           |
+| ------------------------------------------------------------------------------------------- | --------------------------------------------- | ---------- | ------------------ |
+| [**Config**](#config)                                                                       | data passed at the start of a run             | Static     | Single run         |
+| [**Dynamic runtime context (state)**](#dynamic-runtime-context)                             | Mutable data that evolves during a single run | Dynamic    | Single run         |
+| [**Dynamic cross-conversation context (store)**](#dynamic-cross-conversation-context)       | Persistent data shared across conversations   | Dynamic    | Cross-conversation |
+
+## Config
+
+Config 用于放置用户元数据或 API key 这类不可变数据。当你有一些在运行过程中不会变化的值时，就可以使用它。
+
+请使用一个名为 **"configurable"** 的保留键来指定配置。
+
+```typescript
+await graph.invoke(
+  { messages: [{ role: "user", content: "hi!" }] },
+  { configurable: { user_id: "user_123" } } // [!code highlight]
+);
+```
+:::
+
+## 动态运行时上下文
+
+**动态运行时上下文**表示那些在单次运行中会演化的可变数据，它通过 LangGraph 的 state 对象来管理。这包括对话历史、中间结果，以及从工具或 LLM 输出中派生出的值。在 LangGraph 中，state 对象在一次运行期间充当[短期记忆](/oss/concepts/memory)。
+
+<Tabs>
+    <Tab title="In an agent">
+    示例展示了如何把 state 融入智能体 **prompt**。
+
+    :::python
+    State 也可以被智能体的 **tools** 访问，工具可按需读取或更新 state。详见 [tool calling guide](/oss/langchain/tools#short-term-memory-state)。
+    :::
+    :::js
+    State 也可以被智能体的 **tools** 访问，工具可按需读取或更新 state。详见 [tool calling guide](/oss/langchain/tools#access-context)。
+    :::
+
+    :::python
+
+    ```python
+    from langchain.agents import create_agent
+    from langchain.agents.middleware import dynamic_prompt, ModelRequest
+    from langchain.agents import AgentState
+
+
+    class CustomState(AgentState):  # [!code highlight]
+        user_name: str
+
+    @dynamic_prompt  # [!code highlight]
+    def personalized_prompt(request: ModelRequest) -> str:  # [!code highlight]
+        user_name = request.state.get("user_name", "User")
+        return f"You are a helpful assistant. User's name is {user_name}"
+
+    agent = create_agent(
+        model="claude-sonnet-4-6",
+        tools=[...],
+        state_schema=CustomState,  # [!code highlight]
+        middleware=[personalized_prompt],  # [!code highlight]
+    )
+
+    agent.invoke({
+        "messages": "hi!",
+        "user_name": "John Smith"
+    })
+    ```
+    :::
+
+    :::js
+
+    ```typescript
+    import { createAgent, createMiddleware } from "langchain";
+    import type { AgentState } from "langchain";
+    import * as z from "zod";
+
+    const CustomState = z.object({ // [!code highlight]
+      userName: z.string(),
+    });
+
+    const personalizedPrompt = createMiddleware({ // [!code highlight]
+      name: "PersonalizedPrompt",
+      stateSchema: CustomState,
+      wrapModelCall: (request, handler) => {
+        const userName = request.state.userName || "User";
+        const systemPrompt = `You are a helpful assistant. User's name is ${userName}`;
+        return handler({ ...request, systemPrompt });
+      },
+    });
+
+    const agent = createAgent({  // [!code highlight]
+      model: "claude-sonnet-4-6",
+      tools: [/* your tools here */],
+      middleware: [personalizedPrompt] as const, // [!code highlight]
+    });
+
+    await agent.invoke({
+      messages: [{ role: "user", content: "hi!" }],
+      userName: "John Smith",
+    });
+    ```
+    :::
+    </Tab>
+    <Tab title="In a workflow">
+    :::python
+    ```python
+    from typing_extensions import TypedDict
+    from langchain.messages import AnyMessage
+    from langgraph.graph import StateGraph
+
+    class CustomState(TypedDict):  # [!code highlight]
+        messages: list[AnyMessage]
+        extra_field: int
+
+    def node(state: CustomState):  # [!code highlight]
+        messages = state["messages"]
+        ...
+        return {  # [!code highlight]
+            "extra_field": state["extra_field"] + 1  # [!code highlight]
+        }
+
+    builder = StateGraph(State)
+    builder.add_node(node)
+    builder.set_entry_point("node")
+    graph = builder.compile()
+    ```
+    :::
+
+    :::js
+    ```typescript
+    import { z } from "zod/v4";
+    import { StateGraph, StateSchema, MessagesValue, START } from "@langchain/langgraph";
+
+    const CustomState = new StateSchema({  // [!code highlight]
+      messages: MessagesValue,
+      extraField: z.number(),
+    });
+
+    const builder = new StateGraph(CustomState)
+      .addNode("node", async (state) => {  // [!code highlight]
+        const messages = state.messages;
+        // ...
+        return {  // [!code highlight]
+          extraField: state.extraField + 1,
+        };
+      })
+      .addEdge(START, "node");
+
+    const graph = builder.compile();
+    ```
+    :::
+    </Tab>
+</Tabs>
+
+<Tip>
+    **开启记忆**
+    更多关于如何启用记忆的细节，请参见 [memory guide](/oss/langgraph/add-memory)。这是一个很强大的功能，它允许你在多次调用之间持久化智能体状态。否则，state 只会限定在单次运行范围内。
+</Tip>
+
+## 动态跨对话上下文
+
+**动态跨对话上下文**表示跨多个对话或会话持久存在、且可变的数据，它通过 LangGraph store 来管理。这包括用户资料、偏好和历史交互。LangGraph store 在多次运行之间充当[长期记忆](/oss/concepts/memory#long-term-memory)。你可以用它读取或更新持久事实（例如用户资料、偏好、先前交互）。
+
+## 进一步了解
+
+- [Memory conceptual overview](/oss/concepts/memory)
+- [Short-term memory in LangChain](/oss/langchain/short-term-memory)
+- [Memory in LangGraph](/oss/langgraph/add-memory)

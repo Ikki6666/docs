@@ -1,0 +1,168 @@
+---
+title: 向后兼容性
+description: 在生产环境中更新 LangGraph 图代码，而不会破坏正在进行的运行。
+---
+
+LangGraph 的图代码在生产中迟早都要变化。新的需求、修复 bug 和重构最终都会进入你的图代码。因为 LangGraph 会用最新部署的图去处理已经为现有线程持久化的状态，所以你发布的每一次变更，对于已有 checkpoints 来说，本质上都等同于一次向后兼容的 API 变更。
+
+与会把运行固定到其启动时代码版本的工作流引擎不同，LangGraph 会立刻把最新图应用到 *每个* 线程，包括新线程和从 checkpoint 恢复的线程。这很方便，因为修复可以不经额外流程就传播到正在进行中的对话和智能体。但这也意味着，你必须考虑每次变更如何与基于旧版本代码启动的运行交互。
+
+需要关注的兼容性问题主要有三类，顺序大致如下：
+
+1. [技术兼容性](#technical-compatibility)：最常见；新代码必须仍然能够基于现有 State 正常加载和执行。
+2. [业务兼容性](#business-compatibility)：较少见；即使代码已经变化，已有运行也应继续遵循旧的业务逻辑。
+3. [非确定性](#non-determinism)：只适用于 [Functional API](/oss/langgraph/functional-api)。
+
+<Tip>
+如果你想快速了解运行时默认支持哪些图拓扑和状态变更，可以先看 [图迁移](/oss/langgraph/graph-api#graph-migrations)。本页其余部分会介绍当某个变更超出该支持范围时可以采用的模式。
+</Tip>
+
+<a id="technical-compatibility"></a>
+## 技术兼容性
+
+技术兼容性相当于微服务里的 API 破坏性变更。这里的“API”指的是你的图代码与 [checkpointer](/oss/langgraph/checkpointers#checkpointer-libraries) 已为现有线程持久化的数据之间的契约。当线程恢复时，LangGraph 会反序列化已保存的状态，把它分发给指定名称的节点，并期望节点返回符合状态 schema 的值。
+
+常见的技术层面破坏包括：
+
+- **重命名或删除节点**，而这些节点恰好是某些暂停中的线程即将进入的节点，例如在 @[`interrupt`] 处，或者通过仍然路由到旧名称的 checkpoint 条件边进入。恢复时，LangGraph 无法根据保存的名称找到该节点，运行就会失败。恢复运行的起点是停止执行的那个节点开头，因此缺失节点也就没有可恢复的入口。
+- **重命名或删除 State 键**，而旧 checkpoints 里仍然包含这些键，或者下游节点仍会读取这些键。
+- **收紧 State 字段约束**，例如把 `Optional` 字段改成必填，缩窄类型，或者增加一个没有默认值的新必填字段。现有 checkpoints 将无法满足新的 schema。
+
+checkpoint 本身并不持久化边拓扑。只要节点仍然存在，在节点之间添加、删除或重定向边，对进行中的线程都是安全的。根据 [图迁移](/oss/langgraph/graph-api#graph-migrations) 的总结，唯一可能破坏中断线程的拓扑变更，是重命名或删除节点。
+
+### 推荐模式
+
+:::python
+
+- 把新的状态字段加成 `NotRequired`（或 `Optional[...] = None`），这样旧 checkpoints 仍然可以通过校验：
+
+  ```python
+  from typing import NotRequired
+  from typing_extensions import TypedDict
+
+  class State(TypedDict):
+      messages: list
+      summary: NotRequired[str]  # [!code ++]
+  ```
+
+- 把删除视为弃用。即使没有节点再读取它，也至少在一个 drain 周期内保留该字段定义，这样已有 checkpoints 仍然可以加载。
+- 用“先加后删”来完成重命名。先在旧字段或旧节点旁边添加新字段或新节点，在弃用窗口内同时写入或双路由，然后在确认没有进行中的线程依赖旧项后再删除旧项。
+- 让节点函数对未知键保持容错。`TypedDict` 在运行时会忽略多余键，所以旧版本代码残留的 state 不会报错，除非某个节点显式读取了缺失键。
+- 使用 [time travel](/oss/langgraph/use-time-travel) 和 @[`graph.get_state`][get_state]，在正式发布前于预发布环境中抽查现有线程与新代码的兼容情况。
+
+:::
+
+:::js
+
+- 将新的状态字段标记为可选（`z.string().optional()` 或 `.nullish()`），这样旧 checkpoints 仍然可以通过校验。
+- 把删除视为弃用：至少在一个 drain 周期内保留 schema 中的字段，这样已有 checkpoints 仍然可以加载。
+- 通过“先加后删”来重命名：先在旧字段或旧节点旁边添加新字段或新节点，在弃用窗口内同时写入或双路由，然后在确认没有进行中的线程依赖旧项后再删除旧项。
+- 使用 [time travel](/oss/langgraph/use-time-travel) 和 @[`graph.getState`][get_state]，在正式发布前于预发布环境中抽查现有线程与新代码的兼容情况。
+
+:::
+
+### 检测进行中的线程
+
+在删除节点、重命名 State 键，或进行其他旧线程无法容忍的变更之前，你需要知道是否有线程当前还停留在你准备删除的那版代码上。LangGraph 本身不会为 thread state 维护可搜索索引，所以答案取决于你的图运行在哪里。
+
+**如果你部署到 [LangSmith](/langsmith/deployment)。** 使用 Agent Server 的 thread 搜索按状态筛选。`status` 字段支持 `idle`、`busy`、`interrupted` 和 `error`，因此你可以批量查询 `interrupted` 或 `busy` 线程，并可选择用 metadata 过滤进一步缩小范围。请参阅 [按 thread 状态筛选](/langsmith/use-threads#filter-by-thread-status) 和 [列出 threads](/langsmith/use-threads#list-threads)。
+
+**在任何 LangGraph 运行环境中。** 使用 [LangSmith tracing](/oss/langgraph/observability) 监控生产环境中哪些节点被进入和退出。这是判断某个节点或状态字段是否已经不再处于任何活跃代码路径中的最可靠信号。
+
+**当你已经有一个 `thread_id` 时。** 直接查看那个单独的线程：
+
+:::python
+
+- @[`graph.get_state(config)`][get_state] 会返回最新的 checkpoint，包括线程暂停在哪个节点以及任何待处理的 interrupts。
+- @[`graph.get_state_history(config)`][get_state_history] 会返回该线程完整的按时间顺序排列的 checkpoints 列表。
+
+:::
+
+:::js
+
+- @[`graph.getState(config)`][get_state] 会返回最新的 checkpoint，包括线程暂停在哪个节点以及任何待处理的 interrupts。
+- @[`graph.getStateHistory(config)`][get_state_history] 会返回该线程完整的按时间顺序排列的 checkpoints 列表。
+
+:::
+
+拿不准时，最好先把被弃用的节点或字段保留着，直到 Agent Server 的 thread 列表和 tracing 都不再显示它有活动为止。
+
+## 业务兼容性
+
+有时某个变更在技术上是合法的（现有 checkpoint 都能加载，所有节点都能解析），但新图的*含义*与旧图不同。新行为对新线程是正确的，但你不希望把它回放到那些在旧逻辑下开始的线程上。
+
+例如，假设你的图运行 `intake → triage → respond`，而你决定在 `triage` 和 `respond` 之间插入一个新的 `policy_check` 步骤：
+
+- 已经通过 `triage` 的线程应该继续直接到 `respond`（旧流程）。
+- 新线程应该运行完整的新流程。
+
+推荐的做法是在线程开始时把相关的*行为版本*记录到 state 中，然后通过 [conditional edge](/oss/langgraph/graph-api#conditional-edges) 来分支：
+
+:::python
+
+```python
+from typing import NotRequired
+from typing_extensions import TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+
+class State(TypedDict):
+    request: str
+    flow_version: NotRequired[int]
+    response: NotRequired[str]
+
+
+def intake(state: State) -> dict:
+    # 在新线程上标记当前流程版本。已有线程如果在 `intake` 之后恢复，
+    # 会保留已经保存下来的值。
+    return {"flow_version": state.get("flow_version", 2)}
+
+
+def triage(state: State) -> dict: ...
+def policy_check(state: State) -> dict: ...
+def respond(state: State) -> dict: ...
+
+
+def after_triage(state: State) -> str:
+    if state.get("flow_version", 1) >= 2:
+        return "policy_check"
+    return "respond"
+
+
+builder = StateGraph(State)
+builder.add_node("intake", intake)
+builder.add_node("triage", triage)
+builder.add_node("policy_check", policy_check)
+builder.add_node("respond", respond)
+builder.add_edge(START, "intake")
+builder.add_edge("intake", "triage")
+builder.add_conditional_edges("triage", after_triage, ["policy_check", "respond"])
+builder.add_edge("policy_check", "respond")
+builder.add_edge("respond", END)
+
+graph = builder.compile()
+```
+
+:::
+
+已恢复的旧线程在 `triage` 之后会从已保存的 state 中读取 `flow_version`（或者回退到 v1 默认值），并跳过 `policy_check`。新线程从 `intake` 开始，会被标记为 `flow_version=2`，然后走新路径。一旦所有 v1 线程都完成，就可以删除版本标记和条件边。
+
+这个模式只有在你在*线程开始时*设置版本时才有效，也就是在任何需要版本区分的分支之前。设置得太晚的话，旧线程在需要这个值的时候还不会拥有它。
+
+## 非确定性
+
+这一类只适用于 [Functional API](/oss/langgraph/functional-api)，以及 Graph API **node** 内部的 [**task**](/oss/langgraph/functional-api#task) 或 @[`interrupt`] 调用。普通 Graph API **node** 在恢复时会[从节点函数开头重新执行](/oss/langgraph/graph-api#re-execution-and-idempotency)；你应该把副作用设计成幂等的，但如果没有在那个 **node** 里使用 **task** 或 @[`interrupt`]，就不需要保留 task 调用顺序。
+
+一个 Functional API **entrypoint** 会编译成单个 **node**。当运行恢复时，它会从开头重新回放 entrypoint 主体，并使用缓存的 @[`@task`][task] 结果来跳过已经完成的工作。下面两类变更会破坏这个模型：
+
+- **增加、删除或重排 `@task` 调用或 @[`interrupt`] 调用**，而这些调用位于恢复点*之前*。LangGraph 会按回放中的位置匹配缓存结果和恢复值，因此如果你改变了位置，就可能把错误的缓存值回放给另一个调用。
+- **在 `@task` 之外引入非确定性操作**，例如 `time.time()`、`random.random()`，或者在 entrypoint 主体里直接发起网络请求。回放时，这些操作会产生与首次运行不同的值，从而改变控制流。
+
+如果你想看更深入的讲解和示例，可以参阅 Functional API 指南中的 [Determinism](/oss/langgraph/functional-api#determinism) 和 [Common pitfalls](/oss/langgraph/functional-api#common-pitfalls)。
+
+如果你需要对一个已有进行中运行的 `@entrypoint` 做非平凡代码修改，最稳妥的做法是：
+
+- 让进行中的运行先自然结束，再部署变更。
+- 把新增逻辑包进新的 `@task`，这样它的结果会独立 checkpoint。
+- 在 `langgraph.json` 中用新的 graph 名称注册一个新的 entrypoint 来承载新行为，并把新线程路由过去。

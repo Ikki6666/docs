@@ -1,0 +1,370 @@
+---
+title: 图执行
+description: 使用每个节点的状态和流式内容来可视化多步骤图流水线
+---
+
+LangGraph 智能体不是黑盒。每个图都由按顺序或并行执行的 **named nodes** 组成：分类、检索、分析、综合。Graph execution 卡片通过为每个节点渲染一个卡片、显示其状态、实时流式输出内容以及跟踪整个工作流的完成情况，让这条流水线变得可见。用户可以清楚地看到智能体正在做什么、当前处于哪一步，以及每一步产出了什么。
+
+这种模式尤其适合生产环境中的智能体，因为它把 graph 结构转化成了产品 UX。你不必把 run 只当作一条 assistant 响应，而是可以暴露 LangGraph 在内部使用的 checkpoint、节点名称、state key 和流式元数据。
+
+import { PatternEmbed } from "/snippets/pattern-embed.jsx"
+import UseStreamTypeInference from '/snippets/oss/use-stream-type-inference.mdx';
+
+<PatternEmbed pattern="graph-execution-cards" />
+
+## 图节点如何映射到 UI 卡片
+
+LangGraph 图由一系列节点组成，每个节点负责一项特定任务。例如，一个研究流水线可能包含：
+
+1. **Classify**：对用户查询进行分类
+2. **Research**：收集相关信息
+3. **Analyze**：从研究结果中得出结论
+4. **Synthesize**：生成最终、润色后的响应
+
+每个节点都会把输出写入 graph state 中的某个特定 key。在前端，你不需要手写这种映射，因为 @[`useStream`] 会在运行过程中通过 `stream.subgraphs` 自动发现每个节点，并为每个观察到的步骤暴露一个 @[`SubgraphDiscoverySnapshot`]：
+
+```ts
+// 节点会自动发现，不需要硬编码列表
+const graphNodes = [...stream.subgraphs.values()];
+
+// 每个 snapshot 都带有节点名和当前状态
+graphNodes.forEach((node) => {
+  console.log(node.nodeName, node.status); // "classify", "running"
+});
+```
+
+使用 `node.nodeName` 作为进度条和卡片标题的标签。把每个 snapshot 传给 `useMessages(stream, node)`，即可渲染节点范围内的流式内容，而不需要把 UI 与 graph state key 名称耦合。
+
+这种映射会成为你的图和 UI 之间的契约。后端作者可以有意添加、重命名或重新排序节点，而前端作者则决定如何可视化每个 state key：状态徽标、Markdown 面板、表格、图表、trace 视图，或者审批卡片。
+
+## 设置 `useStream`
+
+像平常一样接好 @[`useStream`]。你会用到的关键属性是 `messages`（用于对话）和 `subgraphs`（用于当前运行中发现的图节点）。把每个发现的 subgraph snapshot 传给 selector，即可读取该节点范围内的消息。
+
+<UseStreamTypeInference />
+
+<CodeGroup>
+```tsx React
+import { useStream } from "@langchain/react";
+
+const AGENT_URL = "http://localhost:2024";
+
+export function PipelineChat() {
+  const stream = useStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "graph_execution_cards",
+  });
+  const graphNodes = [...stream.subgraphs.values()];
+
+  return (
+    <div>
+      <PipelineProgress nodes={graphNodes} isLoading={stream.isLoading} />
+      <NodeCardList nodes={graphNodes} stream={stream} isLoading={stream.isLoading} />
+    </div>
+  );
+}
+```
+
+```vue Vue
+<script setup lang="ts">
+import { useStream } from "@langchain/vue";
+
+const AGENT_URL = "http://localhost:2024";
+
+const stream = useStream<typeof myAgent>({
+  apiUrl: AGENT_URL,
+  assistantId: "graph_execution_cards",
+});
+</script>
+
+<template>
+  <div>
+    <PipelineProgress
+      :nodes="[...stream.subgraphs.value.values()]"
+      :is-loading="stream.isLoading.value"
+    />
+    <NodeCardList
+      :nodes="[...stream.subgraphs.value.values()]"
+      :stream="stream"
+      :is-loading="stream.isLoading.value"
+    />
+  </div>
+</template>
+```
+
+```svelte Svelte
+<script lang="ts">
+  import { useStream } from "@langchain/svelte";
+
+  const AGENT_URL = "http://localhost:2024";
+
+  const stream = useStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "graph_execution_cards",
+  });
+</script>
+
+<div>
+  <PipelineProgress nodes={[...stream.subgraphs.values()]} isLoading={stream.isLoading} />
+  <NodeCardList
+    nodes={[...stream.subgraphs.values()]}
+    {stream}
+    isLoading={stream.isLoading}
+  />
+</div>
+```
+
+```ts Angular
+import { Component, computed } from "@angular/core";
+import { injectStream } from "@langchain/angular";
+
+const AGENT_URL = "http://localhost:2024";
+
+@Component({
+  selector: "app-pipeline-chat",
+  template: `
+    <div>
+      <app-pipeline-progress
+        [nodes]="graphNodes()"
+        [isLoading]="stream.isLoading()"
+      />
+      <app-node-card-list
+        [nodes]="graphNodes()"
+        [stream]="stream"
+        [isLoading]="stream.isLoading()"
+      />
+    </div>
+  `,
+})
+export class PipelineChatComponent {
+  stream = injectStream<typeof myAgent>({
+    apiUrl: AGENT_URL,
+    assistantId: "graph_execution_cards",
+  });
+
+  graphNodes = computed(() => [...this.stream.subgraphs().values()]);
+}
+```
+</CodeGroup>
+
+## 将流式 token 路由到节点
+
+随着图的流式执行，每个被发现的 subgraph snapshot 都会标识它所属的节点。把该 snapshot 传给 selector hook 或 composable，就可以读取该节点范围内的消息：
+
+```tsx
+import { AIMessage } from "langchain";
+import { useMessages, type AnyStream, type SubgraphDiscoverySnapshot } from "@langchain/react";
+
+function NodeCard({
+  node,
+  stream,
+}: {
+  node: SubgraphDiscoverySnapshot;
+  stream: AnyStream;
+}) {
+  const messages = useMessages(stream, node);
+  const lastAIMessage = messages.find(AIMessage.isInstance);
+  const streamingContent = lastAIMessage?.text ?? "";
+
+  return <NodeCardBody node={node} content={streamingContent} />;
+}
+```
+
+第一个挂载的 selector 会为该节点 namespace 打开一个作用域订阅。当节点卡片卸载时，订阅会自动释放。
+
+## 确定节点状态
+
+每个被发现的节点都会携带当前状态。直接使用 `node.status` 即可；discovery snapshot 会报告 `"pending"`、`"running"`、`"complete"` 或 `"error"`：
+
+```ts
+type NodeStatus = SubgraphDiscoverySnapshot["status"];
+
+const status: NodeStatus = node.status;
+```
+
+## 构建流水线进度条
+
+顶部的水平进度条可以让用户对整个流水线有一目了然的视图。每一步都是一个带标签的分段，随着节点完成而逐渐填充：
+
+```tsx
+function PipelineProgress({
+  nodes,
+  isLoading,
+}: {
+  nodes: SubgraphDiscoverySnapshot[];
+  isLoading: boolean;
+}) {
+  const firstIncompleteIdx = nodes.findIndex((node) => node.status !== "complete");
+
+  return (
+    <div className="flex items-center gap-1">
+      {nodes.map((node, i) => {
+        const isRunning =
+          isLoading && node.status !== "complete" && firstIncompleteIdx === i;
+        const colors = {
+          pending: "bg-gray-200 text-gray-500",
+          running: "bg-blue-400 text-white animate-pulse",
+          complete: "bg-green-500 text-white",
+          error: "bg-red-500 text-white",
+        };
+        const status = isRunning ? "running" : node.status;
+
+        return (
+          <div key={node.id} className="flex items-center">
+            <div
+              className={`rounded-full px-3 py-1 text-xs font-medium ${colors[status]}`}
+            >
+              {node.nodeName}
+            </div>
+            {i < nodes.length - 1 && (
+              <div
+                className={`mx-1 h-0.5 w-6 ${
+                  status === "complete" ? "bg-green-500" : "bg-gray-200"
+                }`}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+```
+
+## 构建可折叠的 NodeCard 组件
+
+每个节点都有自己的卡片，显示状态徽标、内容（流式或最终内容），以及一个用于展示长输出的可折叠主体：
+
+```tsx
+function NodeCard({
+  node,
+  stream,
+}: {
+  node: SubgraphDiscoverySnapshot;
+  stream: AnyStream;
+}) {
+  const [open, setOpen] = useState(node.status === "running");
+  const messages = useMessages(stream, node);
+  const lastAIMessage = messages.find(AIMessage.isInstance);
+
+  useEffect(() => {
+    if (node.status === "running") setOpen(true);
+    if (node.status === "complete") setOpen(false);
+  }, [node.status]);
+
+  return (
+    <div className="rounded-lg border bg-white shadow-sm">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex w-full items-center justify-between p-4"
+      >
+        <div className="flex items-center gap-3">
+          <h3 className="font-semibold">{node.nodeName}</h3>
+          <StatusBadge status={node.status} />
+        </div>
+        <span className={open ? "rotate-90" : ""}>▶</span>
+      </button>
+
+      {open && (
+        <div className="border-t px-4 py-3">
+          <div className="prose prose-sm max-w-none">
+            {lastAIMessage?.text?.trim()
+              ? <Markdown>{lastAIMessage.text}</Markdown>
+              : <p className="italic text-gray-500">Processing...</p>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+## 流式内容 vs. 已完成内容
+
+节点卡片会同时读取流式和最终内容对应的 scoped messages。这样就不需要假设图节点名称和它写入的 state key 一一对应（例如 `do_research` 会在 playground 图中写入 `research`）：
+
+| 来源 | 适用场景 |
+| --- | --- |
+| `useMessages(stream, node)` | 渲染节点作用域内的流式和最终消息 |
+| `stream.values` | 读取整个图的 state，例如最终的 `synthesis` 字段，使用实际的 state key |
+
+模式是这样的：在节点卡片中显示最近的一条 scoped AI message，只有在你明确需要某个 graph state field 时才使用 `stream.values`。
+
+由于 scoped messages 与产生它们的节点绑定，UI 可以支持并行 graph 路径，而不必根据消息顺序猜测。每个卡片都会从属于它自己的 stream events 更新，而已完成的值仍然可以通过 `stream.values` 访问。
+
+```ts
+function NodeContent({ stream, node }: { stream: AnyStream; node: SubgraphDiscoverySnapshot }) {
+  const messages = useMessages(stream, node);
+  const content = messages.find(AIMessage.isInstance)?.text ?? "";
+
+  return <Markdown>{content}</Markdown>;
+}
+```
+
+<Tip>
+流式内容可能包含部分 token，或者还没完全形成的 markdown。如果你要渲染 markdown，请确保你的渲染器能优雅处理不完整语法，例如未闭合的粗体标记 `**`。
+</Tip>
+
+## 将所有内容组合起来
+
+下面是完整的卡片列表，它把路由、状态检测和卡片渲染组合在一起：
+
+```tsx
+function NodeCardList({
+  nodes,
+  stream,
+  isLoading,
+}: {
+  nodes: SubgraphDiscoverySnapshot[];
+  stream: AnyStream;
+  isLoading: boolean;
+}) {
+  const firstIncompleteIdx = nodes.findIndex((node) => node.status !== "complete");
+
+  return (
+    <div className="space-y-3">
+      {nodes.map((node, i) => {
+        const isComplete = node.status === "complete";
+        const isRunning = isLoading && !isComplete && firstIncompleteIdx === i;
+        if (!isComplete && !isRunning) return null;
+
+        return <NodeCard key={node.id} node={node} stream={stream} />;
+      })}
+    </div>
+  );
+}
+```
+
+## 使用场景
+
+Graph execution 卡片非常适合任何需要可见性的多步骤流水线：
+
+- **研究流水线**：分类 → 收集来源 → 分析 → 综合报告
+- **内容生成**：提纲 → 草稿 → 事实核查 → 编辑 → 发布
+- **数据处理**：采集 → 验证 → 转换 → 聚合 → 导出
+- **代码生成**：理解需求 → 规划架构 → 编写代码 → 审查 → 测试
+- **决策工作流**：收集上下文 → 评估选项 → 评分备选方案 → 推荐
+
+## 处理动态流水线
+
+并不是所有图都有固定的节点集合。有些流水线会根据输入增加或跳过节点。discovery map 只包含当前线程中观察到的节点：
+
+```ts
+const activeNodes = [...stream.subgraphs.values()];
+```
+
+这样 UI 只会显示与当前执行相关的卡片，避免空白占位卡片。
+
+<Info>
+如果你的图有条件分支（例如对简单事实查询跳过 "Research"），被跳过的节点不会出现在 `stream.subgraphs` 中。你的流水线进度条可以只渲染已发现的节点，或者把没有匹配 snapshot 的预期节点显示为灰色。
+</Info>
+
+## 最佳实践
+
+- **从 stream 中发现节点**。使用 `stream.subgraphs` 渲染卡片，而不是硬编码预期节点；条件或跳过的步骤只有在运行时才会出现。
+- **把 state key 当作 UI 契约**。决定哪些图输出应该足够稳定以供前端渲染，并把这些 key 写在图定义旁边。
+- **对节点卡片使用 scoped messages**。它们在节点流式输出时和完成后都可用，不需要把 UI 卡片和 state key 名称耦合。
+- **自动折叠已完成节点**。在长流水线中，自动折叠完成的卡片，让用户专注于当前活动步骤。
+- **显示预计耗时**。如果你有每个节点耗时的历史数据，可以展示时间预估，帮助用户形成预期。
+- **添加全局进度指示器**。在流水线视图顶部用总进度条补充每个节点的卡片，例如“第 2 步，共 4 步”。
+- **按节点展示错误**。如果某个节点失败，就在它自己的卡片中显示错误，而不要让整个流水线一起折叠。其他节点仍然可能成功完成。

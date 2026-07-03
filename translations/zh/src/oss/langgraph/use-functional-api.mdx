@@ -1,0 +1,1700 @@
+---
+title: 使用 Functional API
+sidebarTitle: 使用 Functional API
+---
+
+import LanggraphFunctionalApiStreamCustomDataPy from '/snippets/code-samples/langgraph-functional-api-stream-custom-data-py.mdx';
+import LanggraphFunctionalApiStreamCustomDataJs from '/snippets/code-samples/langgraph-functional-api-stream-custom-data-js.mdx';
+
+[**Functional API**](/oss/langgraph/functional-api) 允许你以尽量少的改动，把 LangGraph 的关键能力（[persistence](/oss/langgraph/persistence)、[memory](/oss/langgraph/add-memory)、[human-in-the-loop](/oss/langgraph/interrupts) 和 [streaming](/oss/langgraph/streaming)）加入现有应用。
+
+<Tip>
+关于 Functional API 的概念说明，请参阅 [Functional API](/oss/langgraph/functional-api)。
+</Tip>
+
+## 创建一个简单工作流
+
+在定义 `entrypoint` 时，输入只会限制为函数的第一个参数。若要传入多个输入，可以使用一个字典。
+
+:::python
+```python
+@entrypoint(checkpointer=checkpointer)
+def my_workflow(inputs: dict) -> int:
+    value = inputs["value"]
+    another_value = inputs["another_value"]
+    ...
+
+my_workflow.invoke({"value": 1, "another_value": 2})
+```
+:::
+
+:::js
+```typescript
+const checkpointer = new MemorySaver();
+
+const myWorkflow = entrypoint(
+  { checkpointer, name: "myWorkflow" },
+  async (inputs: { value: number; anotherValue: number }) => {
+    const value = inputs.value;
+    const anotherValue = inputs.anotherValue;
+    // ...
+  }
+);
+
+await myWorkflow.invoke({ value: 1, anotherValue: 2 });
+```
+:::
+
+<Accordion title="扩展示例：简单工作流">
+  :::python
+  ```python
+  from langchain_core.utils.uuid import uuid7
+  from langgraph.func import entrypoint, task
+  from langgraph.checkpoint.memory import InMemorySaver
+
+  # 检查数字是否为偶数的 task
+  @task
+  def is_even(number: int) -> bool:
+      return number % 2 == 0
+
+  # 格式化消息的 task
+  @task
+  def format_message(is_even: bool) -> str:
+      return "The number is even." if is_even else "The number is odd."
+
+  # 创建用于持久化的 checkpointer
+  checkpointer = InMemorySaver()
+
+  @entrypoint(checkpointer=checkpointer)
+  def workflow(inputs: dict) -> str:
+      """根据数字进行分类的简单工作流。"""
+      even = is_even(inputs["number"]).result()
+      return format_message(even).result()
+
+  # 使用唯一 thread ID 运行工作流
+  config = {"configurable": {"thread_id": str(uuid7())}}
+  result = workflow.invoke({"number": 7}, config=config)
+  print(result)
+  ```
+  :::
+
+  :::js
+  ```typescript
+  import { v7 as uuid7 } from "uuid";
+  import { entrypoint, task, MemorySaver } from "@langchain/langgraph";
+
+  // 检查数字是否为偶数的 task
+  const isEven = task("isEven", async (number: number) => {
+    return number % 2 === 0;
+  });
+
+  // 格式化消息的 task
+  const formatMessage = task("formatMessage", async (isEven: boolean) => {
+    return isEven ? "The number is even." : "The number is odd.";
+  });
+
+  // 创建用于持久化的 checkpointer
+  const checkpointer = new MemorySaver();
+
+  const workflow = entrypoint(
+    { checkpointer, name: "workflow" },
+    async (inputs: { number: number }) => {
+      // 根据数字进行分类的简单工作流
+      const even = await isEven(inputs.number);
+      return await formatMessage(even);
+    }
+  );
+
+  // 使用唯一 thread ID 运行工作流
+  const config = { configurable: { thread_id: uuid7() } };
+  const result = await workflow.invoke({ number: 7 }, config);
+  console.log(result);
+  ```
+  :::
+</Accordion>
+
+## 并行执行
+
+可以通过并发调用 tasks 并等待结果来并行执行它们。这对于 IO 密集型任务（例如调用 API 获取 LLM 结果）尤其有助于提升性能。
+
+:::python
+```python
+@task
+def add_one(number: int) -> int:
+    return number + 1
+
+@entrypoint(checkpointer=checkpointer)
+def graph(numbers: list[int]) -> list[str]:
+    futures = [add_one(i) for i in numbers]
+    return [f.result() for f in futures]
+```
+:::
+
+:::js
+```typescript
+const addOne = task("addOne", async (number: number) => {
+  return number + 1;
+});
+
+const graph = entrypoint(
+  { checkpointer, name: "graph" },
+  async (numbers: number[]) => {
+    return await Promise.all(numbers.map(addOne));
+  }
+);
+```
+:::
+
+<Accordion title="扩展示例：并行 LLM 调用">
+  这个示例演示了如何使用 `@task` 并行运行多个 LLM 调用。每次调用会针对不同主题生成一段文字，最后把结果合并成一篇文本。
+
+  :::python
+  ```python
+  import uuid
+  from langchain.chat_models import init_chat_model
+  from langgraph.func import entrypoint, task
+  from langgraph.checkpoint.memory import InMemorySaver
+
+  # 初始化 LLM 模型
+  model = init_chat_model("gpt-3.5-turbo")
+
+  # 针对给定主题生成段落的 task
+  @task
+  def generate_paragraph(topic: str) -> str:
+      response = model.invoke([
+          {"role": "system", "content": "You are a helpful assistant that writes educational paragraphs."},
+          {"role": "user", "content": f"Write a paragraph about {topic}."}
+      ])
+      return response.content
+
+  # 创建用于持久化的 checkpointer
+  checkpointer = InMemorySaver()
+
+  @entrypoint(checkpointer=checkpointer)
+  def workflow(topics: list[str]) -> str:
+      """并行生成多段文字并将其合并。"""
+      futures = [generate_paragraph(topic) for topic in topics]
+      paragraphs = [f.result() for f in futures]
+      return "\n\n".join(paragraphs)
+
+  # 运行工作流
+  config = {"configurable": {"thread_id": str(uuid7())}}
+  result = workflow.invoke(["quantum computing", "climate change", "history of aviation"], config)
+  print(result)
+  ```
+  :::
+
+  :::js
+  ```typescript
+  import { v7 as uuid7 } from "uuid";
+  import { ChatOpenAI } from "@langchain/openai";
+  import { entrypoint, task, MemorySaver } from "@langchain/langgraph";
+
+  // 初始化 LLM 模型
+  const model = new ChatOpenAI({ model: "gpt-3.5-turbo" });
+
+  // 针对给定主题生成段落的 task
+  const generateParagraph = task("generateParagraph", async (topic: string) => {
+    const response = await model.invoke([
+      { role: "system", content: "You are a helpful assistant that writes educational paragraphs." },
+      { role: "user", content: `Write a paragraph about ${topic}.` }
+    ]);
+    return response.content as string;
+  });
+
+  // 创建用于持久化的 checkpointer
+  const checkpointer = new MemorySaver();
+
+  const workflow = entrypoint(
+    { checkpointer, name: "workflow" },
+    async (topics: string[]) => {
+      // 并行生成多段文字并将其合并
+      const paragraphs = await Promise.all(topics.map(generateParagraph));
+      return paragraphs.join("\n\n");
+    }
+  );
+
+  // 运行工作流
+  const config = { configurable: { thread_id: uuid7() } };
+  const result = await workflow.invoke(["quantum computing", "climate change", "history of aviation"], config);
+  console.log(result);
+  ```
+  :::
+
+  这个示例使用 LangGraph 的并发模型来提升执行时间，尤其适合像调用 LLM 这种 IO 操作。
+</Accordion>
+
+## 调用图
+
+**Functional API** 和 [**Graph API**](/oss/langgraph/graph-api) 可以在同一个应用里一起使用，因为它们共享同一个底层运行时。
+
+:::python
+```python
+from langgraph.func import entrypoint
+from langgraph.graph import StateGraph
+
+builder = StateGraph()
+...
+some_graph = builder.compile()
+
+@entrypoint()
+def some_workflow(some_input: dict) -> int:
+    # 调用使用 Graph API 定义的图
+    result_1 = some_graph.invoke(...)
+    # 调用另一个使用 Graph API 定义的图
+    result_2 = another_graph.invoke(...)
+    return {
+        "result_1": result_1,
+        "result_2": result_2
+    }
+```
+:::
+
+:::js
+```typescript
+import { entrypoint } from "@langchain/langgraph";
+import { StateGraph } from "@langchain/langgraph";
+
+const builder = new StateGraph(/* ... */);
+// ...
+const someGraph = builder.compile();
+
+const someWorkflow = entrypoint(
+  { name: "someWorkflow" },
+  async (someInput: Record<string, any>) => {
+    // 调用使用 Graph API 定义的图
+    const result1 = await someGraph.invoke(/* ... */);
+    // 调用另一个使用 Graph API 定义的图
+    const result2 = await anotherGraph.invoke(/* ... */);
+    return {
+      result1,
+      result2,
+    };
+  }
+);
+```
+:::
+
+<Accordion title="扩展示例：用 Functional API 调用一个简单图">
+  :::python
+  ```python
+  import uuid
+  from typing import TypedDict
+  from langgraph.func import entrypoint
+  from langgraph.checkpoint.memory import InMemorySaver
+  from langgraph.graph import StateGraph
+
+  # 定义共享 state 类型
+  class State(TypedDict):
+      foo: int
+
+  # 定义一个简单的变换 node
+  def double(state: State) -> State:
+      return {"foo": state["foo"] * 2}
+
+  # 使用 Graph API 构建图
+  builder = StateGraph(State)
+  builder.add_node("double", double)
+  builder.set_entry_point("double")
+  graph = builder.compile()
+
+  # 定义 Functional API 工作流
+  checkpointer = InMemorySaver()
+
+  @entrypoint(checkpointer=checkpointer)
+  def workflow(x: int) -> dict:
+      result = graph.invoke({"foo": x})
+      return {"bar": result["foo"]}
+
+  # 执行工作流
+  config = {"configurable": {"thread_id": str(uuid7())}}
+  print(workflow.invoke(5, config=config))  # Output: {'bar': 10}
+  ```
+  :::
+
+  :::js
+  ```typescript
+  import { v7 as uuid7 } from "uuid";
+  import { entrypoint, MemorySaver, StateGraph, StateSchema } from "@langchain/langgraph";
+  import * as z from "zod";
+
+  // 定义共享 state 类型
+  const State = new StateSchema({
+    foo: z.number(),
+  });
+
+  // 使用 Graph API 构建图
+  const builder = new StateGraph(State)
+    .addNode("double", (state) => {
+      return { foo: state.foo * 2 };
+    })
+    .addEdge("__start__", "double");
+  const graph = builder.compile();
+
+  // 定义 Functional API 工作流
+  const checkpointer = new MemorySaver();
+
+  const workflow = entrypoint(
+    { checkpointer, name: "workflow" },
+    async (x: number) => {
+      const result = await graph.invoke({ foo: x });
+      return { bar: result.foo };
+    }
+  );
+
+  // 执行工作流
+  const config = { configurable: { thread_id: uuid7() } };
+  console.log(await workflow.invoke(5, config)); // Output: { bar: 10 }
+  ```
+  :::
+</Accordion>
+
+## 调用其他 entrypoint
+
+你可以在一个 **entrypoint** 或一个 **task** 中调用其他 **entrypoint**。
+
+:::python
+```python
+@entrypoint() # 会自动使用父 entrypoint 的 checkpointer
+def some_other_workflow(inputs: dict) -> int:
+    return inputs["value"]
+
+@entrypoint(checkpointer=checkpointer)
+def my_workflow(inputs: dict) -> int:
+    value = some_other_workflow.invoke({"value": 1})
+    return value
+```
+:::
+
+:::js
+```typescript
+// 会自动使用父 entrypoint 的 checkpointer
+const someOtherWorkflow = entrypoint(
+  { name: "someOtherWorkflow" },
+  async (inputs: { value: number }) => {
+    return inputs.value;
+  }
+);
+
+const myWorkflow = entrypoint(
+  { checkpointer, name: "myWorkflow" },
+  async (inputs: { value: number }) => {
+    const value = await someOtherWorkflow.invoke({ value: 1 });
+    return value;
+  }
+);
+```
+:::
+
+<Accordion title="扩展示例：调用另一个 entrypoint">
+  :::python
+  ```python
+  import uuid
+  from langgraph.func import entrypoint
+  from langgraph.checkpoint.memory import InMemorySaver
+
+  # 初始化 checkpointer
+  checkpointer = InMemorySaver()
+
+  # 一个可复用的子工作流，用于乘法计算
+  @entrypoint()
+  def multiply(inputs: dict) -> int:
+      return inputs["a"] * inputs["b"]
+
+  # 调用该子工作流的主工作流
+  @entrypoint(checkpointer=checkpointer)
+  def main(inputs: dict) -> dict:
+      result = multiply.invoke({"a": inputs["x"], "b": inputs["y"]})
+      return {"product": result}
+
+  # 执行主工作流
+  config = {"configurable": {"thread_id": str(uuid7())}}
+  print(main.invoke({"x": 6, "y": 7}, config=config))  # Output: {'product': 42}
+  ```
+  :::
+
+  :::js
+  ```typescript
+  import { v7 as uuid7 } from "uuid";
+  import { entrypoint, MemorySaver } from "@langchain/langgraph";
+
+  // 初始化 checkpointer
+  const checkpointer = new MemorySaver();
+
+  // 一个可复用的子工作流，用于乘法计算
+  const multiply = entrypoint(
+    { name: "multiply" },
+    async (inputs: { a: number; b: number }) => {
+      return inputs.a * inputs.b;
+    }
+  );
+
+  // 调用该子工作流的主工作流
+  const main = entrypoint(
+    { checkpointer, name: "main" },
+    async (inputs: { x: number; y: number }) => {
+      const result = await multiply.invoke({ a: inputs.x, b: inputs.y });
+      return { product: result };
+    }
+  );
+
+  // 执行主工作流
+  const config = { configurable: { thread_id: uuid7() } };
+  console.log(await main.invoke({ x: 6, y: 7 }, config)); // Output: { product: 42 }
+  ```
+  :::
+</Accordion>
+
+## 流式传输
+
+**Functional API** 使用与 **Graph API** 相同的流式传输机制。更多细节请阅读 [**streaming guide**](/oss/langgraph/streaming) 章节。
+
+下面是一个使用流式 API 从工作流运行中流式输出 value chunk 的示例。
+
+:::python
+
+<LanggraphFunctionalApiStreamCustomDataPy />
+
+1. 从 `langgraph.config` 导入 @[`get_stream_writer`]。
+2. 在 entrypoint 内获取一个 stream writer 实例。
+3. 在计算开始前发出自定义数据。
+4. 在计算结果后再发出一个自定义消息。
+5. 使用 `stream_events()` 处理流式输出。
+6. 迭代 `(mode, chunk)` 对，来自 `interleave("values")`。
+
+<Warning>
+**Python < 3.11 下的 async**
+如果你使用 Python 3.11 以下版本并编写 async 代码，使用 @[`get_stream_writer`] 将无法工作。请改用 `StreamWriter` 类。更多详情请参阅 [Async with Python < 3.11](/oss/langgraph/streaming#async)。
+
+```python
+from langgraph.types import StreamWriter
+
+@entrypoint(checkpointer=checkpointer)
+async def main(inputs: dict, writer: StreamWriter) -> int:  # [!code highlight]
+...
+```
+</Warning>
+:::
+
+:::js
+
+<LanggraphFunctionalApiStreamCustomDataJs />
+
+1. 在计算开始前发出自定义数据。
+2. 在计算结果后再发出一个自定义消息。
+3. 使用 `streamEvents()` 处理流式输出。
+4. 迭代 `stream.values` 获取 value 快照。
+:::
+
+## 重试策略
+
+:::python
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.func import entrypoint, task
+from langgraph.types import RetryPolicy
+
+# 这个变量只用于演示，模拟网络故障。
+# 你的实际代码里不会这样写。
+attempts = 0
+
+# 这里配置 RetryPolicy，让它在 ValueError 上重试。
+# 默认 RetryPolicy 针对特定网络错误做了优化。
+retry_policy = RetryPolicy(retry_on=ValueError)
+
+@task(retry_policy=retry_policy)
+def get_info():
+    global attempts
+    attempts += 1
+
+    if attempts < 2:
+        raise ValueError('Failure')
+    return "OK"
+
+checkpointer = InMemorySaver()
+
+@entrypoint(checkpointer=checkpointer)
+def main(inputs, writer):
+    return get_info().result()
+
+config = {
+    "configurable": {
+        "thread_id": "1"
+    }
+}
+
+main.invoke({'any_input': 'foobar'}, config=config)
+```
+
+```pycon
+'OK'
+```
+:::
+
+:::js
+```typescript
+import {
+  MemorySaver,
+  entrypoint,
+  task,
+  RetryPolicy,
+} from "@langchain/langgraph";
+
+// 这个变量只用于演示，模拟网络故障。
+// 你的实际代码里不会这样写。
+let attempts = 0;
+
+// 这里配置 RetryPolicy，让它在 ValueError 上重试。
+// 默认 RetryPolicy 针对特定网络错误做了优化。
+const retryPolicy: RetryPolicy = { retryOn: (error) => error instanceof Error };
+
+const getInfo = task(
+  {
+    name: "getInfo",
+    retry: retryPolicy,
+  },
+  () => {
+    attempts += 1;
+
+    if (attempts < 2) {
+      throw new Error("Failure");
+    }
+    return "OK";
+  }
+);
+
+const checkpointer = new MemorySaver();
+
+const main = entrypoint(
+  { checkpointer, name: "main" },
+  async (inputs: Record<string, any>) => {
+    return await getInfo();
+  }
+);
+
+const config = {
+  configurable: {
+    thread_id: "1",
+  },
+};
+
+await main.invoke({ any_input: "foobar" }, config);
+```
+
+```
+'OK'
+```
+:::
+
+:::python
+
+## 为 task 和 entrypoint 设置超时
+
+给 `@task` 或 `@entrypoint` 使用 `timeout` 参数，可以限制单个 async 尝试运行多久。你可以传入秒数，或 `datetime.timedelta`。
+
+```python
+import asyncio
+
+from langgraph.errors import NodeTimeoutError
+from langgraph.func import entrypoint, task
+from langgraph.types import RetryPolicy
+
+
+@task(
+    timeout=1.0,
+    retry_policy=RetryPolicy(retry_on=NodeTimeoutError),
+)
+async def call_api(url: str) -> str:
+    await asyncio.sleep(2)
+    return f"result from {url}"
+
+
+@entrypoint(timeout=5.0)
+async def workflow(inputs: dict) -> str:
+    return await call_api(inputs["url"])
+
+
+try:
+    await workflow.ainvoke({"url": "https://example.com"})
+except NodeTimeoutError:
+    print("Task timed out")
+```
+
+超时仅支持 async task 和 entrypoint。如果你在同步函数上设置 `timeout`，LangGraph 会在声明 task 或 entrypoint 时抛出错误。
+
+当 task 或 entrypoint 超过超时时间时，LangGraph 会抛出 `NodeTimeoutError`，它继承自 Python 内置的 `TimeoutError`。如果重试策略会重试 `TimeoutError` 或 `NodeTimeoutError`，那么超时的尝试就会被重试。超时会对每次尝试单独生效，因此每次重试都会重新计时。
+
+:::
+
+## 缓存 task
+
+:::python
+```python
+import time
+from langgraph.cache.memory import InMemoryCache
+from langgraph.func import entrypoint, task
+from langgraph.types import CachePolicy
+
+
+@task(cache_policy=CachePolicy(ttl=120))    # [!code highlight]
+def slow_add(x: int) -> int:
+    time.sleep(1)
+    return x * 2
+
+
+@entrypoint(cache=InMemoryCache())
+def main(inputs: dict) -> dict[str, int]:
+    result1 = slow_add(inputs["x"]).result()
+    result2 = slow_add(inputs["x"]).result()
+    return {"result1": result1, "result2": result2}
+
+
+stream = main.stream_events({"x": 5}, version="v3")
+for snapshot in stream.values:
+    print(snapshot)
+```
+
+1. `ttl` 以秒为单位。超过这个时间后，缓存会失效。
+:::
+
+:::js
+```typescript
+import {
+  InMemoryCache,
+  entrypoint,
+  task,
+  CachePolicy,
+} from "@langchain/langgraph";
+
+const slowAdd = task(
+  {
+    name: "slowAdd",
+    cache: { ttl: 120 },   // [!code highlight]
+  },
+  async (x: number) => {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    return x * 2;
+  }
+);
+
+const main = entrypoint(
+  { cache: new InMemoryCache(), name: "main" },
+  async (inputs: { x: number }) => {
+    const result1 = await slowAdd(inputs.x);
+    const result2 = await slowAdd(inputs.x);
+    return { result1, result2 };
+  }
+);
+
+const stream = await main.streamEvents({ x: 5 }, { version: "v3" });
+for await (const snapshot of stream.values) {
+  console.log(snapshot);
+}
+```
+
+1. `ttl` 以秒为单位。超过这个时间后，缓存会失效。
+:::
+
+## 从错误中恢复后继续执行
+
+:::python
+```python
+import time
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.func import entrypoint, task
+from langgraph.types import StreamWriter
+
+# 这个变量只用于演示，模拟网络故障。
+# 你的实际代码里不会这样写。
+attempts = 0
+
+@task()
+def get_info():
+    """
+    模拟一个先失败一次、随后成功的 task。
+    第一次尝试时抛出异常，之后返回 "OK"。
+    """
+    global attempts
+    attempts += 1
+
+    if attempts < 2:
+        raise ValueError("Failure")  # 模拟第一次尝试失败
+    return "OK"
+
+# 初始化一个内存 checkpointer 用于持久化
+checkpointer = InMemorySaver()
+
+@task
+def slow_task():
+    """
+    通过引入 1 秒延迟来模拟一个慢速任务。
+    """
+    time.sleep(1)
+    return "Ran slow task."
+
+@entrypoint(checkpointer=checkpointer)
+def main(inputs, writer: StreamWriter):
+    """
+    主工作流函数，依次运行 slow_task 和 get_info tasks。
+
+    Parameters:
+    - inputs: 包含工作流输入值的字典。
+    - writer: 用于流式输出自定义数据的 StreamWriter。
+
+    工作流先执行 `slow_task`，然后尝试执行 `get_info`，
+    而后者会在首次调用时失败。
+    """
+    slow_task_result = slow_task().result()  # 阻塞调用 slow_task
+    get_info().result()  # 首次尝试会在这里抛出异常
+    return slow_task_result
+
+# 带唯一线程标识符的工作流执行配置
+config = {
+    "configurable": {
+        "thread_id": "1"  # 用于跟踪工作流执行的唯一标识符
+    }
+}
+
+# 由于 slow_task 的执行，这次调用大约需要 1 秒
+try:
+    # 第一次调用会因为 `get_info` 失败而抛出异常
+    main.invoke({'any_input': 'foobar'}, config=config)
+except ValueError:
+    pass  # 优雅地处理失败
+```
+
+当我们恢复执行时，不需要重新运行 `slow_task`，因为它的结果已经保存在 checkpoint 中。
+
+```python
+main.invoke(None, config=config)
+```
+
+```pycon
+'Ran slow task.'
+```
+:::
+
+:::js
+```typescript
+import { entrypoint, task, MemorySaver } from "@langchain/langgraph";
+
+// 这个变量只用于演示，模拟网络故障。
+// 你的实际代码里不会这样写。
+let attempts = 0;
+
+const getInfo = task("getInfo", async () => {
+  /**
+   * 模拟一个先失败一次、随后成功的 task。
+   * 第一次尝试时抛出异常，之后返回 "OK"。
+   */
+  attempts += 1;
+
+  if (attempts < 2) {
+    throw new Error("Failure"); // 模拟第一次尝试失败
+  }
+  return "OK";
+});
+
+// 初始化一个内存 checkpointer 用于持久化
+const checkpointer = new MemorySaver();
+
+const slowTask = task("slowTask", async () => {
+  /**
+   * 通过引入 1 秒延迟来模拟一个慢速任务。
+   */
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  return "Ran slow task.";
+});
+
+const main = entrypoint(
+  { checkpointer, name: "main" },
+  async (inputs: Record<string, any>) => {
+    /**
+     * 主工作流函数，依次运行 slowTask 和 getInfo tasks。
+     *
+     * Parameters:
+     * - inputs: 包含工作流输入值的 Record<string, any>。
+     *
+     * 工作流先执行 `slowTask`，然后尝试执行 `getInfo`，
+     * 而后者会在首次调用时失败。
+     */
+    const slowTaskResult = await slowTask(); // 阻塞调用 slowTask
+    await getInfo(); // 首次尝试会在这里抛出异常
+    return slowTaskResult;
+  }
+);
+
+// 带唯一线程标识符的工作流执行配置
+const config = {
+  configurable: {
+    thread_id: "1", // 用于跟踪工作流执行的唯一标识符
+  },
+};
+
+// 由于 slowTask 的执行，这次调用大约需要 1 秒
+try {
+  // 第一次调用会因为 `getInfo` 失败而抛出异常
+  await main.invoke({ any_input: "foobar" }, config);
+} catch (err) {
+  // 优雅地处理失败
+}
+```
+
+当我们恢复执行时，不需要重新运行 `slowTask`，因为它的结果已经保存在 checkpoint 中。
+
+```typescript
+await main.invoke(null, config);
+```
+
+```
+'Ran slow task.'
+```
+:::
+
+## 人在环中
+
+Functional API 支持通过 @[`interrupt`] 函数和 `Command` 原语实现 [human-in-the-loop](/oss/langgraph/interrupts) 工作流。
+
+### 基础 human-in-the-loop 工作流
+
+我们会创建三个 [tasks](/oss/langgraph/functional-api#task)：
+
+1. 追加 `"bar"`。
+2. 暂停等待人工输入。恢复时追加人工输入。
+3. 追加 `"qux"`。
+
+:::python
+```python
+from langgraph.func import entrypoint, task
+from langgraph.types import Command, interrupt
+
+
+@task
+def step_1(input_query):
+    """追加 bar。"""
+    return f"{input_query} bar"
+
+
+@task
+def human_feedback(input_query):
+    """追加用户输入。"""
+    feedback = interrupt(f"Please provide feedback: {input_query}")
+    return f"{input_query} {feedback}"
+
+
+@task
+def step_3(input_query):
+    """追加 qux。"""
+    return f"{input_query} qux"
+```
+:::
+
+:::js
+```typescript
+import { entrypoint, task, interrupt, Command } from "@langchain/langgraph";
+
+const step1 = task("step1", async (inputQuery: string) => {
+  // 追加 bar
+  return `${inputQuery} bar`;
+});
+
+const humanFeedback = task("humanFeedback", async (inputQuery: string) => {
+  // 追加用户输入
+  const feedback = interrupt(`Please provide feedback: ${inputQuery}`);
+  return `${inputQuery} ${feedback}`;
+});
+
+const step3 = task("step3", async (inputQuery: string) => {
+  // 追加 qux
+  return `${inputQuery} qux`;
+});
+```
+:::
+
+现在我们可以把这些 tasks 组合进一个 [entrypoint](/oss/langgraph/functional-api#entrypoint)：
+
+:::python
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+checkpointer = InMemorySaver()
+
+
+@entrypoint(checkpointer=checkpointer)
+def graph(input_query):
+    result_1 = step_1(input_query).result()
+    result_2 = human_feedback(result_1).result()
+    result_3 = step_3(result_2).result()
+
+    return result_3
+```
+:::
+
+:::js
+```typescript
+import { MemorySaver } from "@langchain/langgraph";
+
+const checkpointer = new MemorySaver();
+
+const graph = entrypoint(
+  { checkpointer, name: "graph" },
+  async (inputQuery: string) => {
+    const result1 = await step1(inputQuery);
+    const result2 = await humanFeedback(result1);
+    const result3 = await step3(result2);
+    return result3;
+  }
+);
+```
+:::
+
+使用 `graph.stream_events` 运行这个工作流：
+
+:::python
+```python
+config = {"configurable": {"thread_id": "1"}}
+stream = graph.stream_events("foo", config, version="v3")
+for snapshot in stream.values:
+    print(snapshot)
+```
+:::
+
+:::js
+```typescript
+const config = { configurable: { thread_id: "1" } };
+const stream = await graph.streamEvents("foo", config, { version: "v3" });
+for await (const snapshot of stream.values) {
+  console.log(snapshot);
+}
+```
+:::
+
+当运行到 `interrupt` 时，你可以用 `Command` 恢复并继续：
+
+:::python
+```python
+# 继续执行
+stream = graph.stream_events(Command(resume="baz"), config, version="v3")
+for snapshot in stream.values:
+    print(snapshot)
+```
+:::
+
+:::js
+```typescript
+// 继续执行
+const stream = await graph.streamEvents(
+  new Command({ resume: "baz" }),
+  config,
+  { version: "v3" }
+);
+for await (const snapshot of stream.values) {
+  console.log(snapshot);
+}
+```
+:::
+
+恢复后，运行会继续执行剩余步骤并按预期终止。
+
+### 审核 tool call
+
+为了在执行前审核 tool call，我们添加一个 `review_tool_call` 函数，它会调用 [`interrupt`](/oss/langgraph/interrupts#pause-using-interrupt)。当这个函数被调用时，执行会暂停，直到我们发出恢复命令。
+
+对于给定的 tool call，这个函数会 @[`interrupt`] 以进行人工审核。届时我们可以：
+
+* 接受这个 tool call
+* 修改这个 tool call 并继续
+* 生成一个自定义 tool message（例如，提示模型重新格式化它的 tool call）
+
+:::python
+```python
+from typing import Union
+
+def review_tool_call(tool_call: ToolCall) -> Union[ToolCall, ToolMessage]:
+    """审核 tool call，返回一个验证后的版本。"""
+    human_review = interrupt(
+        {
+            "question": "Is this correct?",
+            "tool_call": tool_call,
+        }
+    )
+    review_action = human_review["action"]
+    review_data = human_review.get("data")
+    if review_action == "continue":
+        return tool_call
+    elif review_action == "update":
+        updated_tool_call = {**tool_call, **{"args": review_data}}
+        return updated_tool_call
+    elif review_action == "feedback":
+        return ToolMessage(
+            content=review_data, name=tool_call["name"], tool_call_id=tool_call["id"]
+        )
+```
+:::
+
+:::js
+```typescript
+import { ToolCall } from "@langchain/core/messages/tool";
+import { ToolMessage } from "@langchain/core/messages";
+
+function reviewToolCall(toolCall: ToolCall): ToolCall | ToolMessage {
+  // 审核 tool call，返回一个验证后的版本
+  const humanReview = interrupt({
+    question: "Is this correct?",
+    tool_call: toolCall,
+  });
+
+  const reviewAction = humanReview.action;
+  const reviewData = humanReview.data;
+
+  if (reviewAction === "continue") {
+    return toolCall;
+  } else if (reviewAction === "update") {
+    const updatedToolCall = { ...toolCall, args: reviewData };
+    return updatedToolCall;
+  } else if (reviewAction === "feedback") {
+    return new ToolMessage({
+      content: reviewData,
+      name: toolCall.name,
+      tool_call_id: toolCall.id,
+    });
+  }
+
+  throw new Error(`Unknown review action: ${reviewAction}`);
+}
+```
+:::
+
+我们现在可以更新 [entrypoint](/oss/langgraph/functional-api#entrypoint) 来审核生成的 tool call。若 tool call 被接受或修改，就按之前一样执行。否则，就直接追加人工提供的 @[`ToolMessage`]。之前 task 的结果 - 在这里就是初始模型调用 - 会被保存在 checkpoint 中，因此在 @[`interrupt`] 之后不会重新运行。
+
+:::python
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph.message import add_messages
+from langgraph.types import Command, interrupt
+
+
+checkpointer = InMemorySaver()
+
+
+@entrypoint(checkpointer=checkpointer)
+def agent(messages, previous):
+    if previous is not None:
+        messages = add_messages(previous, messages)
+
+    model_response = call_model(messages).result()
+    while True:
+        if not model_response.tool_calls:
+            break
+
+        # 审核 tool call
+        tool_results = []
+        tool_calls = []
+        for i, tool_call in enumerate(model_response.tool_calls):
+            review = review_tool_call(tool_call)
+            if isinstance(review, ToolMessage):
+                tool_results.append(review)
+            else:  # 是一个验证通过的 tool call
+                tool_calls.append(review)
+                if review != tool_call:
+                    model_response.tool_calls[i] = review  # 更新消息
+
+        # 执行剩余的 tool call
+        tool_result_futures = [call_tool(tool_call) for tool_call in tool_calls]
+        remaining_tool_results = [fut.result() for fut in tool_result_futures]
+
+        # 追加到消息列表
+        messages = add_messages(
+            messages,
+            [model_response, *tool_results, *remaining_tool_results],
+        )
+
+        # 再次调用模型
+        model_response = call_model(messages).result()
+
+    # 生成最终响应
+    messages = add_messages(messages, model_response)
+    return entrypoint.final(value=model_response, save=messages)
+```
+:::
+
+:::js
+```typescript
+import {
+  MemorySaver,
+  entrypoint,
+  interrupt,
+  Command,
+  addMessages,
+} from "@langchain/langgraph";
+import { ToolMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
+
+const checkpointer = new MemorySaver();
+
+const agent = entrypoint(
+  { checkpointer, name: "agent" },
+  async (
+    messages: BaseMessage[],
+    previous?: BaseMessage[]
+  ): Promise<BaseMessage> => {
+    if (previous !== undefined) {
+      messages = addMessages(previous, messages);
+    }
+
+    let modelResponse = await callModel(messages);
+    while (true) {
+      if (!modelResponse.tool_calls?.length) {
+        break;
+      }
+
+      // 审核 tool call
+      const toolResults: ToolMessage[] = [];
+      const toolCalls: ToolCall[] = [];
+
+      for (let i = 0; i < modelResponse.tool_calls.length; i++) {
+        const review = reviewToolCall(modelResponse.tool_calls[i]);
+        if (review instanceof ToolMessage) {
+          toolResults.push(review);
+        } else {
+          // 是一个验证通过的 tool call
+          toolCalls.push(review);
+          if (review !== modelResponse.tool_calls[i]) {
+            modelResponse.tool_calls[i] = review; // 更新消息
+          }
+        }
+      }
+
+      // 执行剩余的 tool call
+      const remainingToolResults = await Promise.all(
+        toolCalls.map((toolCall) => callTool(toolCall))
+      );
+
+      // 追加到消息列表
+      messages = addMessages(messages, [
+        modelResponse,
+        ...toolResults,
+        ...remainingToolResults,
+      ]);
+
+      // 再次调用模型
+      modelResponse = await callModel(messages);
+    }
+
+    // 生成最终响应
+    messages = addMessages(messages, modelResponse);
+    return entrypoint.final({ value: modelResponse, save: messages });
+  }
+);
+```
+:::
+
+## 短期记忆
+
+短期记忆允许在同一个 **thread id** 的不同 **invocation** 之间存储信息。更多细节请参阅 [short-term memory](/oss/langgraph/functional-api#short-term-memory)。
+
+### 管理 checkpoint
+
+你可以查看和删除 checkpointer 中存储的信息。
+
+<a id="checkpoint"></a>
+#### 查看线程状态
+
+:::python
+```python
+config = {
+    "configurable": {
+        "thread_id": "1",  # [!code highlight]
+        # 也可以为特定 checkpoint 提供 ID，
+        # 否则会显示最新 checkpoint
+        # "checkpoint_id": "1f029ca3-1f5b-6704-8004-820c16b69a5a"  # [!code highlight]
+
+    }
+}
+graph.get_state(config)  # [!code highlight]
+```
+
+```
+StateSnapshot(
+    values={'messages': [HumanMessage(content="hi! I'm bob"), AIMessage(content='Hi Bob! How are you doing today?), HumanMessage(content="what's my name?"), AIMessage(content='Your name is Bob.')]}, next=(),
+    config={'configurable': {'thread_id': '1', 'checkpoint_ns': '', 'checkpoint_id': '1f029ca3-1f5b-6704-8004-820c16b69a5a'}},
+    metadata={
+        'source': 'loop',
+        'writes': {'call_model': {'messages': AIMessage(content='Your name is Bob.')}},
+        'step': 4,
+        'parents': {},
+        'thread_id': '1'
+    },
+    created_at='2025-05-05T16:01:24.680462+00:00',
+    parent_config={'configurable': {'thread_id': '1', 'checkpoint_ns': '', 'checkpoint_id': '1f029ca3-1790-6b0a-8003-baf965b6a38f'}},
+    tasks=(),
+    interrupts=()
+)
+```
+:::
+
+:::js
+```typescript
+const config = {
+  configurable: {
+    thread_id: "1",  // [!code highlight]
+    // 也可以为特定 checkpoint 提供 ID，
+    // 否则会显示最新 checkpoint
+    // checkpoint_id: "1f029ca3-1f5b-6704-8004-820c16b69a5a" [!code highlight]
+  },
+};
+await graph.getState(config);  // [!code highlight]
+```
+
+```
+StateSnapshot {
+  values: {
+    messages: [
+      HumanMessage { content: "hi! I'm bob" },
+      AIMessage { content: "Hi Bob! How are you doing today?" },
+      HumanMessage { content: "what's my name?" },
+      AIMessage { content: "Your name is Bob." }
+    ]
+  },
+  next: [],
+  config: { configurable: { thread_id: '1', checkpoint_ns: '', checkpoint_id: '1f029ca3-1f5b-6704-8004-820c16b69a5a' } },
+  metadata: {
+    source: 'loop',
+    writes: { call_model: { messages: AIMessage { content: "Your name is Bob." } } },
+    step: 4,
+    parents: {},
+    thread_id: '1'
+  },
+  createdAt: '2025-05-05T16:01:24.680462+00:00',
+  parentConfig: { configurable: { thread_id: '1', checkpoint_ns: '', checkpoint_id: '1f029ca3-1790-6b0a-8003-baf965b6a38f' } },
+  tasks: [],
+  interrupts: []
+}
+```
+:::
+
+<a id="checkpoints"></a>
+#### 查看线程历史
+
+:::python
+```python
+config = {
+    "configurable": {
+        "thread_id": "1"  # [!code highlight]
+    }
+}
+list(graph.get_state_history(config))  # [!code highlight]
+```
+
+```
+[
+    StateSnapshot(
+        values={'messages': [HumanMessage(content="hi! I'm bob"), AIMessage(content='Hi Bob! How are you doing today? Is there anything I can help you with?'), HumanMessage(content="what's my name?"), AIMessage(content='Your name is Bob.')]},
+        next=(),
+        config={'configurable': {'thread_id': '1', 'checkpoint_ns': '', 'checkpoint_id': '1f029ca3-1f5b-6704-8004-820c16b69a5a'}},
+        metadata={'source': 'loop', 'writes': {'call_model': {'messages': AIMessage(content='Your name is Bob.')}}, 'step': 4, 'parents': {}, 'thread_id': '1'},
+        created_at='2025-05-05T16:01:24.680462+00:00',
+        parent_config={'configurable': {'thread_id': '1', 'checkpoint_ns': '', 'checkpoint_id': '1f029ca3-1790-6b0a-8003-baf965b6a38f'}},
+        tasks=(),
+        interrupts=()
+    ),
+    StateSnapshot(
+        values={'messages': [HumanMessage(content="hi! I'm bob"), AIMessage(content='Hi Bob! How are you doing today? Is there anything I can help you with?'), HumanMessage(content="what's my name?")]},
+        next=('call_model',),
+        config={'configurable': {'thread_id': '1', 'checkpoint_ns': '', 'checkpoint_id': '1f029ca3-1790-6b0a-8003-baf965b6a38f'}},
+        metadata={'source': 'loop', 'writes': None, 'step': 3, 'parents': {}, 'thread_id': '1'},
+        created_at='2025-05-05T16:01:23.863421+00:00',
+        parent_config={...}
+        tasks=(PregelTask(id='8ab4155e-6b15-b885-9ce5-bed69a2c305c', name='call_model', path=('__pregel_pull', 'call_model'), error=None, interrupts=(), state=None, result={'messages': AIMessage(content='Your name is Bob.')}),),
+        interrupts=()
+    ),
+    StateSnapshot(
+        values={'messages': [HumanMessage(content="hi! I'm bob"), AIMessage(content='Hi Bob! How are you doing today? Is there anything I can help you with?')]},
+        next=('__start__',),
+        config={...},
+        metadata={'source': 'input', 'writes': {'__start__': {'messages': [{'role': 'user', 'content': "what's my name?"}]}}, 'step': 2, 'parents': {}, 'thread_id': '1'},
+        created_at='2025-05-05T16:01:23.863173+00:00',
+        parent_config={...}
+        tasks=(PregelTask(id='24ba39d6-6db1-4c9b-f4c5-682aeaf38dcd', name='__start__', path=('__pregel_pull', '__start__'), error=None, interrupts=(), state=None, result={'messages': [{'role': 'user', 'content': "what's my name?"}]}),),
+        interrupts=()
+    ),
+    StateSnapshot(
+        values={'messages': [HumanMessage(content="hi! I'm bob"), AIMessage(content='Hi Bob! How are you doing today? Is there anything I can help you with?')]},
+        next=(),
+        config={...},
+        metadata={'source': 'loop', 'writes': {'call_model': {'messages': AIMessage(content='Hi Bob! How are you doing today? Is there anything I can help you with?')}}, 'step': 1, 'parents': {}, 'thread_id': '1'},
+        created_at='2025-05-05T16:01:23.862295+00:00',
+        parent_config={...}
+        tasks=(),
+        interrupts=()
+    ),
+    StateSnapshot(
+        values={'messages': [HumanMessage(content="hi! I'm bob")]},
+        next=('call_model',),
+        config={...},
+        metadata={'source': 'loop', 'writes': None, 'step': 0, 'parents': {}, 'thread_id': '1'},
+        created_at='2025-05-05T16:01:22.278960+00:00',
+        parent_config={...}
+        tasks=(PregelTask(id='8cbd75e0-3720-b056-04f7-71ac805140a0', name='call_model', path=('__pregel_pull', 'call_model'), error=None, interrupts=(), state=None, result={'messages': AIMessage(content='Hi Bob! How are you doing today? Is there anything I can help you with?')}),),
+        interrupts=()
+    ),
+    StateSnapshot(
+        values={'messages': []},
+        next=('__start__',),
+        config={'configurable': {'thread_id': '1', 'checkpoint_ns': '', 'checkpoint_id': '1f029ca3-0870-6ce2-bfff-1f3f14c3e565'}},
+        metadata={'source': 'input', 'writes': {'__start__': {'messages': [{'role': 'user', 'content': "hi! I'm bob"}]}}, 'step': -1, 'parents': {}, 'thread_id': '1'},
+        created_at='2025-05-05T16:01:22.277497+00:00',
+        parent_config=None,
+        tasks=(PregelTask(id='d458367b-8265-812c-18e2-33001d199ce6', name='__start__', path=('__pregel_pull', '__start__'), error=None, interrupts=(), state=None, result={'messages': [{'role': 'user', 'content': "hi! I'm bob"}]}),),
+        interrupts=()
+    )
+]
+```
+:::
+
+:::js
+```typescript
+const config = {
+  configurable: {
+    thread_id: "1",  // [!code highlight]
+  },
+};
+const history = [];  // [!code highlight]
+for await (const state of graph.getStateHistory(config)) {
+  history.push(state);
+}
+```
+
+```
+[
+  StateSnapshot {
+    values: {
+      messages: [
+        HumanMessage { content: "hi! I'm bob" },
+        AIMessage { content: "Hi Bob! How are you doing today? Is there anything I can help you with?" },
+        HumanMessage { content: "what's my name?" },
+        AIMessage { content: "Your name is Bob." }
+      ]
+    },
+    next: [],
+    config: { configurable: { thread_id: '1', checkpoint_ns: '', checkpoint_id: '1f029ca3-1f5b-6704-8004-820c16b69a5a' } },
+    metadata: { source: 'loop', writes: { call_model: { messages: AIMessage { content: "Your name is Bob." } } }, step: 4, parents: {}, thread_id: '1' },
+    createdAt: '2025-05-05T16:01:24.680462+00:00',
+    parentConfig: { configurable: { thread_id: '1', checkpoint_ns: '', checkpoint_id: '1f029ca3-1790-6b0a-8003-baf965b6a38f' } },
+    tasks: [],
+    interrupts: []
+  },
+  // ... more state snapshots
+]
+```
+:::
+
+### 将返回值与保存值解耦
+
+使用 `entrypoint.final` 可以把返回给调用者的值和保存在 checkpoint 里的值分开。这在以下情况很有用：
+
+* 你想返回一个计算结果（例如摘要或状态），但在下一次调用时保留不同的内部值。
+* 你需要控制下一轮运行时传给 `previous` 参数的内容。
+
+:::python
+```python
+from langgraph.func import entrypoint
+from langgraph.checkpoint.memory import InMemorySaver
+
+checkpointer = InMemorySaver()
+
+@entrypoint(checkpointer=checkpointer)
+def accumulate(n: int, *, previous: int | None) -> entrypoint.final[int, int]:
+    previous = previous or 0
+    total = previous + n
+    # 向调用者返回 *previous* 值，但把 *new* total 保存到 checkpoint。
+    return entrypoint.final(value=previous, save=total)
+
+config = {"configurable": {"thread_id": "my-thread"}}
+
+print(accumulate.invoke(1, config=config))  # 0
+print(accumulate.invoke(2, config=config))  # 1
+print(accumulate.invoke(3, config=config))  # 3
+```
+:::
+
+:::js
+```typescript
+import { entrypoint, MemorySaver } from "@langchain/langgraph";
+
+const checkpointer = new MemorySaver();
+
+const accumulate = entrypoint(
+  { checkpointer, name: "accumulate" },
+  async (n: number, previous?: number) => {
+    const prev = previous || 0;
+    const total = prev + n;
+    // 向调用者返回 *previous* 值，但把 *new* total 保存到 checkpoint。
+    return entrypoint.final({ value: prev, save: total });
+  }
+);
+
+const config = { configurable: { thread_id: "my-thread" } };
+
+console.log(await accumulate.invoke(1, config)); // 0
+console.log(await accumulate.invoke(2, config)); // 1
+console.log(await accumulate.invoke(3, config)); // 3
+```
+:::
+
+### 聊天机器人示例
+
+下面是一个使用 Functional API 和 @[`InMemorySaver`] checkpointer 的简单聊天机器人示例。
+
+这个 bot 可以记住之前的对话，并从上次停下的地方继续。
+
+:::python
+```python
+from langchain.messages import BaseMessage
+from langgraph.graph import add_messages
+from langgraph.func import entrypoint, task
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain_anthropic import ChatAnthropic
+
+model = ChatAnthropic(model="claude-sonnet-4-6")
+
+@task
+def call_model(messages: list[BaseMessage]):
+    response = model.invoke(messages)
+    return response
+
+checkpointer = InMemorySaver()
+
+@entrypoint(checkpointer=checkpointer)
+def workflow(inputs: list[BaseMessage], *, previous: list[BaseMessage]):
+    if previous:
+        inputs = add_messages(previous, inputs)
+
+    response = call_model(inputs).result()
+    return entrypoint.final(value=response, save=add_messages(inputs, response))
+
+config = {"configurable": {"thread_id": "1"}}
+input_message = {"role": "user", "content": "hi! I'm bob"}
+stream = workflow.stream_events([input_message], config, version="v3")
+for snapshot in stream.values:
+    print(snapshot)
+
+input_message = {"role": "user", "content": "what's my name?"}
+stream = workflow.stream_events([input_message], config, version="v3")
+for snapshot in stream.values:
+    print(snapshot)
+```
+:::
+
+:::js
+```typescript
+import { BaseMessage } from "@langchain/core/messages";
+import {
+  addMessages,
+  entrypoint,
+  task,
+  MemorySaver,
+} from "@langchain/langgraph";
+import { ChatAnthropic } from "@langchain/anthropic";
+
+const model = new ChatAnthropic({ model: "claude-sonnet-4-6" });
+
+const callModel = task(
+  "callModel",
+  async (messages: BaseMessage[]): Promise<BaseMessage> => {
+    const response = await model.invoke(messages);
+    return response;
+  }
+);
+
+const checkpointer = new MemorySaver();
+
+const workflow = entrypoint(
+  { checkpointer, name: "workflow" },
+  async (
+    inputs: BaseMessage[],
+    previous?: BaseMessage[]
+  ): Promise<BaseMessage> => {
+    let messages = inputs;
+    if (previous) {
+      messages = addMessages(previous, inputs);
+    }
+
+    const response = await callModel(messages);
+    return entrypoint.final({
+      value: response,
+      save: addMessages(messages, response),
+    });
+  }
+);
+
+const config = { configurable: { thread_id: "1" } };
+const inputMessage = { role: "user", content: "hi! I'm bob" };
+
+const stream1 = await workflow.streamEvents([inputMessage], { ...config, version: "v3" });
+for await (const snapshot of stream1.values) {
+  console.log(snapshot);
+}
+
+const inputMessage2 = { role: "user", content: "what's my name?" };
+const stream2 = await workflow.streamEvents([inputMessage2], { ...config, version: "v3" });
+for await (const snapshot of stream2.values) {
+  console.log(snapshot);
+}
+```
+:::
+
+## 长期记忆
+
+[long-term memory](/oss/concepts/memory#long-term-memory) 允许在不同 **thread ids** 之间存储信息。这在你想在一段对话中学习某个用户的信息，并在另一段对话中使用它时会很有用。
+
+## Workflows
+
+* [Workflows and agent](/oss/langgraph/workflows-agents) 指南，提供更多使用 Functional API 构建工作流的示例。
+
+## 与其他库集成
+
+* [Use the functional API to add LangGraph features to other frameworks](/langsmith/deploy-other-frameworks)：将 persistence、memory 和 streaming 等 LangGraph 功能加入那些本身不提供这些能力的其他 agent 框架。
+
+<Accordion title="扩展示例：用 LLM 组合一篇 essay">
+  这个示例演示了如何从语法层面使用 `@task` 和 `@entrypoint` 装饰器。由于提供了 checkpointer，工作流结果会被持久化到 checkpointer 中。
+
+  :::python
+  ```python
+  import uuid
+  from langchain.chat_models import init_chat_model
+  from langgraph.func import entrypoint, task
+  from langgraph.checkpoint.memory import InMemorySaver
+
+  model = init_chat_model('gpt-3.5-turbo')
+
+  # 用 LLM 生成 essay 的 task
+  @task
+  def compose_essay(topic: str) -> str:
+      """根据给定主题生成一篇 essay。"""
+      return model.invoke([
+          {"role": "system", "content": "You are a helpful assistant that writes essays."},
+          {"role": "user", "content": f"Write an essay about {topic}."}
+      ]).content
+
+  # 创建用于持久化的 checkpointer
+  checkpointer = InMemorySaver()
+
+  @entrypoint(checkpointer=checkpointer)
+  def workflow(topic: str) -> str:
+      """用 LLM 生成 essay 的简单工作流。"""
+      return compose_essay(topic).result()
+
+  # 执行工作流
+  config = {"configurable": {"thread_id": str(uuid7())}}
+  result = workflow.invoke("the history of flight", config=config)
+  print(result)
+  ```
+  :::
+
+  :::js
+  ```typescript
+  import { v7 as uuid7 } from "uuid";
+  import { ChatOpenAI } from "@langchain/openai";
+  import { entrypoint, task, MemorySaver } from "@langchain/langgraph";
+
+  const model = new ChatOpenAI({ model: "gpt-3.5-turbo" });
+
+  // 用 LLM 生成 essay 的 task
+  const composeEssay = task("composeEssay", async (topic: string) => {
+    // 根据给定主题生成一篇 essay
+    const response = await model.invoke([
+      { role: "system", content: "You are a helpful assistant that writes essays." },
+      { role: "user", content: `Write an essay about ${topic}.` }
+    ]);
+    return response.content as string;
+  });
+
+  // 创建用于持久化的 checkpointer
+  const checkpointer = new MemorySaver();
+
+  const workflow = entrypoint(
+    { checkpointer, name: "workflow" },
+    async (topic: string) => {
+      // 用 LLM 生成 essay 的简单工作流
+      return await composeEssay(topic);
+    }
+  );
+
+  // 执行工作流
+  const config = { configurable: { thread_id: uuid7() } };
+  const result = await workflow.invoke("the history of flight", config);
+  console.log(result);
+  ```
+  :::
+</Accordion>
+
+## 并行执行
+
+可以通过并发调用 tasks 并等待结果来并行执行它们。这对于 IO 密集型任务（例如调用 LLM API）尤其有助于提升性能。
+
+:::python
+```python
+@task
+def add_one(number: int) -> int:
+    return number + 1
+
+@entrypoint(checkpointer=checkpointer)
+def graph(numbers: list[int]) -> list[str]:
+    futures = [add_one(i) for i in numbers]
+    return [f.result() for f in futures]
+```
+:::
+
+:::js
+```typescript
+const addOne = task("addOne", async (number: number) => {
+  return number + 1;
+});
+
+const graph = entrypoint(
+  { checkpointer, name: "graph" },
+  async (numbers: number[]) => {
+    return await Promise.all(numbers.map(addOne));
+  }
+);
+```
+:::
+
+<Accordion title="扩展示例：并行 LLM 调用">
+  这个示例演示了如何使用 `@task` 并行运行多个 LLM 调用。每次调用会针对不同主题生成一段文字，最后把结果合并成一篇文本。
+
+  :::python
+  ```python
+  import uuid
+  from langchain.chat_models import init_chat_model
+  from langgraph.func import entrypoint, task
+  from langgraph.checkpoint.memory import InMemorySaver
+
+  # 初始化 LLM 模型
+  model = init_chat_model("gpt-3.5-turbo")
+
+  # 针对给定主题生成段落的 task
+  @task
+  def generate_paragraph(topic: str) -> str:
+      response = model.invoke([
+          {"role": "system", "content": "You are a helpful assistant that writes educational paragraphs."},
+          {"role": "user", "content": f"Write a paragraph about {topic}."}
+      ])
+      return response.content
+
+  # 创建用于持久化的 checkpointer
+  checkpointer = InMemorySaver()
+
+  @entrypoint(checkpointer=checkpointer)
+  def workflow(topics: list[str]) -> str:
+      """并行生成多段文字并将其合并。"""
+      futures = [generate_paragraph(topic) for topic in topics]
+      paragraphs = [f.result() for f in futures]
+      return "\n\n".join(paragraphs)
+
+  # 运行工作流
+  config = {"configurable": {"thread_id": str(uuid7())}}
+  result = workflow.invoke(["quantum computing", "climate change", "history of aviation"], config)
+  print(result)
+  ```
+  :::

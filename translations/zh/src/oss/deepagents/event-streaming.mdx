@@ -1,0 +1,380 @@
+---
+title: 事件流式传输
+description: 从 Deep Agents 中流式传输 subagent、消息、tool call 和最终输出。
+tag: "Beta"
+---
+
+本页介绍 Deep Agents 特有的流式传输注意事项，最重要的是通过 `stream.subagents` 获取委派 subagent 的流式输出。关于通用的 agent 流式传输（`stream.messages`、`stream.values`、tool call、自定义更新），请参见 [LangChain Event Streaming](/oss/langchain/event-streaming)。
+
+## 流式查看 subagent
+
+Deep Agents 在 LangGraph streaming 之上增加了一个 subagent 投影层。当你希望每个委派的 `task` 调用都有一个独立的 stream handle 时，就用 `stream.subagents`。这个投影很轻量：它会先发现 subagent task，而消息、tool-call 和 value 流只有在你访问某个 subagent handle 时才会打开。
+
+每个 handle 的 `name` 都是 subagent 的配置名称，也就是 coordinator 调用 `task` tool 时传入的 `subagent_type`。Deep Agents 会把这个名字绑定到委派运行，因此你在 subagent spec 中定义的同一个标签，也就是你在流里过滤和路由时使用的标签。
+
+:::python
+```py
+stream = agent.stream_events({
+    "messages": [{"role": "user", "content": "Write me a haiku about the sea"}],
+}, version="v3")
+
+for subagent in stream.subagents:
+    print(subagent.name, subagent.path, subagent.status)
+
+    for message in subagent.messages:
+        print(message.text)
+```
+:::
+
+:::js
+```ts
+const stream = await agent.streamEvents(
+  { messages: [{ role: "user", content: "Write me a haiku about the sea" }] },
+  { version: "v3" }
+);
+
+for await (const subagent of stream.subagents) {
+  console.log(subagent.name);
+  console.log(await subagent.taskInput);
+
+  for await (const message of subagent.messages) {
+    console.log(await message.text);
+  }
+}
+```
+:::
+
+## Subagent 流字段
+
+每个 subagent 流都暴露与父运行相同类型的投影，例如消息、tool call、嵌套 subagent 和最终输出。关于通用的父运行流式模型，请参见 [LangChain Event Streaming](/oss/langchain/event-streaming)。
+
+:::python
+Python 使用 snake_case 的投影名，例如 `tool_calls`。每个 subagent 流都可以暴露 `.messages`、`.tool_calls`、`.values`、`.subagents` 和 `.output`。
+:::
+
+:::js
+TypeScript 使用 camelCase 的投影名，例如 `toolCalls` 和 `taskInput`。每个 subagent 流都可以暴露 `.messages`、`.toolCalls`、`.values`、`.subagents` 和 `.output`。
+:::
+
+| 字段 | 说明 |
+| --- | --- |
+| `name` | subagent 名称，取自 coordinator 在 `task` 调用中选择的 `subagent_type`。 |
+| `messages` | subagent 发出的消息。 |
+| `subagents` | 嵌套的 subagent 调用。 |
+| `output` | subagent 的最终状态，或委派任务的完成信号。 |
+:::python
+| `path` | subagent 流的命名空间路径。 |
+| `status` | 生命周期状态，例如 `started`、`completed`、`failed` 或 `interrupted`。 |
+| `tool_calls` | 作用域限定在 subagent 内的 tool call。 |
+:::
+:::js
+| `taskInput` | 传给 task tool 的 prompt 对应的 Promise。 |
+| `toolCalls` | 作用域限定在 subagent 内的 tool call。 |
+:::
+
+## 跟踪 subagent 生命周期
+
+当你只需要展示哪些 subagent 已经开始和结束时，就用 `stream.subagents`。除非你要访问某个单独 subagent 的消息或 value 投影，否则不需要订阅这些流。
+
+:::python
+```py
+stream = agent.stream_events(input, version="v3")
+
+running = 0
+completed = 0
+failed = 0
+
+for subagent in stream.subagents:
+    running += 1
+    print(f"{subagent.name}: started")
+
+    try:
+        _ = subagent.output
+        running -= 1
+        completed += 1
+        print(f"{subagent.name}: completed")
+    except Exception:
+        running -= 1
+        failed += 1
+        print(f"{subagent.name}: failed")
+```
+:::
+
+:::js
+```ts
+const stream = await agent.streamEvents(input, { version: "v3" });
+
+let running = 0;
+let completed = 0;
+let failed = 0;
+const watchers: Promise<void>[] = [];
+
+for await (const subagent of stream.subagents) {
+  running += 1;
+  console.log(`${subagent.name}: started`);
+
+  watchers.push(
+    subagent.output.then(
+      () => {
+        running -= 1;
+        completed += 1;
+        console.log(`${subagent.name}: completed`);
+      },
+      () => {
+        running -= 1;
+        failed += 1;
+        console.log(`${subagent.name}: failed`);
+      }
+    )
+  );
+}
+
+await Promise.all(watchers);
+console.log({ running, completed, failed });
+```
+:::
+
+
+## 流式传输消息
+
+Deep Agents 可以从 coordinator agent 和委派 subagent 输出消息。顶层消息用 `stream.messages`，每个委派 subagent 则用 `subagent.messages`。
+
+:::python
+```py
+stream = agent.stream_events(input, version="v3")
+
+for message in stream.messages:
+    print("[coordinator]", message.text)
+
+for subagent in stream.subagents:
+    for message in subagent.messages:
+        print(f"[{subagent.name}]", message.text)
+```
+:::
+
+:::js
+```ts
+const stream = await agent.streamEvents(input, { version: "v3" });
+
+for await (const message of stream.messages) {
+  console.log("[coordinator]", await message.text);
+}
+
+for await (const subagent of stream.subagents) {
+  for await (const message of subagent.messages) {
+    console.log(`[${subagent.name}]`, await message.text);
+  }
+}
+```
+:::
+
+## 流式传输 tool call
+
+Deep Agents 会在 agent tree 的每一层暴露 tool call。coordinator 的 tools 用顶层 `stream.tool_calls`，委派工作则用每个 `subagent.tool_calls`。
+
+:::python
+```py
+stream = agent.stream_events(input, version="v3")
+
+for call in stream.tool_calls:
+    print("[coordinator tool]", call.tool_name, call.input)
+    print(call.completed, call.error)
+
+for subagent in stream.subagents:
+    for call in subagent.tool_calls:
+        print(f"[{subagent.name} tool]", call.tool_name, call.input)
+        for delta in call.output_deltas:
+            print(delta, end="", flush=True)
+
+        if call.completed and call.error is None:
+            print(call.output)
+        elif call.error is not None:
+            print(call.error)
+```
+:::
+
+:::js
+```ts
+const stream = await agent.streamEvents(input, { version: "v3" });
+
+for await (const call of stream.toolCalls) {
+  console.log("[coordinator tool]", call.name, call.input);
+  console.log(await call.status);
+}
+
+for await (const subagent of stream.subagents) {
+  for await (const call of subagent.toolCalls) {
+    console.log(`[${subagent.name} tool]`, call.name, call.input);
+
+    const status = await call.status;
+    if (status === "finished") {
+      console.log(await call.output);
+    } else if (status === "error") {
+      console.error(await call.error);
+    }
+  }
+}
+```
+:::
+
+## 流式传输嵌套工作
+
+你可以递归进入 subagent 流，观察嵌套 subagent、消息和 tool call。
+
+:::python
+```py
+stream = agent.stream_events(input, version="v3")
+
+for subagent in stream.subagents:
+    print(f"subagent {subagent.name}: {subagent.status}")
+
+    for tool_call in subagent.tool_calls:
+        print(f"{tool_call.tool_name}({tool_call.input})")
+        for delta in tool_call.output_deltas:
+            print(delta, end="", flush=True)
+
+    for nested in subagent.subagents:
+        print(f"nested subagent {nested.name}: {nested.status}")
+```
+:::
+
+:::js
+```ts
+const stream = await agent.streamEvents(input, { version: "v3" });
+
+for await (const subagent of stream.subagents) {
+  console.log(`subagent ${subagent.name}: started`);
+
+  for await (const toolCall of subagent.toolCalls) {
+    console.log(`${toolCall.name}(${JSON.stringify(toolCall.input)})`);
+
+    const status = await toolCall.status;
+    if (status === "finished") {
+      console.log(await toolCall.output);
+    } else if (status === "error") {
+      console.error(await toolCall.error);
+    }
+  }
+
+  for await (const nested of subagent.subagents) {
+    console.log(`nested subagent ${nested.name}: started`);
+  }
+}
+```
+:::
+
+## 并发消费
+
+coordinator 和 subagent 的输出经常会交错出现。当你需要实时 UI 更新时，请并发消费这些投影。
+
+:::python
+在异步代码里做并发消费时，可以配合 `asyncio.gather` 使用 `astream_events`：
+
+```py
+import asyncio
+
+stream = await agent.astream_events(input, version="v3")
+
+async def consume_coordinator():
+    async for message in stream.messages:
+        print("[coordinator]", await message.text)
+
+async def consume_subagents():
+    async for subagent in stream.subagents:
+        async for message in subagent.messages:
+            print(f"[{subagent.name}]", await message.text)
+
+await asyncio.gather(consume_coordinator(), consume_subagents())
+```
+
+在同步代码里，则使用 `stream.interleave(...)`：
+
+```py
+stream = agent.stream_events(input, version="v3")
+
+for name, item in stream.interleave("messages", "subagents"):
+    if name == "messages":
+        print("[coordinator]", item.text)
+    else:
+        for message in item.messages:
+            print(f"[{item.name}]", message.text)
+```
+:::
+
+:::js
+在 JavaScript 中使用并发消费者：
+
+```ts
+const stream = await agent.streamEvents(input, { version: "v3" });
+
+await Promise.all([
+  (async () => {
+    for await (const message of stream.messages) {
+      console.log("[coordinator]", await message.text);
+    }
+  })(),
+  (async () => {
+    for await (const subagent of stream.subagents) {
+      void (async () => {
+        for await (const message of subagent.messages) {
+          console.log(`[${subagent.name}]`, await message.text);
+        }
+      })();
+    }
+  })(),
+]);
+```
+:::
+
+当你需要 coordinator 和所有 subagent 的精确到达顺序时，遍历原始 protocol event，并使用 `namespace` 来识别来源：
+
+:::python
+```py
+stream = agent.stream_events(input, version="v3")
+
+for event in stream:
+    if event.get("method") != "messages":
+        continue
+
+    payload = event["params"]["data"][0]
+    if not isinstance(payload, dict):
+        continue
+    if payload.get("event") != "content-block-delta":
+        continue
+
+    block = payload.get("delta") or {}
+    if block.get("type") == "text-delta":
+        source = "subagent" if event["params"]["namespace"] else "coordinator"
+        print(f"[{source}] {block['text']}")
+```
+:::
+
+:::js
+```ts
+const stream = await agent.streamEvents(input, { version: "v3" });
+
+for await (const event of stream) {
+  if (event.method !== "messages") continue;
+
+  const data = event.params.data;
+  if (data.event !== "content-block-delta") continue;
+
+  const block = data.delta ?? {};
+  if (block.type === "text-delta") {
+    const isSubagent = event.params.namespace.some((seg) => seg.startsWith("tools:"));
+    const source = isSubagent ? "subagent" : "coordinator";
+    console.log(`[${source}] ${block.text}`);
+  }
+}
+```
+:::
+
+## Subagents 与 subgraphs 的区别
+
+`stream.subgraphs` 展示的是 graph 执行结构。`stream.subagents` 展示的是产品层面的 Deep Agents 任务委派。面向用户的 UI 应该使用 `stream.subagents`，因为它会隐藏内部 graph node，并直接暴露 subagent 概念。
+
+## 相关内容
+
+- [LangChain Event Streaming](/oss/langchain/event-streaming) 涵盖通用的 agent message 和 tool-call 流式传输概念。
+- [Subagent frontend streaming](/oss/deepagents/frontend/subagent-streaming) 展示如何把 coordinator 消息和 subagent 卡片分开渲染的 UI 模式。
+- [LangGraph Event Streaming](/oss/langgraph/event-streaming) 涵盖底层 graph 流式模型。

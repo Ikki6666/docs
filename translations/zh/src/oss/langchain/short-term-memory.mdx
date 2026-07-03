@@ -194,3 +194,255 @@ const result = await agent.invoke({
 
 :::python
 要在智能体中裁剪消息历史，请使用 @[`@before_model`] middleware 装饰器：
+
+```python
+from langchain.messages import RemoveMessage
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain.agents import create_agent, AgentState
+from langchain.agents.middleware import before_model
+from langgraph.runtime import Runtime
+from langchain_core.runnables import RunnableConfig
+from typing import Any
+
+
+@before_model
+def trim_messages(state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
+    """只保留最近的几条消息，以适配上下文窗口。"""
+    messages = state["messages"]
+
+    if len(messages) <= 3:
+        return None  # 无需修改
+
+    first_msg = messages[0]
+    recent_messages = messages[-3:] if len(messages) % 2 == 0 else messages[-4:]
+    new_messages = [first_msg] + recent_messages
+
+    return {
+        "messages": [
+            RemoveMessage(id=REMOVE_ALL_MESSAGES),
+            *new_messages
+        ]
+    }
+
+agent = create_agent(
+    "gpt-5.5",
+    tools=[...],
+    middleware=[trim_messages],
+    checkpointer=InMemorySaver(),
+)
+
+config: RunnableConfig = {"configurable": {"thread_id": "1"}}
+
+agent.invoke({"messages": "hi, my name is bob"}, config)
+agent.invoke({"messages": "write a short poem about cats"}, config)
+agent.invoke({"messages": "now do the same but for dogs"}, config)
+final_response = agent.invoke({"messages": "what's my name?"}, config)
+
+final_response["messages"][-1].pretty_print()
+"""
+================================== Ai Message ==================================
+
+Your name is Bob. You told me that earlier.
+If you'd like me to call you a nickname or use a different name, just say the word.
+"""
+```
+:::
+:::js
+要在智能体中裁剪消息历史，请使用 @[`createMiddleware`] 和一个 `beforeModel` hook：
+
+```typescript
+import { RemoveMessage } from "@langchain/core/messages";
+import { createAgent, createMiddleware, trimMessages } from "langchain";
+import { MemorySaver } from "@langchain/langgraph";
+import { REMOVE_ALL_MESSAGES } from "@langchain/langgraph";
+
+const trimMessageHistory = createMiddleware({
+  name: "TrimMessages",
+  beforeModel: async (state) => {
+    const trimmed = await trimMessages(state.messages, {
+      maxTokens: 384,
+      strategy: "last",
+      startOn: "human",
+      endOn: ["human", "tool"],
+      tokenCounter: (msgs) => msgs.length,
+    });
+    return {
+      messages: [new RemoveMessage({ id: REMOVE_ALL_MESSAGES }), ...trimmed],
+    };
+  },
+});
+
+const checkpointer = new MemorySaver();
+const agent = createAgent({
+  model: "gpt-5-nano",
+  tools: [],
+  middleware: [trimMessageHistory],
+  checkpointer,
+});
+```
+:::
+
+### 删除消息
+
+你可以从 graph state 中删除消息，以便管理消息历史。
+
+当你想移除特定消息，或者清空整个消息历史时，这个方法很有用。
+
+:::python
+要从 graph state 中删除消息，可以使用 `RemoveMessage`。
+
+要让 `RemoveMessage` 生效，你需要使用带 @[`add_messages`] [reducer](/oss/langgraph/graph-api#reducers) 的 state key。
+
+默认的 @[`AgentState`] 已经提供了这一点。
+
+要删除特定消息：
+
+```python
+from langchain.messages import RemoveMessage  # [!code highlight]
+
+def delete_messages(state):
+    messages = state["messages"]
+    if len(messages) > 2:
+        # 删除最早的两条消息
+        return {"messages": [RemoveMessage(id=m.id) for m in messages[:2]]}  # [!code highlight]
+```
+
+要删除**所有**消息：
+
+```python
+from langgraph.graph.message import REMOVE_ALL_MESSAGES  # [!code highlight]
+
+def delete_messages(state):
+    return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)]}  # [!code highlight]
+```
+:::
+
+:::js
+要从 graph state 中删除消息，可以使用 `RemoveMessage`。要让 `RemoveMessage` 生效，需要使用带 @[`messagesStateReducer`][messagesStateReducer] [reducer](/oss/langgraph/graph-api#reducers) 的 state key，例如 `MessagesValue`。
+
+要删除特定消息：
+
+```typescript
+import { RemoveMessage } from "@langchain/core/messages";
+
+const deleteMessages = (state) => {
+    const messages = state.messages;
+    if (messages.length > 2) {
+        // 删除最早的两条消息
+        return {
+        messages: messages
+            .slice(0, 2)
+            .map((m) => new RemoveMessage({ id: m.id })),
+        };
+    }
+};
+```
+:::
+
+<Warning>
+    删除消息时，**务必**确保最终的消息历史仍然有效。请检查你使用的 LLM provider 的限制。例如：
+
+    * 有些 provider 要求消息历史必须以 `user` 消息开始
+    * 大多数 provider 要求带 tool call 的 `assistant` 消息后面必须跟对应的 `tool` result 消息
+</Warning>
+
+:::python
+
+```python
+from langchain.messages import RemoveMessage
+from langchain.agents import create_agent, AgentState
+from langchain.agents.middleware import after_model
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.runtime import Runtime
+from langchain_core.runnables import RunnableConfig
+
+
+@after_model
+def delete_old_messages(state: AgentState, runtime: Runtime) -> dict | None:
+    """删除旧消息，让对话更易管理。"""
+    messages = state["messages"]
+    if len(messages) > 2:
+        # 删除最早的两条消息
+        return {"messages": [RemoveMessage(id=m.id) for m in messages[:2]]}
+    return None
+
+
+agent = create_agent(
+    "gpt-5-nano",
+    tools=[...],
+    system_prompt="Please be concise and to the point.",
+    middleware=[delete_old_messages],
+    checkpointer=InMemorySaver(),
+)
+
+config: RunnableConfig = {"configurable": {"thread_id": "1"}}
+
+stream = agent.stream_events(
+    {"messages": [{"role": "user", "content": "hi! I'm bob"}]},
+    config,
+    version="v3",
+)
+for snapshot in stream.values:
+    print([(message.type, message.content) for message in snapshot["messages"]])
+
+stream = agent.stream_events(
+    {"messages": [{"role": "user", "content": "write a short poem about cats"}]},
+    config,
+    version="v3",
+)
+for snapshot in stream.values:
+    print([(message.type, message.content) for message in snapshot["messages"]])
+
+stream = agent.stream_events(
+    {"messages": [{"role": "user", "content": "what's my name?"}]},
+    config,
+    version="v3",
+)
+for snapshot in stream.values:
+    print([(message.type, message.content) for message in snapshot["messages"]])
+```
+
+```
+[('human', "hi! I'm bob")]
+[('human', "hi! I'm bob"), ('ai', 'Hi Bob! Nice to meet you. How can I help you today? I can answer questions, brainstorm ideas, draft text, explain things, or help with code.')]
+[('human', "hi! I'm bob"), ('ai', 'Hi Bob! Nice to meet you. How can I help you today? I can answer questions, brainstorm ideas, draft text, explain things, or help with code.'), ('human', "write a short poem about cats")]
+[('human', "hi! I'm bob"), ('ai', 'Hi Bob! Nice to meet you. How can I help you today? I can answer questions, brainstorm ideas, draft text, explain things, or help with code.'), ('human', "write a short poem about cats"), ('ai', 'There once was a cat on a wall, Who barely moved at all...')]
+[('human', "write a short poem about cats"), ('ai', 'There once was a cat on a wall, Who barely moved at all...')]
+[('human', "write a short poem about cats"), ('ai', 'There once was a cat on a wall, Who barely moved at all...'), ('human', "what's my name?")]
+[('human', "write a short poem about cats"), ('ai', 'There once was a cat on a wall, Who barely moved at all...'), ('human', "what's my name?"), ('ai', "I don't know your name - you haven't told me!")]
+[('human', "what's my name?"), ('ai', "I don't know your name - you haven't told me!")]
+```
+:::
+
+:::js
+```typescript
+import { RemoveMessage } from "@langchain/core/messages";
+import { createAgent, createMiddleware } from "langchain";
+import { REMOVE_ALL_MESSAGES } from "@langchain/langgraph";
+
+const validateResponse = createMiddleware({
+  name: "ValidateResponse",
+  afterModel: (state) => {
+    const lastMessage = state.messages.at(-1)?.content;
+    if (
+      typeof lastMessage === "string" &&
+      lastMessage.toLowerCase().includes("confidential")
+    ) {
+      return {
+        messages: [
+          new RemoveMessage({ id: REMOVE_ALL_MESSAGES }),
+        ],
+      };
+    }
+    return;
+  },
+});
+
+const agent = createAgent({
+  model: "gpt-5-nano",
+  tools: [],
+  middleware: [validateResponse],
+});
+```
+:::

@@ -1,0 +1,175 @@
+---
+title: 多模态输入和输出
+sidebarTitle: 多模态
+description: 当模型支持多模态输入和工具结果时，在 Deep Agents 中使用图像、音频、视频和文档
+---
+
+import MultimodalSummarizationPy from '/snippets/code-samples/multimodal-summarization-py.mdx';
+import MultimodalSummarizationJs from '/snippets/code-samples/multimodal-summarization-js.mdx';
+
+当你使用支持多模态输入和工具结果，或支持返回多模态输出的 [大语言模型](/oss/integrations/chat) 时，Deep Agents 支持多模态工作流。你可以把图像和其他媒体附加到用户消息中，用内置的 `read_file` 工具读取非文本文件，还可以从自定义工具返回多模态内容。
+
+内置的[上下文压缩](/oss/deepagents/context-engineering#context-compression)主要面向文本。规划多模态工作负载时要考虑这一点：尽量把大体积媒体存到后端，只传递引用。
+
+## 多模态用户输入
+
+把多模态内容放进传给 agent 的 `messages` 中，使用与 LangChain chat model 相同的[标准内容块](/oss/langchain/messages#standard-content-blocks)：
+
+:::python
+```python
+result = agent.invoke({
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What is in this screenshot?"},
+            {"type": "image", "url": "https://example.com/screenshot.png"},
+        ],
+    }],
+})
+```
+:::
+
+:::js
+```typescript
+const result = await agent.invoke({
+  messages: [{
+    role: "user",
+    content: [
+      { type: "text", text: "What is in this screenshot?" },
+      { type: "image", url: "https://example.com/screenshot.png" },
+    ],
+  }],
+});
+```
+:::
+
+有关 block 类型、provider 级要求以及更多示例（PDF、音频、视频），请参见 [多模态消息](/oss/langchain/messages#multimodal)。
+
+## 内置 `read_file` 工具
+
+harness 的 `read_file` 工具会为受支持的多模态文件返回[标准内容块](/oss/langchain/messages#standard-content-blocks)，而不是纯文本。只要所选模型支持对应模态，agent 就可以检查其[文件系统](/oss/deepagents/overview#virtual-filesystem-access)中的图像、文档和媒体文件。请查阅 provider 文档，确认你的模型支持哪些 MIME 类型。
+
+<Accordion title="支持的多模态文件扩展名">
+
+| 类型 | 扩展名 |
+| ---- | ------ |
+| [图像](/oss/langchain/messages#multimodal) | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.heic`, `.heif` |
+| [视频](/oss/langchain/messages#multimodal) | `.mp4`, `.mpeg`, `.mov`, `.avi`, `.flv`, `.mpg`, `.webm`, `.wmv`, `.3gpp` |
+| [音频](/oss/langchain/messages#multimodal) | `.wav`, `.mp3`, `.aiff`, `.aac`, `.ogg`, `.flac` |
+| [文件](/oss/langchain/messages#multimodal) | `.pdf`, `.ppt`, `.pptx` |
+
+</Accordion>
+
+
+## 自定义工具输出
+
+[自定义工具](/oss/deepagents/tools#custom-tools)可以包含多模态文件，例如图像：
+
+:::python
+```python
+from langchain.tools import tool
+
+
+@tool
+def capture_screenshot() -> list[dict]:
+    """Capture a screenshot of the current page."""
+    return [
+        {"type": "text", "text": "Screenshot of the current page:"},
+        {"type": "image", "url": "https://example.com/page.png"},
+    ]
+```
+:::
+
+:::js
+```typescript
+import { tool } from "langchain";
+import { z } from "zod";
+
+const captureScreenshot = tool(
+  async () => [
+    { type: "text", text: "Screenshot of the current page:" },
+    { type: "image", url: "https://example.com/page.png" },
+  ],
+  {
+    name: "capture_screenshot",
+    description: "Capture a screenshot of the current page.",
+    schema: z.object({}),
+  }
+);
+```
+:::
+
+返回值会被转换为模型在下一轮读取的 `ToolMessage`。可以在生成的消息上使用 `content_blocks` 访问规范化后的表示。有关返回类型选项、序列化行为和 MCP 示例，请参见 [工具返回值](/oss/langchain/tools#tool-return-values) 和 [多模态工具内容](/oss/langchain/mcp#multimodal-tool-content)。
+
+<Tip>
+当工具产生图像或其他大体积二进制数据时，把产物保存到[后端](/oss/deepagents/backends)，然后只返回简洁的文本描述和路径或 URL。这样可以让消息历史更小，在[上下文压缩](/oss/deepagents/context-engineering#context-compression)下也更好用。
+</Tip>
+
+## 上下文压缩与多模态内容
+
+内置的卸载和摘要主要针对文本和消息历史：
+
+- **卸载** 只统计文本 token。非文本 block（包括图像）会保留在替换消息里，而不会被压缩。只包含图像的消息不会仅凭图像大小被卸载。
+- **摘要** 会把较早的消息压缩成纯文本摘要。该范围内的图像、音频、视频和文件 block 不会继续向前传递，模型只能看到摘要器对它们写出的内容。最近、低于保留阈值的消息保持不变。
+
+    当摘要运行时，旧轮次里的媒体 block 会从活动上下文中移除：
+
+    :::python
+    ```python
+    # Before — model receives image blocks in older turns
+    [
+        HumanMessage(
+            content=[
+                {"type": "text", "text": "What trends do you see in this chart?"},
+                {"type": "image", "base64": IMG, "mime_type": "image/png"},
+            ]
+        ),
+        ToolMessage(
+            content=[
+                {"type": "text", "text": "Updated chart:"},
+                {"type": "image", "base64": IMG, "mime_type": "image/png"},
+            ],
+            tool_call_id="call_chart_1",
+        ),
+        AIMessage(content="Revenue rose in Q3 based on the chart trend."),
+        HumanMessage(content="Reply with one sentence summarizing our analysis."),
+    ]
+
+    # After — those turns collapse to text; image blocks are gone
+    {"content": (
+        "User asked about trends in a chart screenshot. "
+        "Tool returned an updated chart. Agent identified Q3 revenue growth."
+    )}
+    ```
+    :::
+
+    :::js
+    ```typescript
+    // Before — model receives image blocks in older turns
+    { role: "user", content: [
+        { type: "text", text: "What trends do you see in this chart?" },
+        { type: "image", url: "https://example.com/chart.png" },
+    ]}
+    { role: "tool", content: [
+        { type: "text", text: "Updated chart:" },
+        { type: "image", url: "https://example.com/chart-v2.png" },
+    ]}
+
+    // After — those turns collapse to text; image blocks are gone
+    { content:
+        "User asked about trends in a chart screenshot. " +
+        "Tool returned an updated chart. Agent identified Q3 revenue growth."
+    }
+    ```
+    :::
+
+    原始对话仍会以文本形式写入文件系统。有关触发条件、保留阈值和完整流程，请参见[摘要](/oss/deepagents/context-engineering#summarization)。
+
+对于重度多模态工作负载：
+
+- 把图像、截图和图表存到文件系统后端或外部对象存储中，然后通过消息传递文件路径或 URL。
+- 在长时间运行的对话中，优先使用引用，而不是 base64 编码的图像 block。
+- 对图像密集型检查使用[子 agent](/oss/deepagents/subagents)，这样主 agent 只接收紧凑的文本结果。
+- 当 provider 会对图像收取较多 token 费用时，调整摘要阈值，或提供自定义 token 计数器。
+
+有关卸载阈值、摘要触发条件和自定义选项，请参见[上下文压缩](/oss/deepagents/context-engineering#context-compression)。
