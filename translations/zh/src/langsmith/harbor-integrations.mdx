@@ -1,0 +1,288 @@
+---
+title: Harbor 集成
+description: 在 LangSmith 上结合 Harbor 运行 evaluations、Deep Agents 和 sandboxes。
+---
+
+你可以在 LangSmith 中统一运行、跟踪、对比并统计 agent evaluations 的成本，而 [Harbor](https://harborframework.com/docs) 作为底层执行层。Harbor 是一个用于在沙盒环境中评估和优化 agents 与语言模型的框架，由 [Terminal-Bench](https://www.tbench.ai) 的创建者开发。它会把每次试验运行在隔离容器中，因此你可以在多个环境中并行执行 evaluations 和 rollouts。
+
+LangSmith 与 Harbor 在三个层面集成：
+
+- **LangSmith evaluations**：使用 `--plugin langsmith`，把每个 Harbor job 记录为 LangSmith 中的 experiment。
+- **Deep Agents**：使用 `--agent langgraph`，把 LangGraph 或 Deep Agents 应用作为 Harbor agent 运行。
+- **Sandboxes**：使用 `--env langsmith`，让每个 Harbor trial 在 LangSmith sandbox 上运行。
+
+本页介绍 Harbor 中与 LangSmith 相关的 flags。完整 CLI 请运行 `harbor run --help`，或参阅 [Harbor documentation](https://harborframework.com/docs)。
+
+## 前置要求
+
+- 一个 [LangSmith account](https://smith.langchain.com) 和一个 [API key](/langsmith/create-account-api-key)。
+- 安装了 `pip` 的 Python 环境。
+- 一个你所调用模型对应的 provider API key，例如 `ANTHROPIC_API_KEY`。
+
+### 安装
+
+使用 `langsmith` extra 安装 Harbor。该 extra 会包含 `harbor-langsmith` 包，用于 LangSmith plugin、environment 和 agent：
+
+```bash
+pip install "harbor[langsmith]"
+```
+
+### 认证
+
+Harbor 使用你的 LangSmith 凭证完成认证。你可以设置 API key：
+
+```bash
+export LANGSMITH_API_KEY="<LANGSMITH_API_KEY>"
+```
+
+或者不直接导出 key，而是选择一个 [LangSmith SDK profile](/langsmith/profile-configuration)：
+
+```bash
+export LANGSMITH_PROFILE=prod
+```
+
+## 快速开始
+
+把一个 Harbor job 记录为 LangSmith 中的 experiment：
+
+```bash
+harbor run -d "terminal-bench@2.0" \
+  --agent <agent> \
+  --model <provider:model> \
+  --plugin langsmith
+```
+
+将 `<agent>` 替换为 Harbor agent，将 `<provider:model>` 替换为 `provider:model` 格式的模型，该模型需要能被已安装的 `langchain-*` provider 解析，例如 `anthropic:claude-opus-4-8`。你可以运行 `harbor run --help` 查看可用 agents，或查看下面的 [Deep Agents](#deep-agents) 小节获取完整的 `langgraph` 运行示例。
+
+然后打开 [Datasets & Experiments](/langsmith/manage-datasets)，选择 Harbor 同步的数据集（例如 `terminal-bench@2.0`），再进入 Experiments 标签页查看这次运行。
+
+## LangSmith evaluations
+
+LangSmith plugin 会把每个 Harbor job 都记录到 LangSmith 中，因此你可以在 Datasets & Experiments 中查看和比较结果。这个 plugin 适用于任意 Harbor agent，而不只限于 Deep Agents。通过 `--plugin langsmith` 启用它。[Quickstart](#quickstart) 展示了最基本的调用方式，而本节会进一步说明 plugin 记录了哪些内容，以及如何配置它。
+
+如果你希望同时捕获完整的 agent traces，请选择一个本身会向 LangSmith 发送 traces 的 agent。如果 agent 不会向 LangSmith tracing，plugin 仍然会创建 dataset 与 experiment，并记录结果和 feedback，只是不会带 agent trace。
+
+如果你需要显式消除插件名称歧义，也可以传入完整 import path，而不是短插件名：
+
+```bash
+harbor run ... --plugin harbor_langsmith:LangSmithPlugin
+```
+
+该 plugin 需要 `LANGSMITH_API_KEY`。
+
+### 查看 plugin 记录的内容
+
+随着 job 执行，plugin 会通过 API 向 LangSmith 写入以下数据：
+
+- **Dataset**：基于 job 同步一个 reference dataset。默认名称来自 dataset 或 task，例如 `terminal-bench@2.0`。每个 task 都会成为一个 example，其 inputs 包含 task name、instruction 和 task ID。
+- **Experiment**：为每个 job 创建一个 experiment，命名格式为 `<name>-<job-id-prefix>`，并与 reference dataset 关联。
+- **Runs**：为每个 trial 创建一个 root run，其中包含 task name、instruction、agent 和 model 等 inputs；同时还会创建 environment、agent 和 verification 阶段对应的 child runs。
+- **Feedback**：为每个 verifier reward key 添加一个 feedback score（例如 `reward`）；如果某个 trial 抛出异常，则会额外附加一个 `harbor_error` feedback。
+- **Outputs**：在每个 trial run 上记录 token 统计（位于 `tokens` 下，包括 `input`、`cache`、`output`）以及成本 `cost_usd`。
+
+### 在 LangSmith 中查看结果
+
+在 LangSmith 中打开 [Datasets & Experiments](/langsmith/manage-datasets)，选择 plugin 同步的数据集（例如 `terminal-bench@2.0`），再进入 Experiments 标签页。每一个 Harbor job 都会显示为一个 experiment，你可以通过 `reward` 与 `harbor_error` feedback、每个 run 上记录的 token 数与成本，以及延迟等维度来[比较 experiments](/langsmith/analyze-an-experiment)。
+
+### 配置 plugin 输入
+
+plugin 会优先从构造函数关键字参数中读取输入，如果没有，再退回到环境变量。你可以通过以下环境变量进行设置：
+
+- **`HARBOR_LANGSMITH_DATASET`**：dataset 名称。默认会根据 job 自动推导。
+- **`HARBOR_LANGSMITH_EXPERIMENT`**：experiment 的基础名称。默认使用 job name。
+- **`LANGSMITH_ENDPOINT`**：LangSmith API endpoint。默认为 `https://api.smith.langchain.com`。
+- **`LANGSMITH_WORKSPACE_ID`**：目标 workspace。
+- **`HARBOR_LANGSMITH_SYNC_DATASET`**：设为 `false` 可禁用 dataset 和 examples 的同步。
+- **`HARBOR_LANGSMITH_FAIL_FAST`**：设为 `true` 时，如果 LangSmith API 出错会直接抛出异常，而不是继续执行 job。
+
+你也可以通过命令行中的 `--pk` 传入相同的输入，或者在 job 配置文件的 `kwargs:` 中填写。对应构造函数参数分别是：`dataset_name`、`experiment_name`、`endpoint`、`api_key`、`workspace_id`、`sync_dataset` 和 `fail_fast`。
+
+## Deep Agents
+
+`langgraph` agent 会把一个 LangGraph 应用（例如 Deep Agent）作为 Harbor agent 来运行。通过 `--agent langgraph` 选择它。Harbor 会把你的项目拷贝进 sandbox，安装依赖，并在每个 trial 的容器中运行该 graph。
+
+设置好 LangSmith 和模型凭证后，就可以运行 Harbor。`harbor run` 是 `harbor job start` 的别名，它会构建 job、启动环境，并运行 LangGraph agent：
+
+```bash
+export LANGSMITH_PROFILE=prod
+export LANGSMITH_TRACING=true
+export LANGSMITH_PROJECT=harbor-deepagents
+export FIREWORKS_API_KEY="<FIREWORKS_API_KEY>"
+
+harbor run \
+  -t hello-world/hello-world \
+  --agent langgraph \
+  --model fireworks:accounts/fireworks/models/glm-5p2 \
+  --ak project_path=./deep-agent \
+  --ak graph=deep_agent
+```
+
+### 选择评估对象
+
+一个 task 就是一个遵循固定结构的目录：`task.toml` 用于配置、`instruction.md` 存放 prompt、`environment/` 放置构建 sandbox 的 Dockerfile，`tests/` 放置会写入 reward 的 verifier。一个 dataset 则是由许多这样的 task 目录组成。
+
+task 或 dataset 都可以来自本地，也可以来自远程：你可以让 Harbor 指向自己维护的 task 目录集合，也可以从 Harbor registry 拉取。
+
+有三个输入参数用于选择 job 要运行的 tasks：
+
+- **`-t org/name[@ref]`**：从 registry 中选择单个 task。远程 task 会先在 registry 中解析，再以固定 commit clone 到 `~/.cache/harbor/tasks`。
+- **`-d name@version`**：选择整个 benchmark dataset，它由多个 tasks 组成。每个 task 都会从 registry 解析并 clone 到缓存中。
+- **`-p <dir>`**：指向单个本地 task，或一个包含多个 tasks 的根目录。本地路径会被原地读取，不会下载，也不会复制到缓存中。
+
+你可以通过 `-i` 和 `-x`（glob include 与 exclude）过滤被选中的 tasks，并通过 `-l` 限制数量。
+
+一个 task 目录结构如下：
+
+```text
+hello-world/
+├── task.toml         # timeouts, CPU, and memory
+├── instruction.md    # the prompt given to the agent
+├── environment/
+│   └── Dockerfile    # image the sandbox is built from
+├── tests/
+│   ├── test.sh       # writes the reward to /logs/verifier/reward.txt
+│   └── test_state.py # the assertions
+└── solution/         # optional, used only by the oracle agent
+```
+
+一个 dataset 则是由多个 task 目录组成的目录：
+
+```text
+terminal-bench/
+├── hello-world/      # each subdirectory is a full task
+├── fix-bug/          # (task.toml + instruction.md + environment/ + tests/)
+└── parse-csv/
+```
+
+### 配置 agent
+
+通过 `--ak` 传入 agent kwargs：
+
+- **`--agent langgraph`**：选择 LangGraph agent。
+- **`--model <provider:model>`**：要运行的模型。没有默认值，因此这是必填项。该 agent 会使用 @[init_chat_model] 解析它，所以它必须是某个已安装 `langchain-*` provider 可识别的 `provider:model` 格式，例如 `anthropic:claude-opus-4-8`。如果传入的是 `provider/model`，会被自动规范化为 `provider:model`。模型值会从 `configurable['model']` 或 `HARBOR_MODEL` 环境变量中读取；如果该值缺失或无法解析，将抛出 `ValueError`。
+- **`--ak project_path=<dir>`**：包含 `langgraph.json` 的本地目录。
+- **`--ak graph=<name>`**：指定运行 `langgraph.json` 中的哪个 graph。
+- **`--ak config=<file>`**：`project_path` 内声明 graphs 的配置文件名。默认为 `langgraph.json`。
+- **`--ak configurable='{...}'`**：传给 `config["configurable"]` 的 LangGraph per-run 配置，由 graph 在 invoke 时读取。常见 key 包括 `model`、`model_kwargs` 和 `cwd`。
+- **`--ak model_kwargs='{...}'`**：`configurable` 中嵌套 `model_kwargs` 字段的简写，例如 `{"temperature": 0, "max_tokens": 8000}`。
+- **`--ak dependency_overrides='[...]'`**：指定 agent virtual environment 中要安装的 pip packages。这个列表会替换掉 `langgraph.json` 中声明的 dependencies，因此你可以在不修改项目代码的情况下，锁定或替换版本，例如 `'["deepagents==0.1.5"]'`。
+
+### 在 langgraph.json 中声明 agent 和依赖
+
+该 agent 会从 `project_path` 下的 `langgraph.json` 中加载 graphs。文件中声明了 graph 的入口点，以及 Harbor 会在 sandbox 虚拟环境中安装的 pip dependencies：
+
+```json
+{
+  "dependencies": [
+    "deepagents>=0.6.10,<0.7.0",
+    "langchain-anthropic>=1.4.6,<1.5.0",
+    "langchain-openai>=1.3.0,<1.4.0"
+  ],
+  "graphs": {
+    "deep_agent": "./agent.py:make_graph",
+    "research_agent": "./agent.py:make_research_graph"
+  }
+}
+```
+
+这个项目暴露了两个 graphs，可通过 `--ak graph` 选择。它们都通过 @[create_deep_agent] 构建 Deep Agent，不同之处仅在于输入不同：
+
+- **`deep_agent`** 对应 `make_graph`，即只传入模型构建的 Deep Agent。
+- **`research_agent`** 对应 `make_research_graph`，也就是加入 research system prompt 的 Deep Agent。
+
+两个 graph 都会把 `--model` 传进来（从 `configurable.model` 读取），再交给 `create_deep_agent`，它内部使用 `init_chat_model()` 进行解析：
+
+```python
+from deepagents import create_deep_agent
+
+
+def make_graph(config):
+    return create_deep_agent(model=config["configurable"]["model"])
+
+
+def make_research_graph(config):
+    return create_deep_agent(
+        model=config["configurable"]["model"],
+        system_prompt="You are a research assistant.",
+    )
+```
+
+使用读取 `configurable.model` 的 factory function，可以让 graph 保持 model-agnostic；但如果你希望它始终固定运行同一个模型，也可以在 graph 中直接写死模型。对于固定模型，请在 `langgraph.json` 中指向一个已编译 graph，而不是 factory：
+
+```python
+from deepagents import create_deep_agent
+
+graph = create_deep_agent(model="fireworks:accounts/fireworks/models/glm-5p2")
+```
+
+### 在 sandbox 内部运行 agent
+
+Harbor 会把整个 agent 都运行在 trial 容器内部。
+
+<Accordion title="Single-trial lifecycle">
+
+1. **Parse and prepare**：`harbor run` 会把命令行参数解析为 job config。job factory 会解析并缓存 tasks，校验环境资源限制，并在任何 trial 启动前解析 metrics。缓存只作用于远程 tasks，因此 `-p` 指向的本地 task 会被原地读取。
+2. **Fan out**：Harbor 会基于 `n_attempts × tasks × agents` 构建 trial 列表，然后按 `-n` 指定的并发上限执行 trial，并结合 `-r` 处理重试。并发是以单个 trial 为单位，因此不同 tasks、agents 和 attempts 会并行运行，每个 trial 都在自己的 sandbox 中执行。
+3. **Create the trial**：trial 会加载缓存任务，并根据 `project_path`、`graph` 和 `model` 构建 LangGraph agent，同时创建 environment 但还不启动。
+4. **Start the environment**：environment 启动并拉起容器。对于 Docker environment，这一步会构建镜像或复用已有镜像，然后运行容器。
+5. **Install the agent**：Harbor 会在容器中创建一个虚拟环境，上传 `project_path`，并根据 `langgraph.json` 安装 dependencies。
+6. **Run and verify**：Harbor 在容器中通过 LangGraph runner 执行 graph，然后运行 `tests/test.sh`，该脚本会把 reward 写到 `/logs/verifier/reward.txt`。
+7. **Finalize**：Harbor 停止并删除容器，写入 trial 结果，并最终把所有 trial 结果聚合为一个 job result。
+
+</Accordion>
+
+关于如何构建 Deep Agents，请参阅 [Deep Agents documentation](/oss/deepagents/overview)。
+
+## Sandboxes
+
+`langsmith` Harbor environment 会让每个 trial 运行在 LangSmith sandbox 上。使用 `--env langsmith` 即可选中它，让 Harbor jobs 运行在 LangSmith 基础设施上，并与其他 sandbox providers 并列使用。每个 trial 都会获得独立 sandbox，Harbor 会在 trial 结束后将其删除。
+
+### 运行评估
+
+运行 Harbor job，并通过 `--env langsmith` 选择 LangSmith environment：
+
+```bash
+harbor run -d "<org/name>" \
+  --model "<model>" \
+  --agent "<agent>" \
+  --env langsmith \
+  -n "<n-parallel-trials>"
+```
+
+Harbor 会为每个 trial 创建一个 LangSmith sandbox，并在其中运行 agent 与 verifier。
+
+### 配置 sandbox environment
+
+LangSmith environment 会通过文件系统快照来启动每个 sandbox。你可以在 Harbor task 中提供以下任一方式：
+
+- **Prebuilt image**：在 `task.toml` 中设置 `[environment].docker_image`。Harbor 会复用该镜像，或基于它创建 snapshot。
+- **Existing snapshot**：通过 `environment.kwargs.snapshot_name` 指定一个你已经创建好的 [snapshot](/langsmith/sandbox-snapshots)。
+- **Dockerfile**：在 `environment/` 目录下放置 `Dockerfile`。Harbor 会使用任务的 `environment/` 目录作为构建上下文，并通过 [build-from-Dockerfile flow](/langsmith/sandbox-snapshots#build-a-snapshot-from-a-dockerfile) 构建 snapshot。
+
+你可以通过 environment kwargs 来调节 sandbox 生命周期，这些参数通过命令行中的 `--ek` 传入：
+
+```bash
+harbor run -d "<org/name>" \
+  --model "<model>" \
+  --agent "<agent>" \
+  --env langsmith \
+  -n "<n-parallel-trials>" \
+  --ek idle_ttl_seconds=0 \
+  --ek delete_after_stop_seconds=7200
+```
+
+- **`idle_ttl_seconds`**：sandbox 空闲超过指定秒数后自动停止。设为 `0` 可禁用空闲超时。
+- **`delete_after_stop_seconds`**：sandbox 停止后，经过指定秒数再自动删除。
+
+## 故障排查
+
+- **Job 启动时因为认证错误失败**：确认已经设置了 `LANGSMITH_API_KEY`，或者 `LANGSMITH_PROFILE` 指向了一个正确配置的 profile。
+- **Agent 因 model 抛出 `ValueError`**：请使用 `provider:model` 格式传入 `--model`，并安装与之匹配的 `langchain-*` provider 包，使得 `init_chat_model()` 可以正确解析它。
+
+## See also
+
+- [Deep Agents documentation](/oss/deepagents/overview)
+- [Datasets & Experiments](/langsmith/manage-datasets)
+- [Analyze an experiment](/langsmith/analyze-an-experiment)
+- [Sandbox snapshots](/langsmith/sandbox-snapshots)
+- [Harbor documentation](https://harborframework.com/docs)

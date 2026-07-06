@@ -1,0 +1,1145 @@
+---
+title: 使用 SDK 查询 traces
+sidebarTitle: 查询 traces
+tag: "SDK"
+---
+
+推荐使用 [SDK](https://reference.langchain.com/python/langsmith/) 中的 `list_runs` 方法，或 [API](/langsmith/smith-api-ref) 中的 `/runs/query` 端点，来查询 [runs](/langsmith/observability-concepts#runs)（也就是 LangSmith traces 中的 span 数据）。LangSmith 以一种简单格式存储 traces，该格式定义见 [Run（span）数据格式](/langsmith/run-data-format)。
+
+本页涵盖以下内容：
+
+- [使用 filter 参数](#use-filter-arguments)：通过 SDK 参数进行基于关键字的筛选。
+- [使用过滤查询语言](#use-filter-query-language)：使用 LangSmith 过滤语法编写复杂查询。
+- [使用子 run 谓词查询 trace trees](#query-trace-trees-with-child-run-predicates)：结合服务端收窄范围与本地子 run 遍历。
+- [速率限制](#rate-limits)：每个租户的限制以及避免触发限制的最佳实践。
+
+<Note>
+如果你想导出大量 traces，建议使用 [Bulk Data Export](/langsmith/data-export)。它对大数据量处理更稳健，并支持自动重试与分区并行。
+</Note>
+
+## 使用 filter 参数
+
+对于简单查询，你不必依赖查询语法。可以直接使用[filter 参数参考](/langsmith/trace-query-syntax#filter-arguments)中列出的参数。
+
+<Warning>
+**前置条件**
+
+运行下面的代码片段之前，请先初始化 client。
+</Warning>
+
+<CodeGroup>
+
+```python Python
+from langsmith import Client
+
+client = Client()
+```
+
+```typescript TypeScript
+import { Client, Run } from "langsmith";
+
+const client = new Client();
+```
+
+```java Java
+import com.langchain.smith.client.LangsmithClient;
+import com.langchain.smith.client.okhttp.LangsmithOkHttpClient;
+
+LangsmithClient client = LangsmithOkHttpClient.fromEnv();
+```
+
+</CodeGroup>
+
+下面是一些使用关键字参数列出 runs 的示例：
+
+### 列出项目中的所有 runs
+
+<CodeGroup>
+
+```python Python
+project_runs = client.list_runs(project_name="<your_project>")
+```
+
+```typescript TypeScript
+// Download runs in a project
+const projectRuns: Run[] = [];
+for await (const run of client.listRuns({
+  projectName: "<your_project>",
+})) {
+  projectRuns.push(run);
+};
+```
+
+```java Java
+import com.langchain.smith.models.runs.RunQueryParams;
+
+RunQueryParams projectRuns = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .build();
+```
+
+</CodeGroup>
+
+### 列出过去 24 小时内的 LLM 和 chat runs
+
+<CodeGroup>
+
+```python Python
+todays_llm_runs = client.list_runs(
+    project_name="<your_project>",
+    start_time=datetime.now() - timedelta(days=1),
+    run_type="llm",
+)
+```
+
+```typescript TypeScript
+const todaysLlmRuns: Run[] = [];
+for await (const run of client.listRuns({
+  projectName: "<your_project>",
+  startTime: new Date(Date.now() - 1000 * 60 * 60 * 24),
+  runType: "llm",
+})) {
+  todaysLlmRuns.push(run);
+};
+```
+
+```java Java
+OffsetDateTime now = OffsetDateTime.now();
+OffsetDateTime twentyFourHoursAgo = now.minus(24, ChronoUnit.HOURS);
+
+RunQueryParams todaysLlmRuns = RunQueryParams.builder()
+    .runType(RunQueryParams.RunType.LLM)
+    .startTime(twentyFourHoursAgo)
+    .addSession("<your_project>")
+    .limit(50L)
+    .build();
+```
+
+</CodeGroup>
+
+### 列出项目中的 root runs
+
+Root runs 是没有父级的 runs。它们的 `is_root` 值为 `True`，你可以利用这一点来筛选 root runs。
+
+<CodeGroup>
+
+```python Python
+root_runs = client.list_runs(
+    project_name="<your_project>",
+    is_root=True
+)
+```
+
+```typescript TypeScript
+const rootRuns: Run[] = [];
+for await (const run of client.listRuns({
+  projectName: "<your_project>",
+  isRoot: 1,
+})) {
+  rootRuns.push(run);
+};
+```
+
+```java Java
+import com.langchain.smith.models.runs.RunQueryParams;
+
+RunQueryParams rootRuns = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .isRoot(true)
+    .build();
+```
+
+</CodeGroup>
+
+### 列出没有错误的 runs
+
+<CodeGroup>
+
+```python Python
+correct_runs = client.list_runs(project_name="<your_project>", error=False)
+```
+
+```typescript TypeScript
+const correctRuns: Run[] = [];
+for await (const run of client.listRuns({
+  projectName: "<your_project>",
+  error: false,
+})) {
+  correctRuns.push(run);
+};
+```
+
+```java Java
+import com.langchain.smith.models.runs.RunQueryParams;
+
+RunQueryParams noErrorRuns = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .error(false)
+    .build();
+```
+
+</CodeGroup>
+
+### 按 run ID 列出 runs
+
+<Warning>
+**会忽略其他参数**
+
+如果你按上述方式提供一个 run ID 列表，系统会忽略 `project_name`、`run_type` 等其他筛选参数，而是直接返回与这些 ID 匹配的 runs。
+</Warning>
+
+如果你已经有一组 run IDs，可以直接列出它们：
+
+<CodeGroup>
+
+```python Python
+run_ids = ['a36092d2-4ad5-4fb4-9c0d-0dba9a2ed836','9398e6be-964f-4aa4-8ae9-ad78cd4b7074']
+selected_runs = client.list_runs(id=run_ids)
+```
+
+```typescript TypeScript
+const runIds = [
+  "a36092d2-4ad5-4fb4-9c0d-0dba9a2ed836",
+  "9398e6be-964f-4aa4-8ae9-ad78cd4b7074",
+];
+const selectedRuns: Run[] = [];
+for await (const run of client.listRuns({
+  id: runIds,
+})) {
+  selectedRuns.push(run);
+};
+```
+
+```java Java
+import com.langchain.smith.models.runs.RunQueryParams;
+
+RunQueryParams runIdsRuns = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .id(runIds)
+    .build();
+```
+
+</CodeGroup>
+
+### 按 ID 获取单个 run
+
+如果你想按 ID 获取单个 run（trace），请使用 `read_run` 方法。这在你已经有一个明确的 trace ID 时特别有用，例如从 LangSmith 共享链接 `https://smith.langchain.com/public/<trace-id>/r` 中获取到该 ID，并想读取其完整数据。
+
+<CodeGroup>
+
+```python Python
+run_id = "a36092d2-4ad5-4fb4-9c0d-0dba9a2ed836"
+run = client.read_run(run_id)
+
+# Access run data
+print(run.inputs)
+print(run.outputs)
+print(run.name)
+```
+
+```typescript TypeScript
+const runId = "a36092d2-4ad5-4fb4-9c0d-0dba9a2ed836";
+const run = await client.readRun(runId);
+
+// Access run data
+console.log(run.inputs);
+console.log(run.outputs);
+console.log(run.name);
+```
+
+```java Java
+import com.langchain.smith.models.runs.RunQueryParams;
+
+RunQueryParams runIdRun = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .addId(runId)
+    .build();
+```
+
+</CodeGroup>
+
+<Tip>
+    **使用 LangGraph 在本地重放 traces**
+
+    如果你使用了带 checkpoint 的 LangGraph，可以先从 LangSmith 拉取一条 trace，再在本地重放用于调试。详情请参阅 [LangGraph 的 time travel 和 replay 文档](/oss/langgraph/use-time-travel)。
+</Tip>
+
+## 使用过滤查询语言
+
+如果查询更复杂，可以使用过滤查询语言。以下示例覆盖了最常见的模式。完整的运算符和字段参考，包括全部比较器、可筛选字段、取值格式规则以及速查示例表，请参阅 [Trace query syntax: filter query language](/langsmith/trace-query-syntax#filter-query-language)。
+
+### 列出会话 thread 中的所有 root runs
+
+这是获取某个会话 thread 中 runs 的方式。关于如何设置 threads，请参阅[设置 threads 的操作指南](/langsmith/threads)。
+Threads 是通过共享 thread ID 进行分组的。LangSmith UI 允许使用以下任一 metadata key：`session_id` 或 `thread_id`。其中 session ID 也叫 tracing project ID。下面的查询会匹配这两者中的任意一种。
+
+<CodeGroup>
+
+```python Python
+group_key = "<your_thread_id>"
+filter_string = f'and(in(metadata_key, ["session_id","thread_id"]), eq(metadata_value, "{group_key}"))'
+thread_runs = client.list_runs(
+    project_name="<your_project>",
+    filter=filter_string,
+    is_root=True
+)
+```
+
+```typescript TypeScript
+const groupKey = "<your_thread_id>";
+const filterString = `and(in(metadata_key, ["session_id","thread_id"]), eq(metadata_value, "${groupKey}"))`;
+const threadRuns: Run[] = [];
+for await (const run of client.listRuns({
+  projectName: "<your_project>",
+  filter: filterString,
+  isRoot: true
+})) {
+  threadRuns.push(run);
+};
+```
+
+```java Java
+import com.langchain.smith.models.runs.RunQueryParams;
+
+String groupKey = "<your_thread_id>";
+
+String filterString = String.format(
+    "and(in(metadata_key, [\"session_id\",\"thread_id\"]), eq(metadata_value, \"%s\"))",
+    groupKey
+);
+
+RunQueryParams threadRuns = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter(filterString)
+    .build();
+```
+
+</CodeGroup>
+
+### 列出所有名称为 "extractor" 且其 trace 根节点带有 "user_score"=1 反馈的 runs
+
+<CodeGroup>
+
+```python Python
+client.list_runs(
+    project_name="<your_project>",
+    filter='eq(name, "extractor")',
+    trace_filter='and(eq(feedback_key, "user_score"), eq(feedback_score, 1))'
+)
+```
+
+```typescript TypeScript
+client.listRuns({
+  projectName: "<your_project>",
+  filter: 'eq(name, "extractor")',
+  traceFilter: 'and(eq(feedback_key, "user_score"), eq(feedback_score, 1))'
+})
+```
+
+```java Java
+RunQueryParams extractorRuns = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("eq(name, \"extractor\")")
+    .traceFilter("and(eq(feedback_key, \"user_score\"), eq(feedback_score, 1))")
+    .build();
+```
+
+</CodeGroup>
+
+### 列出 `star_rating` 大于 4 的 runs
+
+<CodeGroup>
+
+```python Python
+client.list_runs(
+    project_name="<your_project>",
+    filter='and(eq(feedback_key, "star_rating"), gt(feedback_score, 4))'
+)
+```
+
+```typescript TypeScript
+client.listRuns({
+  projectName: "<your_project>",
+  filter: 'and(eq(feedback_key, "star_rating"), gt(feedback_score, 4))'
+})
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("and(eq(feedback_key, \"star_rating\"), gt(feedback_score, 4))")
+    .build();
+```
+
+</CodeGroup>
+
+### 列出完成耗时超过 5 秒的 runs
+
+<CodeGroup>
+
+```python Python
+client.list_runs(project_name="<your_project>", filter='gt(latency, "5s")')
+```
+
+```typescript TypeScript
+client.listRuns({projectName: "<your_project>", filter: 'gt(latency, "5s")'})
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("gt(latency, \"5s\")")
+    .build();
+```
+
+</CodeGroup>
+
+### 列出所有状态不是 "error" 的 runs
+
+<CodeGroup>
+
+```python Python
+client.list_runs(project_name="<your_project>", filter='neq(status, "error")')
+```
+
+```typescript TypeScript
+client.listRuns({projectName: "<your_project>", filter: 'neq(status, "error")'})
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("neq(status, \"error\")")
+    .build();
+```
+
+</CodeGroup>
+
+### 列出 `start_time` 晚于某个时间戳的所有 runs
+
+<CodeGroup>
+
+```python Python
+client.list_runs(project_name="<your_project>", filter='gt(start_time, "2023-07-15T12:34:56Z")')
+```
+
+```typescript TypeScript
+client.listRuns({projectName: "<your_project>", filter: 'gt(start_time, "2023-07-15T12:34:56Z")'})
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("gt(start_time, \"2023-07-15T12:34:56Z\")")
+    .build();
+```
+
+</CodeGroup>
+
+### 列出包含字符串 "substring" 的所有 runs
+
+<CodeGroup>
+
+```python Python
+client.list_runs(project_name="<your_project>", filter='search("substring")')
+```
+
+```typescript TypeScript
+client.listRuns({projectName: "<your_project>", filter: 'search("substring")'})
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("search(\"substring\")")
+    .build();
+```
+
+</CodeGroup>
+
+### 列出带有 git hash "2aa1cf4" tag 的所有 runs
+
+<CodeGroup>
+
+```python Python
+client.list_runs(project_name="<your_project>", filter='has(tags, "2aa1cf4")')
+```
+
+```typescript TypeScript
+client.listRuns({projectName: "<your_project>", filter: 'has(tags, "2aa1cf4")'})
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("has(tags, \"2aa1cf4\")")
+    .build();
+```
+
+</CodeGroup>
+
+### 列出所有满足以下条件的 runs：在指定时间戳之后启动，且状态不是 error，或 feedback "Correctness" 分数等于 0
+
+<CodeGroup>
+
+```python Python
+client.list_runs(
+  project_name="<your_project>",
+  filter='and(gt(start_time, "2023-07-15T12:34:56Z"), or(neq(status, "error"), and(eq(feedback_key, "Correctness"), eq(feedback_score, 0.0))))'
+)
+```
+
+```typescript TypeScript
+client.listRuns({
+  projectName: "<your_project>",
+  filter: 'and(gt(start_time, "2023-07-15T12:34:56Z"), or(neq(status, "error"), and(eq(feedback_key, "Correctness"), eq(feedback_score, 0.0))))'
+})
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("and(gt(start_time, \"2023-07-15T12:34:56Z\"), or(neq(status, \"error\"), and(eq(feedback_key, \"Correctness\"), eq(feedback_score, 0.0))))")
+    .build();
+```
+
+</CodeGroup>
+
+### 复杂查询：列出 tags 包含 "experimental" 或 "beta"，且延迟大于 2 秒的所有 runs
+
+<CodeGroup>
+
+```python Python
+client.list_runs(
+  project_name="<your_project>",
+  filter='and(or(has(tags, "experimental"), has(tags, "beta")), gt(latency, 2))'
+)
+```
+
+```typescript TypeScript
+client.listRuns({
+  projectName: "<your_project>",
+  filter: 'and(or(has(tags, "experimental"), has(tags, "beta")), gt(latency, 2))'
+})
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("and(or(has(tags, 'experimental'), has(tags, 'beta')), gt(latency, 2))")
+    .build();
+```
+
+</CodeGroup>
+
+### 通过全文搜索 trace trees
+
+你可以在不指定字段的情况下使用 `search()` 函数，对 run 中所有字符串字段做全文搜索。这样可以快速找到与某个搜索词匹配的 traces。
+
+<CodeGroup>
+
+```python Python
+client.list_runs(
+  project_name="<your_project>",
+  filter='search("image classification")'
+)
+```
+
+```typescript TypeScript
+client.listRuns({
+  projectName: "<your_project>",
+  filter: 'search("image classification")'
+})
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("search(\"image classification\")")
+    .build();
+```
+
+</CodeGroup>
+
+### 检查 metadata 是否存在
+
+如果你想检查某个 metadata 是否存在，可以使用 `eq` 运算符，并可结合 `and` 同时匹配值。这适合在 run 中记录更结构化信息后再进行筛选。
+
+<CodeGroup>
+
+```python Python
+to_search = {
+    "user_id": ""
+}
+
+# Check for any run with the "user_id" metadata key
+client.list_runs(
+  project_name="default",
+  filter="eq(metadata_key, 'user_id')"
+)
+# Check for runs with user_id=4070f233-f61e-44eb-bff1-da3c163895a3
+client.list_runs(
+  project_name="default",
+  filter="and(eq(metadata_key, 'user_id'), eq(metadata_value, '4070f233-f61e-44eb-bff1-da3c163895a3'))"
+)
+```
+
+```typescript TypeScript
+// Check for any run with the "user_id" metadata key
+client.listRuns({
+  projectName: 'default',
+  filter: `eq(metadata_key, 'user_id')`
+});
+// Check for runs with user_id=4070f233-f61e-44eb-bff1-da3c163895a3
+client.listRuns({
+  projectName: 'default',
+  filter: `and(eq(metadata_key, 'user_id'), eq(metadata_value, '4070f233-f61e-44eb-bff1-da3c163895a3'))`
+});
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("eq(metadata_key, 'user_id')")
+    .build();
+
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("and(eq(metadata_key, 'user_id'), eq(metadata_value, '4070f233-f61e-44eb-bff1-da3c163895a3'))")
+    .build();
+```
+
+</CodeGroup>
+
+### 检查 metadata 中的环境信息
+
+一种常见模式是通过 metadata 为 traces 添加环境信息。如果你想筛选包含环境 metadata 的 runs，也可以使用相同模式：
+
+<CodeGroup>
+
+```python Python
+client.list_runs(
+  project_name="default",
+  filter="and(eq(metadata_key, 'environment'), eq(metadata_value, 'production'))"
+)
+```
+
+```typescript TypeScript
+client.listRuns({
+  projectName: 'default',
+  filter: `and(eq(metadata_key, 'environment'), eq(metadata_value, 'production'))`
+});
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("and(eq(metadata_key, 'environment'), eq(metadata_value, 'production'))")
+    .build();
+```
+
+</CodeGroup>
+
+### 检查 metadata 中的 thread ID
+
+把同一段对话中的 traces 关联起来的一种常见方式，是为它们设置相同的 thread ID。如果你想按这种方式筛选 runs，可以在 metadata 中搜索该 ID。
+
+<CodeGroup>
+
+```python Python
+client.list_runs(
+  project_name="default",
+  filter="and(eq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))"
+)
+```
+
+```typescript TypeScript
+client.listRuns({
+  projectName: 'default',
+  filter: `and(eq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))`
+});
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("and(eq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))")
+    .build();
+```
+
+</CodeGroup>
+
+### 对键值对做负向筛选
+
+你可以对 metadata、input 和 output 键值对进行负向筛选，以排除特定 runs。下面的示例使用的是 metadata 键值对，但同样的逻辑也适用于 input 和 output。
+
+<CodeGroup>
+
+```python Python
+# Find all runs where the metadata does not contain a "thread_id" key
+client.list_runs(
+  project_name="default",
+  filter="and(neq(metadata_key, 'thread_id'))"
+)
+
+# Find all runs where the thread_id in metadata is not "a1b2c3d4-e5f6-7890"
+client.list_runs(
+  project_name="default",
+  filter="and(eq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))"
+)
+
+# Find all runs where there is no "thread_id" metadata key and the "a1b2c3d4-e5f6-7890" value is not present
+client.list_runs(
+  project_name="default",
+  filter="and(neq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))"
+)
+
+# Find all runs where the thread_id metadata key is not present but the "a1b2c3d4-e5f6-7890" value is present
+client.list_runs(
+  project_name="default",
+  filter="and(neq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))"
+)
+```
+
+```typescript TypeScript
+// Find all runs where the metadata does not contain a "thread_id" key
+client.listRuns({
+  projectName: 'default',
+  filter: `and(neq(metadata_key, 'thread_id'))`
+});
+
+// Find all runs where the thread_id in metadata is not "a1b2c3d4-e5f6-7890"
+client.listRuns({
+  projectName: 'default',
+  filter: `and(eq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))`
+});
+
+// Find all runs where there is no "thread_id" metadata key and the "a1b2c3d4-e5f6-7890" value is not present
+client.listRuns({
+  projectName: 'default',
+  filter: `and(neq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))`
+});
+
+// Find all runs where the thread_id metadata key is not present but the "a1b2c3d4-e5f6-7890" value is present
+client.listRuns({
+  projectName: 'default',
+  filter: `and(neq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))`
+});
+```
+
+```java Java
+// Find all runs where the metadata does not contain a "thread_id" key
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("default")
+    .filter("and(neq(metadata_key, 'thread_id'))")
+    .build();
+
+// Find all runs where the thread_id in metadata is not "a1b2c3d4-e5f6-7890"
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("default")
+    .filter("and(eq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))")
+    .build();
+
+// Find all runs where there is no "thread_id" metadata key and the "a1b2c3d4-e5f6-7890" value is not present
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("default")
+    .filter("and(neq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))")
+    .build();
+
+// Find all runs where the thread_id metadata key is not present but the "a1b2c3d4-e5f6-7890" value is present
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("default")
+    .filter("and(neq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))")
+    .build();
+```
+
+</CodeGroup>
+
+### 组合多个筛选条件
+
+如果你想组合多个条件来进一步缩小查询范围，可以使用 `and` 运算符配合其他过滤函数。下面的示例展示了如何搜索名称为 `ChatOpenAI`，并且 metadata 中带有特定 `thread_id` 的 runs：
+
+<CodeGroup>
+
+```python Python
+client.list_runs(
+  project_name="default",
+  filter="and(eq(name, 'ChatOpenAI'), eq(metadata_key, 'thread_id'), eq(metadata_value, '69b12c91-b1e2-46ce-91de-794c077e8151'))"
+)
+```
+
+```typescript TypeScript
+client.listRuns({
+  projectName: 'default',
+  filter: `and(eq(name, 'ChatOpenAI'), eq(metadata_key, 'thread_id'), eq(metadata_value, '69b12c91-b1e2-46ce-91de-794c077e8151'))`
+});
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("and(eq(name, 'ChatOpenAI'), eq(metadata_key, 'thread_id'), eq(metadata_value, '69b12c91-b1e2-46ce-91de-794c077e8151'))")
+    .build();
+```
+
+</CodeGroup>
+
+### Tree filter
+
+列出所有名为 `RetrieveDocs` 的 runs，它们所在 trace 的 root run 具有值为 1 的 `user_score` 反馈，并且整棵 trace tree 中任意 run 的名称为 `ExpandQuery`。
+
+如果你想提取某个特定 run，同时又要求 trace 内部满足若干状态或步骤条件，这类查询就很有用。
+
+<CodeGroup>
+
+```python Python
+client.list_runs(
+    project_name="<your_project>",
+    filter='eq(name, "RetrieveDocs")',
+    trace_filter='and(eq(feedback_key, "user_score"), eq(feedback_score, 1))',
+    tree_filter='eq(name, "ExpandQuery")'
+)
+```
+
+```typescript TypeScript
+client.listRuns({
+  projectName: "<your_project>",
+  filter: 'eq(name, "RetrieveDocs")',
+  traceFilter: 'and(eq(feedback_key, "user_score"), eq(feedback_score, 1))',
+  treeFilter: 'eq(name, "ExpandQuery")'
+})
+```
+
+```java Java
+RunQueryParams runs = RunQueryParams.builder()
+    .addSession("<your_project>")
+    .filter("eq(name, \"RetrieveDocs\")")
+    .traceFilter("and(eq(feedback_key, 'user_score'), eq(feedback_score, 1))")
+    .treeFilter("eq(name, 'ExpandQuery')")
+    .build();
+```
+
+</CodeGroup>
+
+## 使用子 run 谓词查询 trace trees
+
+使用 `trace_filter` 可以匹配 root run 上的字段，使用 `tree_filter` 可以匹配 trace tree 中任意 run 上受支持的可搜索字段。如果你需要对任意返回的子 run 字段进行断言，例如嵌套的 `inputs`、`outputs` 或 `extra` 载荷，请按以下步骤进行：
+
+1. 先在服务端使用 `filter`、`trace_filter`、`tree_filter`、`run_type`、metadata 过滤器、`parent_run_id` 以及 `ls_run_depth` [system metadata key](/langsmith/ls-metadata-parameters#ls_run_depth) 来收窄候选 root traces。
+2. 在 Python 中调用 `read_run(..., load_child_runs=True)`，或在 TypeScript 中调用 `readRun(..., { loadChildRuns: true })`，把每个候选 root trace 连同子 runs 一起 hydrate 出来。
+3. 在本地遍历已经 hydrate 的 `child_runs` tree，并对那些无法作为服务端过滤字段使用的内容应用你的断言。
+
+下面这个示例（Python 0.8 与 JS 0.7）会返回包含某个工具 run，且该工具 run 输出中包含特定值的 root traces。服务端的 `tree_filter` 先把候选范围收窄到包含该工具 run 的 traces，然后本地断言再检查 hydrate 后的 `outputs` 载荷。
+
+<CodeGroup>
+
+```python Python
+from datetime import datetime, timedelta
+
+from langsmith import Client
+
+client = Client()
+project_name = "<your_project>"
+
+
+def iter_runs(run):
+    yield run
+    for child in run.child_runs or []:
+        yield from iter_runs(child)
+
+
+candidate_roots = client.list_runs(
+    project_name=project_name,
+    is_root=True,
+    start_time=datetime.now() - timedelta(days=7),
+    tree_filter='and(eq(run_type, "tool"), eq(name, "<tool_name>"))',
+    select=["id"],
+)
+
+matching_roots = []
+for candidate in candidate_roots:
+    root = client.read_run(candidate.id, load_child_runs=True)
+    has_matching_child = any(
+        child.id != root.id
+        and child.run_type == "tool"
+        and child.name == "<tool_name>"
+        and "<expected_value>" in str(child.outputs or {})
+        for child in iter_runs(root)
+    )
+    if has_matching_child:
+        matching_roots.append(root)
+```
+
+```typescript TypeScript
+import { Client, Run } from "langsmith";
+
+const client = new Client();
+const projectName = "<your_project>";
+
+function* iterRuns(run: Run): Generator<Run> {
+  yield run;
+  for (const child of run.child_runs ?? []) {
+    yield* iterRuns(child);
+  }
+}
+
+const candidateRoots: Run[] = [];
+for await (const run of client.listRuns({
+  projectName,
+  isRoot: true,
+  startTime: new Date(Date.now() - 1000 * 60 * 60 * 24 * 7),
+  treeFilter: 'and(eq(run_type, "tool"), eq(name, "<tool_name>"))',
+  select: ["id"],
+})) {
+  candidateRoots.push(run);
+}
+
+const matchingRoots: Run[] = [];
+for (const candidate of candidateRoots) {
+  const root = await client.readRun(candidate.id, { loadChildRuns: true });
+  const hasMatchingChild = [...iterRuns(root)].some(
+    (child) =>
+      child.id !== root.id &&
+      child.run_type === "tool" &&
+      child.name === "<tool_name>" &&
+      JSON.stringify(child.outputs ?? {}).includes("<expected_value>"),
+  );
+  if (hasMatchingChild) {
+    matchingRoots.push(root);
+  }
+}
+```
+
+</CodeGroup>
+
+### 高级：导出扁平化的 trace 视图，并带上子工具使用情况
+
+下面的 Python 示例展示了如何导出 traces 的扁平化视图，并包含每条 trace 内 agent 使用过的工具信息（来自嵌套 runs）。
+这适合用来分析 agents 在多条 traces 中的行为。
+
+这个示例会查询指定天数范围内的所有工具 runs，并按其父级（root）run ID 分组。然后它会为每个 root run 拉取相关信息，例如 run name、inputs、outputs，并把这些信息与子 run 信息组合在一起。
+
+为了优化查询，该示例：
+
+1. 查询工具 runs 时只选择必要字段，从而减少查询耗时。
+2. 批量拉取 root runs，同时并发处理工具 runs。
+
+<CodeGroup>
+
+```python Python
+from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+from langsmith import Client
+from tqdm.auto import tqdm
+
+client = Client()
+project_name = "my-project"
+num_days = 30
+
+# List all tool runs
+tool_runs = client.list_runs(
+    project_name=project_name,
+    start_time=datetime.now() - timedelta(days=num_days),
+    run_type="tool",
+    # We don't need to fetch inputs, outputs, and other values that # may increase the query time
+    select=["trace_id", "name", "run_type"],
+)
+
+data = []
+futures: list[Future] = []
+trace_cursor = 0
+trace_batch_size = 50
+
+tool_runs_by_parent = defaultdict(lambda: defaultdict(set))
+# Do not exceed rate limit
+with ThreadPoolExecutor(max_workers=2) as executor:
+    # Group tool runs by parent run ID
+    for run in tqdm(tool_runs):
+        # Collect all tools invoked within a given trace
+        tool_runs_by_parent[run.trace_id]["tools_involved"].add(run.name)
+        # maybe send a batch of parent run IDs to the server
+        # this lets us query for the root runs in batches
+        # while still processing the tool runs
+        if len(tool_runs_by_parent) % trace_batch_size == 0:
+            if this_batch := list(tool_runs_by_parent.keys())[
+                trace_cursor : trace_cursor + trace_batch_size
+            ]:
+                trace_cursor += trace_batch_size
+                futures.append(
+                    executor.submit(
+                        client.list_runs,
+                        project_name=project_name,
+                        run_ids=this_batch,
+                        select=["name", "inputs", "outputs", "run_type"],
+                    )
+                )
+    if this_batch := list(tool_runs_by_parent.keys())[trace_cursor:]:
+        futures.append(
+            executor.submit(
+                client.list_runs,
+                project_name=project_name,
+                run_ids=this_batch,
+                select=["name", "inputs", "outputs", "run_type"],
+            )
+        )
+
+for future in tqdm(futures):
+    root_runs = future.result()
+    for root_run in root_runs:
+        root_data = tool_runs_by_parent[root_run.id]
+        data.append(
+            {
+                "run_id": root_run.id,
+                "run_name": root_run.name,
+                "run_type": root_run.run_type,
+                "inputs": root_run.inputs,
+                "outputs": root_run.outputs,
+                "tools_involved": list(root_data["tools_involved"]),
+            }
+        )
+
+# (Optional): Convert to a pandas DataFrame
+import pandas as pd
+
+df = pd.DataFrame(data)
+df.head()
+```
+
+</CodeGroup>
+
+### 高级：导出带有反馈的 traces 中的 retriever 输入输出
+
+如果你想基于 retriever 行为来微调 embeddings，或者诊断端到端系统表现，这类查询会很有帮助。
+下面的 Python 示例展示了如何导出带有特定反馈分数的 traces 中，retriever 的 inputs 和 outputs。
+
+<CodeGroup>
+
+```python Python
+from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+import pandas as pd
+from langsmith import Client
+from tqdm.auto import tqdm
+
+client = Client()
+project_name = "your-project-name"
+num_days = 1
+
+# List all tool runs
+retriever_runs = client.list_runs(
+    project_name=project_name,
+    start_time=datetime.now() - timedelta(days=num_days),
+    run_type="retriever",
+    # This time we do want to fetch the inputs and outputs, since they
+    # may be adjusted by query expansion steps.
+    select=["trace_id", "name", "run_type", "inputs", "outputs"],
+    trace_filter='eq(feedback_key, "user_score")',
+)
+
+data = []
+futures: list[Future] = []
+trace_cursor = 0
+trace_batch_size = 50
+
+retriever_runs_by_parent = defaultdict(lambda: defaultdict(list))
+# Do not exceed rate limit
+with ThreadPoolExecutor(max_workers=2) as executor:
+    # Group retriever runs by parent run ID
+    for run in tqdm(retriever_runs):
+        # Collect all retriever calls invoked within a given trace
+        for k, v in run.inputs.items():
+            retriever_runs_by_parent[run.trace_id][f"retriever.inputs.{k}"].append(v)
+        for k, v in (run.outputs or {}).items():
+            # Extend the docs
+            retriever_runs_by_parent[run.trace_id][f"retriever.outputs.{k}"].extend(v)
+        # maybe send a batch of parent run IDs to the server
+        # this lets us query for the root runs in batches
+        # while still processing the retriever runs
+        if len(retriever_runs_by_parent) % trace_batch_size == 0:
+            if this_batch := list(retriever_runs_by_parent.keys())[
+                trace_cursor : trace_cursor + trace_batch_size
+            ]:
+                trace_cursor += trace_batch_size
+                futures.append(
+                    executor.submit(
+                        client.list_runs,
+                        project_name=project_name,
+                        run_ids=this_batch,
+                        select=[
+                            "name",
+                            "inputs",
+                            "outputs",
+                            "run_type",
+                            "feedback_stats",
+                        ],
+                    )
+                )
+    if this_batch := list(retriever_runs_by_parent.keys())[trace_cursor:]:
+        futures.append(
+            executor.submit(
+                client.list_runs,
+                project_name=project_name,
+                run_ids=this_batch,
+                select=["name", "inputs", "outputs", "run_type"],
+            )
+        )
+
+for future in tqdm(futures):
+    root_runs = future.result()
+    for root_run in root_runs:
+        root_data = retriever_runs_by_parent[root_run.id]
+        feedback = {
+            f"feedback.{k}": v.get("avg")
+            for k, v in (root_run.feedback_stats or {}).items()
+        }
+        inputs = {f"inputs.{k}": v for k, v in root_run.inputs.items()}
+        outputs = {f"outputs.{k}": v for k, v in (root_run.outputs or {}).items()}
+        data.append(
+            {
+                "run_id": root_run.id,
+                "run_name": root_run.name,
+                **inputs,
+                **outputs,
+                **feedback,
+                **root_data,
+            }
+        )
+
+# (Optional): Convert to a pandas DataFrame
+import pandas as pd
+df = pd.DataFrame(data)
+df.head()
+```
+
+</CodeGroup>
+
+## 速率限制
+
+[`POST /runs/query`](/langsmith/smith-api/run/query-runs) 端点（Python 中的 [`list_runs`](https://reference.langchain.com/python/langsmith/client/Client/list_runs)，JavaScript 中的 [`listRuns`](https://reference.langchain.com/javascript/langsmith/client/Client/listRuns)）会按租户施加速率限制，且会随着查询参数不同而变化：
+
+| **查询类型** | **限制** | **窗口** |
+|---|---|---|
+| 短时间窗口（≤ 7 天） | 10 次请求 | 10 秒 |
+| 大时间窗口（> 7 天） | 3 次请求 | 10 秒 |
+| 全文搜索，短时间窗口（≤ 7 天） | 3 次请求 | 10 秒 |
+| 全文搜索，大时间窗口（> 7 天） | 1 次请求 | 10 秒 |
+| 选择 `child_run_ids`，短时间窗口（≤ 7 天） | 3 次请求 | 10 秒 |
+| 选择 `child_run_ids`，大时间窗口（> 7 天） | 1 次请求 | 10 秒 |
+
+时间窗口由 `end_time - start_time` 决定。如果没有提供 `end_time`，LangSmith 会使用当前时间。未提供 `start_time` 的查询会被视为大时间窗口查询。
+
+### 最佳实践
+
+为了避免触发速率限制，并减少查询耗时，尤其是在 runs 的 inputs/outputs 很大时，建议遵循以下做法：
+
+- **设置 `start_time`**：省略它会触发大时间窗口限流档位（每 10 秒 3 次请求，而不是 10 次）。如果可能，请将时间窗口控制在 7 天以内。
+- **使用 `select`**：默认会返回所有字段。只指定你需要的字段（例如 `select=["inputs", "outputs"]`）可以显著减少响应体大小和查询耗时，特别适用于 inputs/outputs 很大的 runs。
+- **设置 `limit`**：如果你不需要分页拉取全部数据，可以限制结果数量。
+- **避免全文搜索**：`filter='search("...")'` 的速率限制最严格。如有可能，优先使用结构化过滤器（例如 `eq()`、`has()`）。
+- **避免选择 `child_run_ids`**：这同样会触发更严格的限流档位。
+
+如果超过这些限制，API 会返回 `429 Too Many Requests`。如需了解通用速率限制信息，请参阅 [Administration overview](/langsmith/usage-and-billing#rate-limits)。

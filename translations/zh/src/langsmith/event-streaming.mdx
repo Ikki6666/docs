@@ -1,0 +1,739 @@
+---
+title: 事件流 API
+sidebarTitle: 事件流 API
+description: 使用类型化投影为消息、状态、工具调用、子图和自定义转换器流式消费 LangSmith 部署。
+tag: "Beta"
+---
+
+事件流是面向 LangSmith 部署的类型化投影流式模型。LangGraph SDK（[Python](/langsmith/langgraph-python-sdk)、[JavaScript](/langsmith/langgraph-js-ts-sdk)）会针对 [LangSmith Deployment API](/langsmith/server-api-ref) 打开一个订阅，并把消息、状态、工具调用、子图、输出以及自定义 transformer 扩展暴露为类型化投影，这些投影都可以在同一次 run 中并发消费。
+
+事件流位于[流式 API](/langsmith/streaming)之上，后者暴露的是原始 stream modes。
+
+<Note>
+事件流要求 [LangGraph Agent Server](/langsmith/agent-server) 上的 `langgraph-api>=0.10.0`。托管版 LangSmith 部署会自动更新，自托管服务端则必须运行兼容版本。客户端 SDK 需要满足 `langgraph-sdk>=0.4.0` 和 `langchain-core>=1.4.0`（Python），或 `@langchain/langgraph-sdk>=1.9.15`（JavaScript）。更早版本的服务端仍然只提供[流式 API](/langsmith/streaming)。
+</Note>
+
+## 快速开始
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    from langgraph_sdk import get_client
+
+    client = get_client(url=DEPLOYMENT_URL, api_key=API_KEY)
+
+    async with client.threads.stream(assistant_id="agent") as thread:
+        await thread.run.start(
+            input={"messages": [{"role": "user", "content": "What is 42 * 17?"}]},
+        )
+
+        async for message in thread.messages:
+            async for token in message.text:
+                print(token, end="", flush=True)
+
+        final_state = await thread.output
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript
+    import { Client } from "@langchain/langgraph-sdk";
+
+    const client = new Client({
+      apiUrl: process.env.DEPLOYMENT_URL,
+      apiKey: process.env.LANGSMITH_API_KEY,
+    });
+
+    const thread = client.threads.stream({ assistantId: "agent" });
+
+    await thread.run.start({
+      input: { messages: [{ role: "user", content: "What is 42 * 17?" }] },
+    });
+
+    for await (const message of thread.messages) {
+      for await (const token of message.text) {
+        process.stdout.write(token);
+      }
+    }
+
+    const finalState = await thread.output;
+    await thread.close();
+    ```
+
+    JavaScript 流没有 `async with` 等价写法，因此完成后请调用 `await thread.close()` 释放底层订阅。
+    </Tab>
+    <Tab title="cURL">
+    事件流使用两个端点。先打开 SSE 订阅，再在同一个 thread 上发送 `run.start` 命令。SDK 会替你处理这两步，但在线路层面它们是两次独立请求。
+
+    先创建一个 thread：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{}'
+    ```
+
+    打开事件订阅。请求体是一个 `EventStreamRequest`，包含要订阅的 channels，以及可选的 `namespaces`、`depth` 和 `since` seq 游标：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream/events \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{"channels": ["values", "updates", "messages", "tools", "lifecycle", "input", "checkpoints", "tasks", "custom"]}'
+    ```
+
+    然后通过第二个请求发送 `run.start` 命令来启动 run。命令体是一个类似 JSON-RPC 的信封，包含 `id`、`method` 和 `params`：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/commands \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{
+        "id": 1,
+        "method": "run.start",
+        "params": {
+          "assistant_id": "agent",
+          "input": {"messages": [{"role": "user", "content": "What is 42 * 17?"}]}
+        }
+      }'
+    ```
+
+    SSE 响应中的每一行都是一个 `ProtocolEvent` 信封。请按 `method` 解析并分发事件，以重建 SDK 暴露的类型化投影。
+    </Tab>
+</Tabs>
+
+如需查看 LangGraph 应用代码中的进程内等价模式，请参阅 [LangGraph event streaming](/oss/langgraph/event-streaming)。
+
+默认情况下，SDK 通过 Server-Sent Events 进行流式传输。如果要改用全双工 WebSocket 连接，请向 `client.threads.stream(...)` 传入 `transport="websocket"`。
+
+## 事件流提供了什么
+
+`client.threads.stream(...)` 返回的流会在一个底层事件流之上暴露多种类型化投影：
+
+| Projection | 用途 |
+| ---------- | --- |
+| `thread.events` | 遍历所有原始协议事件（Python）。在 JavaScript 中，使用 `thread.subscribe(...)`。 |
+| `thread.messages` | 流式读取聊天模型消息、token 增量、reasoning 和工具调用参数分块。 |
+| `thread.values` | 遍历状态快照，并等待最终值。 |
+| `thread.output` | 等待最终输出。 |
+| `thread.tool_calls`（JavaScript 中为 `thread.toolCalls`） | 观察工具调用，包括完整输入、流式输出和结果。 |
+| `thread.subgraphs` | 发现并观察嵌套图执行。 |
+| `thread.subagents` | 面向子代理的 `thread.subgraphs` 视图。在 Deep Agents 的 subagent 调用场景中使用这个名称。 |
+| `thread.interrupts` | 查看 human-in-the-loop interrupt 的载荷。 |
+| `thread.interrupted` | 检查 run 是否因为人工输入而暂停。 |
+| `thread.extensions` | 消费通过 `custom:<name>` channels 发布的自定义 stream transformer 投影。 |
+
+多个消费者可以并发读取这些投影。读取 `thread.messages` 不会消耗 `thread.values`、`thread.toolCalls`、`thread.subgraphs` 或 `thread.output` 所需的事件。
+
+## 流式读取消息
+
+使用 `thread.messages` 读取聊天模型输出：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    async with client.threads.stream(assistant_id="agent") as thread:
+        await thread.run.start(input=input)
+
+        async for message in thread.messages:
+            text = await message.text
+            usage = (await message.output).usage_metadata
+
+            print(text)
+            print(usage)
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript
+    const thread = client.threads.stream({ assistantId: "agent" });
+
+    await thread.run.start({ input });
+
+    for await (const message of thread.messages) {
+      const text = await message.text;
+      const usage = (await message.output).usage_metadata;
+
+      console.log(text);
+      console.log(usage);
+    }
+    ```
+    </Tab>
+    <Tab title="cURL">
+    打开只订阅 `messages` channel 的连接：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream/events \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{"channels": ["messages"]}'
+    ```
+
+    然后像[快速开始](#quickstart)中那样，在 `/commands` 上发送 `run.start`。根据 `params.data.event`（`message-start`、`content-block-start`、`content-block-delta`、`content-block-finish`、`message-finish`）分发每个事件，以重新组装每条消息及其 content blocks。
+    </Tab>
+</Tabs>
+
+`message.text` 同时是异步可迭代对象和 awaitable。你可以迭代它来逐 token 输出，也可以直接 `await` 它获取完整文本。`message.reasoning` 暴露 reasoning 增量，`message.tool_calls`（JavaScript 中为 `message.toolCalls`）暴露工具调用参数分块。`await message.output` 可以获得最终消息，包括其中的 `usage_metadata`。如果你需要严格按到达顺序消费 text、reasoning 和工具调用分块，请遍历原始事件流，而不是分别读取这些投影。
+
+## 流式读取状态
+
+使用 `thread.values` 在每一步之后流式读取完整状态快照：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    async with client.threads.stream(assistant_id="agent") as thread:
+        await thread.run.start(input=input)
+
+        async for snapshot in thread.values:
+            print(snapshot)
+
+        final_state = await thread.output
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript
+    const thread = client.threads.stream({ assistantId: "agent" });
+
+    await thread.run.start({ input });
+
+    for await (const snapshot of thread.values) {
+      console.log(snapshot);
+    }
+
+    const finalState = await thread.output;
+    ```
+    </Tab>
+    <Tab title="cURL">
+    打开只订阅 `values` channel 的连接：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream/events \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{"channels": ["values"]}'
+    ```
+
+    然后像[快速开始](#quickstart)中那样，在 `/commands` 上发送 `run.start`。每个事件的 `params.data` 都是一个完整状态快照。
+    </Tab>
+</Tabs>
+
+`thread.values` 也可以被 `await`。`await thread.values` 会解析为最终状态，等价于 `await thread.output`。
+
+## 流式读取工具调用
+
+`thread.tool_calls`（JavaScript 中为 `thread.toolCalls`）会暴露已组装好的工具调用。每个 handle 都包含工具名（`call.name`）和已组装的输入（`call.input`，它是普通值，不需要 await）。工具调用结束后，可以 `await call.output` 获取工具结果：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    async for call in thread.tool_calls:
+        print(call.name, call.input)
+        print(await call.output)
+
+        if call.error is not None:
+            print(call.error)
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript
+    for await (const call of thread.toolCalls) {
+      console.log(call.name, call.input);
+      console.log(await call.output);
+    }
+    ```
+    </Tab>
+    <Tab title="cURL">
+    打开只订阅 `tools` channel 的连接：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream/events \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{"channels": ["tools"]}'
+    ```
+
+    然后像[快速开始](#quickstart)中那样，在 `/commands` 上发送 `run.start`。按 `params.data.event`（`tool-started`、`tool-output-delta`、`tool-finished`、`tool-error`）分发事件，并通过工具调用 ID 与 `messages` channel 上对应的工具调用 content block 关联起来。
+    </Tab>
+</Tabs>
+
+在 Python 中，`call.deltas` 是工具输出的异步迭代器，可用于边产出边消费；如果工具抛出异常，异常会保存在 `call.error` 中。工具事件会通过工具调用 ID 与 `thread.messages` 中对应的工具调用 content blocks 相关联。
+
+## 流式读取子图
+
+使用 `thread.subgraphs` 观察嵌套图执行，而不必自己解析 namespace 字符串：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    async for subgraph in thread.subgraphs:
+        print(subgraph.graph_name, subgraph.path)
+
+        async for message in subgraph.messages:
+            print(await message.text)
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript
+    for await (const subgraph of thread.subgraphs) {
+      console.log(subgraph.name, subgraph.namespace);
+
+      for await (const message of subgraph.messages) {
+        console.log(await message.text);
+      }
+    }
+    ```
+    </Tab>
+    <Tab title="cURL">
+    子图活动通过每个事件上的 `params.namespace` 路径传递。请打开订阅 `lifecycle` channel 的连接，并视需要一并订阅想在子图内部观察的其他 channels：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream/events \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{"channels": ["lifecycle", "messages", "tools"]}'
+    ```
+
+    然后像[快速开始](#quickstart)中那样，在 `/commands` 上发送 `run.start`。观察 `lifecycle` channel 中带有 `graph_name` 的 `started` 事件，以发现新的子图，然后按该 namespace 前缀筛选后续事件，查看对应子图中的工作。
+    </Tab>
+</Tabs>
+
+每个子图 handle 都暴露图名称（Python 中为 `subgraph.graph_name`，JavaScript 中为 `subgraph.name`）以及其 namespace 路径（Python 中为 `subgraph.path`，JavaScript 中为 `subgraph.namespace`），同时还带有该子图范围内的 `messages`、`tool_calls` 和嵌套 `subgraphs` 投影。
+
+对于 [Deep Agents](/oss/deepagents/event-streaming) 部署，建议优先使用 `thread.subagents` 来观察 subagent 调用。它会暴露 subagent 名称，以及按 subagent 组织的消息和工具调用投影。
+
+## 流式读取输出
+
+run 完成后，可以 `await thread.output` 获取最终状态：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    await thread.run.start(input=input)
+
+    final_state = await thread.output
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript
+    await thread.run.start({ input });
+
+    const finalState = await thread.output;
+    ```
+    </Tab>
+    <Tab title="cURL">
+    打开订阅 `values` 和 `lifecycle` 的连接：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream/events \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{"channels": ["values", "lifecycle"]}'
+    ```
+
+    然后像[快速开始](#quickstart)中那样，在 `/commands` 上发送 `run.start`。持续读取，直到你观察到 root namespace 上 `params.data.event == "completed"` 的 `lifecycle` 事件。其之前最后一个 `values` 事件就是最终状态。
+    </Tab>
+</Tabs>
+
+`thread.output` 与 `thread.values` 共用同一个订阅，因此如果另一个也在读取，等待其中任何一个都不需要额外的往返请求。
+
+## 流式读取多个投影
+
+如果应用代码需要同时消费多个投影，可以并发运行多个消费者：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    import asyncio
+
+
+    async def consume_messages():
+        async for message in thread.messages:
+            print(await message.text)
+
+
+    async def consume_tool_calls():
+        async for call in thread.tool_calls:
+            print(call.name, await call.output)
+
+
+    async def consume_subgraphs():
+        async for subgraph in thread.subgraphs:
+            print(subgraph.graph_name, subgraph.path)
+
+
+    await asyncio.gather(consume_messages(), consume_tool_calls(), consume_subgraphs())
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript
+    await Promise.all([
+      (async () => {
+        for await (const message of thread.messages) {
+          console.log(await message.text);
+        }
+      })(),
+      (async () => {
+        for await (const call of thread.toolCalls) {
+          console.log(call.name, await call.output);
+        }
+      })(),
+      (async () => {
+        for await (const subgraph of thread.subgraphs) {
+          console.log(subgraph.name, subgraph.namespace);
+        }
+      })(),
+    ]);
+    ```
+    </Tab>
+    <Tab title="cURL">
+    打开一个覆盖所有所需 channels 的订阅：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream/events \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{"channels": ["messages", "tools", "lifecycle"]}'
+    ```
+
+    然后像[快速开始](#quickstart)中那样，在 `/commands` 上发送 `run.start`。单个 SSE 订阅会传递请求体中列出的所有 channels。按 `method` 分发后即可喂给各自独立的消费者。SDK 的并发投影在客户端完成的也是同样的拆分工作。
+    </Tab>
+</Tabs>
+
+每个投影都会在同一个 thread 上打开一个经过筛选的订阅，因此并发读取不会让服务端负担超过实际消费的 channels。
+
+## 在 interrupt 后恢复
+
+当图因人工输入而暂停时，检查 `thread.interrupted` 和 `thread.interrupts`，然后通过响应 interrupt 来恢复：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    async with client.threads.stream(assistant_id="agent") as thread:
+        await thread.run.start(input=input)
+
+        async for message in thread.messages:
+            print(await message.text)
+
+        if thread.interrupted:
+            for interrupt in thread.interrupts:
+                await thread.run.respond(
+                    {"decisions": [{"type": "approve"}]},
+                    interrupt_id=interrupt["interrupt_id"],
+                )
+
+        final_state = await thread.output
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript
+    const thread = client.threads.stream({ assistantId: "agent" });
+
+    await thread.run.start({ input });
+
+    for await (const message of thread.messages) {
+      console.log(await message.text);
+    }
+
+    if (thread.interrupted) {
+      for (const interrupt of thread.interrupts) {
+        await thread.input.respond({
+          namespace: interrupt.namespace,
+          interrupt_id: interrupt.interruptId,
+          response: { decisions: [{ type: "approve" }] },
+        });
+      }
+    }
+
+    const finalState = await thread.output;
+    ```
+    </Tab>
+    <Tab title="cURL">
+    将 interrupt 响应作为 `input.respond` 命令发送：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/commands \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{
+        "id": 2,
+        "method": "input.respond",
+        "params": {
+          "namespace": <INTERRUPT_NAMESPACE>,
+          "interrupt_id": "<INTERRUPT_ID>",
+          "response": {"decisions": [{"type": "approve"}]}
+        }
+      }'
+    ```
+
+    `namespace` 是 interrupt 的 namespace 数组（root graph 对应 `[]`），如果省略则默认作用于 root。请保持原有 SSE 连接开启，部署会在命令生效后继续在同一个 thread 上发出事件。
+    </Tab>
+</Tabs>
+
+## 加入一个正在运行的 run
+
+如果某个 run 已经在 thread 上执行中，而你想在页面刷新后、另一个 worker 中，或从其他客户端附着上去，可以使用已有的 `thread_id` 打开 thread 流，并跳过 `thread.run.start()`。连接建立后，部署会重放缓冲事件，因此消费者能够从头重建 run 状态，而不会漏掉已有输出。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    from langgraph_sdk import get_client
+
+    client = get_client(url=DEPLOYMENT_URL, api_key=API_KEY)
+
+    async with client.threads.stream(
+        thread_id=thread_id,
+        assistant_id="agent",
+    ) as thread:
+        async for message in thread.messages:
+            print(await message.text)
+
+        final_state = await thread.output
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript
+    import { Client } from "@langchain/langgraph-sdk";
+
+    const client = new Client({ apiUrl: DEPLOYMENT_URL, apiKey: API_KEY });
+
+    const thread = client.threads.stream(threadId, { assistantId: "agent" });
+
+    for await (const message of thread.messages) {
+      console.log(await message.text);
+    }
+
+    const finalState = await thread.output;
+    ```
+    </Tab>
+    <Tab title="cURL">
+    打开事件流而不发送 `run.start` 命令，即可作为被动观察者附着到现有 run：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream/events \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{"channels": ["values", "updates", "messages", "tools", "lifecycle", "input", "checkpoints", "tasks", "custom"]}'
+    ```
+
+    当订阅打开时，服务端会从 run 开始处重放缓冲事件。
+    </Tab>
+</Tabs>
+
+## 流式读取所有协议事件
+
+当应用代码需要拿到每一个事件时，请读取原始协议事件流。在 Python 中遍历 `thread.events`；在 JavaScript 中则打开 `subscribe`（JavaScript 的 stream 对象本身不可直接迭代）：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    async with client.threads.stream(assistant_id="agent") as thread:
+        await thread.run.start(input=input)
+
+        async for event in thread.events:
+            print(event["method"], event["params"]["namespace"], event["params"]["data"])
+    ```
+
+    如果想只关注特定 channels，可以在 thread 上打开 `subscribe`：
+
+    ```python
+    async for event in thread.subscribe(["messages", "tools"]):
+        ...
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript
+    const thread = client.threads.stream({ assistantId: "agent" });
+
+    const events = await thread.subscribe({
+      channels: ["messages", "tools", "values", "lifecycle"],
+    });
+
+    await thread.run.start({ input });
+
+    for await (const event of events) {
+      console.log(event.method, event.params.namespace, event.params.data);
+    }
+    ```
+
+    `thread.subscribe(...)` 返回的是 `Promise`，因此迭代前请先 `await`。如果要缩小订阅范围，可以传入 channel 名数组：
+
+    ```javascript
+    const sub = await thread.subscribe(["messages", "tools"]);
+    for await (const event of sub) {
+      // ...
+    }
+    ```
+    </Tab>
+    <Tab title="cURL">
+    打开一个覆盖所有 channels 的订阅，然后像[快速开始](#quickstart)中那样，在 `/commands` 上发送 `run.start`：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream/events \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{"channels": ["values", "updates", "messages", "tools", "lifecycle", "input", "checkpoints", "tasks", "custom"]}'
+    ```
+
+    响应是 SSE frame 流。每个 frame 都有 `event:` 行（channel，与 `method` 对应）、`id:` 行（每个 session 内的 `seq`）和 `data:` 行（一个 JSON `ProtocolEvent`）。持久化的 `event_id` 位于 JSON 体内，而不在 `id:` 行上。
+
+    ```text
+    event: lifecycle
+    id: 1
+    data: {"type":"event","seq":1,"method":"lifecycle","params":{"namespace":[],"timestamp":1736...,"data":{"event":"started"}},"event_id":"01HZ..."}
+
+    event: messages
+    id: 2
+    data: {"type":"event","seq":2,"method":"messages","params":{"namespace":[],"timestamp":1736...,"data":{"event":"message-start","message":{...}}},"event_id":"01HZ..."}
+    ```
+    </Tab>
+</Tabs>
+
+每个事件都是一个 `ProtocolEvent` 信封，包裹着某个 channel 特定的载荷：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    from typing import Any, NotRequired, TypedDict
+
+
+    class ProtocolEventParams(TypedDict):
+        namespace: list[str]   # path of "<name>:<runtime_id>" segments; [] is the root
+        timestamp: int         # wall-clock milliseconds; can drift, do not rely on for ordering
+        data: Any              # channel-specific payload
+
+
+    class ProtocolEvent(TypedDict):
+        type: str              # always "event"
+        seq: int               # increasing within a session; carried on the SSE `id:` line; use for ordering
+        method: str            # channel name: "messages", "values", "tools", "lifecycle", "custom", ...
+        params: ProtocolEventParams
+        event_id: NotRequired[str]   # durable cross-session dedup ID, carried in the JSON body
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```typescript
+    interface ProtocolEvent {
+      readonly type: "event";
+      readonly seq: number;          // increasing within a session; carried on the SSE `id:` line; use for ordering
+      readonly method: string;       // channel name: "messages", "values", "tools", "lifecycle", "custom", ...
+      readonly params: {
+        readonly namespace: string[];   // path of "<name>:<runtime_id>" segments; [] is the root
+        readonly timestamp: number;     // wall-clock milliseconds; can drift, do not rely on for ordering
+        readonly data: unknown;         // channel-specific payload
+      };
+      readonly event_id?: string;    // durable cross-session dedup ID, carried in the JSON body
+    }
+    ```
+    </Tab>
+    <Tab title="cURL">
+    原始 SSE frame：
+
+    ```text
+    event: messages
+    id: 42
+    data: {"type":"event","seq":42,"method":"messages","params":{"namespace":["researcher:6f4d"],"timestamp":1736283600123,"data":{"event":"content-block-delta","index":0,"delta":{"type":"text","text":"Hello"}}},"event_id":"01HZQ8XK5N6F9M2A3B4C5D6E7F"}
+    ```
+
+    `id:` 行携带的是当前 session 内的 `seq`；持久化的 `event_id` 位于 JSON 体内，客户端用它做去重。线路协议不会使用 `Last-Event-ID` 头进行恢复，客户端需要在请求体中传入 `since` seq 游标。Agent Server 会按 run 把事件保存在一个有界缓冲区中，并在新订阅建立时重放，SDK 则会在客户端按 `event_id` 做去重。
+    </Tab>
+</Tabs>
+
+`namespace` 表示从 root graph 到发出该事件的作用域路径。root 对应空数组。每个子执行都会追加一个 `"name:runtime_id"` 片段，因此，子图中的嵌套工具调用可能表现为 `["researcher:6f4d", "tools:91ac"]`。如果你只关心某个特定子树，可以直接按 namespace 过滤原始事件；而 `thread.subgraphs` 已经为嵌套图执行做好了这层工作。
+
+## Channels 与事件生命周期
+
+原始事件通过 channels 流动。channel 名会出现在事件的 `method` 字段中，每个 channel 都会发出特定形态的事件。
+
+| Channel | 用途 |
+| ------- | ------- |
+| `values` | 完整图状态快照。 |
+| `updates` | 按节点划分的状态增量。 |
+| `messages` | 以 content block 为中心的聊天模型输出。 |
+| `tools` | 工具调用开始、流式输出、结束和错误事件。 |
+| `lifecycle` | run、子图和子代理的状态变化。 |
+| `checkpoints` | 用于分支和 time travel 的轻量 checkpoint 信封。 |
+| `input` | human-in-the-loop 输入请求与响应。 |
+| `tasks` | Pregel task 创建与结果事件。 |
+| `custom` | 图代码中用户自定义的载荷。 |
+| `custom:<name>` | 应用自定义的 stream transformer 输出。 |
+
+类型化投影（`thread.messages`、`thread.values`、`thread.toolCalls` 等）都是从这些 channels 构建出来的。直接迭代 stream 对象时，原始事件的 `method` 字段就是 channel 名。
+
+### Messages
+
+`messages` channel 会把输出建模为 content blocks。`data.event` 可能是 `message-start`、`content-block-start`、`content-block-delta`、`content-block-finish`、`message-finish` 或 `error`。content blocks 具有明确边界：一个 block 先开始，再发出零个或多个增量，然后在同一条消息中的下一个 block 开始前结束。`message-finish` 可能包含 token usage；无法恢复的模型调用失败则会以消息错误事件形式到达。
+
+### Tools
+
+`tools` channel 暴露工具执行过程。`data.event` 可能是 `tool-started`、`tool-output-delta`、`tool-finished`、`tool-error`。工具事件会通过工具调用 ID 进行关联，因此你可以把某次工具执行和 `messages` channel 上发起它的工具调用 content block 对应起来。
+
+### Lifecycle
+
+`lifecycle` channel 用于跟踪 root run、子图和子代理的状态。`data.event` 可能是 `started`、`running`、`completed`、`failed`、`interrupted`。root run 最终会进入 `completed`、`failed` 或 `interrupted` 之一；子作用域也可能报告 `running`。lifecycle 数据还可能包含可选的 `graph_name`、`error` 和 `cause`，用于说明某个子作用域为何启动，例如父工具调用、fan-out send 或 edge transition。
+
+## 从最后一个事件恢复
+
+事件流支持恢复。Agent Server 会按 run 在有界缓冲区中保存事件，为每个事件分配 `seq`（当前 session 内排序）和持久化的 `event_id`（跨重放与副本稳定），并在重连时从游标位置开始重放。SDK 会自动处理临时断连：每个打开的订阅都会跟踪已看到的最高 `seq`，重连后 SDK 会从该游标处重放，并按 `event_id` 去重重复发送的事件。
+
+如果你需要跨进程恢复，比如页面刷新、worker 切换或换一个客户端继续读取，只需用同一个 `thread_id` 重新打开 thread。服务端会在新订阅建立时重放缓冲事件，SDK 则会把它们重新分流为相同的类型化投影。由于每个 run 的缓冲区是有界的，如果某个 run 很长，最早的事件可能已经被驱逐。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    async with client.threads.stream(
+        thread_id=thread_id,
+        assistant_id="agent",
+    ) as thread:
+        async for event in thread.events:
+            print(event["method"], event.get("event_id"))
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript
+    const thread = client.threads.stream(threadId, { assistantId: "agent" });
+
+    const events = await thread.subscribe({
+      channels: ["values", "updates", "messages", "tools", "lifecycle", "input", "checkpoints", "tasks", "custom"],
+    });
+
+    for await (const event of events) {
+      console.log(event.method, event.event_id);
+    }
+    ```
+    </Tab>
+    <Tab title="cURL">
+    重新打开订阅，即可收到重放事件：
+
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream/events \
+      --header 'Content-Type: application/json' \
+      --header 'x-api-key: <API_KEY>' \
+      --data '{"channels": ["values", "updates", "messages", "tools", "lifecycle", "input", "checkpoints", "tasks", "custom"]}'
+    ```
+
+    在线路层面，如果在请求体中传入 `since` seq 游标，就只会返回该位置之后的事件。SDK 会在重连时自动管理这个游标，因此 `client.threads.stream(...)` 不会把 `since` 暴露成参数。
+    </Tab>
+</Tabs>
+
+## 相关内容
+
+- [Streaming API](/langsmith/streaming)：基于 `stream_mode` 的流式 API，也支持 `langgraph-api>=0.10.0`。
+- [LangGraph event streaming](/oss/langgraph/event-streaming)：将相同概念应用于进程内 LangGraph 应用。
+- [LangChain agent event streaming](/oss/langchain/event-streaming)：面向 agent 的消息、工具调用和 middleware 更新投影。
+- [Deep Agents event streaming](/oss/deepagents/event-streaming)：子代理流、嵌套消息和子代理工具调用。
+- [LangSmith Deployment API](/langsmith/server-api-ref)：`POST /threads/{thread_id}/stream/events` 及相关端点的线路级参考。
+
+线路级事件与命令格式定义在 [Agent Protocol](https://github.com/langchain-ai/agent-protocol) 仓库中。

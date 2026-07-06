@@ -1,0 +1,383 @@
+---
+title: 细粒度计费使用量
+sidebarTitle: 细粒度用量
+description: 获取按 workspace、project、user 或 API key 细分的 trace 与 LangSmith Deployment 详细使用数据。
+---
+
+<Note>
+**Trace usage：** 对于 LangSmith Cloud，细粒度 trace 计费数据的采集开始于 2026 年 1 月 5 日。在此日期之前摄入的 traces 不提供这类数据。
+
+对于自托管实例，trace 数据采集会在通过下列环境变量启用该功能时开始，或者在[升级到默认启用该功能的版本后](/langsmith/self-hosted-changelog#langsmith-0-13-12)开始。
+
+```env
+DEFAULT_ORG_FEATURE_ENABLE_GRANULAR_USAGE_REPORTING=true
+GRANULAR_USAGE_TABLE_ENABLED=true
+```
+
+**LangSmith Deployment usage** 使用的是另一套独立数据源。更多细节请参阅 [LangSmith Deployment 小节](/langsmith/granular-usage#langsmith-deployment-usage-kind%3Dlangsmith_deployments)。
+</Note>
+
+LangSmith 提供了细粒度计费用量 API，允许你按 workspace、project、user 或 API key 获取详细的用量数据。该接口通过 `kind` 查询参数，在同一个端点上支持两个计费域：
+
+- **Trace usage**（`kind=traces`，默认）：摄入的 traces 数量。
+- **LangSmith Deployment usage**（`kind=langsmith_deployments`）：已执行节点数、agent runs 数量，以及 [LangSmith Deployment](/langsmith/billing) 的 agent uptime。
+
+这两种用量类型共享相同的查询参数（时间范围、workspace 过滤、分组维度），并返回相同的按时间桶聚合的数据结构。但它们的数据源彼此独立，因此某一种 `kind` 返回的记录不会出现在另一种中。
+
+这些 API 可以帮助你：
+
+- 跟踪不同团队或 workspaces 的用量
+- 找出哪些用户或 API keys 正在消耗最多 traces，或运行了最多 agents
+- 分析随时间变化的使用模式
+- 导出用量数据，用于内部报表
+
+## 前置要求
+
+- 你必须拥有 [`organization:read` 权限](/langsmith/organization-workspace-operations) 才能访问细粒度用量数据。
+- 你只能查看自己有读取权限的 workspaces 的用量。
+
+## 在 UI 中查看
+
+你也可以在 [LangSmith UI](https://smith.langchain.com) 中查看细粒度用量数据：
+
+1. 进入 **Settings** > **Billing and Usage**
+2. 选择 **Granular Usage** 标签页
+3. 在 **LangSmith Traces** 与 **LangSmith Deployments** 子标签之间切换，以查看各自的用量域。当前子标签会反映在 URL 中（`?tab=traces` 或 `?tab=deployments`），因此你可以收藏该 URL 以便下次直接进入相同视图。
+4. 使用页面控件来：
+   - 选择时间范围（Last 7 days、30 days、3 months、6 months、1 year，或自定义）
+   - 按 workspace、project、user 或 API key 分组
+   - 过滤到特定 workspaces
+   - 在 **LangSmith Traces** 标签下，可选择按保留层级过滤（`All Retention` / `Long-lived only` / `Short-lived only`）
+5. 点击 **Export CSV** 下载当前标签页对应的数据。
+
+时间范围和 workspace 过滤器会在两个子标签之间共享，因此切换子标签时你当前的选择会被保留。**LangSmith Deployments** 标签会显示三个统计卡片（Total Nodes Executed / Total Agent Runs / Total Agent Uptime (seconds)），以及按垂直方向堆叠的三个图表，因为这三个指标的单位不同。
+
+## 查询参数
+
+细粒度用量接口支持以下查询参数：
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `start_time` | datetime | Yes | 时间范围起点（ISO 8601 格式）。 |
+| `end_time` | datetime | Yes | 时间范围终点。必须晚于 `start_time`。 |
+| `workspace_ids` | array of UUIDs | Yes | 将结果过滤到指定 workspaces。 |
+| `kind` | string | No | `traces`（默认）或 `langsmith_deployments`。用于选择计费域。 |
+| `group_by` | string | No | 分组维度，可选值：`workspace`、`project`、`user`、`api_key`。默认：`workspace`。 |
+| `trace_tier` | string | No | 仅用于 trace 的保留层级过滤：`longlived` 或 `shortlived`。省略则表示所有 retention。对于 `kind=langsmith_deployments` 会被忽略。 |
+
+### 按天粒度的契约
+
+用量数据按“天”进行聚合。接口会在 API 层把时间窗口规范化到完整日期：
+
+- `start_time` 会向下取整到该日的 UTC 零点。
+- `end_time` 会向上取整到下一日的 UTC 零点（如果本来就是零点则不变）。
+- 只要请求时间窗口与某一天有重叠，这一天就会被完整纳入结果。
+
+因此，如果你请求 `2026-01-01T12:00:00Z` 到 `2026-01-02T12:00:00Z` 这 24 小时窗口，返回的数据会包含完整的 1 月 1 日和 1 月 2 日两个 bucket。
+
+### Stride
+
+响应中的 `stride` 字段表示用于聚合的时间桶大小，它根据请求时间范围自动计算。最小单位是“天”，因此即便请求的是不足一天的窗口，也仍然会按一天为单位分桶。
+
+| 时间范围 | 聚合方式 | Stride |
+|------------|-------------|--------|
+| 最多 31 天 | 按天 | `days: 1` |
+| 32–93 天（约 3 个月） | 按周 | `days: 7` |
+| 94–366 天（约 1 年） | 按月 | `days: 30` |
+| 超过 366 天 | 按年 | `days: 365` |
+
+### 兼容性
+
+如果把 `kind=langsmith_deployments` 与 `group_by=trace_tier` 组合使用，会返回 `400 Bad Request`。Retention tiers 只适用于 traces。
+
+## API endpoint
+
+```
+GET /api/v1/orgs/current/billing/granular-usage
+```
+
+已有调用方如果省略 `kind`，会继续得到和之前完全相同结构的 trace usage 数据。
+
+### Trace usage（`kind=traces`）
+
+#### Response
+
+```json
+{
+  "stride": {
+    "days": 1,
+    "hours": 0
+  },
+  "usage": [
+    {
+      "time_bucket": "2026-01-15T00:00:00Z",
+      "dimensions": {
+        "workspace_id": "uuid",
+        "workspace_name": "My Workspace"
+      },
+      "traces": 1500
+    }
+  ]
+}
+```
+
+#### 示例：按 workspace 获取 trace usage
+
+<CodeGroup>
+```python Python
+import httpx
+from datetime import datetime, timedelta, timezone
+
+client = httpx.Client(
+    base_url="https://api.smith.langchain.com",
+    headers={"x-api-key": "<your-api-key>"}
+)
+
+end_time = datetime.now(timezone.utc)
+start_time = end_time - timedelta(days=30)
+
+response = client.get(
+    "/api/v1/orgs/current/billing/granular-usage",
+    params={
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "workspace_ids": ["<workspace-id>"],
+        "group_by": "workspace",
+    },
+)
+
+data = response.json()
+for record in data["usage"]:
+    print(f"{record['time_bucket']}: {record['traces']} traces")
+```
+
+```typescript TypeScript
+const response = await fetch(
+  `https://api.smith.langchain.com/api/v1/orgs/current/billing/granular-usage?` +
+  new URLSearchParams({
+    start_time: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+    end_time: new Date().toISOString(),
+    workspace_ids: "<workspace-id>",
+    group_by: "workspace",
+  }),
+  {
+    headers: {
+      "x-api-key": "<your-api-key>",
+    },
+  }
+);
+
+const data = await response.json();
+for (const record of data.usage) {
+  console.log(`${record.time_bucket}: ${record.traces} traces`);
+}
+```
+
+```bash cURL
+curl -X GET "https://api.smith.langchain.com/api/v1/orgs/current/billing/granular-usage?\
+start_time=2026-01-01T00:00:00Z&\
+end_time=2026-01-15T00:00:00Z&\
+workspace_ids=<workspace-id>&\
+group_by=workspace" \
+  -H "x-api-key: <your-api-key>"
+```
+</CodeGroup>
+
+#### 示例：按 user 获取 trace usage，并仅过滤 long-lived retention
+
+<CodeGroup>
+```python Python
+response = client.get(
+    "/api/v1/orgs/current/billing/granular-usage",
+    params={
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "workspace_ids": ["<workspace-id>"],
+        "group_by": "user",
+        "trace_tier": "longlived",
+    },
+)
+
+data = response.json()
+for record in data["usage"]:
+    user_email = record["dimensions"].get("user_email", "Unknown")
+    print(f"{user_email}: {record['traces']} long-lived traces")
+```
+</CodeGroup>
+
+### LangSmith Deployment usage（`kind=langsmith_deployments`）
+
+每条记录会同时携带三个指标，因此一次请求就足以驱动整个 Deployment 视图。
+
+<Note>
+**LangSmith Deployment usage** 的数据源独立于 trace usage，并且在你部署用量的完整保留期内可用。
+
+对于自托管实例，Deployment usage endpoint 默认不开启，需要显式通过以下环境变量启用：
+
+```env
+REMOTE_METRICS_ROLLUP_ENABLED=true
+```
+
+或者升级到默认启用它的 LangSmith 版本（参见 [self-hosted changelog](/langsmith/self-hosted-changelog)）。
+</Note>
+
+#### Response
+
+```json
+{
+  "stride": {
+    "days": 1,
+    "hours": 0
+  },
+  "usage": [
+    {
+      "time_bucket": "2026-01-15T00:00:00Z",
+      "dimensions": {
+        "workspace_id": "uuid",
+        "workspace_name": "My Workspace"
+      },
+      "nodes_executed": 12500,
+      "agent_runs": 320,
+      "agent_uptime_seconds": 86400
+    }
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `nodes_executed` | 该时间桶中执行的 LangGraph 节点总数。 |
+| `agent_runs` | 该时间桶中的 agent run（graph 调用）总数。 |
+| `agent_uptime_seconds` | 各 deployment replicas 在该时间桶内的 uptime 秒数总和。用于计费的去重 standby 分钟会由 billing pipeline 单独计算；这里暴露的是用于拆分和分析的原始总和。 |
+
+#### 示例：按 workspace 获取 Deployment usage
+
+<CodeGroup>
+```python Python
+response = client.get(
+    "/api/v1/orgs/current/billing/granular-usage",
+    params={
+        "kind": "langsmith_deployments",
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "workspace_ids": ["<workspace-id>"],
+        "group_by": "workspace",
+    },
+)
+
+data = response.json()
+for record in data["usage"]:
+    print(
+        f"{record['time_bucket']}: "
+        f"{record['nodes_executed']} nodes, "
+        f"{record['agent_runs']} runs, "
+        f"{record['agent_uptime_seconds']}s uptime"
+    )
+```
+
+```typescript TypeScript
+const response = await fetch(
+  `https://api.smith.langchain.com/api/v1/orgs/current/billing/granular-usage?` +
+  new URLSearchParams({
+    kind: "langsmith_deployments",
+    start_time: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+    end_time: new Date().toISOString(),
+    workspace_ids: "<workspace-id>",
+    group_by: "workspace",
+  }),
+  {
+    headers: {
+      "x-api-key": "<your-api-key>",
+    },
+  }
+);
+
+const data = await response.json();
+for (const record of data.usage) {
+  console.log(
+    `${record.time_bucket}: ${record.nodes_executed} nodes, ` +
+    `${record.agent_runs} runs, ${record.agent_uptime_seconds}s uptime`
+  );
+}
+```
+
+```bash cURL
+curl -X GET "https://api.smith.langchain.com/api/v1/orgs/current/billing/granular-usage?\
+kind=langsmith_deployments&\
+start_time=2026-01-01T00:00:00Z&\
+end_time=2026-01-15T00:00:00Z&\
+workspace_ids=<workspace-id>&\
+group_by=workspace" \
+  -H "x-api-key: <your-api-key>"
+```
+</CodeGroup>
+
+## CSV 导出
+
+```
+GET /api/v1/orgs/current/billing/granular-usage/export
+```
+
+它支持与数据接口相同的查询参数，包括 `kind`。返回的是 CSV 文件，其中每一行对应一个（时间桶，维度）元组。所有维度列都会始终存在，只有与当前 `group_by` 匹配的列会被填充。
+
+当 `kind=traces` 时，值列为 `Traces`。当 `kind=langsmith_deployments` 时，值列则为 `Nodes Executed`、`Agent Runs` 和 `Agent Uptime (seconds)`。
+
+| Column | Present when |
+|--------|--------------|
+| Time Bucket Start | Always |
+| Time Bucket End | Always |
+| Workspace ID / Name | Always（当 `group_by=workspace` 时填充） |
+| Project ID / Name | Always（当 `group_by=project` 时填充） |
+| User ID / Email | Always（当 `group_by=user` 时填充） |
+| API Key Short Key | Always（当 `group_by=api_key` 时填充） |
+| Traces | `kind=traces` |
+| Nodes Executed / Agent Runs / Agent Uptime (seconds) | `kind=langsmith_deployments` |
+
+对于任何以 `=`、`+`、`-`、`@`、制表符或回车开头的单元格值，系统都会自动添加制表符前缀，以避免在 Excel / Google Sheets / LibreOffice 中被当作公式执行。
+
+<CodeGroup>
+```python Python
+response = client.get(
+    "/api/v1/orgs/current/billing/granular-usage/export",
+    params={
+        "kind": "langsmith_deployments",
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "workspace_ids": ["<workspace-id>"],
+        "group_by": "workspace",
+    },
+)
+
+with open("deployment_usage_report.csv", "wb") as f:
+    f.write(response.content)
+```
+
+```bash cURL
+curl -X GET "https://api.smith.langchain.com/api/v1/orgs/current/billing/granular-usage/export?\
+kind=langsmith_deployments&\
+start_time=2026-01-01T00:00:00Z&\
+end_time=2026-01-15T00:00:00Z&\
+workspace_ids=<workspace-id>&\
+group_by=workspace" \
+  -H "x-api-key: <your-api-key>" \
+  -o deployment_usage_report.csv
+```
+</CodeGroup>
+
+## 分组选项
+
+`group_by` 参数决定用量数据的聚合方式：
+
+| Value | Description | Dimensions returned | Available for |
+|-------|-------------|---------------------|---------------|
+| `workspace` | 按 workspace 分组 | `workspace_id`, `workspace_name` | 两种 kind 都支持 |
+| `project` | 按 project 分组 | `project_id`, `project_name` | 两种 kind 都支持 |
+| `user` | 按 user 分组 | `user_id`, `user_email` | 两种 kind 都支持 |
+| `api_key` | 按 API key 分组 | `api_key_short_key` | 两种 kind 都支持 |
+
+对于 trace usage，这里的 “project” 指的是 [LangSmith tracer session](/langsmith/observability-concepts)。而对于 Deployment usage，“project” 指的是 LangSmith Deployment project（即某个已部署的 agent）。
+
+## 相关资源
+
+- [在你的账户中管理 billing](/langsmith/billing)
+- [Organization and workspace operations](/langsmith/organization-workspace-operations)

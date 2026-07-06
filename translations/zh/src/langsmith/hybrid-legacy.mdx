@@ -1,0 +1,205 @@
+---
+title: 设置指南（旧版）
+sidebarTitle: 设置指南（旧版）
+description: 旧版 hybrid 部署模型，采用 LangChain 托管的 control plane 与你自管的 data plane。
+---
+
+import SaasRegionUrls from '/snippets/langsmith/saas-region-urls.mdx';
+
+<Warning>
+本页描述的是旧版 hybrid 部署模型，它使用 LangChain 托管的 control plane 来编排运行在你云环境中的 Agent Servers。关于当前版本的 hybrid 模式，请参阅 [Hybrid](/langsmith/hybrid)。
+</Warning>
+
+<Info>
+Hybrid 选项需要 [Enterprise](https://langchain.com/pricing) 套餐。你可以通过 [Get a demo](https://www.langchain.com/contact-sales) 进一步了解。
+</Info>
+
+**hybrid** 模型会将 LangSmith 基础设施拆分到 LangChain 的云端和你自己的云环境中：
+
+- **Control plane**（LangSmith UI、APIs 与编排能力）运行在 LangChain 的云端，由 LangChain 托管。
+- **Data plane**（你的 <Tooltip tip="The server that runs your applications.">Agent Servers</Tooltip> 与 agent 工作负载）运行在你自己的云端，由你自行管理。
+
+这种方式兼顾了托管界面的便利性，以及在自有环境中运行工作负载的灵活性。
+
+<Note>
+如需进一步理解架构概念，请参阅 [control plane](/langsmith/control-plane)、[data plane](/langsmith/data-plane) 和 [Agent Server](/langsmith/agent-server)。
+</Note>
+
+| Component      | Responsibilities | Where it runs | Who manages it |
+|----------------|------------------|---------------|----------------|
+| <Tooltip tip="The LangSmith UI and APIs for managing deployments.">Control plane</Tooltip> | <ul><li>用于创建 deployments 与 revisions 的 UI</li><li>管理 deployments 的 APIs</li><li>存储 observability 数据</li></ul> | LangChain 的云端 | LangChain |
+| <Tooltip tip="The runtime environment where your Agent Servers and agents execute.">Data plane</Tooltip> | <ul><li>用于协调 deployments 的 operator/listener</li><li>Agent Servers（agents/graphs）</li><li>相关支撑服务（Postgres、Redis 等）</li></ul> | 你的云环境 | 你 |
+
+当 LangSmith 以 hybrid 模式运行时，你需要使用 [LangSmith API key](/langsmith/create-account-api-key) 来完成认证。
+
+### 工作流
+
+1. 使用 `langgraph-cli` 或 [Studio](/langsmith/studio) 在本地测试 graph。
+1. 使用 `langgraph build` 命令构建 Docker image。
+1. 从 [control plane UI](/langsmith/control-plane#control-plane-ui) 部署你的 Agent Server。
+
+<Note>
+支持的计算平台：[Kubernetes](https://kubernetes.io/)。具体请参阅下方的 [Kubernetes setup](#kubernetes-setup)。
+</Note>
+
+### 架构
+
+<img
+    className="block dark:hidden"
+    src="/langsmith/images/hybrid-with-deployment-light.png"
+    alt="Hybrid deployment: LangChain-hosted control plane (LangSmith UI/APIs) manages deployments. Your cloud runs a listener, Agent Server instances, and backing stores (Postgres/Redis) on Kubernetes."
+/>
+
+<img
+    className="hidden dark:block"
+    src="/langsmith/images/hybrid-with-deployment-dark.png"
+    alt="Hybrid deployment: LangChain-hosted control plane (LangSmith UI/APIs) manages deployments. Your cloud runs a listener, Agent Server instances, and backing stores (Postgres/Redis) on Kubernetes."
+/>
+
+### 计算平台
+
+- **Kubernetes**：Hybrid 支持在任意 Kubernetes cluster 上运行 data plane。
+
+<Tip>
+关于 Kubernetes 上的具体设置，请参阅下方的 [Kubernetes setup](#kubernetes-setup)。
+</Tip>
+
+### 到 LangSmith 与 control plane 的出站流量
+
+在 hybrid 部署模型中，你的自托管 data plane 会向 control plane 发起网络请求，以轮询那些需要在 data plane 中落实的变更。来自 data plane deployments 的 traces 也会发送到与 control plane 集成的 LangSmith 实例中。所有到 control plane 的流量都会通过 HTTPS 加密传输。data plane 会使用 LangSmith API key 与 control plane 进行认证。
+
+为了允许这些出站流量，你可能需要更新内部防火墙规则或云资源（例如 Security Groups），以[放通某些 IP 地址](/langsmith/cloud#ingress-into-langchain-saas)。
+
+<Warning>
+当前不支持 AWS/Azure PrivateLink 或 GCP Private Service Connect。相关流量将通过公网传输。
+</Warning>
+
+## Kubernetes 设置
+
+下面的步骤说明了如何把你的自托管 data plane 连接到托管的 LangSmith control plane。
+
+### 前置要求
+
+1. 你的 cluster 中已安装 `KEDA`。
+    ```bash
+      helm repo add kedacore https://kedacore.github.io/charts
+      helm install keda kedacore/keda --namespace keda --create-namespace
+    ```
+
+    <Info>
+    `KEDA` 用于根据队列大小自动伸缩 deployment system。
+    </Info>
+
+2. 你的 cluster 中已经安装了有效的 `Ingress` controller。关于如何为部署配置 ingress，请参阅 [Create an ingress for installations](/langsmith/self-host-ingress)。在生产环境中，我们强烈建议使用现代化的 [Gateway API](/langsmith/self-host-ingress#option-2%3A-gateway-api)。
+3. 如果你打算让 listener 监听多个 namespaces，那么你**必须**使用 [Gateway API](/langsmith/self-host-ingress#option-2%3A-gateway-api) 或 [Istio Gateway](/langsmith/self-host-ingress#option-3%3A-istio-gateway)，而不能使用[标准 ingress](/langsmith/self-host-ingress#option-1%3A-standard-ingress)。标准 ingress 资源只能把流量路由到同一 namespace 中的 services，而 Gateway 或 Istio Gateway 可以跨 namespaces 路由。
+4. 你的 cluster 中需要留出足够空间来承载多个 deployments。建议启用 `Cluster-Autoscaler`，以便自动 provision 新节点。
+5. 你需要放通到两个 control plane URLs 的出站访问。listener 会轮询这些端点以获取 deployments 信息。请使用与你 LangSmith 区域相匹配的一对地址。
+
+LangSmith Deployment control plane：
+
+<SaasRegionUrls prefix="api.host" />
+
+LangSmith API：
+
+<SaasRegionUrls prefix="api.smith" />
+
+### 设置步骤
+
+1. 把你的 LangSmith organization ID 提供给我们。这样你的 LangSmith organization 才会被配置成把 data plane 部署到你的云环境中。
+2. 在 LangSmith UI 中创建一个 listener。这个 `Listener` 数据模型会用于实际的 ["listener" application](/langsmith/data-plane#listener-application) 配置。
+    1. 在左侧导航中进入 `Deployments` > `Listeners`。
+    2. 在页面右上角点击 `+ Create Listener`。
+    3. 为 listener 输入一个唯一的 `Compute ID`。`Compute ID` 是用户自定义标识符，并且在当前 LangSmith workspace 内必须唯一。它会展示给最终用户，用于说明某个 Agent Server deployment 将被部署到哪里。请确保这个 `Compute ID` 能帮助最终用户理解部署目标环境。例如，可以设置为 `k8s-cluster-name-dev-01`。在这个例子里，Kubernetes cluster 名称为 `k8s-cluster-name`，`dev` 表示该 cluster 用于“开发”工作负载，`01` 则用于降低命名冲突概率。
+    4. 输入一个或多个 Kubernetes namespaces。稍后，实际的 "listener" application 会被配置为部署到这些 namespaces。
+    5. 在页面右上角点击 `Submit`。
+    6. listener 创建完成后，复制 listener ID。后续在 Kubernetes cluster 中安装实际的 "listener" application 时（第 5 步）会用到它。
+    <Info>
+    **重要**
+    在 LangSmith UI 中创建 listener，并不会自动在 Kubernetes cluster 中安装 "listener" application。
+    </Info>
+3. 我们提供了一个 [Helm chart](https://github.com/langchain-ai/helm/tree/main/charts/langgraph-dataplane)，用于在 Kubernetes cluster 中安装所需组件。
+    - `langgraph-dataplane-listener`：该服务监听 LangChain 的 [control plane](/langsmith/control-plane)，接收 deployments 的变更，并创建/更新下游 CRDs。它就是实际的 ["listener" application](/langsmith/data-plane#listener-application)。
+    - `LangGraphPlatform CRD`：面向 LangSmith Deployment 的 CRD，用于定义和管理某个 LangSmith Deployment 实例。
+    - `langgraph-dataplane-operator`：该 operator 负责处理 LangSmith CRDs 的变更。
+    - `langgraph-dataplane-redis`：Redis 被 `langgraph-dataplane-listener` 用于管理各类任务（主要是创建和删除 deployments）。
+4. 配置你的 `langgraph-dataplane-values.yaml` 文件。
+    ```bash
+      config:
+        langsmithApiKey: "" # API Key of your Workspace
+        langsmithWorkspaceId: "" # Workspace ID
+        hostBackendUrl: "https://api.host.langchain.com" # Use the matching regional LangSmith Deployment control plane URL from the table above
+        smithBackendUrl: "https://api.smith.langchain.com" # Use the matching regional LangSmith API URL from the table above
+        langgraphListenerId: "" # Listener ID from Step 2f
+        watchNamespaces: "" # comma-separated list of Kubernetes namespaces that the listener and operator will deploy to
+        enableLGPDeploymentHealthCheck: true # enable/disable health check step for deployments
+
+      ingress:
+        hostname: "" # specify a hostname that will be configured for all deployments
+
+      operator:
+        enabled: true
+        createCRDs: true # set this to `false` if the CRD has been previously installed in the current Kubernetes cluster
+    ```
+    - `config.langsmithApiKey`：`langgraph-listener` deployment 会使用 `langsmithApiKey` 与 LangChain 的 LangGraph control plane API 完成认证。
+    - `config.langsmithWorkspaceId`：`langgraph-listener` deployment 只会管理某一个 LangSmith workspace 下的 Agent Server deployments。换句话说，它只能管理与该 workspace ID 绑定的 deployments。
+    - `config.langgraphListenerId`：除了绑定到某个 LangSmith workspace 外，`langgraph-listener` deployment 还会绑定到某个 listener。当新的 Agent Server deployment 被创建时，它会自动和某个 `langgraphListenerId` 关联。指定 `langgraphListenerId` 可以确保该 `langgraph-listener` deployment 只管理绑定到这个 listener 的 deployments。
+    - `config.watchNamespaces`：`langgraph-listener` deployment 要部署到的 Kubernetes namespaces 列表，以逗号分隔。这个列表应与步骤 2d 中填写的 namespaces 一致。
+    - `config.enableLGPDeploymentHealthCheck`：如果要关闭 Agent Server 健康检查，请将其设为 `false`。
+    - `ingress.hostname`：在部署流程中，`langgraph-listener` deployment 会尝试调用 Agent Server 的健康检查端点（`GET /ok`），以确认应用已经正常启动。典型做法是为 Agent Server deployments 建立共享 DNS 记录或域名。这个部分并不由 LangSmith 管理。域名准备好后，请将其写入 `ingress.hostname`，以便完成健康检查。
+    - `operator.createCRDs`：如果当前 Kubernetes cluster 已经安装了 `LangGraphPlatform CRD`，请将该值设为 `false`。若 CRD 已存在，安装时会报错。如果在同一个 Kubernetes cluster 中部署多个 listeners，就可能出现这种情况。
+5. 部署 `langgraph-dataplane` Helm chart。
+    ```bash
+      helm repo add langchain https://langchain-ai.github.io/helm/
+      helm repo update
+      helm upgrade -i langgraph-dataplane langchain/langgraph-dataplane --values langgraph-dataplane-values.yaml --wait --debug
+    ```
+6. 如果部署成功，你会看到 namespace 中启动了三个服务。
+    ```bash
+      NAME                                            READY   STATUS              RESTARTS   AGE
+      langgraph-dataplane-listener-6dd4749445-zjmr4   0/1     ContainerCreating   0          26s
+      langgraph-dataplane-operator-6b88879f9b-t76gk   1/1     Running             0          26s
+      langgraph-dataplane-redis-0                     1/1     Running             0          25s
+    ```
+
+    至此，你的 hybrid 基础设施已经可以用于创建 deployments。
+
+### 在同一 cluster 中配置额外 data planes
+
+如果你想在同一个 cluster 的不同 namespace 中创建额外 data plane，请重复上述步骤，并在 `helm upgrade` 中使用 `-n` 参数来指定不同的 namespace。
+
+**在同一个 cluster 中安装多个 data planes 时，必须严格遵守以下规则：**
+1. 不同安装的 `config.watchNamespaces` 列表绝不能有交集。例如，如果安装 A 监听 `foo,bar` 两个 namespace，那么安装 B 就不能监听 `foo` 或 `bar`。多个 operators 或 listeners 监听同一 namespace 会导致不可预期的行为。这也意味着多个 LangSmith workspaces 不能部署到同一个 namespace！建议你先阅读下面的 [cluster organization](#kubernetes-cluster-organization) 小节，理解这种组织方式。
+2. 必须使用 [Gateway API](/langsmith/self-host-ingress#option-2%3A-gateway-api) 或 [Istio Gateway](/langsmith/self-host-ingress#option-3%3A-istio-gateway)。如果继续依赖[标准 ingress](/langsmith/self-host-ingress#option-1%3A-standard-ingress)，则可能与同一 cluster 中其他 data plane 创建的 Ingress 对象发生冲突。由于这种情况下的实际行为取决于具体 ingress controller，结果可能不可预测，甚至并非你想要的。
+
+## Listeners
+
+在 hybrid 模式下，会运行一个或多个 ["listener" applications](/langsmith/data-plane#listener-application)，这取决于你的 LangSmith workspaces 与 Kubernetes clusters 是如何组织的。
+
+### Kubernetes cluster 组织方式
+- 一个 Kubernetes cluster 中可以运行一个或多个 listeners。
+- 一个 listener 可以向该 cluster 中的一个或多个 namespaces 部署。
+- 多个 listeners 不能部署到同一个 namespace。
+- Cluster 所有者需要负责规划 listener 的布局，以及 Agent Server deployments 的组织方式。
+
+### LangSmith workspace 组织方式
+- 一个 workspace 可以关联一个或多个 listeners。
+- 一个 listener 只能关联一个 workspace。也就是说，LangSmith workspace 到 listener 是一对多关系。
+- 一个 workspace 只能部署到那些已经部署了它所有 listeners 的 Kubernetes clusters。
+
+## 用例
+
+以下是一些常见的 listener 配置方式（并非强制要求）：
+
+### 每个 LangSmith workspace → 独立 Kubernetes cluster
+- Cluster `alpha` 运行 workspace `A`
+- Cluster `beta` 运行 workspace `B`
+
+### 一个 cluster，每个 workspace 一个 namespace
+- Cluster `alpha`、namespace `1` 运行 workspace `A`
+- Cluster `alpha`、namespace `2` 运行 workspace `B`
+
+### 独立 clusters + 一个共享的 “dev” cluster
+- Cluster `alpha` 运行 workspace `A`
+- Cluster `beta` 运行 workspace `B`
+- Cluster `dev` 同时运行 workspace `A` 和 `B`
+- 两个 workspaces 都各自拥有两个 listeners；因此 cluster `dev` 中会部署两个 listener 实例

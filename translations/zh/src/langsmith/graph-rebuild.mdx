@@ -1,0 +1,189 @@
+---
+title: 在运行时重建 graph
+sidebarTitle: 在运行时重建 graph
+description: 使用 ServerRuntime 为每次 run 采用不同配置来重建 graph。
+---
+你可能需要在新的 run 开始时，用不同配置重建 graph。例如，你可能希望根据用户凭证动态加载不同工具。本指南将展示如何借助 `ServerRuntime` 实现这一点。
+
+<Note>
+在大多数情况下，与其动态改变整个 graph 结构，更推荐在各个节点内部根据 config 做条件分支。这种方式通常更容易测试和管理。
+</Note>
+
+## 前置要求
+
+- 请先阅读[这篇 how-to 指南](/langsmith/setup-app-requirements-txt)，完成应用部署前的基础设置。
+- `ServerRuntime` 需要 `langgraph-api >= 0.7.31` 和 `langgraph-sdk >= 0.3.5`。在此之前，graph factories 只接受单个 `config: RunnableConfig` 参数。
+
+## 定义 graphs
+
+假设你有一个应用，其中包含一个简单的 graph：它调用某个 LLM，并把响应返回给用户。应用目录结构如下：
+
+```
+my-app/
+|-- langgraph.json
+|-- my_project/
+|   |-- __init__.py
+|   |-- agents.py     # code for your graph
+|-- pyproject.toml
+```
+
+其中 graph 定义在 `agents.py` 中。
+
+### 不重建
+
+部署 Agent Server 最常见的方式，是直接引用定义在文件顶层的已编译 graph 实例。示例如下：
+
+```python
+# my_project/agents.py
+from langgraph.graph import StateGraph, MessagesState, START
+
+async def model(state: MessagesState):
+    return {"messages": [{"role": "assistant", "content": "Hi, there!"}]}
+
+graph_workflow = StateGraph(MessagesState)
+graph_workflow.add_node("model", model)
+graph_workflow.add_edge(START, "model")
+agent = graph_workflow.compile()
+```
+
+为了让服务端知道你的 graph，需要在 LangGraph API 配置文件（`langgraph.json`）中指定包含该 @[`CompiledStateGraph`] 实例变量的路径，例如：
+
+```json
+{
+    "$schema": "https://langgra.ph/schema.json",
+    "dependencies": ["."],
+    "graphs": {
+        "chat_agent": "my_project.agents:agent",
+    }
+}
+```
+
+### 重建
+
+如果你希望每个新 run 都重建 graph，请提供一个**factory function**，返回（或 yield）一个 graph。该 factory 可以选择性地接受 `ServerRuntime` 参数，或 `RunnableConfig` 参数。服务端会检查函数的类型注解，以决定应该注入哪些参数，因此请务必写上正确的 type hints。只要服务端的 queue workers 需要处理某个 run，就会调用这个 factory function。它也会在一些其他端点中被调用，例如更新状态、读取状态，或获取 assistant schemas。`ServerRuntime` 能告诉你，这次调用是由什么上下文触发的。
+
+<Note>
+`ServerRuntime` 目前处于 [beta](/langsmith/release-stages) 阶段，未来版本中可能发生变化。
+</Note>
+
+#### 简单 factory
+
+最简单的形式是一个普通的 `async def`，直接返回一个已编译 graph：
+
+```python
+from langchain_openai import ChatOpenAI
+from langgraph.graph import START, StateGraph
+from langchain_core.runnables import RunnableConfig
+from langgraph_sdk.runtime import ServerRuntime
+
+from my_agent.utils.state import AgentState
+
+model = ChatOpenAI(model="gpt-5.5")
+
+
+def make_graph_for_user(user_id: str):
+    """Build a graph customized per user."""
+    graph_workflow = StateGraph(AgentState)
+
+    async def call_model(state):
+        return {"messages": [await model.ainvoke(state["messages"])]}
+
+    graph_workflow.add_node("agent", call_model)
+    graph_workflow.add_edge(START, "agent")
+    return graph_workflow.compile()
+
+
+async def make_graph(config: RunnableConfig, runtime: ServerRuntime):
+    user = runtime.ensure_user()
+    return make_graph_for_user(user.identity)
+```
+
+#### 使用 context manager 的 factory
+
+如果你需要初始化和清理资源（例如数据库连接、加载 MCP tools 等），可以使用异步 context manager。利用 `runtime.execution_runtime` 判断此次 graph 调用是否是为了真正执行，还是仅用于内省（schemas、visualization）：
+
+```python
+import contextlib
+
+from langchain_openai import ChatOpenAI
+from langgraph.graph import START, StateGraph
+from langchain_core.runnables import RunnableConfig
+from langgraph_sdk.runtime import ServerRuntime
+
+from my_agent.utils.state import AgentState
+
+model = ChatOpenAI(model="gpt-5.5")
+
+
+def make_agent_graph(tools: list):
+    """Make a simple LLM agent."""
+    graph_workflow = StateGraph(AgentState)
+    bound = model.bind_tools(tools)
+
+    async def call_model(state):
+        return {"messages": [await bound.ainvoke(state["messages"])]}
+
+    graph_workflow.add_node("agent", call_model)
+    graph_workflow.add_edge(START, "agent")
+    return graph_workflow.compile()
+
+
+@contextlib.asynccontextmanager
+async def make_graph(runtime: ServerRuntime):
+    if ert := runtime.execution_runtime:
+        # Only set up expensive resources during actual execution.
+        # Introspection calls (get_schema, get_graph, ...) skip this.
+        mcp_tools = await connect_mcp(ert.ensure_user())  # your setup logic
+        yield make_agent_graph(tools=mcp_tools)
+        await disconnect_mcp()  # your teardown logic
+    else:
+        # For schema/state reads, return a graph with the same
+        # topology but no expensive resource setup.
+        yield make_agent_graph(tools=[])
+```
+
+最后，在 `langgraph.json` 中指定这个 factory 的路径：
+
+```json
+{
+    "$schema": "https://langgra.ph/schema.json",
+    "dependencies": ["."],
+    "graphs": {
+        "chat_agent": "my_project.agents:make_graph",
+    }
+}
+```
+
+## ServerRuntime 参考
+
+你的 factory function 会收到一个 `ServerRuntime` 实例，它包含以下属性：
+
+| Attribute | Type | Description |
+|---|---|---|
+| `access_context` | `str` | 触发本次 factory 调用的原因：`"threads.create_run"`、`"threads.update"`、`"threads.read"` 或 `"assistants.read"`。 |
+| `user` | `BaseUser \| None` | 当前已认证用户；如果没有配置[自定义认证](/langsmith/custom-auth)，则为 `None`。 |
+| `store` | `BaseStore` | 用于持久化和 memory 的 store 实例。 |
+
+**Methods：**
+
+| Method | Description |
+|---|---|
+| `ensure_user()` | 返回当前已认证用户；如果没有用户信息，则抛出 `PermissionError`。 |
+| `execution_runtime` | 当 `access_context` 为 `"threads.create_run"` 时返回 execution runtime，否则返回 `None`。可利用它仅在真正执行时才初始化昂贵资源。 |
+
+### Access contexts
+
+服务端调用你的 factory，不仅仅发生在执行 run 时，还会在多种上下文中发生。无论在哪种上下文里，返回的 graph 都应该保持**相同拓扑结构**（节点、边和状态 schema）。如果在写入上下文（`threads.create_run`、`threads.update`）中拓扑不一致，可能导致错误的状态更新。在读取上下文（`threads.read`、`assistants.read`）中，拓扑不一致虽然不会破坏数据，但会影响 pending tasks、schemas 和可视化结果。你可以利用 `execution_runtime` 来控制是否初始化昂贵资源，而不改变 graph 结构本身。
+
+| Context | Description |
+|---|---|
+| `threads.create_run` | 完整 graph 执行。此时 `execution_runtime` 可用。 |
+| `threads.update` | 通过 `aupdate_state` 更新状态。不会执行节点函数，但可能改变 pending tasks。 |
+| `threads.read` | 通过 `aget_state` / `aget_state_history` 读取状态。 |
+| `assistants.read` | 用于 schema 和 graph 内省，服务于 visualization、MCP、A2A 等。 |
+
+## 为不同 graph 定制 tracing
+
+你也可以使用 factory function 为某个特定 graph 定制或关闭 tracing。示例请参阅 [Conditional tracing: Customize tracing in deployed agents](/langsmith/conditional-tracing#customize-tracing-in-deployed-agents)。
+
+关于 [LangGraph API configuration file](/langsmith/cli#configuration-file) 的更多说明也可以一并参考。
