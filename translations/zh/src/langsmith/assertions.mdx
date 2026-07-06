@@ -1,0 +1,90 @@
+---
+title: 使用 assertions
+sidebarTitle: 使用 assertions
+description: 在 annotation queue 中审核 runs 时，通过编写 assertions 将自由形式的验收标准保存为 dataset examples。
+icon: "checklist"
+---
+
+Assertions 可以把审核者用自然语言表达的标准转化为自动化检查。它们是简短、自由形式的断言，用来描述一个正确答案应该包含什么或不应该包含什么。你在[单 run annotation queue](/langsmith/annotation-queues#single-run-annotation-queues)中审核某个 run 时编写这些断言，LangSmith 会把每条断言保存在一个[dataset example](/langsmith/example-data-format)上。之后，任何[离线 evaluator](/langsmith/evaluation-concepts#offline-evaluations)都可以检查应用的新输出是否满足每条断言。
+
+在以下场景中适合使用 assertions：
+
+- 某次 run 的实际输出是错的，而你更愿意描述一个正确答案应该长什么样，而不是手写一个完整答案。
+- 你想在不离开审核流程的情况下，用自然语言记录验收标准。
+
+<Note>
+Assertions 仅适用于[单 run annotation queues](/langsmith/annotation-queues#single-run-annotation-queues)。[Pairwise queues](/langsmith/annotation-queues#pairwise-annotation-queues)保持不变。Assertions 目前仅在 LangSmith UI 中可用。
+</Note>
+
+<Tip>
+[LangSmith Engine](/langsmith/engine#add-offline-examples) 可以为被标记为重复性问题的生产 traces 自动提出 assertions。打开某个 issue 的 offline examples 流程后，你可以在保存到 dataset 之前，审核、编辑或扩展 Engine 提出的 assertions。
+</Tip>
+
+## 添加 assertions
+
+1. 在 [LangSmith UI](https://smith.langchain.com) 中，前往左侧边栏的 **Annotation Queues**。打开一个单 run queue，并选中某个 run。
+1. 在侧边面板中，找到位于 **Feedback** 下方的 **Assertions** 部分。
+1. 点击 **+ Add** 创建一条 assertion 行。
+1. 输入一个用于概括该断言的 **key**（例如 `must_cite_source`、`must_not_invent_url`），以及一句描述该断言的 **comment**。
+
+    key 是自由格式的。`must_` / `must_not_` 前缀只是一种命名习惯，LangSmith 不会对它们做特殊处理。
+
+1. 对于你想记录的每条标准，重复第 3 和第 4 步。
+
+    Run 编辑器会在 assertion 侧边面板旁显示该 run 的 inputs 和 outputs。只要你添加了至少一条 assertion，run 编辑器中的 **Outputs** 面板就会从显示该 run 的实际输出，切换为只读的 assertion 预览。这个预览内容才会被保存到 dataset 中。该 run 的实际输出不会被保存，因为 assertions 描述的是一个正确答案应该包含什么，而不是这次 run 实际产生了什么。
+
+    <img
+      className="block dark:hidden"
+      src="/langsmith/images/assertions-example-light.png"
+      alt="Annotation queue run editor with assertions added in the side panel and the Outputs panel showing a read-only preview of those assertions."
+    />
+
+    <img
+      className="hidden dark:block"
+      src="/langsmith/images/assertions-example-dark.png"
+      alt="Annotation queue run editor with assertions added in the side panel and the Outputs panel showing a read-only preview of those assertions."
+    />
+
+    你仍然可以随时编辑 run 的 **Inputs**，例如为了在保存 example 前进一步打磨 prompt。只要还有 assertions 存在，**Outputs** 面板就会一直锁定在 assertion 预览上。
+
+1. 点击侧边面板底部的 **Add to Dataset & Next**（快捷键：macOS 上为 <kbd>⌘ Enter</kbd>，其他系统为 <kbd>Ctrl Enter</kbd>）。LangSmith 会将当前 run 添加到该 queue 的[默认 dataset](/langsmith/annotation-queues#basic-details)中；如果没有配置默认 dataset，则会提示你先选一个。随后队列会自动切换到下一个 run。
+
+保存后的 example 的 `outputs` 字段会以 JSON 形式存储。例如：
+
+```json
+{
+  "assertions": [
+    {
+      "key": "must_cite_source",
+      "comment": "The response cites the source URL it is drawing from."
+    },
+    {
+      "key": "must_not_invent_url",
+      "comment": "The response does not include URLs that do not appear in the inputs."
+    }
+  ]
+}
+```
+
+Example 的 `inputs` 字段会保存该 run 的 inputs，或者在你做过修改时保存修改后的版本。完整结构请参阅[Example data format](/langsmith/example-data-format)。
+
+## 基于 assertions 做评估
+
+编写一个[离线 evaluator](/langsmith/evaluation-concepts#offline-evaluations)，从 `reference_outputs["assertions"]` 读取保存好的 assertions，并为每条 assertion 返回一条 feedback 分数。最小形态如下：
+
+```python
+def grade_against_assertions(outputs: dict, reference_outputs: dict) -> list[dict]:
+    """Return one feedback score per assertion."""
+    feedback = []
+    for assertion in reference_outputs["assertions"]:
+        # Replace with your scoring logic: LLM judge, regex, schema check, and so on.
+        score = ...
+        feedback.append({"key": assertion["key"], "score": score})
+    return feedback
+```
+
+如何为每条断言打分完全由你决定。常见的有三种模式，而且可以在同一个 evaluator 中组合使用：
+
+- **[LLM-as-a-judge](/langsmith/llm-as-judge)**：针对每条 assertion，把应用输出和 assertion 的 `comment` 一起喂给模型，并让它返回一个分数。适用于主观性较强、难以通过机械方式验证的断言。
+- **[基于代码的检查](/langsmith/code-evaluator-ui)**：针对每条 assertion，依据其 `key` 执行确定性的检查，例如正则匹配、schema 校验或子串存在性判断。适用于具有明确、机械化答案的断言。
+- **[部分得分](/langsmith/multiple-scores)**：返回数值分数（例如 0.0 到 1.0 之间），而不是布尔值，从而按尺度打分，并对满足部分条件但未满足全部条件的输出给予“部分得分”。

@@ -1,0 +1,154 @@
+---
+title: 在 AWS 上 self-host LangSmith
+sidebarTitle: AWS
+icon: "brand-aws"
+---
+
+当你在 [Amazon Web Services (AWS)](https://aws.amazon.com/) 上运行 LangSmith 时，[self-hosted](/langsmith/self-hosted) 模式会部署一个包含 observability 功能的完整 LangSmith 平台。
+
+本页包含：
+
+- 部署到 EKS、配置托管服务以及设置认证所需的[初始步骤](#initial-setup)。
+- AWS 专属的[参考架构](#reference-architecture)模式和参考图。
+- 服务选型建议与[计算选项](#compute-options)最佳实践。
+- 面向运维卓越性、安全性和可靠性的 [AWS Well-Architected 最佳实践](#aws-well-architected-best-practices)。
+
+<Note>
+LangChain 提供了专门面向 AWS 的 Terraform modules，帮助你为 LangSmith 预配基础设施。这些 modules 可以快速搭建 EKS clusters、RDS、ElastiCache、S3 和网络资源。
+
+查看 [AWS Terraform modules](https://github.com/langchain-ai/terraform/tree/main/modules/aws) 获取文档和示例。
+</Note>
+
+## 初始设置
+
+<Steps>
+  <Step title="Deploy to Kubernetes">
+    按照 [Kubernetes installation guide](/langsmith/kubernetes) 操作。LangSmith 已在 Amazon Elastic Kubernetes Service (EKS) 上完成测试。
+
+    **EKS-specific notes:**
+    - 确保已安装 EBS CSI Driver，以支持持久化存储
+    - 使用 `ebs.csi.aws.com` storage class provisioner
+  </Step>
+
+  <Step title="Configure external services">
+    对于生产部署，请连接到 AWS 托管服务：
+
+    <CardGroup cols={2}>
+      <Card title="Amazon S3" icon="database" href="/langsmith/self-host-blob-storage#amazon-s3">
+        将 trace 数据存储到 S3
+      </Card>
+      <Card title="Amazon RDS" icon="database" href="/langsmith/self-host-external-postgres#amazon-rds">
+        PostgreSQL 数据库
+      </Card>
+      <Card title="Amazon ElastiCache" icon="cpu" href="/langsmith/self-host-external-redis#amazon-elasticache">
+        用于缓存的 Redis 或 Valkey
+      </Card>
+      <Card title="ClickHouse Cloud" icon="chart-line" href="/langsmith/self-host-external-clickhouse">
+        分析数据库
+      </Card>
+    </CardGroup>
+  </Step>
+
+  <Step title="Set up authentication">
+    使用 [IAM Roles for Service Accounts (IRSA)](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html)，让 LangSmith pods 无需静态凭证即可认证访问 AWS 服务。
+
+    **Key pages:**
+    - [S3 IRSA configuration](/langsmith/self-host-blob-storage#amazon-s3)
+    - [RDS IAM authentication](/langsmith/self-host-external-postgres#iam-authentication)
+    - [ElastiCache IAM authentication](/langsmith/self-host-external-redis#iam-authentication)
+  </Step>
+</Steps>
+
+完成这些初始设置后，你就可以继续查看下方完整的 AWS 架构与最佳实践。
+
+## 参考架构
+
+我们建议尽量利用 AWS 的托管服务，以提供可扩展、安全且具备弹性的运行平台。下列架构同时适用于 self-hosted 和 hybrid，并与 [AWS Well-Architected Framework](https://aws.amazon.com/architecture/well-architected/) 保持一致：
+
+![Architecture diagram showing AWS relations to LangSmith services](/langsmith/images/aws-architecture-self-hosted.png)
+
+- <Icon icon="globe" /> **Ingress & networking**：请求通过 [Amazon Application Load Balancer (ALB)](https://aws.amazon.com/elasticloadbalancing/application-load-balancer/) 进入你的 [VPC](https://aws.amazon.com/vpc/)，并结合 [AWS WAF](https://aws.amazon.com/waf/) 与基于 [IAM](https://aws.amazon.com/iam/) 的认证进行保护。
+- <Icon icon="cube" /> **Frontend & backend services:** Containers 运行在 [Amazon EKS](https://aws.amazon.com/eks/) 上，并由 ALB 编排流量。必要时，它会把请求路由到集群内的其他服务。
+- <Icon icon="database" /> **Storage & databases:**
+  - [Amazon RDS for PostgreSQL](https://aws.amazon.com/rds/postgresql/) 或 [Aurora](https://aws.amazon.com/rds/aurora/)：用于存储 metadata、projects、users，以及已部署 agents 的短期和长期 memory。LangSmith 支持 PostgreSQL 14 及以上版本。
+  - [Amazon ElastiCache](https://aws.amazon.com/elasticache/)（Redis 或 Valkey）：用于缓存和 job queues。ElastiCache 可以以单实例或集群模式运行。LangSmith 要求 Redis OSS 5 及以上版本，或 Valkey 8。
+  - ClickHouse + [Amazon EBS](https://aws.amazon.com/ebs/)：用于分析与 trace 存储。
+    - 除非出于安全或合规原因无法采用，否则我们建议使用[外部托管的 ClickHouse 方案](/langsmith/self-host-external-clickhouse)。
+    - Hybrid deployments 不要求 ClickHouse。
+  - [Amazon S3](https://aws.amazon.com/s3/)：用于存储 trace artifacts 和 telemetry 的对象存储。
+
+- <Icon icon="sparkles" /> **LLM integration:** 可选地通过代理将请求转发给 [Amazon Bedrock](https://aws.amazon.com/bedrock/) 或 [Amazon SageMaker](https://aws.amazon.com/sagemaker/) 进行 LLM 推理。
+- <Icon icon="chart-line" /> **Monitoring & observability:** 可与 [Amazon CloudWatch](https://aws.amazon.com/cloudwatch/) 集成。
+
+
+## 计算选项
+
+LangSmith 支持多种计算选项，你可以按需求选择：
+
+| Compute option | Description | Suitable for |
+|-----------------|-------------|--------------|
+| **Elastic Kubernetes Service (preferred)** | 高级扩缩容和多租户支持 | 大型企业 |
+| **EC2-based** | 完整控制权，自带基础设施 | 受监管或 air-gapped 环境 |
+
+## AWS Well-Architected 最佳实践
+
+本参考设计与 AWS Well-Architected Framework 的六大支柱保持一致：
+
+### Operational excellence
+
+- 使用 IaC（[CloudFormation](https://aws.amazon.com/cloudformation/) / [Terraform](https://www.terraform.io/)）自动化部署。
+- 使用 [AWS Systems Manager Parameter Store](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html) 管理配置。
+- 配置你的 LangSmith 实例以[导出 telemetry data](/langsmith/export-backend)，并通过 [CloudWatch Logs](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/WhatIsCloudWatchLogs.html) 持续监控。
+- 管理 [LangSmith deployments](/langsmith/deployment) 的首选方式，是构建一条 CI 流程，用于构建 [Agent Server](/langsmith/agent-server) 镜像并推送到 [ECR](https://aws.amazon.com/ecr/)。在 pull request 阶段创建测试 deployment，并在 PR 合并后将新 revision 部署到 staging 或 production。
+
+### Security
+
+- 使用最小权限策略的 [IAM](https://aws.amazon.com/iam/) roles。
+- 启用静态加密（[RDS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Overview.Encryption.html)、[S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingEncryption.html)、ClickHouse volumes）以及传输加密（TLS 1.2+）。
+- 使用 [AWS Secrets Manager](https://aws.amazon.com/secrets-manager/) 管理凭证。
+- 将 [Amazon Cognito](https://aws.amazon.com/cognito/) 作为 IDP，与 LangSmith 内置的认证和授权能力配合使用，以保护 agents 及其工具的访问。
+
+### Reliability
+
+- 跨区域复制 LangSmith 的[data plane](/langsmith/data-plane)：为 LangSmith Deployment 在不同区域的 Kubernetes clusters 中部署相同的数据平面。[RDS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZSingleStandby.html) 和 [ECS](https://aws.amazon.com/ecs/) 服务请使用 [Multi-AZ](https://aws.amazon.com/about-aws/global-infrastructure/regions_az/) 部署。
+- 为后端 workers 实施[自动扩缩容](https://aws.amazon.com/autoscaling/)。
+- 使用 [Amazon Route 53](https://aws.amazon.com/route53/) 的健康检查与故障转移策略。
+
+### Performance efficiency
+
+- 使用 [EC2](https://aws.amazon.com/ec2/) 实例获取更优化的计算性能。
+- 对低频访问的 trace 数据使用 [S3 Intelligent-Tiering](https://aws.amazon.com/s3/storage-classes/intelligent-tiering/)。
+
+### Cost optimization
+
+- 使用 [Compute Savings Plans](https://aws.amazon.com/savingsplans/compute-pricing/) 为 [EKS](https://aws.amazon.com/eks/) clusters 进行合理规格配置。
+- 使用 [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) dashboards 监控成本 KPI。
+
+### Sustainability
+
+- 通过按需计算资源最小化空闲工作负载。
+- 将 telemetry 存储在低延迟、低成本层级中。
+- 为非生产环境启用自动关闭。
+
+## 安全与合规
+
+LangSmith 可以被配置为：
+
+- 仅允许 [PrivateLink](https://aws.amazon.com/privatelink/) 访问（除了计费所需的出站流量外，不暴露到公共互联网）。
+- 使用基于 [KMS](https://aws.amazon.com/kms/) 的加密密钥保护 S3、RDS 和 EBS。
+- 将审计日志输出到 [CloudWatch](https://aws.amazon.com/cloudwatch/) 和 [AWS CloudTrail](https://aws.amazon.com/cloudtrail/)。
+
+客户可按需部署在 [GovCloud](https://aws.amazon.com/govcloud-us/)、ISO 或 HIPAA 区域。
+
+## Monitoring 和 evals
+
+使用 LangSmith 可以：
+
+- 捕获运行在 [Bedrock](https://aws.amazon.com/bedrock/) 或 [SageMaker](https://aws.amazon.com/sagemaker/) 上的 LLM apps traces。
+- 使用 [LangSmith datasets](/langsmith/manage-datasets) 评估模型输出。
+- 跟踪延迟、token 使用量和成功率。
+
+可集成：
+
+- [AWS CloudWatch](https://aws.amazon.com/cloudwatch/) dashboards。
+- [OpenTelemetry](https://opentelemetry.io/) 和 [Prometheus](https://prometheus.io/) exporters。

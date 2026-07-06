@@ -1,0 +1,205 @@
+---
+title: "CrateDB 集成"
+description: "使用 LangChain Python 与 CrateDB 集成。"
+---
+
+import LangchainCommunityUnmaintained from '/snippets/oss/langchain-community-unmaintained.mdx';
+
+> [CrateDB] 是一个分布式、可扩展的 SQL 数据库，适用于近实时地存储和分析海量数据，即使面对复杂查询也同样适用。它兼容 PostgreSQL，基于 Lucene 构建，并继承自 Elasticsearch。
+
+
+## 安装与设置
+
+### 设置 CrateDB
+有两种方式可以快速开始使用 CrateDB。你也可以选择其他[CrateDB 安装方式]。
+
+#### 在本地机器上启动 CrateDB
+示例：使用 Docker 或 Podman 启动一个关闭安全特性的单节点 CrateDB 实例。不建议在生产环境中这样使用。
+
+```bash
+docker run --name=cratedb --rm \
+  --publish=4200:4200 --publish=5432:5432 --env=CRATE_HEAP_SIZE=2g \
+  crate:latest -Cdiscovery.type=single-node
+```
+
+#### 在 CrateDB cloud 上部署集群
+[CrateDB Cloud] 是托管式 CrateDB 服务。你可以注册一个[免费试用][CrateDB Cloud Console]。
+
+### 安装客户端
+安装最新版 [langchain-cratedb] 包，以及本教程需要的其他几个包。
+
+<CodeGroup>
+```bash pip
+pip install -U langchain-cratedb langchain-openai unstructured
+```
+
+```bash uv
+uv add langchain-cratedb langchain-openai unstructured
+```
+</CodeGroup>
+
+
+## 文档
+有关 CrateDB 封装器的更详细说明，参见
+[using LangChain with CrateDB]。另请参见 [all features of CrateDB]，
+了解 CrateDB 提供的其他功能。
+
+
+## 功能
+LangChain 的 CrateDB 适配器提供了将 CrateDB 用作 vector store、document loader 和聊天消息存储的 API。
+
+### Vector store
+使用围绕 `FLOAT_VECTOR` 和 `KNN_MATCH` 的 CrateDB vector store 功能，
+实现相似度搜索和其他用途。另请参见 [CrateDBVectorStore Tutorial]。
+
+请确保已经配置有效的 OpenAI API key。
+```bash
+export OPENAI_API_KEY=sk-XJZ...
+```
+
+<LangchainCommunityUnmaintained />
+
+```python
+from langchain_community.document_loaders import UnstructuredURLLoader
+from langchain_cratedb import CrateDBVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain.text_splitter import CharacterTextSplitter
+
+loader = UnstructuredURLLoader(urls=["https://github.com/langchain-ai/langchain/raw/refs/tags/langchain-core==0.3.28/docs/docs/how_to/state_of_the_union.txt"])
+documents = loader.load()
+text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+docs = text_splitter.split_documents(documents)
+
+embeddings = OpenAIEmbeddings()
+
+# Connect to a self-managed CrateDB instance on localhost.
+CONNECTION_STRING = "crate://?schema=testdrive"
+
+store = CrateDBVectorStore.from_documents(
+    documents=docs,
+    embedding=embeddings,
+    collection_name="state_of_the_union",
+    connection=CONNECTION_STRING,
+)
+
+query = "What did the president say about Ketanji Brown Jackson"
+docs_with_score = store.similarity_search_with_score(query)
+```
+
+### Document loader
+使用基于 SQLAlchemy 的 document loader `CrateDBLoader`，
+从 CrateDB 数据库表中加载文档。另请参见 [CrateDBLoader Tutorial]。
+
+要在应用中使用 document loader：
+
+<LangchainCommunityUnmaintained />
+
+```python
+import sqlalchemy as sa
+from langchain_community.utilities import SQLDatabase
+from langchain_cratedb import CrateDBLoader
+
+# Connect to a self-managed CrateDB instance on localhost.
+CONNECTION_STRING = "crate://?schema=testdrive"
+
+db = SQLDatabase(engine=sa.create_engine(CONNECTION_STRING))
+
+loader = CrateDBLoader(
+    'SELECT * FROM sys.summits LIMIT 42',
+    db=db,
+)
+documents = loader.load()
+```
+
+### Chat message history
+使用 CrateDB 存储聊天消息。
+另请参见 [CrateDBChatMessageHistory Tutorial]。
+
+要在应用中使用 chat message history：
+```python
+from langchain_cratedb import CrateDBChatMessageHistory
+
+# Connect to a self-managed CrateDB instance on localhost.
+CONNECTION_STRING = "crate://?schema=testdrive"
+
+message_history = CrateDBChatMessageHistory(
+    session_id="test-session",
+    connection=CONNECTION_STRING,
+)
+
+message_history.add_user_message("hi!")
+```
+
+### Full cache
+
+标准 / 全量缓存会在提供的 prompt 与之前已见过的内容完全一致时，避免再次调用 LLM。
+另请参见 [CrateDBCache Example]。
+
+要在应用中使用 full cache：
+```python
+import sqlalchemy as sa
+from langchain.globals import set_llm_cache
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_cratedb import CrateDBCache
+
+# Configure cache.
+engine = sa.create_engine("crate://crate@localhost:4200/?schema=testdrive")
+set_llm_cache(CrateDBCache(engine))
+
+# Invoke LLM conversation.
+llm = ChatOpenAI(
+    model_name="gpt-5.5",
+    temperature=0.7,
+)
+print()
+print("Asking with full cache:")
+answer = llm.invoke("What is the answer to everything?")
+print(answer.content)
+```
+
+### Semantic cache
+
+语义缓存允许用户基于当前输入与先前缓存输入之间的语义相似度来检索缓存结果。它还能在不需要时避免调用 LLM。
+另请参见 [CrateDBSemanticCache Example]。
+
+要在应用中使用语义缓存：
+```python
+import sqlalchemy as sa
+from langchain.globals import set_llm_cache
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_cratedb import CrateDBSemanticCache
+
+# Configure embeddings.
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+# Configure cache.
+engine = sa.create_engine("crate://crate@localhost:4200/?schema=testdrive")
+set_llm_cache(
+    CrateDBSemanticCache(
+        embedding=embeddings,
+        connection=engine,
+        search_threshold=1.0,
+    )
+)
+
+# Invoke LLM conversation.
+llm = ChatOpenAI(model_name="gpt-5.5")
+print()
+print("Asking with semantic cache:")
+answer = llm.invoke("What is the answer to everything?")
+print(answer.content)
+```
+
+
+[all features of CrateDB]: https://cratedb.com/docs/guide/feature/
+[CrateDB]: https://cratedb.com/database
+[CrateDB Cloud]: https://cratedb.com/database/cloud
+[CrateDB Cloud Console]: https://console.cratedb.cloud/?utm_source=langchain&utm_content=documentation
+[CrateDB installation options]: https://cratedb.com/docs/guide/install/
+[CrateDBCache Example]: https://github.com/crate/langchain-cratedb/blob/main/examples/basic/cache.py
+[CrateDBSemanticCache Example]: https://github.com/crate/langchain-cratedb/blob/main/examples/basic/cache.py
+[CrateDBChatMessageHistory Tutorial]: https://github.com/crate/cratedb-examples/blob/main/topic/machine-learning/llm-langchain/conversational_memory.ipynb
+[CrateDBLoader Tutorial]: https://github.com/crate/cratedb-examples/blob/main/topic/machine-learning/llm-langchain/document_loader.ipynb
+[CrateDBVectorStore Tutorial]: https://github.com/crate/cratedb-examples/blob/main/topic/machine-learning/llm-langchain/vector_search.ipynb
+[langchain-cratedb]: https://pypi.org/project/langchain-cratedb/
+[using LangChain with CrateDB]: https://cratedb.com/docs/guide/integrate/langchain/

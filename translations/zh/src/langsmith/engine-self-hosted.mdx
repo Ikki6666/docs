@@ -1,0 +1,91 @@
+---
+title: 自托管环境中的 LangSmith Engine
+sidebarTitle: 自托管
+description: LangSmith Engine 在自托管部署中如何运行、它如何通过私有链路访问托管推理，以及这对你的数据意味着什么。
+---
+
+<Note>
+  自托管版 Engine 即将推出！
+</Note>
+
+LangSmith Engine 是 LangSmith 内的一个 agent，它会监控你的生产 traces，将它们聚类成 issues，结合你的源代码诊断每个问题，提出一个修复 PR，并识别应添加到 datasets 中的 ground truth evals。关于产品概览，请参阅 [Engine](/langsmith/engine-overview)。
+
+本页解释 Engine 在自托管部署中如何运行、它如何访问托管推理，以及这对你的数据意味着什么。
+
+{/* TODO(author): Add a version-added <Note> stating the minimum LangSmith / Helm chart version that supports self-hosted Engine managed inference. Required by the docs style guide for new features. */}
+
+Engine 会处理三类数据：
+
+- **Code**（可选）**：**你的 agent 源代码，Engine 会读取它来诊断问题并提出修复方案。
+- **Traces：**来自 agents 的运行时数据，其中可能包含用户消息、工具输出和 PII。
+- **Model：**Engine 为执行诊断、生成修复方案和编写 evaluators 而发起的 LLM 调用。
+
+在自托管部署中，Engine 的编排逻辑作为 LangSmith 的一部分运行在你的 VPC 内：读取 traces、读取代码，并执行 detect、fix、verify 循环。模型调用是唯一的例外。Engine 不会在本地运行模型，而是通过私有网络连接访问由 LangChain 托管、具备零数据保留（ZDR）的推理服务。Traces 是最敏感的数据类型，下方架构会将 trace 数据保留在你的云服务提供商（CSP）内部的私有网络中。
+
+## 推理如何工作
+
+Engine 的推理由 LangChain 托管的 LangSmith Intelligence 服务提供。该服务与 LangSmith 完全隔离，不会对任何客户数据做 tracing、存储或持久化。
+
+流程如下：
+
+- 你的自托管部署通过私有链路连接到 LangSmith Intelligence（AWS 和 Azure 使用 PrivateLink，GCP 使用 Private Service Connect）。
+- LangSmith Intelligence 在你的云服务提供商环境内运行模型（Bedrock、Vertex 或 Foundry），因此数据不会离开你的 CSP。
+- 该服务只记录用于计费的请求元数据，以及保持服务可靠性所需的遥测信息。
+
+{/* TODO(author): For security review, enumerate exactly what "request metadata" includes (for example, token counts, timestamps, model ID) and confirm that no request payload is recorded. Do not ship vague wording. */}
+
+每次推理请求都会携带模型完成推理所需的 trace 内容、代码和中间输出。请求会在运行于你的云提供商内部的模型中处理，并且绝不会被存储。你的数据不会在 CSP 之外留下任何持久化副本。
+
+{/* TODO(author): State data residency: which region(s) the models run in, whether the customer selects the region, and whether any cross-region inference can occur. */}
+
+{/* TODO(author): Document the failure mode: what happens to the detect-fix-verify loop if the private link to LangSmith Intelligence is unavailable (degrade, queue, or fail closed). */}
+
+{/* TODO(author): Link or list the specific models served on each platform so customers can validate against approved-model policies. */}
+
+### AWS
+
+<Frame caption="AWS：通过 PrivateLink 连接 LangSmith Intelligence，模型由 Bedrock 提供">
+  <img
+    src="/langsmith/images/engine-self-hosted-aws.png"
+    alt="Architecture diagram showing a self-hosted LangSmith deployment on AWS connecting to LangSmith Intelligence over PrivateLink, with inference served by Bedrock inside the customer's account"
+  />
+</Frame>
+
+### GCP
+
+<Frame caption="GCP：通过 Private Service Connect 连接 LangSmith Intelligence，模型由 Vertex 提供">
+  <img
+    src="/langsmith/images/engine-self-hosted-gcp.png"
+    alt="Architecture diagram showing a self-hosted LangSmith deployment on GCP connecting to LangSmith Intelligence over Private Service Connect, with inference served by Vertex inside the customer's project"
+  />
+</Frame>
+
+### Azure
+
+<Frame caption="Azure：通过 PrivateLink 连接 LangSmith Intelligence，模型由 Foundry 提供">
+  <img
+    src="/langsmith/images/engine-self-hosted-azure.png"
+    alt="Architecture diagram showing a self-hosted LangSmith deployment on Azure connecting to LangSmith Intelligence over PrivateLink, with inference served by Foundry inside the customer's environment"
+  />
+</Frame>
+
+## 模型选择与质量
+
+模型选择在很大程度上决定了 Engine 的效果。Engine 会为工作流中的不同步骤使用不同模型，并进行不同调优，例如聚类 issues、结合代码诊断根因、生成修复方案，以及编写用于验证修复的 evaluator。LangChain 会针对质量和 token 效率同时调优这些模型，并随着更优秀模型的发布进行升级。
+
+托管推理正是实现这一点的关键。由于 Engine 始终使用 LangChain 为各步骤调优后的模型，所以其行为能够保持一致，并随着这些模型升级而持续改进。如果采用自带 key（bring-your-own-key）的方式，Engine 就会受限于你配置的模型，因此调优效果和 token 效率会因请求不同而波动。
+
+## 这对你的数据意味着什么
+
+- **零数据保留（ZDR）：**推理服务不会存储客户数据，且 LangChain 仅使用支持 ZDR 的模型。
+- **不训练：**LangChain 不会使用你的数据进行训练。
+- **仅私有网络：**所有数据传输都通过私有链路完成，不经过公网。
+- **In-CSP：**模型运行在你的 CSP 内，因此数据不会离开该环境。
+
+{/* TODO(author): Link the contractual or compliance backing for the ZDR and no-training claims (DPA, security page, or SOC 2 report) so security teams can verify rather than take the claim on assertion. */}
+
+## 另请参阅
+
+- [Engine](/langsmith/engine-overview)
+- [配置 Engine](/langsmith/engine)
+- [Engine webhooks](/langsmith/engine-webhooks)

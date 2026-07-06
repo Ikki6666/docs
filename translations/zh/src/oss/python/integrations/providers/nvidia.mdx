@@ -1,0 +1,289 @@
+---
+title: "NVIDIA"
+description: "使用 LangChain Python 与 NVIDIA 集成。"
+---
+
+LangChain 和 NVIDIA 在整个 agent 栈上都展开了合作：
+
+1. [Components](#components)
+2. [Sandboxed agents with OpenShell](#sandboxed-agents-with-openshell)
+3. [LangGraph acceleration primitives](#accelerate-langgraph-with-nvidia)
+4. [NeMo Agent Toolkit optimizations](#nemo-agent-toolkit-optimizations-with-langsmith-telemetry)
+5. [Post-training agent workflows](#post-training-agent-workflows)
+6. [Full Stack blueprints](#full-stack-blueprints)
+
+## Components
+
+`langchain-nvidia-ai-endpoints` 包为 LangChain 提供了由 NVIDIA AI 驱动的 chat、embeddings、reranking 和 retrieval 集成，其中包括 [Nemotron](https://www.nvidia.com/en-us/ai-data-science/foundation-models/nemotron/)，即 NVIDIA 面向 agentic AI 的开源模型家族，以及 [NVIDIA API Catalog](https://build.nvidia.com/) 中数百个社区模型。
+
+这些模型运行在 NVIDIA NIM microservices 上，这是一组容器镜像，暴露标准的 OpenAI 兼容 API，并通过 TensorRT-LLM 在 NVIDIA 硬件上实现峰值吞吐量优化。你既可以通过托管的 API Catalog 访问它们，也可以在本地环境中自托管部署。
+
+
+| Component | Class | Description |
+| :--- | :--- | :--- |
+| Chat | [`ChatNVIDIA`](#chat-chatnvidia) | 使用任意 NVIDIA 托管模型或本地 NIM 进行聊天补全 |
+| Chat (Dynamo) | [`ChatNVIDIADynamo`](#chat-chatnvidiadynamo) | 为 Dynamo 部署添加 KV cache 路由提示的 `ChatNVIDIA` |
+| Embeddings | [`NVIDIAEmbeddings`](#embeddings-nvidiaembeddings) | 用于语义搜索和 RAG 的稠密向量嵌入 |
+| Reranking | [`NVIDIARerank`](#reranking-nvidiarerank) | 按查询相关性对文档进行重排 |
+| Retrieval | [`NVIDIARAGRetriever`](#retrieval-nvidiaragretriever) | 从 NVIDIA RAG Blueprint server 中检索内容 |
+
+
+### Chat: ChatNVIDIA
+
+`ChatNVIDIA` 提供基于 NVIDIA 托管模型和本地 NIM 部署的聊天补全能力。它支持 tool calling、structured output、image inputs 和 streaming。
+
+#### 安装
+
+```bash
+pip install -qU langchain-nvidia-ai-endpoints
+```
+
+#### 访问 NVIDIA API Catalog
+
+1. 在 [NVIDIA API Catalog](https://build.nvidia.com/) 上创建一个免费账号并登录。
+2. 点击你的头像图标，然后进入 **API Keys** > **Generate API Key**。
+3. 复制并保存这个 key，作为 `NVIDIA_API_KEY`。
+
+```python
+import getpass
+import os
+
+if os.environ.get("NVIDIA_API_KEY", "").startswith("nvapi-"):
+    print("Valid NVIDIA_API_KEY already in environment. Delete to reset")
+else:
+    nvapi_key = getpass.getpass("NVAPI Key (starts with nvapi-): ")
+    assert nvapi_key.startswith(
+        "nvapi-"
+    ), f"{nvapi_key[:5]}... is not a valid key"
+    os.environ["NVIDIA_API_KEY"] = nvapi_key
+```
+
+#### Nemotron: 面向 agentic AI 的旗舰模型
+
+[Nemotron](https://www.nvidia.com/en-us/ai-data-science/foundation-models/nemotron/) 是 NVIDIA 面向 agentic AI 设计的开源模型家族。这些模型采用混合式 Mamba-Transformer mixture-of-experts 架构，在实现领先基准性能的同时，还具有高吞吐和最多 100 万 token 上下文窗口支持。Nemotron 的模型权重、训练数据和实现方案都已基于 NVIDIA Open Model License 公开发布。
+
+
+```python
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
+
+# Nemotron 3 Ultra - frontier reasoning and agentic workflows
+llm = ChatNVIDIA(model="nvidia/nemotron-3-ultra-550b-a55b")
+result = llm.invoke("Plan a three-step research workflow for competitive analysis.")
+print(result.content)
+```
+
+完整文档，包括 tool calling、多模态输入以及 Nemotron 专属示例，参见 [`ChatNVIDIA` integration page](/oss/integrations/chat/nvidia_ai_endpoints)。
+
+
+### Chat: ChatNVIDIADynamo
+
+`ChatNVIDIADynamo` 是 `ChatNVIDIA` 的可直接替换版本，适用于 [NVIDIA Dynamo](https://developer.nvidia.com/dynamo) 部署。它会自动在每个请求中注入 KV cache 路由提示，让 Dynamo 调度器能够优化内存分配、负载路由和请求优先级。
+
+```python
+from langchain_nvidia_ai_endpoints import ChatNVIDIADynamo
+
+llm = ChatNVIDIADynamo(
+    base_url="http://localhost:8099/v1",
+    model="nvidia/nemotron-3-ultra-550b-a55b",
+    osl=512,             # expected output sequence length (tokens)
+    iat=250,             # expected inter-arrival time (ms)
+    latency_sensitivity=1.0,
+    priority=1,
+)
+result = llm.invoke("Summarize KV cache routing in one sentence.")
+print(result.content)
+```
+
+完整的 `ChatNVIDIADynamo` 参考，包括每次调用覆盖参数和 streaming，参见 [`ChatNVIDIA` integration page](/oss/integrations/chat/nvidia_ai_endpoints#use-with-nvidia-dynamo)。
+
+
+### Embeddings: NVIDIAEmbeddings
+
+`NVIDIAEmbeddings` 用于生成稠密向量嵌入，适用于语义搜索和 RAG 流水线。
+
+```python
+from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings
+
+embedder = NVIDIAEmbeddings(model="NV-Embed-QA")
+embedder.embed_query("What's the temperature today?")
+```
+
+完整文档参见 [`NVIDIAEmbeddings` integration page](/oss/integrations/embeddings/nvidia_ai_endpoints)。
+
+
+### Reranking: NVIDIARerank
+
+`NVIDIARerank` 使用 NeMo Retriever reranking NIM，按查询相关性对文档列表进行重排。
+
+```python
+from langchain_core.documents import Document
+from langchain_nvidia_ai_endpoints import NVIDIARerank
+
+ranker = NVIDIARerank(model="nvidia/llama-3.2-nv-rerankqa-1b-v1")
+docs = ranker.compress_documents(
+    query="What is GPU memory bandwidth?",
+    documents=[Document(page_content=p) for p in passages],
+)
+```
+
+
+### Retrieval: NVIDIARAGRetriever
+
+`NVIDIARAGRetriever` 可将 LangChain 连接到一个正在运行的 [NVIDIA RAG Blueprint](https://docs.nvidia.com/rag/latest/index.html) server，并通过 `/v1/search` endpoint 检索相关文档。它支持 reranking、query rewriting 和 metadata filtering。
+
+```python
+from langchain_nvidia_ai_endpoints import NVIDIARAGRetriever
+
+retriever = NVIDIARAGRetriever(base_url="http://localhost:8081", k=4)
+docs = retriever.invoke("What is NVIDIA NIM?")
+```
+
+完整文档参见 [`NVIDIARAGRetriever` integration page](/oss/integrations/retrievers/nvidia)。
+
+
+### 使用 NVIDIA NIM Microservices 自托管
+
+当你准备部署 AI 应用时，可以使用 NVIDIA NIM 自托管模型。更多信息参见 [NVIDIA NIM Microservices](https://www.nvidia.com/en-us/ai-data-science/products/nim-microservices/)。
+
+```python
+from langchain_nvidia_ai_endpoints import ChatNVIDIA, NVIDIAEmbeddings, NVIDIARerank
+
+# connect to a chat NIM running at localhost:8000, specifying a model
+llm = ChatNVIDIA(base_url="http://localhost:8000/v1", model="nvidia/nemotron-3-ultra-550b-a55b")
+
+# connect to an embedding NIM running at localhost:8080
+embedder = NVIDIAEmbeddings(base_url="http://localhost:8080/v1")
+
+# connect to a reranking NIM running at localhost:2016
+ranker = NVIDIARerank(base_url="http://localhost:2016/v1")
+```
+
+
+## 使用 OpenShell 的沙箱 Agent
+
+[OpenShell](https://github.com/NVIDIA/OpenShell) 为 LangChain agents 提供了受策略管控的 Linux 沙箱，支持代码执行、文件访问、进程权限和网络出口控制。这对于需要检查数据、编写代码、运行命令，或访问本地资源的 deep agents 很有帮助，同时又能让执行环境与宿主机保持隔离。
+
+对于 LangChain 应用，[`langchain-nvidia-openshell`](https://github.com/langchain-ai/langchain-nvidia/tree/main/libs/openshell) 包将 OpenShell 适配到了 Deep Agents 的 sandbox interface。agent 可以在宿主机上配合 `ChatNVIDIA` 运行，而 tool 执行则通过 `OpenShellSandbox` backend 被派发到 OpenShell 沙箱中。
+
+相关资源：
+
+- [LangChain NVIDIA samples](https://github.com/langchain-samples/langchain-nvidia-samples) 包含可运行的 NVIDIA 示例，其中包括一个基于 OpenShell 的 incident-analysis agent
+- [OpenShell Deep Agent](https://github.com/langchain-ai/openshell-deepagent) 是一个参考编码 agent，运行在 OpenShell 沙箱中，由 Deep Agents 编排，并由 NVIDIA Nemotron 提供能力
+- [`langchain-nvidia-openshell`](https://github.com/langchain-ai/langchain-nvidia/tree/main/libs/openshell) 提供 Python 适配器、设置说明、策略指导以及面向沙箱 Deep Agents 的 notebook 示例
+
+```python
+import openshell
+from deepagents import create_deep_agent
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from langchain_nvidia_openshell import OpenShellSandbox
+
+with openshell.Sandbox() as sandbox:
+    backend = OpenShellSandbox(sandbox=sandbox)
+    agent = create_deep_agent(
+        model=ChatNVIDIA(model="nvidia/nemotron-3-ultra-550b-a55b"),
+        system_prompt="You are a careful coding agent.",
+        backend=backend,
+    )
+```
+
+
+## 使用 NVIDIA 加速 LangGraph
+
+`langchain-nvidia-langgraph` 包为 LangGraph graph 提供了针对 NVIDIA 优化的执行策略。它提供两种可在编译时应用的互补优化：
+
+- **Parallel execution**：自动识别独立节点并并发执行，消除不必要的串行瓶颈
+- **Speculative execution**：条件边的两条分支会同时执行，一旦路由条件解析完成，就丢弃错误分支
+
+这两种优化都不需要修改节点逻辑或 graph edges。
+
+### 安装
+
+```bash
+pip install -qU langchain-nvidia-langgraph
+```
+
+### 并行执行
+
+将 LangGraph 中的 `StateGraph` 替换为 `langchain_nvidia_langgraph.graph` 中的 `StateGraph`。其余 graph 定义保持不变。
+
+```python
+from langchain_nvidia_langgraph.graph import StateGraph, OptimizationConfig
+from langgraph.graph import END
+from typing import TypedDict
+
+class AgentState(TypedDict):
+  ...
+
+graph = StateGraph(AgentState)
+app = graph.compile(optimization=OptimizationConfig(enable_parallel=True))
+```
+
+或者包装已有的 `StateGraph`：
+
+```
+from langgraph.graph import StateGraph as LangGraphStateGraph
+graph = LangGraphStateGraph(AgentState)
+app = with_app_compile(graph).compile(optimization=OptimizationConfig(enable_parallel=True))
+```
+
+装饰器可用于显式控制哪些节点参与优化：
+
+```python
+from langchain_nvidia_langgraph.graph import sequential, depends_on, speculation_unsafe
+
+# Prevent a node from being parallelized (e.g., it writes to shared state)
+@sequential
+def write_to_db(state):
+    ...
+
+# Declare a dependency not expressed in graph edges
+@depends_on("write_to_db")
+def next_action(state):
+    ...
+```
+
+### 推测执行
+
+在编译时通过 `OptimizationConfig` 启用 speculation。执行器会并行运行条件分支，并保留与最终路由决策相匹配的结果。
+
+```python
+app = graph.compile(optimization=OptimizationConfig(enable_speculation=True))
+```
+
+## 结合 LangSmith Telemetry 的 NeMo Agent Toolkit 优化
+
+NVIDIA NeMo Agent Toolkit 是一个开源 AI 工具包，用于构建、分析和优化 agents。开发者可以在几乎不改代码的前提下，将 LangChain 与 NeMo Agent Toolkit 搭配使用，以启用 profiling、evaluation、GPU capacity planning 和自动化优化。NeMo Agent Toolkit 与 LangSmith 互操作。
+
+- [Get Started with NeMo Agent Toolkit and LangChain](https://github.com/NVIDIA/NeMo-Agent-Toolkit/blob/develop/examples/frameworks/auto_wrapper/langchain_deep_research/langgraph_deep_research.ipynb)
+
+- [Optimize LangChain with NeMo Agent Toolkit and LangSmith](https://github.com/NVIDIA/NeMo-Agent-Toolkit/blob/develop/docs/source/run-workflows/observe/observe-workflow-with-langsmith.md)
+
+## 后训练 Agent 工作流
+
+NVIDIA NeMo Gym 为 agentic systems 提供后训练工作流，其中包括将 LangGraph agents 与 Responses API 风格训练数据和评估循环配合使用的示例。当你希望在初始 prompting 和 harness tuning 之后继续改进 agent 行为，尤其是 tool-use 和多步推理任务时，可以使用这些工作流。
+
+- [NeMo Gym LangGraph agent example](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_agents/langgraph_agent)
+
+## 全栈 Blueprints
+
+NVIDIA 与 LangChain 共同协作了 [full stack examples](https://github.com/langchain-ai/deepagents/tree/main/examples)，展示如何将这些组件组合起来，面向两个企业场景，并聚焦于生产可用性：
+
+- [NVIDIA AI-Q](https://github.com/NVIDIA-AI-Blueprints/aiq/tree/develop) 是一个面向企业数据源深度研究的 blueprint，使用了 LangChain Deep Agents
+- [NVIDIA VSS](https://github.com/NVIDIA-AI-Blueprints/video-search-and-summarization) 是一个基于 LangChain 和 LangGraph 的视频搜索与摘要 blueprint
+
+## 其他资源
+
+- [`langchain-nvidia-ai-endpoints` package README](https://github.com/langchain-ai/langchain-nvidia/blob/main/libs/ai-endpoints/README.md)
+- [`langchain-nvidia-langgraph` package](https://github.com/langchain-ai/langchain-nvidia/tree/main/libs/langgraph)
+- [Nemotron model family](https://www.nvidia.com/en-us/ai-data-science/foundation-models/nemotron/)
+- [`langchain-nvidia-openshell` package](https://github.com/langchain-ai/langchain-nvidia/tree/main/libs/openshell)
+- [LangChain NVIDIA samples](https://github.com/langchain-samples/langchain-nvidia-samples)
+- [OpenShell Deep Agent](https://github.com/langchain-ai/openshell-deepagent)
+- [NeMo Gym LangGraph agent example](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_agents/langgraph_agent)
+- [Overview of NVIDIA NIM for Large Language Models (LLMs)](https://docs.nvidia.com/nim/large-language-models/latest/introduction.html)
+- [Overview of NeMo Retriever Embedding NIM](https://docs.nvidia.com/nim/nemo-retriever/text-embedding/latest/overview.html)
+- [Overview of NeMo Retriever Reranking NIM](https://docs.nvidia.com/nim/nemo-retriever/text-reranking/latest/overview.html)
+- [`ChatNVIDIA` Model](/oss/integrations/chat/nvidia_ai_endpoints)
+- [`NVIDIAEmbeddings` Model for RAG Workflows](/oss/integrations/embeddings/nvidia_ai_endpoints)
+- [`NVIDIARAGRetriever`](/oss/integrations/retrievers/nvidia)
+- [NVIDIA Dynamo](https://developer.nvidia.com/dynamo)

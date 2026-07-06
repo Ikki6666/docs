@@ -1,0 +1,231 @@
+---
+title: "Browserbase 集成"
+description: "使用 LangChain Python 与 Browserbase 集成。"
+---
+
+import LangchainCommunityUnmaintained from '/snippets/oss/langchain-community-unmaintained.mdx';
+
+[Browserbase](https://browserbase.com) 是一个开发者平台，可稳定地运行、管理并监控无头浏览器。
+
+借助以下能力，为你的 AI 数据检索提供支持：
+- [Serverless Infrastructure](https://docs.browserbase.com/under-the-hood)，提供可靠浏览器以从复杂 UI 中提取数据
+- [Stealth Mode](https://docs.browserbase.com/features/stealth-mode)，内置指纹伪装策略与自动验证码求解
+- [Session Debugger](https://docs.browserbase.com/features/sessions)，可通过网络时间线与日志检查 Browser Session
+- [Live Debug](https://docs.browserbase.com/guides/session-debug-connection/browser-remote-control)，便于快速调试自动化流程
+
+## 安装与设置
+
+- 从 [browserbase.com](https://browserbase.com) 获取 API key 和 Project ID，并将其设置为环境变量 `BROWSERBASE_API_KEY`、`BROWSERBASE_PROJECT_ID`
+- 安装 [Browserbase SDK](https://github.com/browserbase/python-sdk)：
+
+```bash
+pip install browserbase
+```
+
+## Document loader
+
+参见[使用示例](/oss/integrations/document_loaders/browserbase)。
+
+<LangchainCommunityUnmaintained />
+
+```python
+from langchain_community.document_loaders import BrowserbaseLoader
+```
+
+## Deep Agents 集成
+
+[Deep Agents](/oss/deepagents/overview) 与 Browserbase 配合得很好，因为它会将浏览器能力暴露为 Python tools，而不是通过 CLI 路由。这个集成模式让主规划器可以使用轻量、无状态的工具执行搜索和页面检索，同时把开销更高的渲染型和交互型浏览器工作委托给专门的 `browser-specialist` subagent。
+
+### 安装
+
+```bash
+pip install deepagents browserbase stagehand langchain-openai python-dotenv
+```
+
+### 架构
+
+推荐模式使用四个工具：
+
+| Tool | Description | When to use |
+|------|-------------|-------------|
+| `browserbase_search` | 通过 Browserbase Search API 进行网页搜索 | Discovery，始终先尝试这个 |
+| `browserbase_fetch` | 通过 Browserbase Fetch API 获取无头页面 | 静态页面、快速阅读、不需要 JS |
+| `browserbase_rendered_extract` | 通过 Stagehand 打开完整浏览器会话 | 依赖 JS 或渲染后的页面，只读场景 |
+| `browserbase_interactive_task` | 用于多步浏览器任务的 Stagehand agent | 点击、填表、登录流程 |
+
+轻量工具 `search` 和 `fetch` 放在主规划器上。开销较高的浏览器工具放在 `browser-specialist` subagent 中，将噪声较大的会话输出与主线程隔离。
+
+### 环境变量
+
+```bash
+export BROWSERBASE_API_KEY="bb_..."
+
+# Optional: model overrides
+export DEEPAGENT_MODEL="gpt-5.5"
+export DEEPAGENT_BASE_URL="https://<your-openai-compatible-gateway>"
+export STAGEHAND_MODEL="google/gemini-3-flash-preview"
+export STAGEHAND_AGENT_MODEL="anthropic/claude-sonnet-4-6"
+```
+
+### 定义工具
+
+```python
+import asyncio
+import os
+from browserbase import Browserbase
+from bs4 import BeautifulSoup
+from langchain.tools import tool
+from stagehand import AsyncStagehand
+
+@tool
+def browserbase_search(query: str, num_results: int = 5) -> str:
+    """Search the web with Browserbase. Use this first for discovery before opening pages."""
+    bb = Browserbase(api_key=os.environ["BROWSERBASE_API_KEY"])
+    response = bb.search.web(query=query, num_results=max(1, min(num_results, 10)))
+    results = [
+        {"title": r.title, "url": r.url}
+        for r in getattr(response, "results", [])
+    ]
+    return str({"query": query, "results": results})
+
+
+@tool
+def browserbase_fetch(url: str, use_proxy: bool = False, max_chars: int = 12000) -> str:
+    """Fetch page content without a browser session. Best for static pages and quick reads."""
+    bb = Browserbase(api_key=os.environ["BROWSERBASE_API_KEY"])
+    response = bb.fetch_api.create(url=url, proxies=use_proxy)
+    content = str(getattr(response, "content", ""))
+    soup = BeautifulSoup(content, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    text = (soup.body or soup).get_text("\n", strip=True)[:max_chars]
+    return str({"url": url, "status_code": response.status_code, "text": text})
+
+
+@tool
+def browserbase_rendered_extract(start_url: str, instruction: str) -> str:
+    """Open a full Browserbase browser session and extract rendered content with Stagehand."""
+    return asyncio.run(_rendered_extract(start_url, instruction))
+
+
+@tool
+def browserbase_interactive_task(start_url: str, task: str) -> str:
+    """Open a Browserbase-hosted Stagehand session and execute a multi-step browser task."""
+    return asyncio.run(_interactive_task(start_url, task))
+
+
+async def _rendered_extract(start_url: str, instruction: str) -> str:
+    client = AsyncStagehand(browserbase_api_key=os.environ["BROWSERBASE_API_KEY"])
+    resp = await client.sessions.start(model_name=os.getenv("STAGEHAND_MODEL", "google/gemini-3-flash-preview"))
+    session_id = resp.data.session_id
+    try:
+        await client.sessions.navigate(id=session_id, url=start_url, frame_id="")
+        result = await client.sessions.extract(id=session_id, instruction=instruction)
+        return str({"session_id": session_id, "result": getattr(getattr(result, "data", None), "result", None)})
+    finally:
+        await client.sessions.end(id=session_id)
+
+
+async def _interactive_task(start_url: str, task: str) -> str:
+    model = os.getenv("STAGEHAND_AGENT_MODEL", "anthropic/claude-sonnet-4-6")
+    client = AsyncStagehand(browserbase_api_key=os.environ["BROWSERBASE_API_KEY"])
+    resp = await client.sessions.start(model_name=model)
+    session_id = resp.data.session_id
+    try:
+        await client.sessions.navigate(id=session_id, url=start_url, frame_id="")
+        result = await client.sessions.execute(
+            id=session_id,
+            execute_options={"instruction": task, "max_steps": 20},
+            agent_config={"model": model, "instructions": "Execute the browser task precisely and stop when done."},
+            timeout=300.0,
+        )
+        return str(result)
+    finally:
+        await client.sessions.end(id=session_id)
+```
+
+### 构建 agent
+
+```python
+import uuid
+from deepagents import create_deep_agent
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_openai import ChatOpenAI
+
+BROWSER_SUBAGENT = {
+    "name": "browser-specialist",
+    "description": "Handles JS-heavy browsing, rendered extraction, and interactive browser tasks through Browserbase.",
+    "system_prompt": (
+        "You are a Browserbase browsing specialist. "
+        "Use browserbase_rendered_extract for read-only work on rendered pages. "
+        "Use browserbase_interactive_task only for stateful actions such as clicking, typing, or submitting forms. "
+        "Return concise summaries with the relevant page URL and whether the task succeeded."
+    ),
+    "tools": [browserbase_rendered_extract, browserbase_interactive_task],
+}
+
+agent = create_deep_agent(
+    model=ChatOpenAI(model="gpt-5.5", api_key=os.environ["OPENAI_API_KEY"]),
+    tools=[browserbase_search, browserbase_fetch],
+    subagents=[BROWSER_SUBAGENT],
+    system_prompt=(
+        "You are a research-oriented Deep Agent with Browserbase tools. "
+        "Start with browserbase_search for discovery. "
+        "Prefer browserbase_fetch for quick reads of static pages. "
+        "Delegate JS-heavy or interactive work to the browser-specialist subagent."
+    ),
+    # Gate interactive browser actions behind human approval
+    interrupt_on={
+        "browserbase_interactive_task": {
+            "allowed_decisions": ["approve", "edit", "reject"]
+        }
+    },
+    checkpointer=MemorySaver(),
+)
+```
+
+### 通过 human-in-the-loop approval 运行
+
+`interrupt_on` 会在任何 `browserbase_interactive_task` 调用前暂停执行，这样你就可以在 agent 真正执行动作前审查其拟议操作。
+
+```python
+from langgraph.types import Command
+
+config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "Research the Browserbase Fetch API and explain when to escalate to a full browser session."}]},
+    config=config,
+    version="v2",
+)
+
+# Resume after each interrupt (approve / edit / reject)
+while result.interrupts:
+    interrupt_value = result.interrupts[0].value
+    for action in interrupt_value["action_requests"]:
+        print(f"Pending: {action['name']}\nArgs: {action['args']}")
+    decision = input("Decision [approve/edit/reject]: ").strip().lower()
+    result = agent.invoke(
+        Command(resume={"decisions": [{"type": decision}]}),
+        config=config,
+        version="v2",
+    )
+```
+
+### 决策树：该用哪个工具
+
+```
+User query
+  └─ Is a specific URL already known?
+       ├─ No  → browserbase_search (discover URLs first)
+       └─ Yes ↓
+            Is the page JavaScript-rendered?
+              ├─ No  → browserbase_fetch (fast, stateless)
+              └─ Yes ↓
+                   Does the task require interaction (click / login / form)?
+                     ├─ No  → browserbase_rendered_extract (read-only full browser)
+                     └─ Yes → browserbase_interactive_task (Stagehand agent, triggers interrupt_on)
+```
+
+### 完整示例
+
+完整可运行示例参见 [deepagents repository](https://github.com/browserbase/integrations/tree/main/examples/integrations/langchain/deepagents-browserbase)。

@@ -1,0 +1,137 @@
+---
+title: 使用 control plane 部署
+sidebarTitle: 使用 control plane
+icon: "cloud-upload"
+description: 使用 control plane UI 为 self-hosted LangSmith 构建 Docker 镜像并部署应用。
+---
+
+<Info>
+**本指南适用于 self-hosted LangSmith 用户**，前提是你的实例已经[启用 LangSmith Deployment](/langsmith/deploy-self-hosted-full-platform#enable-langsmith-deployment)。如果你是 Cloud 用户，请参阅[在 Cloud 上部署](/langsmith/deploy-to-cloud)。如果你想在没有 control plane 的情况下运行独立 Agent Server，请参阅[Self-host 独立服务器](/langsmith/deploy-standalone-server)。
+</Info>
+
+本指南介绍如何通过 [control plane](/langsmith/control-plane) 将应用部署到 [self-hosted](/langsmith/self-hosted) LangSmith 实例。使用 control plane 时，你需要在本地构建 Docker 镜像，将其推送到 Kubernetes 集群可访问的镜像仓库中，然后通过 [LangSmith UI](https://smith.langchain.com) 完成部署。
+
+## 拓扑
+
+在现有 self-hosted LangSmith 实例上启用 LangSmith Deployment 后，会额外添加 control plane、data plane listener，以及在集群中创建 Agent Server 的 operator。基础 LangSmith 平台仍然负责 observability、evaluation 和 prompts，而已部署的 Agent Server 会把 traces 回传给它。
+
+关于启用 LangSmith Deployment 后新增的组件，请参阅[启用 LangSmith Deployment](/langsmith/deploy-self-hosted-full-platform#enable-langsmith-deployment)。
+
+## 概览
+
+通过 control plane 部署到 self-hosted LangSmith 的应用使用 Docker 镜像。本文中的部署流程如下：
+
+1. 使用 `langgraph dev` 或 [Studio](/langsmith/studio) 在本地测试应用。
+1. 使用 `langgraph build` 命令构建 Docker 镜像。
+1. 将镜像推送到你的基础设施可访问的容器仓库。
+1. 在 [control plane UI](/langsmith/control-plane#control-plane-ui) 中指定镜像 URL 并完成部署。
+
+## 前置条件
+
+在继续之前，请确认具备以下条件：
+
+- 你的 self-hosted LangSmith 实例已[启用 LangSmith Deployment](/langsmith/deploy-self-hosted-full-platform#enable-langsmith-deployment)。
+- 你可以访问已启用 LangSmith Deployment 的 [LangSmith UI](https://smith.langchain.com)。
+- 你的 Kubernetes 集群能够访问某个容器仓库。如果你使用的是需要认证的私有仓库，则必须在基础设施层面配置 image pull secrets。请参阅[私有仓库认证](#private-registry-authentication)。
+
+## 第 1 步：本地测试
+
+部署之前，先在本地测试应用。你可以使用 [LangGraph CLI](/langsmith/cli#dev) 以开发模式运行 Agent server：
+
+```bash
+langgraph dev
+```
+
+关于本地测试的完整指南，请参阅[本地 server quickstart](/langsmith/local-dev-testing)。
+
+## 第 2 步：构建 Docker 镜像
+
+使用 [`langgraph build`](/langsmith/cli#build) 命令为应用构建 Docker 镜像：
+
+```bash
+langgraph build -t my-image
+```
+
+构建命令支持以下选项：
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-t, --tag TEXT` | Required | Docker 镜像的 tag |
+| `--platform TEXT` | | 构建目标平台，例如 `linux/amd64,linux/arm64` |
+| `--pull / --no-pull` | `--pull` | 构建时是否拉取最新远程 Docker image |
+| `-c, --config FILE` | `langgraph.json` | 配置文件路径 |
+
+指定平台的示例：
+
+```bash
+langgraph build --platform linux/amd64 -t my-image:v1.0.0
+```
+
+完整说明请参阅 [CLI reference](/langsmith/cli#build)。
+
+## 第 3 步：推送到容器仓库
+
+将镜像推送到 Kubernetes 集群可访问的容器仓库。具体命令取决于你的仓库提供商。
+
+<Tip>
+建议为镜像打上版本信息，例如 `my-registry.com/my-app:v1.0.0`，这样更方便回滚。
+</Tip>
+
+## 第 4 步：通过 control plane UI 部署
+
+[control plane UI](/langsmith/control-plane#control-plane-ui) 支持创建和管理 deployments、查看 logs 和 metrics，以及更新配置。要在 [LangSmith UI](https://smith.langchain.com) 中创建新的 deployment：
+
+1. 在左侧导航栏中选择 **Deployments**。
+1. 在右上角点击 **+ New Deployment**。
+1. 在 deployment 配置面板中填写以下信息：
+   - **Image URL**：你在[第 3 步](#step-3-push-to-container-registry)中推送的完整镜像 URL。
+   - **Listener/Compute ID**：选择与你的基础设施绑定的 listener。
+   - **Namespace**：要部署到的 Kubernetes namespace。
+   - **Environment variables**：必需的配置，例如 API keys。
+   - 其他所需的 deployment 设置。
+1. 点击 **Submit**。
+
+control plane 会与 [data plane](/langsmith/data-plane) listener 协同完成应用部署。
+
+创建 deployment 后，基础设施会[异步完成资源创建](/langsmith/control-plane#asynchronous-deployment)。部署可能需要几分钟，首次部署通常更久，因为还要创建数据库。
+
+在 control plane UI 中，你可以查看 build logs、server logs 以及 deployment metrics，包括 CPU / memory 使用量、副本数，以及 API 性能。更多信息请参阅[control plane 监控文档](/langsmith/control-plane#monitoring)。
+
+<Note>
+每个 deployment 都会自动创建一个同名的 [LangSmith Observability tracing project](/langsmith/observability)。tracing 相关环境变量也会由 control plane 自动设置。
+</Note>
+
+## 更新 deployment
+
+如果你想部署应用的新版本，可以创建[新 revision](/langsmith/control-plane#revisions)：
+
+从 LangSmith UI 开始：
+
+1. 在左侧导航栏中选择 **Deployments**。
+1. 选择一个已有 deployment。
+1. 在 Deployment 视图右上角点击 **+ New Revision**。
+1. 更新配置：
+   - 将 **Image URL** 更新为新镜像版本。
+   - 如有需要，更新环境变量。
+   - 按需调整其他设置。
+1. 点击 **Submit**。
+
+## 私有仓库认证
+
+如果你的容器仓库需要认证，例如 AWS ECR、Azure ACR、GCP Artifact Registry 或私有 Docker registry，那么在部署应用之前，你必须先配置 Kubernetes image pull secrets。这是一次性的基础设施配置。
+
+<Note>
+**这项配置发生在基础设施层，而不是单个 deployment 层。** 配置完成后，所有 deployments 都会自动继承仓库凭据。
+</Note>
+
+在 LangSmith Helm chart 的 `values.yaml` 中配置 `imagePullSecrets`。详细步骤请参阅[启用 LangSmith Deployment 指南](/langsmith/deploy-self-hosted-full-platform#enable-langsmith-deployment)。
+
+不同仓库提供商如何创建 image pull secrets，请参阅 [Kubernetes 关于私有仓库拉取镜像的文档](https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/)。
+
+## 下一步
+
+- **[Control plane](/langsmith/control-plane)**：进一步了解 control plane 功能。
+- **[Data plane](/langsmith/data-plane)**：理解 data plane 架构。
+- **[Observability](/langsmith/observability)**：使用自动 tracing 监控 deployments。
+- **[Studio](/langsmith/studio)**：测试并调试已部署应用。
+- **[LangGraph CLI](/langsmith/cli)**：查看完整 CLI reference。

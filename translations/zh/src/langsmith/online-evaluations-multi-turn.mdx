@@ -1,0 +1,88 @@
+---
+title: 设置多轮在线 evaluators
+sidebarTitle: 多轮 evaluators
+---
+
+多轮在线 evaluators 可以评估人类与 agent 之间的整段对话，而不只是单次交互。它们衡量的是一个 thread 中所有轮次上的端到端交互质量。
+
+你可以用多轮评估衡量：
+1. Semantic Intent：用户想要完成什么。
+2. Semantic Outcome：实际发生了什么，任务是否成功。
+3. Trajectory：对话是如何展开的，包括工具调用轨迹。
+
+<Note> 运行多轮在线 evals 会自动将 thread 中的每条 trace 升级为[extended data retention](/langsmith/usage-and-billing#data-retention-auto-upgrades)。这会影响 trace 计费，但能确保符合评估条件的 traces（通常也是最值得分析的那些）被保留下来以供调查。 </Note>
+
+## 工作原理
+
+多轮在线 evaluators 遵循以下评估生命周期：
+
+1. **Trace 摄取**：对话中的每一轮都作为单独 run 被追踪，并通过共享的 thread ID 关联到同一个 thread。
+2. **空闲时间检测**：当 thread 中最后一条 trace 被摄取后，LangSmith 会等待配置好的空闲时间结束。这个空闲期表示对话已经完成，可以开始评估。
+3. **消息组装**：LangSmith 会从 thread 中每条 trace 收集 `messages`，并将其组装成一份完整的对话历史。如果每条 trace 只包含最新消息，LangSmith 会跨轮次把消息拼接起来；如果每条 trace 已经包含完整历史，LangSmith 就直接使用。由于同一 thread 中相邻 traces 往往会重复发送已有历史，LangSmith 会对重叠消息去重，保证每条消息只出现一次。最终结果是一份 OpenAI chat 格式的消息列表（`{"role": ..., "content": ...}`），这也是 prompt 中 `all_messages` 变量所解析到的内容。
+4. **LLM-as-a-judge 评估**：组装后的整段对话会传给你配置好的 LLM-as-a-judge prompt。Evaluator 会依据你的标准，对完整 thread 进行 semantic intent、outcome 或 trajectory 打分。
+5. **记录反馈**：Evaluator 会使用你配置的 feedback key，将 feedback 写入 LangSmith，并与该 thread 关联。
+
+这意味着多轮 evaluators 是每个已完成 thread 运行一次，而不是每条 trace 运行一次。如果你想按单条 trace 做评估，请使用[run-level 在线 evaluators](/langsmith/online-evaluations-llm-as-judge)。
+
+## 前置条件
+
+- 你的 tracing project 必须使用了 [threads](/langsmith/threads)。
+- Thread 中每条 trace 的顶层 inputs 和 outputs 都必须包含一个 `messages` 键，其值为消息列表。我们支持 [LangChain](/langsmith/log-llm-trace#messages-format)、[OpenAI Chat Completions](https://platform.openai.com/docs/api-reference/chat/create) 和 [Anthropic Messages](https://platform.claude.com/docs/en/api/messages) 格式的消息。
+    - 如果每条 trace 的顶层 inputs 和 outputs 只包含对话中的最新消息，LangSmith 会自动把各轮消息合并成一个 thread。
+    - 如果每条 trace 的顶层 inputs 和 outputs 已包含完整对话历史，LangSmith 会直接使用它。
+
+<Note>
+如果你的 traces 不符合上述格式，thread 级 evaluator 将无法工作。你需要调整 trace 到 LangSmith 的方式，确保每条 trace 的顶层 inputs 和 outputs 都包含 `messages` 列表。
+
+更多信息请参阅[故障排查](/langsmith/online-evaluations-multi-turn#troubleshooting)部分。
+</Note>
+
+## 配置
+
+1. 进入 **Tracing** 页面，并选择一个 tracing project。
+2. 点击 **Evaluators** 标签页，然后点击 **+ Evaluator**。在 **Create from scratch** 下选择 **LLM-as-a-Judge Evaluator**。在 **Source** 下选择 **Threads**。
+3. **命名 evaluator**。
+4. 应用 **Filters** 或 **Sampling Rate**。<br />
+使用 filters 或 sampling 控制 evaluator 成本。例如，只评估轮次数少于 *N* 的 threads，或对所有 threads 抽样 10%。
+5. **配置空闲时间**。<br />
+第一次配置 thread level evaluator 时，需要定义 idle time，也就是 thread 中最后一条 trace 之后，要等待多久才视为对话完成并进入评估。这个值应反映应用中用户交互的典型长度。它会作用于该项目中的所有 evaluators。
+<Tip>
+首次测试 evaluator 时，可以先用较短的 idle time，这样能更快看到结果。验证通过后，再将其调大到符合实际用户交互长度的值。
+</Tip>
+6. **配置模型。**<br />
+选择 evaluator 使用的 provider 和 model。由于 threads 往往较长，因此应选择上下文窗口更大的模型，以避免触发限制。例如，OpenAI 的 GPT-5.4 mini 或 Gemini 2.5 Flash 都是不错的选择，因为它们都具备 1M+ token 的上下文窗口。
+
+7. **配置你的 LLM-as-a-judge prompt。**<br />
+定义希望评估的内容。该 prompt 将用于评估整个 thread。你还可以通过 `all_messages` 变量配置要传给 evaluator 的对话内容部分，以控制其接收的数据：
+    - All messages：以 OpenAI chat 格式的 JSON 消息对象列表（`{"role": ..., "content": ...}`）传入完整对话，每条消息都会渲染成带缩进的 JSON，并用空行分隔。
+    - Human and AI pairs：只传入 user 和 assistant 消息，格式为 `<user>...</user>` 与 `<assistant>...</assistant>`，不包含 system messages、tool calls 或其他角色。
+    - First human and last AI：只传入第一条用户消息和最后一条 assistant 回复。
+
+9. **设置 feedback 配置。**<br />
+配置 feedback key 的名称、希望收集的 feedback 格式，并可选启用对 feedback 的 reasoning。
+
+<Warning>
+我们不建议为 thread-level evaluator 和 run-level evaluator 使用同一个 feedback key，否则很难区分两者。
+</Warning>
+
+8. **保存 evaluator。**
+
+保存后，evaluator 会出现在 **Evaluators** 标签页中。对新建 thread 而言，一旦 idle time 过去，就可以开始测试该 evaluator。
+
+## 限制
+
+以下是当前多轮在线 evaluators 的限制（后续可能调整）。如果你遇到这些限制，请联系我们。
+
+- **Runs 必须小于一周**：当 thread 进入 idle 状态时，只有过去 7 天内的 runs 会参与评估。
+- **一次最多评估 500 个 threads**：如果在 5 分钟内有超过 500 个 threads 被标记为 idle，我们会自动对超出 500 的部分进行采样。
+- **每个工作区最多 10 个多轮在线 evaluators**
+
+## 故障排查
+
+**检查 evaluator 状态** <br />
+可以进入 tracing project 内的 **Evaluators** 标签页，点击所创建 evaluator 的 **Logs** 按钮，查看其运行历史，从而确认 evaluator 上次运行的时间。
+
+**检查发送给 evaluator 的数据** <br />
+进入 tracing project 内的 **Evaluators** 标签页，点击所创建的 evaluator，然后进入 **Evaluator traces** 标签页，即可检查发送给 evaluator 的数据。
+
+在该标签页中，可以看到传给 LLM-as-a-judge evaluator 的输入。如果消息没有被正确传入，那么在 inputs 中会看到空值。这通常是因为消息未采用[预期格式之一](/langsmith/online-evaluations-multi-turn#prerequisites)。

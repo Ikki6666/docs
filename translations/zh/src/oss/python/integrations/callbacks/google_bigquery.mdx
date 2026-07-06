@@ -1,0 +1,219 @@
+---
+title: "BigQuery 回调处理器集成"
+description: 将 LangChain 和 LangGraph 的事件记录到 Google BigQuery，以便对 LLM 应用进行监控、审计和实时分析。
+---
+
+# BigQuery 回调处理器
+
+<div class="language-support-tag">
+  <span class="lst-supported">Community</span><span class="lst-python">Python</span><span class="lst-preview">Preview</span>
+</div>
+
+> [Google BigQuery](https://cloud.google.com/bigquery) 是一个无服务器、具备成本效益的企业数据仓库，可跨云工作并随数据规模扩展。
+
+`BigQueryCallbackHandler` 允许将 LangChain 和 LangGraph 的事件记录到 Google BigQuery。这对于监控、审计和分析 LLM 应用的表现很有帮助。
+
+**关键特性：**
+- **支持 LangGraph**：自动检测 LangGraph 节点，并记录 `AGENT_STARTING` / `AGENT_COMPLETED` 事件以及顶层 `INVOCATION_STARTING` / `INVOCATION_COMPLETED` 边界，术语与 [Google ADK 的 `BigQueryAgentAnalyticsPlugin`](https://github.com/google/adk-python/blob/main/src/google/adk/plugins/bigquery_agent_analytics_plugin.py) 保持一致
+- **自动创建分析视图**：为每种事件类型创建一个使用强类型列的 `CREATE OR REPLACE VIEW`，例如使用 `v_llm_response.usage_total_tokens` 而不是 `JSON_VALUE(...)`
+- **自动升级 schema**：对现有表执行增量式 `ALTER TABLE ADD COLUMN`，并通过 schema 版本标签做门控，保证每个版本最多运行一次
+- **子代理归因**：当元数据中没有显式设置 `agent` 时，BigQuery 中的 `agent` 列会自动从 `langgraph_node` 推导出来，因此多代理图可以在无需用户修改的情况下按子代理打标
+- **丰富的 LLM 遥测数据**：记录 token 用量（`prompt_tokens` / `completion_tokens` / `total_tokens` / `cached_content_token_count`）、`model_version`、完整的 `usage_metadata`、`cache_metadata`，以及 `LLM_REQUEST` 上的 `llm_config`（temperature、top_p 等）和 `tools`
+- **延迟跟踪**：内置所有 LLM 和工具调用的延迟测量
+- **事件过滤**：支持可配置的 allowlist / denylist，并提供可选的 `skip_internal_chain_events` 启发式过滤，以丢弃诸如 `ChannelWrite`、`RunnableLambda` 等噪声框架链事件，同时不破坏追踪连续性
+- **图上下文管理器**：提供显式的 `INVOCATION_*` 边界和准确计时
+- **请求间调用 `flush()`**：在不销毁处理器的情况下排空队列
+- **实时仪表盘**：基于 FastAPI 的监控 Web 应用，支持实时事件流
+
+<Note>
+  **预览版本**
+
+  BigQuery 回调处理器当前处于 **Preview** 阶段。API 和功能可能会发生变化。
+  更多信息参见
+  [产品发布阶段说明](https://cloud.google.com/products#product-launch-stages)。
+</Note>
+
+<Warning>
+  **BigQuery Storage Write API**
+
+  该功能使用 **BigQuery Storage Write API**，这是一项付费服务。
+  关于成本，请参见
+  [BigQuery 文档](https://cloud.google.com/bigquery/pricing?e=48754805&hl=en#data-ingestion-pricing)。
+</Warning>
+
+
+## 安装
+
+需要安装带有 `bigquery` 扩展依赖的 `langchain-google-community`。本示例还需要 `langchain-google-genai` 和 `langgraph`。
+
+```bash
+pip install "langchain-google-community[bigquery]" langchain langchain-google-genai langgraph
+```
+
+## 前置条件
+
+1. 已启用 **BigQuery API** 的 **Google Cloud Project**。
+2. **BigQuery Dataset**：在使用回调处理器之前，先创建一个用于存储日志表的数据集。如果表不存在，回调处理器会在该数据集中自动创建所需的事件表。
+3. **Google Cloud Storage Bucket（可选）**：如果打算记录多模态内容，例如图片、音频等，建议创建 GCS bucket 以卸载大文件。
+4. **身份验证**：
+    - 本地：运行 `gcloud auth application-default login`。
+    - 云端：确保服务账号具有所需权限。
+
+## IAM 权限
+
+为了让回调处理器正常工作，运行应用的主体（例如服务账号、用户账号）需要具备以下 Google Cloud 角色：
+
+- 项目级 `roles/bigquery.jobUser`，用于执行 BigQuery 查询。
+- 表级 `roles/bigquery.dataEditor`，用于写入日志或事件数据。
+- 如果使用 GCS 卸载：目标 bucket 上需要 `roles/storage.objectCreator` 和 `roles/storage.objectViewer`。
+
+
+## 与 LangGraph agent 一起使用
+
+要将 `BigQueryCallbackHandler` 用于 LangGraph agent，请使用 Google Cloud 项目 ID 和数据集 ID 实例化它。处理器会在首次运行时创建事件表，以及按事件类型划分的分析视图。使用 `graph_context()` 方法跟踪顶层调用边界，它会在进入时发出 `INVOCATION_STARTING`，在结束时发出 `INVOCATION_COMPLETED`，如果发生异常则发出 `INVOCATION_ERROR`，并附带准确的延迟信息。
+
+调用 agent 时，通过 `config` 对象中的 `metadata` 字典传入 `session_id`、`user_id`，以及可选的 `agent`。如果未设置 `agent`，处理器会自动从 `metadata['langgraph_node']` 推导它，从而将每个子代理的事件正确归因。
+
+```python
+import os
+from datetime import datetime
+
+from langchain.agents import create_agent
+from langchain.messages import HumanMessage
+from langchain.tools import tool
+from langchain_google_community.callbacks.bigquery_callback import (
+    BigQueryCallbackHandler,
+    BigQueryLoggerConfig,
+)
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+# 1. 为 agent 定义工具
+@tool
+def get_current_time() -> str:
+    """Returns the current local time."""
+    now = datetime.now()
+    return f"Current time: {now.strftime('%I:%M:%S %p')} on {now.strftime('%B %d, %Y')}"
+
+@tool
+def get_weather(city: str) -> str:
+    """Returns the current weather for a specific city."""
+    # 模拟天气数据，生产环境中请使用真实 API
+    weather_data = {
+        "new york": {"temp": 22, "condition": "Clear"},
+        "tokyo": {"temp": 24, "condition": "Sunny"},
+        "london": {"temp": 14, "condition": "Overcast"},
+    }
+    city_lower = city.lower()
+    if city_lower in weather_data:
+        data = weather_data[city_lower]
+        return f"Weather in {city.title()}: {data['temp']}°C, {data['condition']}"
+    return f"Weather data for '{city}' not available."
+
+@tool
+def convert_currency(amount: float, from_currency: str, to_currency: str) -> str:
+    """Convert an amount between currencies."""
+    rates = {"USD": 1.0, "EUR": 1.08, "GBP": 1.27, "JPY": 0.0067}
+    from_curr, to_curr = from_currency.upper(), to_currency.upper()
+    if from_curr not in rates or to_curr not in rates:
+        return f"Unknown currency"
+    result = amount * rates[from_curr] / rates[to_curr]
+    return f"{amount} {from_curr} = {result:.2f} {to_curr}"
+
+def run_agent_example(project_id: str):
+    """Run a LangGraph agent with BigQuery logging."""
+
+    dataset_id = "agent_analytics"
+
+    # 2. 配置回调处理器
+    # `table_id` 默认是 "agent_events"，只有在想使用其他表名时才需要显式传入
+    # 处理器会在首次运行时创建该表，以及按事件类型划分的 `v_*` 分析视图
+    config = BigQueryLoggerConfig(
+        batch_size=1,
+        batch_flush_interval=0.5,
+        custom_tags={"env": "prod", "service": "travel"},  # 每个事件上的静态标签
+    )
+
+    handler = BigQueryCallbackHandler(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        config=config,
+        graph_name="travel_assistant",  # 用于 INVOCATION_* 事件和 root_agent_name
+    )
+
+    # 3. 创建 LLM 和 agent
+    # Vertex AI 使用 project 参数，Gemini Developer API 使用 api_key
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        project=project_id,  # 供 Vertex AI 使用
+    )
+    tools = [get_current_time, get_weather, convert_currency]
+    agent = create_agent(llm, tools)
+
+    # 4. 使用 graph_context 记录 INVOCATION_STARTING / INVOCATION_COMPLETED
+    query = "What time is it? What's the weather in Tokyo? How much is 100 USD in EUR?"
+
+    run_metadata = {
+        "session_id": "session-001",
+        "user_id": "user-123",
+        # `agent` 是可选的，省略时处理器会回退到
+        # metadata['langgraph_node'] 以便按子代理进行归因。
+    }
+
+    with handler.graph_context("travel_assistant", metadata=run_metadata):
+        result = agent.invoke(
+            {"messages": [HumanMessage(content=query)]},
+            config={
+                "callbacks": [handler],
+                "metadata": run_metadata,
+            },
+        )
+
+    print(f"Response: {result['messages'][-1].content}")
+
+    # 5. 阻塞直到待写入的行全部完成（适用于请求边界之间）。
+    # 不会关闭处理器，后续调用仍然可用。
+    handler.flush(timeout=5.0)
+
+    # 6. 进程退出时做最终清理。
+    handler.shutdown()
+
+if __name__ == "__main__":
+    project_id = os.environ.get("GCP_PROJECT_ID", "your-project-id")
+    run_agent_example(project_id)
+```
+
+## 配置选项
+
+可以通过 `BigQueryLoggerConfig` 自定义回调处理器。
+
+<ParamField body="enabled" type="bool" default="True">
+  如果希望禁用处理器向 BigQuery 表记录数据，请将该参数设为 `False`。
+</ParamField>
+
+<ParamField body="clustering_fields" type="List[str]" default="['event_type', 'agent', 'user_id']">
+  自动创建 BigQuery 表时，用于聚簇该表的字段。
+</ParamField>
+
+<ParamField body="gcs_bucket_name" type="str" default="None">
+  用于卸载大体积内容（图片、二进制对象、大文本）的 GCS bucket 名称。如果不提供，大内容可能会被截断或替换为占位符。
+</ParamField>
+
+<ParamField body="connection_id" type="str" default="None">
+  用于作为 ObjectRef 列授权方的 BigQuery connection ID，例如 `us.my-connection`。在配合 BigQuery ML 使用 ObjectRef 时必填。
+</ParamField>
+
+<ParamField body="max_content_length" type="int" default="512000">
+  （500 KB）在卸载到 GCS（如果已配置）或截断之前，允许以内联方式存储到 BigQuery 的最大文本内容长度（按字符数计算）。
+</ParamField>
+
+<ParamField body="batch_size" type="int" default="1">
+  在写入 BigQuery 之前要批量累积的事件数量。
+</ParamField>
+
+<ParamField body="batch_flush_interval" type="float" default="1.0">
+  在刷新部分批次之前允许等待的最长时间（秒）。
+</ParamField>
+
+<ParamField body="shutdown_timeout" type="float" default="10.0">
+  关闭期间等待日志刷新完成的秒数。
+</ParamField>

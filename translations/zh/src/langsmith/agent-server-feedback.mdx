@@ -1,0 +1,185 @@
+---
+title: 如何为 Agent Server runs 收集用户反馈
+sidebarTitle: 为 Agent Server runs 收集用户反馈
+---
+本教程介绍如何为 [Agent Server](/langsmith/agent-server) 的 runs 收集用户反馈，并将其自动关联到 LangSmith 中的 [traces](/langsmith/observability-concepts#traces)。创建 run 时，请在请求体的 `feedback_keys` 字段中包含这些 key。响应会为每个 key 返回一个预签名 URL，客户端可以用它来为 Agent Server run 收集用户反馈。
+
+LangSmith 使用反馈持续改进 agent 的实现。要了解 LangSmith 中反馈的工作方式，请参阅[LangSmith feedback](/langsmith/observability-concepts#feedback)。
+
+## 工作原理
+
+1. 创建一个 run，并在请求体中包含 `feedback_keys`。例如，调用 `POST /threads/{thread_id}/runs/stream` 时，把请求体中的 `feedback_keys` 设置为：
+    ```
+    ["user_liked", "user_disliked"]
+    ```
+2. 响应中的 `feedback` 对象会为每个 key 提供一个预签名 URL。例如，`feedback` 对象如下：
+    ```
+    {
+        "user_liked": "https://api.smith.langchain.com/api/v1/feedback/tokens/ef19fedf-dcac-4cbb-a59c-00661efd6425",
+        "user_disliked": "https://api.smith.langchain.com/api/v1/feedback/tokens/e952734e-c0a0-417b-a04d-fc2209691ed5"
+    }
+    ```
+3. 请求返回的 URL（例如 `POST /api/v1/feedback/tokens/{token_id}`），将 feedback key 与由 Agent Server run 生成的 trace 关联起来。更多细节请参阅 [LangSmith API reference](/langsmith/smith-api-ref)。
+4. LangSmith 会使用所选的 feedback key（例如 `user_liked` 或 `user_disliked`），把提交的反馈关联到该 run。
+
+## 调用带有 `feedback_keys` 的 streaming run API
+
+创建一个 run，并从响应中解析 `feedback` 对象。
+
+<Tabs>
+<Tab title="Python SDK">
+
+```python
+from langgraph_sdk import get_client
+
+client = get_client(url="<DEPLOYMENT_URL>", api_key="<API_KEY>")
+
+thread = await client.threads.create()
+thread_id = thread["thread_id"]
+
+feedback_urls = {}
+
+async for event in client.runs.stream(
+    thread_id,
+    "agent",
+    input={
+        "messages": [
+            {"role": "user", "content": "Tell me a joke about databases."}
+        ]
+    },
+    stream_mode="updates",
+    feedback_keys=["user_liked", "user_disliked"],
+):
+    if event.event == "feedback":
+        # Example: {"user_liked": ".../feedback/tokens/<id>", "user_disliked": "..."}
+        feedback_urls = event.data
+        print("Feedback URLs:", feedback_urls)
+    elif event.event == "updates":
+        print(event.data)
+```
+
+</Tab>
+<Tab title="JavaScript SDK">
+
+```javascript
+import { Client } from "@langchain/langgraph-sdk";
+
+const client = new Client({ apiUrl: "<DEPLOYMENT_URL>", apiKey: "<API_KEY>" });
+
+const thread = await client.threads.create();
+const threadId = thread.thread_id;
+
+let feedbackUrls = {};
+
+const streamResponse = client.runs.stream(threadId, "agent", {
+  input: {
+    messages: [{ role: "user", content: "Tell me a joke about databases." }],
+  },
+  streamMode: "updates",
+  feedbackKeys: ["user_liked", "user_disliked"],
+});
+
+for await (const event of streamResponse) {
+  if (event.event === "feedback") {
+    // Example: { user_liked: ".../feedback/tokens/<id>", user_disliked: "..." }
+    feedbackUrls = event.data;
+    console.log("Feedback URLs:", feedbackUrls);
+  } else if (event.event === "updates") {
+    console.log(event.data);
+  }
+}
+```
+
+</Tab>
+<Tab title="cURL">
+
+```bash
+curl --request POST \
+  --url "<DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream" \
+  --header "Content-Type: application/json" \
+  --header "x-api-key: <API_KEY>" \
+  --data '{
+    "assistant_id": "agent",
+    "input": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Tell me a joke about databases."
+        }
+      ]
+    },
+    "stream_mode": "updates",
+    "feedback_keys": ["user_liked", "user_disliked"]
+  }'
+```
+
+</Tab>
+</Tabs>
+
+## 处理流式返回的 `feedback` 事件
+
+流会发出如下所示的 `feedback` 事件：
+
+```text
+event: feedback
+data: {"user_liked":"https://api.smith.langchain.com/api/v1/feedback/tokens/ef19fedf-dcac-4cbb-a59c-00661efd6425", "user_disliked": "https://api.smith.langchain.com/api/v1/feedback/tokens/e952734e-c0a0-417b-a04d-fc2209691ed5"}
+```
+
+`data` 中的每个 key 都对应你传入 `feedback_keys` 的一个值。每个 value 都是一个生成好的 URL，客户端可以调用它来为该 run 提交反馈。
+
+## 使用生成的 URL 提交反馈
+
+当用户选择某个反馈选项时，对相应 URL 发起 `POST`。也支持 `GET`。更多细节请参阅 [LangSmith API reference](/langsmith/smith-api-ref)。
+
+例如，如果用户点击 thumbs down 按钮，则调用 `user_disliked` URL：
+
+<Tabs>
+<Tab title="POST">
+```bash
+curl --request POST \
+  --url "https://api.smith.langchain.com/api/v1/feedback/tokens/e952734e-c0a0-417b-a04d-fc2209691ed5" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "score": 1,
+    "value": 0,
+    "comment": "I didn't like this joke because it didn't make me laugh.",
+    "correction": {},
+    "metadata": {}
+  }'
+```
+</Tab>
+<Tab title="GET">
+`metadata` 不支持与 `GET` 一起使用。
+```bash
+curl --request GET \
+  --url "https://api.smith.langchain.com/api/v1/feedback/tokens/e952734e-c0a0-417b-a04d-fc2209691ed5?score=1&value=0&comment=I%20didn%27t%20like%20this%20joke%20because%20it%20didn%27t%20make%20me%20laugh.&correction=%7B%7D"
+```
+</Tab>
+</Tabs>
+
+此请求成功后，LangSmith 会使用 `user_disliked` 这个 key 在 trace 上记录反馈。
+
+## 优化反馈数据模型
+
+`user_liked` 和 `user_disliked` 这两个 key 也可以建模为单个 key，比如 `user_score`。
+
+例如：
+
+- 对 `user_liked` 使用 `key="user_score"`，并设置 `score=1`
+- 对 `user_disliked` 使用 `key="user_score"`，并设置 `score=-1`
+
+这样可以简化分析，因为所有用户偏好信号都会归到同一个 feedback key 下。
+
+反馈数据模型非常灵活，应根据你的使用场景来设计。例如，有些应用更适合使用独立的布尔风格 key（`user_liked`、`user_disliked`），另一些应用则更适合使用单个数值分数（`user_score`），或者使用包含多个 feedback keys 的更丰富 rubric。
+
+## 在客户端 UI 中产品化
+
+一个可用于生产环境的方案，应该通过前端暴露这些生成的 feedback URLs，而不是手动调用它们。
+
+高层实现示例：
+
+1. 由你的 backend 或 frontend 创建 run。
+2. 捕获 `feedback` 对象，并保存返回的 URLs。
+3. 渲染反馈控件，例如 thumbs up/down 按钮和反馈表单。
+4. 提交反馈时，根据用户的反馈意图，对某个 feedback URL 发起 `POST` 或 `GET`。
+5. 可选地，在提交后禁用反馈控件，并向用户显示确认信息。

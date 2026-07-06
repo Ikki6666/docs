@@ -1,0 +1,1055 @@
+---
+title: Streaming API
+sidebarTitle: Streaming API
+---
+
+[LangGraph SDK](/langsmith/langgraph-python-sdk) 支持以多种模式从 [LangSmith Deployment API](/langsmith/server-api-ref) 流式获取输出，从每一步之后的完整 state 快照，到 LLM 的逐 token 输出都支持。Thread streaming 还支持可恢复性：如果连接中断，你可以带着最后一个 event ID 重新连接，从中断位置继续接收。
+
+<Note>
+LangGraph SDK 和 Agent Server 都是 [LangSmith](/langsmith/observability) 的一部分。
+</Note>
+
+## Basic usage
+
+基础用法示例：
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={12}}
+    from langgraph_sdk import get_client
+    client = get_client(url=<DEPLOYMENT_URL>, api_key=<API_KEY>)
+
+    # Using the graph deployed with the name "agent"
+    assistant_id = "agent"
+
+    # create a thread
+    thread = await client.threads.create()
+    thread_id = thread["thread_id"]
+
+    # create a streaming run
+    async for chunk in client.runs.stream(
+        thread_id,
+        assistant_id,
+        input=inputs,
+        stream_mode="updates"
+    ):
+        print(chunk.data)
+```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={12}}
+    import { Client } from "@langchain/langgraph-sdk";
+    const client = new Client({ apiUrl: <DEPLOYMENT_URL>, apiKey: <API_KEY> });
+
+    // Using the graph deployed with the name "agent"
+    const assistantID = "agent";
+
+    // create a thread
+    const thread = await client.threads.create();
+    const threadID = thread["thread_id"];
+
+    // create a streaming run
+    const streamResponse = client.runs.stream(
+      threadID,
+      assistantID,
+      {
+        input,
+        streamMode: "updates"
+      }
+    );
+    for await (const chunk of streamResponse) {
+      console.log(chunk.data);
+    }
+```
+    </Tab>
+    <Tab title="cURL">
+    Create a thread:
+
+    ```bash
+    curl --request POST \
+    --url <DEPLOYMENT_URL>/threads \
+    --header 'Content-Type: application/json' \
+    --data '{}'
+    ```
+
+    Create a streaming run:
+
+    ```bash
+    curl --request POST \
+    --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream \
+    --header 'Content-Type: application/json' \
+    --header 'x-api-key: <API_KEY>'
+    --data "{
+      \"assistant_id\": \"agent\",
+      \"input\": <inputs>,
+      \"stream_mode\": \"updates\"
+    }"
+    ```
+    </Tab>
+</Tabs>
+
+<Accordion title="Extended example: streaming updates">
+  这是一个可以在 Agent Server 中运行的示例 graph。
+  更多细节请参阅 [LangSmith quickstart](/langsmith/deployment-quickstart)。
+
+  ```python
+  # graph.py
+  from typing import TypedDict
+  from langgraph.graph import StateGraph, START, END
+
+  class State(TypedDict):
+      topic: str
+      joke: str
+
+  def refine_topic(state: State):
+      return {"topic": state["topic"] + " and cats"}
+
+  def generate_joke(state: State):
+      return {"joke": f"This is a joke about {state['topic']}"}
+
+  graph = (
+      StateGraph(State)
+      .add_node(refine_topic)
+      .add_node(generate_joke)
+      .add_edge(START, "refine_topic")
+      .add_edge("refine_topic", "generate_joke")
+      .add_edge("generate_joke", END)
+      .compile()
+  )
+  ```
+
+  当 Agent Server 运行起来后，你可以使用
+  [LangGraph SDK](/langsmith/langgraph-python-sdk)
+  与之交互。
+
+    <Tabs>
+        <Tab title="Python">
+      ```python {highlight={12,16}}
+      from langgraph_sdk import get_client
+      client = get_client(url=<DEPLOYMENT_URL>)
+
+      # Using the graph deployed with the name "agent"
+      assistant_id = "agent"
+
+      # create a thread
+      thread = await client.threads.create()
+      thread_id = thread["thread_id"]
+
+      # create a streaming run
+      async for chunk in client.runs.stream(  # (1)!
+          thread_id,
+          assistant_id,
+          input={"topic": "ice cream"},
+          stream_mode="updates"  # (2)!
+      ):
+          print(chunk.data)
+```
+
+      1. `client.runs.stream()` 方法会返回一个 iterator，持续产出流式输出。
+            2. 通过设置 `stream_mode="updates"`，只流式返回每个 node 执行后对 graph state 的更新。还支持其他 stream mode，详见 [supported stream modes](#supported-stream-modes)。
+        </Tab>
+        <Tab title="JavaScript">
+      ```javascript {highlight={12,17}}
+      import { Client } from "@langchain/langgraph-sdk";
+      const client = new Client({ apiUrl: <DEPLOYMENT_URL> });
+
+      // Using the graph deployed with the name "agent"
+      const assistantID = "agent";
+
+      // create a thread
+      const thread = await client.threads.create();
+      const threadID = thread["thread_id"];
+
+      // create a streaming run
+      const streamResponse = client.runs.stream(  // (1)!
+        threadID,
+        assistantID,
+        {
+          input: { topic: "ice cream" },
+          streamMode: "updates"  // (2)!
+        }
+      );
+      for await (const chunk of streamResponse) {
+        console.log(chunk.data);
+      }
+```
+
+      1. `client.runs.stream()` 方法会返回一个 iterator，持续产出流式输出。
+      2. 通过设置 `streamMode: "updates"`，只流式返回每个 node 执行后对 graph state 的更新。还支持其他 stream mode，详见 [supported stream modes](#supported-stream-modes)。
+        </Tab>
+        <Tab title="cURL">
+      Create a thread:
+
+      ```bash
+      curl --request POST \
+      --url <DEPLOYMENT_URL>/threads \
+      --header 'Content-Type: application/json' \
+      --data '{}'
+      ```
+
+      Create a streaming run:
+
+      ```bash
+      curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream \
+      --header 'Content-Type: application/json' \
+      --data "{
+        \"assistant_id\": \"agent\",
+        \"input\": {\"topic\": \"ice cream\"},
+        \"stream_mode\": \"updates\"
+      }"
+      ```
+        </Tab>
+    </Tabs>
+
+  ```python
+  {'run_id': '1f02c2b3-3cef-68de-b720-eec2a4a8e920', 'attempt': 1}
+  {'refine_topic': {'topic': 'ice cream and cats'}}
+  {'generate_joke': {'joke': 'This is a joke about ice cream and cats'}}
+  ```
+</Accordion>
+
+### Supported stream modes
+
+| Mode                             | Description                                                                                                                                                                         | LangGraph Library Method                                                                                 |
+|----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| [`values`](#stream-graph-state)  | 在每个 [super-step](/langsmith/graph-rebuild#define-graphs) 之后流式返回完整 graph state。                                                                                            | 使用 `.stream()` / `.astream()`，并设置 [`stream_mode="values"`](/oss/langgraph/streaming#graph-state)  |
+| [`updates`](#stream-graph-state) | 在 graph 每一步执行后流式返回对 state 的更新。如果同一步中有多个更新，例如运行了多个 node，这些更新会分别独立流出。 | 使用 `.stream()` / `.astream()`，并设置 [`stream_mode="updates"`](/oss/langgraph/streaming#graph-state) |
+| [`messages-tuple`](#messages)    | 为 graph 中调用 LLM 的节点流式返回 LLM token 和 metadata，适合 chat app。                                                                                 | 使用 `.stream()` / `.astream()`，并设置 [`stream_mode="messages"`](/oss/langgraph/streaming#messages)          |
+| [`debug`](#debug)                | 在 graph 执行全过程中尽可能多地流式返回调试信息。                                                                                                      | 使用 `.stream()` / `.astream()`，并设置 [`stream_mode="debug"`](/oss/langgraph/streaming#graph-state)   |
+| [`custom`](#stream-custom-data)  | 从 graph 内部流式返回自定义数据。                                                                                                                                          | 使用 `.stream()` / `.astream()`，并设置 [`stream_mode="custom"`](/oss/langgraph/streaming#custom-data)  |
+| [`events`](#stream-events)       | 流式返回全部事件，包括 graph state；在迁移大型 LCEL 应用时尤其有用。                                                                                 | `.astream_events()`                                                                                      |
+
+### Stream multiple modes
+
+你可以把 `stream_mode` 设为列表，以同时流式返回多种模式的数据。
+
+流式输出将是 `(mode, chunk)` 这样的 tuple，其中 `mode` 是 stream mode 名称，`chunk` 是该模式对应流出的数据。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    async for chunk in client.runs.stream(
+        thread_id,
+        assistant_id,
+        input=inputs,
+        stream_mode=["updates", "custom"]
+    ):
+        print(chunk)
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```js
+    const streamResponse = client.runs.stream(
+      threadID,
+      assistantID,
+      {
+        input,
+        streamMode: ["updates", "custom"]
+      }
+    );
+    for await (const chunk of streamResponse) {
+      console.log(chunk);
+    }
+    ```
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request POST \
+     --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream \
+     --header 'Content-Type: application/json' \
+     --data "{
+       \"assistant_id\": \"agent\",
+       \"input\": <inputs>,
+       \"stream_mode\": [
+         \"updates\"
+         \"custom\"
+       ]
+     }"
+    ```
+    </Tab>
+</Tabs>
+
+## Stream graph state
+
+使用 `updates` 和 `values` 这两个 stream mode，可以在 graph 执行时流式查看 graph state。
+
+* `updates` 会在 graph 的每一步之后流式返回 **state 的更新**。
+* `values` 会在 graph 的每一步之后流式返回 **state 的完整值**。
+
+<Accordion title="Example graph">
+  ```python
+  from typing import TypedDict
+  from langgraph.graph import StateGraph, START, END
+
+  class State(TypedDict):
+    topic: str
+    joke: str
+
+  def refine_topic(state: State):
+      return {"topic": state["topic"] + " and cats"}
+
+  def generate_joke(state: State):
+      return {"joke": f"This is a joke about {state['topic']}"}
+
+  graph = (
+    StateGraph(State)
+    .add_node(refine_topic)
+    .add_node(generate_joke)
+    .add_edge(START, "refine_topic")
+    .add_edge("refine_topic", "generate_joke")
+    .add_edge("generate_joke", END)
+    .compile()
+  )
+  ```
+</Accordion>
+
+<Note>
+**Stateful runs**
+下面的示例默认你希望把 streaming run 的输出持久化到 [checkpointer](/oss/langgraph/persistence) DB 中，因此已经创建了一个 thread。创建 thread 的方式如下：
+
+<Tabs>
+<Tab title="Python">
+```python
+from langgraph_sdk import get_client
+client = get_client(url=<DEPLOYMENT_URL>)
+
+# Using the graph deployed with the name "agent"
+assistant_id = "agent"
+# create a thread
+thread = await client.threads.create()
+thread_id = thread["thread_id"]
+```
+</Tab>
+<Tab title="JavaScript">
+```js
+import { Client } from "@langchain/langgraph-sdk";
+const client = new Client({ apiUrl: <DEPLOYMENT_URL> });
+
+// Using the graph deployed with the name "agent"
+const assistantID = "agent";
+// create a thread
+const thread = await client.threads.create();
+const threadID = thread["thread_id"]
+```
+</Tab>
+<Tab title="cURL">
+```bash
+curl --request POST \
+--url <DEPLOYMENT_URL>/threads \
+--header 'Content-Type: application/json' \
+--data '{}'
+```
+</Tab>
+</Tabs>
+
+如果你不需要持久化 run 输出，那么在 streaming 时可以传入 `None` 代替 `thread_id`。
+</Note>
+
+### Stream mode: `updates`
+
+用它来仅流式返回每一步之后 node 返回的 **state update**。流式输出中会包含 node 名称以及更新内容。
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={5}}
+    async for chunk in client.runs.stream(
+        thread_id,
+        assistant_id,
+        input={"topic": "ice cream"},
+        stream_mode="updates"
+    ):
+        print(chunk.data)
+```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={6}}
+    const streamResponse = client.runs.stream(
+      threadID,
+      assistantID,
+      {
+        input: { topic: "ice cream" },
+        streamMode: "updates"
+      }
+    );
+    for await (const chunk of streamResponse) {
+      console.log(chunk.data);
+    }
+```
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request POST \
+    --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream \
+    --header 'Content-Type: application/json' \
+    --data "{
+      \"assistant_id\": \"agent\",
+      \"input\": {\"topic\": \"ice cream\"},
+      \"stream_mode\": \"updates\"
+    }"
+    ```
+    </Tab>
+</Tabs>
+
+### Stream mode: `values`
+
+用它来在每一步之后流式返回 graph 的 **完整 state**。
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={5}}
+    async for chunk in client.runs.stream(
+        thread_id,
+        assistant_id,
+        input={"topic": "ice cream"},
+        stream_mode="values"
+    ):
+        print(chunk.data)
+```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={6}}
+    const streamResponse = client.runs.stream(
+      threadID,
+      assistantID,
+      {
+        input: { topic: "ice cream" },
+        streamMode: "values"
+      }
+    );
+    for await (const chunk of streamResponse) {
+      console.log(chunk.data);
+    }
+```
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request POST \
+    --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream \
+    --header 'Content-Type: application/json' \
+    --data "{
+      \"assistant_id\": \"agent\",
+      \"input\": {\"topic\": \"ice cream\"},
+      \"stream_mode\": \"values\"
+    }"
+    ```
+    </Tab>
+</Tabs>
+
+## Subgraphs
+
+如果你想让流式输出中也包含 [subgraphs](/oss/langgraph/use-subgraphs) 的输出，可以在父 graph 的 `.stream()` 方法中设置 `subgraphs=True`。这样既会流式返回父 graph 的输出，也会返回 subgraph 的输出。
+
+```python {highlight={5}}
+async for chunk in client.runs.stream(
+    thread_id,
+    assistant_id,
+    input={"foo": "foo"},
+    stream_subgraphs=True, # (1)!
+    stream_mode="updates",
+):
+    print(chunk)
+```
+
+1. 设置 `stream_subgraphs=True`，即可流式获取 subgraph 输出。
+
+<Accordion title="Extended example: streaming from subgraphs">
+  这是一个可以在 Agent Server 中运行的示例 graph。
+  更多细节请参阅 [LangSmith quickstart](/langsmith/deployment-quickstart)。
+
+  ```python
+  # graph.py
+  from langgraph.graph import START, StateGraph
+  from typing import TypedDict
+
+  # Define subgraph
+  class SubgraphState(TypedDict):
+      foo: str  # note that this key is shared with the parent graph state
+      bar: str
+
+  def subgraph_node_1(state: SubgraphState):
+      return {"bar": "bar"}
+
+  def subgraph_node_2(state: SubgraphState):
+      return {"foo": state["foo"] + state["bar"]}
+
+  subgraph_builder = StateGraph(SubgraphState)
+  subgraph_builder.add_node(subgraph_node_1)
+  subgraph_builder.add_node(subgraph_node_2)
+  subgraph_builder.add_edge(START, "subgraph_node_1")
+  subgraph_builder.add_edge("subgraph_node_1", "subgraph_node_2")
+  subgraph = subgraph_builder.compile()
+
+  # Define parent graph
+  class ParentState(TypedDict):
+      foo: str
+
+  def node_1(state: ParentState):
+      return {"foo": "hi! " + state["foo"]}
+
+  builder = StateGraph(ParentState)
+  builder.add_node("node_1", node_1)
+  builder.add_node("node_2", subgraph)
+  builder.add_edge(START, "node_1")
+  builder.add_edge("node_1", "node_2")
+  graph = builder.compile()
+  ```
+
+  当 Agent Server 运行起来后，你可以使用
+  [LangGraph SDK](/langsmith/langgraph-python-sdk)
+  与之交互。
+
+    <Tabs>
+        <Tab title="Python">
+      ```python {highlight={15}}
+      from langgraph_sdk import get_client
+      client = get_client(url=<DEPLOYMENT_URL>)
+
+      # Using the graph deployed with the name "agent"
+      assistant_id = "agent"
+
+      # create a thread
+      thread = await client.threads.create()
+      thread_id = thread["thread_id"]
+
+      async for chunk in client.runs.stream(
+          thread_id,
+          assistant_id,
+          input={"foo": "foo"},
+          stream_subgraphs=True, # (1)!
+          stream_mode="updates",
+      ):
+          print(chunk)
+```
+
+            1. 设置 `stream_subgraphs=True` 以流式返回 subgraph 输出。
+        </Tab>
+        <Tab title="JavaScript">
+      ```javascript {highlight={17}}
+      import { Client } from "@langchain/langgraph-sdk";
+      const client = new Client({ apiUrl: <DEPLOYMENT_URL> });
+
+      // Using the graph deployed with the name "agent"
+      const assistantID = "agent";
+
+      // create a thread
+      const thread = await client.threads.create();
+      const threadID = thread["thread_id"];
+
+      // create a streaming run
+      const streamResponse = client.runs.stream(
+        threadID,
+        assistantID,
+        {
+          input: { foo: "foo" },
+          streamSubgraphs: true,  // (1)!
+          streamMode: "updates"
+        }
+      );
+      for await (const chunk of streamResponse) {
+        console.log(chunk);
+      }
+```
+
+      1. 设置 `streamSubgraphs: true` 以流式返回 subgraph 输出。
+        </Tab>
+        <Tab title="cURL">
+      Create a thread:
+
+      ```bash
+      curl --request POST \
+      --url <DEPLOYMENT_URL>/threads \
+      --header 'Content-Type: application/json' \
+      --data '{}'
+      ```
+
+      Create a streaming run:
+
+      ```bash
+      curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream \
+      --header 'Content-Type: application/json' \
+      --data "{
+        \"assistant_id\": \"agent\",
+        \"input\": {\"foo\": \"foo\"},
+        \"stream_subgraphs\": true,
+        \"stream_mode\": [
+          \"updates\"
+        ]
+      }"
+      ```
+        </Tab>
+    </Tabs>
+
+  **Note**：你收到的并不仅仅是 node update，还会带有 namespace，用来告诉你当前输出来自哪个 graph，或 subgraph。
+</Accordion>
+
+<a id="debug"></a>
+## Debugging
+
+使用 `debug` streaming mode，可以在 graph 执行期间尽可能多地流式获取信息。流式输出会包含 node 名称以及完整 state。
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={5}}
+    async for chunk in client.runs.stream(
+        thread_id,
+        assistant_id,
+        input={"topic": "ice cream"},
+        stream_mode="debug"
+    ):
+        print(chunk.data)
+```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={6}}
+    const streamResponse = client.runs.stream(
+      threadID,
+      assistantID,
+      {
+        input: { topic: "ice cream" },
+        streamMode: "debug"
+      }
+    );
+    for await (const chunk of streamResponse) {
+      console.log(chunk.data);
+    }
+```
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request POST \
+    --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream \
+    --header 'Content-Type: application/json' \
+    --data "{
+      \"assistant_id\": \"agent\",
+      \"input\": {\"topic\": \"ice cream\"},
+      \"stream_mode\": \"debug\"
+    }"
+    ```
+    </Tab>
+</Tabs>
+
+<a id="messages"></a>
+## LLM tokens
+
+使用 `messages-tuple` streaming mode，可以从 graph 的任意位置，逐 token 地流式返回 Large Language Model (LLM) 输出，包括 node、tool、subgraph 或 task 中的调用。
+
+[`messages-tuple` mode](#supported-stream-modes) 的流式输出是一个 `(message_chunk, metadata)` tuple，其中：
+
+* `message_chunk`：来自 LLM 的 token 或消息片段。
+* `metadata`：一个 dictionary，包含 graph node 和 LLM 调用相关的详细信息。
+
+<Accordion title="Example graph">
+    ```python {highlight={15}}
+    from dataclasses import dataclass
+
+    from langchain.chat_models import init_chat_model
+    from langgraph.graph import StateGraph, START
+
+    @dataclass
+    class MyState:
+        topic: str
+        joke: str = ""
+
+    model = init_chat_model(model="gpt-5.4-mini")
+
+    def call_model(state: MyState):
+        """Call the LLM to generate a joke about a topic"""
+        model_response = model.invoke( # (1)!
+            [
+                {"role": "user", "content": f"Generate a joke about {state.topic}"}
+            ]
+        )
+        return {"joke": model_response.content}
+
+    graph = (
+        StateGraph(MyState)
+        .add_node(call_model)
+        .add_edge(START, "call_model")
+        .compile()
+    )
+    ```
+
+    1. 请注意，即便 LLM 是通过 `invoke` 而不是 `stream` 运行的，message event 仍然会被发出。
+</Accordion>
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={5}}
+    async for chunk in client.runs.stream(
+        thread_id,
+        assistant_id,
+        input={"topic": "ice cream"},
+        stream_mode="messages-tuple",
+    ):
+        if chunk.event != "messages":
+            continue
+
+        message_chunk, metadata = chunk.data  # (1)!
+        if message_chunk["content"]:
+            print(message_chunk["content"], end="|", flush=True)
+```
+
+    1. `"messages-tuple"` stream mode 返回一个 `(message_chunk, metadata)` tuple iterator，其中 `message_chunk` 是 LLM 流出的 token，而 `metadata` 是包含调用该 LLM 的 graph node 及其他信息的 dictionary。
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={6}}
+    const streamResponse = client.runs.stream(
+      threadID,
+      assistantID,
+      {
+        input: { topic: "ice cream" },
+        streamMode: "messages-tuple"
+      }
+    );
+    for await (const chunk of streamResponse) {
+      if (chunk.event !== "messages") {
+        continue;
+      }
+      console.log(chunk.data[0]["content"]);  // (1)!
+    }
+```
+
+    1. `"messages-tuple"` stream mode 返回一个 `(message_chunk, metadata)` tuple iterator，其中 `message_chunk` 是 LLM 流出的 token，而 `metadata` 是包含调用该 LLM 的 graph node 及其他信息的 dictionary。
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request POST \
+    --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream \
+    --header 'Content-Type: application/json' \
+    --data "{
+      \"assistant_id\": \"agent\",
+      \"input\": {\"topic\": \"ice cream\"},
+      \"stream_mode\": \"messages-tuple\"
+    }"
+    ```
+    </Tab>
+</Tabs>
+
+### Filter LLM tokens
+
+* 如果你想按 LLM 调用粒度筛选流出的 token，可以 [associate `tags` with LLM invocations](/oss/langgraph/streaming#filter-by-llm-invocation)。
+* 如果你只想流出特定 node 的 token，可以使用 `stream_mode="messages"`，并通过流式 metadata 中的 `langgraph_node` 字段 [filter the outputs by the `langgraph_node` field](/oss/langgraph/streaming#filter-by-node)。
+
+## Stream custom data
+
+如果你想发送 **custom user-defined data**：
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={5}}
+    async for chunk in client.runs.stream(
+        thread_id,
+        assistant_id,
+        input={"query": "example"},
+        stream_mode="custom"
+    ):
+        print(chunk.data)
+```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={6}}
+    const streamResponse = client.runs.stream(
+      threadID,
+      assistantID,
+      {
+        input: { query: "example" },
+        streamMode: "custom"
+      }
+    );
+    for await (const chunk of streamResponse) {
+      console.log(chunk.data);
+    }
+```
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request POST \
+    --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream \
+    --header 'Content-Type: application/json' \
+    --data "{
+      \"assistant_id\": \"agent\",
+      \"input\": {\"query\": \"example\"},
+      \"stream_mode\": \"custom\"
+    }"
+    ```
+    </Tab>
+</Tabs>
+
+## Stream events
+
+如果你想流式获取所有 event，包括 graph state：
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={5}}
+    async for chunk in client.runs.stream(
+        thread_id,
+        assistant_id,
+        input={"topic": "ice cream"},
+        stream_mode="events"
+    ):
+        print(chunk.data)
+```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={6}}
+    const streamResponse = client.runs.stream(
+      threadID,
+      assistantID,
+      {
+        input: { topic: "ice cream" },
+        streamMode: "events"
+      }
+    );
+    for await (const chunk of streamResponse) {
+      console.log(chunk.data);
+    }
+```
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request POST \
+    --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream \
+    --header 'Content-Type: application/json' \
+    --data "{
+      \"assistant_id\": \"agent\",
+      \"input\": {\"topic\": \"ice cream\"},
+      \"stream_mode\": \"events\"
+    }"
+    ```
+    </Tab>
+</Tabs>
+
+## Stateless runs
+
+如果你不想把 streaming run 的输出持久化到 [checkpointer](/oss/langgraph/persistence) DB 中，你可以在不创建 thread 的情况下发起 stateless run：
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={5}}
+    from langgraph_sdk import get_client
+    client = get_client(url=<DEPLOYMENT_URL>, api_key=<API_KEY>)
+
+    async for chunk in client.runs.stream(
+        None,  # (1)!
+        assistant_id,
+        input=inputs,
+        stream_mode="updates"
+    ):
+        print(chunk.data)
+```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={5,6}}
+    import { Client } from "@langchain/langgraph-sdk";
+    const client = new Client({ apiUrl: <DEPLOYMENT_URL>, apiKey: <API_KEY> });
+
+    // create a streaming run
+    const streamResponse = client.runs.stream(
+      null,  // (1)!
+      assistantID,
+      {
+        input,
+        streamMode: "updates"
+      }
+    );
+    for await (const chunk of streamResponse) {
+      console.log(chunk.data);
+    }
+```
+
+    1. 这里传入的是 `None`，而不是 `thread_id` UUID。
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request POST \
+    --url <DEPLOYMENT_URL>/runs/stream \
+    --header 'Content-Type: application/json' \
+    --header 'x-api-key: <API_KEY>'
+    --data "{
+      \"assistant_id\": \"agent\",
+      \"input\": <inputs>,
+      \"stream_mode\": \"updates\"
+    }"
+    ```
+    </Tab>
+</Tabs>
+
+## Join and stream
+
+LangSmith 允许你加入一个正在运行的 [background run](/langsmith/background-run)，并持续流式接收其输出。你可以使用 [LangGraph SDK](/langsmith/langgraph-python-sdk) 的 `client.runs.join_stream` 方法：
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={4,6}}
+    from langgraph_sdk import get_client
+    client = get_client(url=<DEPLOYMENT_URL>, api_key=<API_KEY>)
+
+    async for chunk in client.runs.join_stream(
+        thread_id,
+        run_id,  # (1)!
+    ):
+        print(chunk)
+```
+
+    1. 这里的 `run_id` 是你想加入的已有 run 的 ID。
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={4,6}}
+    import { Client } from "@langchain/langgraph-sdk";
+    const client = new Client({ apiUrl: <DEPLOYMENT_URL>, apiKey: <API_KEY> });
+
+    const streamResponse = client.runs.joinStream(
+      threadID,
+      runId  // (1)!
+    );
+    for await (const chunk of streamResponse) {
+      console.log(chunk);
+    }
+```
+
+    1. 这里的 `run_id` 是你想加入的已有 run 的 ID。
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request GET \
+    --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/<RUN_ID>/stream \
+    --header 'Content-Type: application/json' \
+    --header 'x-api-key: <API_KEY>'
+    ```
+    </Tab>
+</Tabs>
+
+<Warning>
+**Outputs not buffered**
+当你使用 `.join_stream` 时，输出不会被缓冲，因此在你加入之前已经产生的输出不会再次发送给你。
+</Warning>
+
+## Stream a thread
+
+Thread streaming 会为一个 thread 打开长连接，并流式返回该 thread 上 **每一个 run** 的输出。这样你就能通过单一连接监控整个 thread 上的所有活动，例如在 chat UI 中，多个 run 可能会随着后续消息、[human-in-the-loop](/langsmith/add-human-in-the-loop) 恢复，或 [background runs](/langsmith/background-run) 而陆续触发。如果你想按 ID 加入某个特定已有 run，请参阅 [Join and stream](#join-and-stream)。
+
+### Compare thread and run streaming
+
+| | Thread streaming | Run streaming |
+|---|---|---|
+| **SDK method** | `client.threads.join_stream()` | `client.runs.stream()` |
+| **REST endpoint** | `GET /threads/{thread_id}/stream` | `POST /threads/{thread_id}/runs/stream` |
+| **Scope** | thread 上的所有 run | 单个 run |
+| **Connection lifetime** | 持续保持打开 | run 完成后关闭 |
+| **Creates a run** | 否 | 是 |
+| **Use case** | 监控持续进行中的 thread activity | 执行并流式返回一次交互 |
+
+### Basic usage
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={7}}
+    from langgraph_sdk import get_client
+    client = get_client(url=<DEPLOYMENT_URL>, api_key=<API_KEY>)
+
+    thread = await client.threads.create()
+    thread_id = thread["thread_id"]
+
+    async for chunk in client.threads.join_stream(thread_id):
+        print(chunk)
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={7}}
+    import { Client } from "@langchain/langgraph-sdk";
+    const client = new Client({ apiUrl: <DEPLOYMENT_URL>, apiKey: <API_KEY> });
+
+    const thread = await client.threads.create();
+    const threadID = thread["thread_id"];
+
+    for await (const chunk of client.threads.joinStream(threadID)) {
+      console.log(chunk);
+    }
+    ```
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request GET \
+    --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream \
+    --header 'x-api-key: <API_KEY>'
+    ```
+    </Tab>
+</Tabs>
+
+### Thread stream modes
+
+Thread streaming 支持三种 stream mode，用于控制返回哪些事件。通过 `stream_mode` 参数传入一个或多个 mode 即可。
+
+| Mode | Description |
+|------|-------------|
+| `run_modes`，默认值 | 流式返回所有 run event，等价于 `client.runs.stream()` 的输出。 |
+| `lifecycle` | 仅流式返回 run 的 start 和 end event。适合轻量监控 run 状态，而无需完整输出。 |
+| `state_update` | 仅流式返回 state update event，提供每个 run 完成后的 thread state。 |
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={3}}
+    async for chunk in client.threads.join_stream(
+        thread_id,
+        stream_mode=["lifecycle", "state_update"],
+    ):
+        print(chunk.event, chunk.data)
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={2}}
+    for await (const chunk of client.threads.joinStream(threadID, {
+      streamMode: ["lifecycle", "state_update"],
+    })) {
+      console.log(chunk.event, chunk.data);
+    }
+    ```
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request GET \
+    --url '<DEPLOYMENT_URL>/threads/<THREAD_ID>/stream?stream_modes=lifecycle&stream_modes=state_update' \
+    --header 'x-api-key: <API_KEY>'
+    ```
+    </Tab>
+</Tabs>
+
+### Resume from last event
+
+Thread stream 通过 `Last-Event-ID` header 支持可恢复。如果连接中断，你可以传入最后收到的 event ID，从而在不中断事件流的情况下继续接收。传入 `"-"` 可以从头重放。
+
+<Tabs>
+    <Tab title="Python">
+    ```python {highlight={3}}
+    async for chunk in client.threads.join_stream(
+        thread_id,
+        last_event_id="<LAST_EVENT_ID>",
+    ):
+        print(chunk)
+    ```
+    </Tab>
+    <Tab title="JavaScript">
+    ```javascript {highlight={2}}
+    for await (const chunk of client.threads.joinStream(threadID, {
+      lastEventId: "<LAST_EVENT_ID>",
+    })) {
+      console.log(chunk);
+    }
+    ```
+    </Tab>
+    <Tab title="cURL">
+    ```bash
+    curl --request GET \
+    --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/stream \
+    --header 'x-api-key: <API_KEY>' \
+    --header 'Last-Event-ID: <LAST_EVENT_ID>'
+    ```
+    </Tab>
+</Tabs>
+
+## API reference
+
+关于 API 用法和实现，请参阅 [API reference](/langsmith/server-api-ref)。

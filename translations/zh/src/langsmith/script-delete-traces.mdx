@@ -1,0 +1,100 @@
+---
+title: 删除 traces
+sidebarTitle: 删除 traces
+---
+
+LangSmith UI 目前不支持删除单条 trace。不过，你可以通过直接将该 trace 从 ClickHouse 中所有物化视图（`runs_history` 视图除外）以及 `runs` 和 `feedback` 表中移除，来实现删除。
+
+这个命令既可以通过传入单个 trace ID 来运行，也可以读取一个按行列出 trace IDs 的文件。
+
+### 前置条件
+
+请确保已经准备好以下工具和信息。
+
+1. kubectl
+
+   * [https://kubernetes.io/docs/tasks/tools/](https://kubernetes.io/docs/tasks/tools/)
+
+2. Clickhouse 数据库凭据
+
+   * Host
+   * Port
+   * Username
+     * 如果使用 bundled 版本，则为 `default`
+   * Password
+     * 如果使用 bundled 版本，则为 `password`
+   * Database name
+     * 如果使用 bundled 版本，则为 `default`
+
+3. 从你将要运行 `delete_trace_by_id` 脚本的机器，到 Clickhouse 数据库的连通性。
+
+   * 如果你使用的是 bundled 版本，可能需要将 clickhouse service 端口转发到本地机器。
+   * 运行 `kubectl port-forward svc/langsmith-clickhouse 8123:8123`，把 clickhouse service 端口转发到本地机器。
+
+4. 删除 trace 的脚本
+
+   * 下载 [trace script](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/scripts/delete_trace_by_id.sh)
+
+<Warning>
+**批次大小限制**
+
+这个脚本会对多个 ClickHouse 表按批次发起 `DELETE` mutation。大规模删除可能导致服务中断。
+
+- **每次运行最多 10,000 条 traces**：更大的文件请拆分后顺序处理。
+- **批次之间要等待**：在开始下一批之前，给删除操作留出完成时间。
+- 使用 `--sync` 参数进行顺序删除（更慢，但更安全）。
+</Warning>
+
+### 删除单条 trace 的脚本运行方式
+
+运行以下命令，用单个 trace ID 执行删除脚本：
+
+```bash
+sh delete_trace_by_id.sh <clickhouse_url> --trace_id <trace_id>
+```
+
+例如，如果你使用的是 bundled 版本并配合端口转发，命令会类似于：
+
+```bash
+sh delete_trace_by_id.sh "clickhouse://default:password@localhost:8123/default" --trace_id 4ec70ec7-0808-416a-b836-7100aeec934b
+```
+
+如果此时访问 LangSmith UI，你应该会看到指定 trace ID 已经不存在，也不会再反映到统计信息中。
+
+### 通过文件批量删除多条 trace（文件中每行一个 trace ID）
+
+运行以下命令，用 trace ID 列表执行删除脚本：
+
+```bash
+sh delete_trace_by_id.sh <clickhouse_url> --file <path/to/foo.txt>
+```
+
+例如，如果你使用的是 bundled 版本并配合端口转发，命令会类似于：
+
+```bash
+sh delete_trace_by_id.sh "clickhouse://default:password@localhost:8123/default" --file path/to/traces.txt
+```
+
+如果此时访问 LangSmith UI，你应该会看到所有指定 traces 都已被移除。
+
+## 故障排查
+
+### “Could not find trace IDs” 错误
+
+如果收到提示找不到 trace IDs 的错误，请在命令中添加 `--ssl` 参数。没有这个参数时，脚本可能无法正确连接到 ClickHouse，从而错误地报出 “trace ID not found”。
+
+带 SSL 参数的示例：
+
+```bash
+sh delete_trace_by_id.sh "clickhouse://default:password@localhost:8123/default" --file path/to/traces.txt --ssl
+```
+
+你也可以先使用 `clickhouse-cli` 直接连接到 ClickHouse，查询这些 trace IDs 是否存在，再运行删除脚本。
+
+### 大规模删除后服务中断
+
+如果在删除大量 traces 后服务变得无响应，通常说明删除队列已被压垮。
+
+**预防方式：**每次运行限制在 10,000 条 traces，并在批次之间等待数分钟，让删除操作先处理完成。
+
+如果大规模删除后仍然遇到问题，请联系[support](https://support.langchain.com/)。

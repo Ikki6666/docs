@@ -1,0 +1,325 @@
+---
+title: "CockroachDB 集成"
+description: "使用 LangChain Python 与 CockroachDB 集成。"
+---
+
+>[CockroachDB](https://www.cockroachlabs.com/) 是一个分布式 SQL 数据库，构建在事务型且强一致的键值存储之上。它可以水平扩展，并能在磁盘、机器、机架，甚至数据中心故障时以极小的延迟波动继续运行，而无需人工干预。
+
+**核心特性：**
+- **Distributed SQL**：在保持 ACID 保证的同时实现横向扩展
+- **Native vector support**：内置 `VECTOR` 类型（v24.2+）和 C-SPANN 索引（v25.2+）
+- **PostgreSQL compatible**：可作为 PostgreSQL 应用的直接替代
+- **Global replication**：支持低延迟的多区域部署
+- **Automatic sharding**：数据会自动分布到各节点
+- **SERIALIZABLE isolation**：默认提供最强隔离级别
+
+## 安装与设置
+
+安装 LangChain 集成：
+
+```bash
+pip install langchain-cockroachdb
+```
+
+### 获取 CockroachDB 连接字符串
+
+你需要一个 CockroachDB 集群。可以选择以下方式之一：
+
+**Option 1: CockroachDB Cloud（推荐）**
+1. 在 [cockroachlabs.cloud](https://cockroachlabs.cloud) 注册
+2. 创建一个免费集群
+3. 获取你的连接字符串：`cockroachdb://user:pass@host:26257/db?sslmode=verify-full`
+
+**Option 2: Docker（开发环境）**
+
+```bash
+docker run -d --name cockroachdb -p 26257:26257 \
+  cockroachdb/cockroach:latest start-single-node --insecure
+```
+
+连接字符串：`cockroachdb://root@localhost:26257/defaultdb?sslmode=disable`
+
+**Option 3: 本地二进制**
+
+从 [cockroachlabs.com/docs/releases](https://www.cockroachlabs.com/docs/releases/) 下载
+
+## Integrations
+
+### Vector Store
+
+CockroachDB 可通过原生 `VECTOR` 类型和 C-SPANN 分布式索引，用作 vector store。
+
+**核心特性：**
+- 原生向量支持（v24.2+）
+- 针对分布式系统优化的 C-SPANN 索引（v25.2+）
+- 高级元数据过滤
+- 通过前缀列实现多租户
+- 水平可扩展性
+
+详细用法参见 [CockroachDB vector store documentation](/oss/integrations/vectorstores/cockroachdb)。
+
+**快速示例：**
+
+```python
+from langchain_cockroachdb import AsyncCockroachDBVectorStore, CockroachDBEngine
+from langchain_openai import OpenAIEmbeddings
+
+# Initialize
+engine = CockroachDBEngine.from_connection_string(
+    "cockroachdb://user:pass@host:26257/db"
+)
+
+await engine.ainit_vectorstore_table(
+    table_name="documents",
+    vector_dimension=1536,
+)
+
+vectorstore = AsyncCockroachDBVectorStore(
+    engine=engine,
+    embeddings=OpenAIEmbeddings(),
+    collection_name="documents",
+)
+
+# Use it
+ids = await vectorstore.aadd_texts(["Hello world"])
+results = await vectorstore.asimilarity_search("Hi", k=1)
+```
+
+### Chat Message History
+
+将对话历史存储到 CockroachDB 中，用于持久化、分布式聊天应用。
+
+**核心特性：**
+- 自动复制的分布式存储
+- 强一致性（SERIALIZABLE）
+- 基于 session 的组织方式
+- 高可用性
+
+详细用法参见 [CockroachDB chat history documentation](/oss/integrations/chat_message_histories/cockroachdb)。
+
+**快速示例：**
+
+```python
+from langchain_cockroachdb import CockroachDBChatMessageHistory
+import uuid
+
+chat_history = CockroachDBChatMessageHistory(
+    session_id=str(uuid.uuid4()),
+    connection_string=CONNECTION_STRING,
+    table_name="chat_history",
+)
+
+from langchain.messages import HumanMessage, AIMessage
+
+await chat_history.aadd_message(HumanMessage(content="Hello!"))
+await chat_history.aadd_message(AIMessage(content="Hi there!"))
+
+messages = await chat_history.aget_messages()
+```
+
+### LangGraph Checkpointer
+
+将 LangGraph workflow state 持久化到 CockroachDB 中，用于短期记忆、human-in-the-loop 交互和故障恢复。
+
+同时提供 sync（`CockroachDBSaver`）和 async（`AsyncCockroachDBSaver`）实现。
+
+<Tip>
+首次使用 CockroachDB checkpointer 时，请调用 `checkpointer.setup()`，或 `await checkpointer.setup()`，以创建所需表。
+</Tip>
+
+<Tabs>
+    <Tab title="Sync">
+```python
+import os
+from langchain.chat_models import init_chat_model
+from langgraph.graph import StateGraph, MessagesState, START
+from langchain_cockroachdb import CockroachDBSaver
+
+model = init_chat_model(model="claude-haiku-4-5-20251001")
+
+DB_URI = os.environ["COCKROACHDB_URI"]
+# Example: "cockroachdb://user:password@host:26257/defaultdb?sslmode=verify-full"
+with CockroachDBSaver.from_conn_string(DB_URI) as checkpointer:
+    # checkpointer.setup()
+
+    def call_model(state: MessagesState):
+        response = model.invoke(state["messages"])
+        return {"messages": response}
+
+    builder = StateGraph(MessagesState)
+    builder.add_node(call_model)
+    builder.add_edge(START, "call_model")
+
+    graph = builder.compile(checkpointer=checkpointer)
+
+    config = {"configurable": {"thread_id": "1"}}
+
+    stream = graph.stream_events(
+        {"messages": [{"role": "user", "content": "hi! I'm bob"}]},
+        config,
+        version="v3",
+    )
+    for snapshot in stream.values:
+        snapshot["messages"][-1].pretty_print()
+
+    stream = graph.stream_events(
+        {"messages": [{"role": "user", "content": "what's my name?"}]},
+        config,
+        version="v3",
+    )
+    for snapshot in stream.values:
+        snapshot["messages"][-1].pretty_print()
+```
+    </Tab>
+    <Tab title="Async">
+```python
+import os
+from langchain.chat_models import init_chat_model
+from langgraph.graph import StateGraph, MessagesState, START
+from langchain_cockroachdb import AsyncCockroachDBSaver
+
+model = init_chat_model(model="claude-haiku-4-5-20251001")
+
+DB_URI = os.environ["COCKROACHDB_URI"]
+# Example: "cockroachdb://user:password@host:26257/defaultdb?sslmode=verify-full"
+async with AsyncCockroachDBSaver.from_conn_string(DB_URI) as checkpointer:
+    # await checkpointer.setup()
+
+    async def call_model(state: MessagesState):
+        response = await model.ainvoke(state["messages"])
+        return {"messages": response}
+
+    builder = StateGraph(MessagesState)
+    builder.add_node(call_model)
+    builder.add_edge(START, "call_model")
+
+    graph = builder.compile(checkpointer=checkpointer)
+
+    config = {"configurable": {"thread_id": "1"}}
+
+    stream = await graph.astream_events(
+        {"messages": [{"role": "user", "content": "hi! I'm bob"}]},
+        config,
+        version="v3",
+    )
+    async for snapshot in stream.values:
+        snapshot["messages"][-1].pretty_print()
+
+    stream = await graph.astream_events(
+        {"messages": [{"role": "user", "content": "what's my name?"}]},
+        config,
+        version="v3",
+    )
+    async for snapshot in stream.values:
+        snapshot["messages"][-1].pretty_print()
+```
+    </Tab>
+</Tabs>
+
+<Note>
+连接方式参见上面的 [Get your CockroachDB connection string](#get-your-cockroachdb-connection-string)，其中包括 CockroachDB Cloud、Docker 和本地二进制安装。对于本地开发，可接受 `sslmode=disable`；在生产环境中请始终使用 `sslmode=verify-full`。
+</Note>
+
+<Tip>
+该 checkpointer 使用原始 `psycopg3` 连接，而不是 SQLAlchemy，以兼容 LangGraph 的 checkpoint interface。`from_conn_string` 工厂方法接受 `cockroachdb://` URL，并会自动完成转换。
+</Tip>
+
+#### Row-Level TTL（v0.2.1+）
+
+使用 CockroachDB 的 [Row-Level TTL](https://www.cockroachlabs.com/docs/stable/row-level-ttl) 自动过期旧 checkpoint 数据：
+
+```python
+with CockroachDBSaver.from_conn_string(DB_URI) as checkpointer:
+    checkpointer.setup()
+
+    # Expire checkpoints older than 30 days, clean up daily
+    checkpointer.enable_ttl(ttl_interval="30 days", cron="@daily")
+
+    # Use the checkpointer normally -- old data is cleaned up automatically
+    graph = builder.compile(checkpointer=checkpointer)
+
+    # To disable TTL later:
+    # checkpointer.disable_ttl()
+```
+
+异步版本：`await checkpointer.aenable_ttl(ttl_interval="7 days", cron="@hourly")`
+
+<Note>
+TTL 删除是 **eventual** 的，也就是说，即使行已过期，在 CockroachDB 的后台任务按设定 cron 计划运行之前，这些行仍可能被查询到。
+</Note>
+
+#### 性能优化（v0.2.1+）
+
+该 checkpointer 包含若干面向低延迟读取的优化：
+
+- **Batch fetching**：`list()` 会用 2 次批量查询一次性获取所有 blobs 和 writes，而不是每个 checkpoint 执行 2 次查询
+- **Raw BYTEA**：使用 psycopg3 二进制协议，而不是在 SQL 中对 blobs 做十六进制编码
+- **Prepared statements**：`from_conn_string()` 会启用服务端查询计划缓存，即 `prepare_threshold=5`
+
+### Multi-tenancy
+
+通过可选的 namespace 列按租户隔离向量数据。启用后，所有 CRUD 和搜索操作都会限定在指定 namespace 范围内。
+
+CockroachDB 的 C-SPANN 索引支持前缀列，因此 namespace 过滤可以直接使用向量索引，而无需额外扫描。
+
+```python
+from langchain_cockroachdb import AsyncCockroachDBVectorStore, CockroachDBEngine
+from langchain_openai import OpenAIEmbeddings
+
+engine = CockroachDBEngine.from_connection_string(CONNECTION_STRING)
+
+# Create the table with a namespace column
+await engine.ainit_vectorstore_table(
+    table_name="documents",
+    vector_dimension=1536,
+    namespace_column="namespace",
+)
+
+# Create a vectorstore scoped to a specific tenant
+vectorstore = AsyncCockroachDBVectorStore(
+    engine=engine,
+    embeddings=OpenAIEmbeddings(),
+    collection_name="documents",
+    namespace="tenant_a",
+)
+
+# All operations are scoped to tenant_a
+ids = await vectorstore.aadd_texts(["Tenant A document"])
+results = await vectorstore.asimilarity_search("query", k=5)
+```
+
+## 为什么在 AI 应用中使用 CockroachDB？
+
+### 天生分布式
+- **Horizontal scalability**：添加节点即可处理更高负载
+- **Multi-region deployments**：面向全球用户提供低延迟服务
+- **Automatic rebalancing**：数据会自动在各节点间重新均衡分布
+
+### 面向生产的可靠性
+- **High availability**：能够应对节点、机架和数据中心级故障
+- **Zero-downtime upgrades**：支持无停机滚动升级
+- **Backups and restores**：支持时间点恢复
+
+### 大规模向量搜索
+- **C-SPANN indexes**：分布式近似最近邻搜索
+- **Native vector type**：对 embeddings 提供一等支持
+- **Real-time indexing**：新增向量无需重建索引
+- **Multi-tenancy**：通过前缀列高效实现租户隔离
+
+### PostgreSQL 兼容性
+- **Easy migration**：可作为 PostgreSQL 的直接替代
+- **Familiar SQL**：标准 PostgreSQL 语法
+- **Existing tools**：可配合 PostgreSQL 驱动和工具使用
+
+## 资源
+
+- [CockroachDB Documentation](https://www.cockroachlabs.com/docs/)
+- [langchain-cockroachdb GitHub](https://github.com/cockroachdb/langchain-cockroachdb)
+- [langchain-cockroachdb PyPI](https://pypi.org/project/langchain-cockroachdb/)
+- [CockroachDB Cloud](https://cockroachlabs.cloud)
+- [CockroachDB University](https://university.cockroachlabs.com/)（免费课程）
+
+## 支持
+
+- [CockroachDB Community Forum](https://forum.cockroachlabs.com/)
+- [GitHub Issues](https://github.com/cockroachdb/langchain-cockroachdb/issues)

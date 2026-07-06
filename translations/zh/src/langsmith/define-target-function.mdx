@@ -1,0 +1,220 @@
+---
+title: 如何定义用于评估的 target function
+sidebarTitle: 定义用于评估的 target function
+---
+
+运行评估需要三个主要部分：
+
+1. 一个包含测试输入和期望输出的[数据集](/langsmith/evaluation-concepts#datasets)。
+2. 一个 target function，也就是你要评估的对象。
+3. 对 target function 输出进行打分的[evaluators](/langsmith/evaluation-concepts#evaluators)。
+
+本指南会根据你要评估的是应用中的哪一部分，演示如何定义 target function。关于[如何创建数据集](/langsmith/manage-datasets-programmatically)、[如何定义 evaluators](/langsmith/code-evaluator-ui)，以及[运行评估的端到端示例](/langsmith/evaluate-llm-application)，可分别参阅对应页面。
+
+## Target function 签名
+
+为了在代码中评估一个 application，我们需要一种方式来运行这个 application。在使用 `evaluate()`（@[Python][Client.evaluate] / [JavaScript](https://reference.langchain.com/javascript/functions/langsmith.evaluation.evaluate.html)）时，我们会通过传入 *target function* 参数来做到这一点。这个函数会接收某个数据集 [Example](/langsmith/evaluation-concepts#examples) 的 inputs，并返回 application 输出（dict 格式）。在这个函数内部，你可以按任何喜欢的方式调用自己的 application，也可以按任何喜欢的格式整理输出。关键在于：你定义的 evaluator functions 必须能够处理 target function 返回的输出格式。
+
+```python
+from langsmith import Client
+
+# 'inputs' will come from your dataset.
+def dummy_target(inputs: dict) -> dict:
+    return {"foo": 1, "bar": "two"}
+
+# 'inputs' will come from your dataset.
+# 'outputs' will come from your target function.
+def evaluator_one(inputs: dict, outputs: dict) -> bool:
+    return outputs["foo"] == 2
+
+def evaluator_two(inputs: dict, outputs: dict) -> bool:
+    return len(outputs["bar"]) < 3
+
+client = Client()
+results = client.evaluate(
+    dummy_target,  # <-- target function
+    data="your-dataset-name",
+    evaluators=[evaluator_one, evaluator_two],
+    ...
+)
+```
+
+<Check>
+`evaluate()` 会自动追踪你的 target function。这意味着如果你在 target function 中运行了任何 traceable 代码，这些代码也会作为 target trace 的子 runs 被一起追踪。
+</Check>
+
+## 示例：单次 LLM 调用
+
+<CodeGroup>
+
+```python Python
+from langsmith import wrappers
+from openai import OpenAI
+
+# Optionally wrap the OpenAI client to automatically
+# trace all model calls.
+oai_client = wrappers.wrap_openai(OpenAI())
+
+def target(inputs: dict) -> dict:
+  # This assumes your dataset has inputs with a 'messages' key.
+  # You can update to match your dataset schema.
+  messages = inputs["messages"]
+  response = oai_client.chat.completions.create(
+      messages=messages,
+      model="gpt-5.4-mini",
+  )
+  return {"answer": response.choices[0].message.content}
+```
+
+```typescript TypeScript
+import OpenAI from 'openai';
+import { wrapOpenAI } from "langsmith/wrappers";
+
+const client = wrapOpenAI(new OpenAI());
+
+// This is the function you will evaluate.
+const target = async(inputs) => {
+  // This assumes your dataset has inputs with a `messages` key
+  const messages = inputs.messages;
+  const response = await client.chat.completions.create({
+      messages: messages,
+      model: 'gpt-5.4-mini',
+  });
+  return { answer: response.choices[0].message.content };
+}
+```
+
+```python Python (LangChain)
+from langchain.chat_models import init_chat_model
+
+model = init_chat_model("gpt-5.4-mini")
+
+def target(inputs: dict) -> dict:
+  # This assumes your dataset has inputs with a `messages` key
+  messages = inputs["messages"]
+  response = model.invoke(messages)
+  return {"answer": response.content}
+```
+
+```typescript TypeScript (LangChain)
+import { ChatOpenAI } from '@langchain/openai';
+
+// This is the function you will evaluate.
+const target = async(inputs) => {
+  // This assumes your dataset has inputs with a `messages` key
+  const messages = inputs.messages;
+  const model = new ChatOpenAI({ model: "gpt-5.4-mini" });
+  const response = await model.invoke(messages);
+  return {"answer": response.content};
+}
+```
+
+</CodeGroup>
+
+## 示例：非 LLM 组件
+
+<CodeGroup>
+
+```python Python
+from langsmith import traceable
+
+# Optionally decorate with '@traceable' to trace all invocations of this function.
+@traceable
+def calculator_tool(operation: str, number1: float, number2: float) -> str:
+  if operation == "add":
+      return str(number1 + number2)
+  elif operation == "subtract":
+      return str(number1 - number2)
+  elif operation == "multiply":
+      return str(number1 * number2)
+  elif operation == "divide":
+      return str(number1 / number2)
+  else:
+      raise ValueError(f"Unrecognized operation: {operation}.")
+
+# This is the function you will evaluate.
+def target(inputs: dict) -> dict:
+  # This assumes your dataset has inputs with `operation`, `num1`, and `num2` keys.
+  operation = inputs["operation"]
+  number1 = inputs["num1"]
+  number2 = inputs["num2"]
+  result = calculator_tool(operation, number1, number2)
+  return {"result": result}
+```
+
+```typescript TypeScript
+import { traceable } from "langsmith/traceable";
+
+// Optionally wrap in 'traceable' to trace all invocations of this function.
+const calculatorTool = traceable(async ({ operation, number1, number2 }) => {
+// Functions must return strings
+if (operation === "add") {
+  return (number1 + number2).toString();
+} else if (operation === "subtract") {
+  return (number1 - number2).toString();
+} else if (operation === "multiply") {
+  return (number1 * number2).toString();
+} else if (operation === "divide") {
+  return (number1 / number2).toString();
+} else {
+  throw new Error("Invalid operation.");
+}
+});
+
+// This is the function you will evaluate.
+const target = async (inputs) => {
+// This assumes your dataset has inputs with `operation`, `num1`, and `num2` keys
+const result = await calculatorTool.invoke({
+  operation: inputs.operation,
+  number1: inputs.num1,
+  number2: inputs.num2,
+});
+return { result };
+}
+```
+
+</CodeGroup>
+
+## 示例：应用或 agent
+
+<CodeGroup>
+
+```python Python
+from my_agent import agent
+
+      # This is the function you will evaluate.
+def target(inputs: dict) -> dict:
+  # This assumes your dataset has inputs with a `messages` key
+  messages = inputs["messages"]
+  # Replace `invoke` with whatever you use to call your agent
+  response = agent.invoke({"messages": messages})
+  # This assumes your agent output is in the right format
+  return response
+```
+
+```typescript TypeScript
+import { agent } from 'my_agent';
+
+// This is the function you will evaluate.
+const target = async(inputs) => {
+// This assumes your dataset has inputs with a `messages` key
+const messages = inputs.messages;
+// Replace `invoke` with whatever you use to call your agent
+const response = await agent.invoke({ messages });
+// This assumes your agent output is in the right format
+return response;
+}
+```
+
+</CodeGroup>
+
+<Check>
+如果你有一个 LangGraph/LangChain agent，且它接收的数据输入与数据集定义一致、返回的输出格式也正好能被 evaluators 使用，那么你也可以直接把该对象作为 target 传入：
+
+```python
+from my_agent import agent
+from langsmith import Client
+client = Client()
+client.evaluate(agent, ...)
+```
+</Check>

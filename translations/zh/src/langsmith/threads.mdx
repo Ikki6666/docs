@@ -1,0 +1,300 @@
+---
+title: Configure threads
+sidebarTitle: Threads
+---
+
+import ThreadsChatPipelineJava from '/snippets/code-samples/threads-chat-pipeline-java.mdx';
+import ThreadsChatPipelineKt from '/snippets/code-samples/threads-chat-pipeline-kt.mdx';
+import ThreadsContinueNameJava from '/snippets/code-samples/threads-continue-name-java.mdx';
+import ThreadsContinueNameKt from '/snippets/code-samples/threads-continue-name-kt.mdx';
+import ThreadsContinueFirstMessageJava from '/snippets/code-samples/threads-continue-first-message-java.mdx';
+import ThreadsContinueFirstMessageKt from '/snippets/code-samples/threads-continue-first-message-kt.mdx';
+
+许多 LLM 应用都具有类似 chatbot 的界面，用户和 LLM 应用会进行多轮对话。为了追踪这些对话，你可以在 LangSmith 中使用 [_threads_](/langsmith/observability-concepts#threads)。
+
+## Group traces into threads
+
+要把多个 trace 关联到同一个 thread 中，你需要传入一个特殊的 `metadata` key，其值是该 thread 的唯一标识符。key 名应为以下之一：
+
+- `session_id`
+- `thread_id`
+
+值可以是任意字符串，但我们推荐使用 **UUID v7** 作为 thread ID。
+
+[LangSmith SDK](/langsmith/reference) 导出了一个 `uuid7` helper，Python v0.4.43+，JS v0.3.80+：
+
+- **Python**：`from langsmith import uuid7`
+- **JS/TS**：`import { uuid7 } from 'langsmith'`
+
+具体说明请参阅 [Add metadata and tags to traces](/langsmith/add-metadata-tags)。
+
+<Warning>
+**Important:** 为了确保整个 thread 上的筛选和 token 统计都能正常工作，你必须在 **所有 runs** 上设置 thread metadata，`session_id` 或 `thread_id`，包括 trace 中的 child run。
+
+如果 child run 没有 `thread_id` metadata，它们将不会被纳入以下场景：
+
+- 按 thread 筛选 runs。
+- 计算 thread 的 token usage。
+- 汇总 thread 的 cost。
+
+在创建 child run，例如为嵌套函数使用 `@traceable`，或创建 child span 时，请确保把 thread metadata 传递给所有 child run。
+</Warning>
+
+### Example
+
+下面这个示例展示了如何使用结构化消息格式记录和获取对话历史，以维持长时间运行的聊天。
+
+该示例设置了一个 `THREAD_ID`，并通过 `metadata` 传给 tracing wrapper，把同一会话中的每个 run 都关联到 LangSmith 中同一个 thread。对话历史会在本地持久化保存，你可以在生产环境中将这里的基于文件或内存的存储替换为数据库或缓存。`get_chat_history` 标志用于控制 pipeline 是继续已有 thread，还是从新对话开始：
+
+<CodeGroup>
+
+```python Python expandable wrap
+import os
+import json
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+import openai
+from langsmith import traceable, Client, uuid7
+from langsmith.wrappers import wrap_openai
+
+# Initialize clients
+langsmith_client = Client()
+client = wrap_openai(openai.Client())
+
+# Configuration
+THREAD_ID = str(uuid7())
+
+# Using a local directory to store thread history. For production use, use a persistent storage solution.
+THREADS_DIR = os.path.join(os.path.dirname(__file__), "threads")
+
+# gets a history of all LLM calls in the thread to construct conversation history
+def get_thread_history(thread_id: str) -> list:
+    path = os.path.join(THREADS_DIR, f"{thread_id}.json")
+    if not os.path.exists(path):
+        return []
+    with open(path, "r") as f:
+        return json.load(f)
+
+def save_thread_history(thread_id: str, messages: list):
+    os.makedirs(THREADS_DIR, exist_ok=True)
+    with open(os.path.join(THREADS_DIR, f"{thread_id}.json"), "w") as f:
+        json.dump(messages, f, indent=2, default=str)
+
+
+@traceable(name="Chat Bot", metadata={"thread_id": THREAD_ID})
+def chat_pipeline(messages: list, get_chat_history: bool = False):
+    # Whether to continue an existing thread or start a new one
+    if get_chat_history:
+        history_messages = get_thread_history(THREAD_ID)
+        # Get existing conversation history and append new messages
+        all_messages = history_messages + messages
+    else:
+        all_messages = messages
+
+    # Invoke the model
+    chat_completion = client.chat.completions.create(
+        model="gpt-5.4-mini", messages=all_messages
+    )
+
+    response_message = chat_completion.choices[0].message
+    print("Response from model:", response_message)
+
+    full_conversation = all_messages + [{"role": response_message.role, "content": response_message.content}]
+    save_thread_history(THREAD_ID, full_conversation)
+
+    return {"messages": full_conversation}
+
+
+# Format message
+messages = [
+    {
+        "content": "Hi, my name is Sally",
+        "role": "user"
+    }
+]
+
+# Call the chat pipeline
+result = chat_pipeline(messages, get_chat_history=False)
+```
+
+```typescript TypeScript expandable wrap
+import * as fs from "fs";
+import * as path from "path";
+import { fileURLToPath } from "url";
+import * as dotenv from "dotenv";
+import OpenAI from "openai";
+import { traceable } from "langsmith/traceable";
+import { wrapOpenAI } from "langsmith/wrappers";
+import { uuid7 } from "langsmith";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Load environment variables from .env file
+dotenv.config();
+
+// Initialize client
+const client = wrapOpenAI(new OpenAI());
+
+// Configuration
+const THREAD_ID = uuid7();
+
+// Using a local directory to store thread history. For production use, use a persistent storage solution.
+const THREADS_DIR = path.join(__dirname, "threads");
+
+type Message = { role: string; content: string };
+
+// Gets a history of all LLM calls in the thread to construct conversation history
+function getThreadHistory(threadId: string): Message[] {
+  const filePath = path.join(THREADS_DIR, `${threadId}.json`);
+  if (!fs.existsSync(filePath)) return [];
+  return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+}
+
+function saveThreadHistory(threadId: string, messages: Message[]): void {
+  fs.mkdirSync(THREADS_DIR, { recursive: true });
+  fs.writeFileSync(
+    path.join(THREADS_DIR, `${threadId}.json`),
+    JSON.stringify(messages, null, 2)
+  );
+}
+
+const chatPipeline = traceable(
+  async function chatPipeline({ messages, get_chat_history = false }: { messages: Message[]; get_chat_history?: boolean }) {
+    // Whether to continue an existing thread or start a new one
+    if (get_chat_history) {
+      const historyMessages = getThreadHistory(THREAD_ID);
+      // Get existing conversation history and append new messages
+      messages = [...historyMessages, ...messages];
+    }
+
+    // Invoke the model
+    const chatCompletion = await client.chat.completions.create({
+      model: "gpt-5.4-mini",
+      messages,
+    });
+
+    const responseMessage = chatCompletion.choices[0].message;
+    console.log("Response from model:", responseMessage);
+
+    const fullConversation: Message[] = [
+      ...messages,
+      { role: responseMessage.role, content: responseMessage.content ?? "" },
+    ];
+    saveThreadHistory(THREAD_ID, fullConversation);
+
+    return { messages: fullConversation };
+  },
+  { name: "Chat Bot", metadata: { thread_id: THREAD_ID } }
+);
+
+// Format message
+const messages: Message[] = [{ role: "user", content: "Hi! My name is Sally" }];
+
+// Call the chat pipeline
+await chatPipeline({ messages, get_chat_history: false });
+```
+
+<ThreadsChatPipelineJava />
+<ThreadsChatPipelineKt />
+</CodeGroup>
+
+Java 和 Kotlin 示例使用了专门的 executor。在进程退出前关闭 executor 并等待其结束，可以确保后台 trace 提交完成。
+
+接下来可以按下面的方式继续对话。通过传入 `get_chat_history=True`、`get_chat_history: true` 或 `getChatHistory = true`，你就可以从上一次中断的位置继续对话。这意味着 LLM 会收到完整的消息历史，并基于它作答，而不是只回应最新消息：
+
+<CodeGroup>
+
+```python Python
+# Format message
+messages = [
+    {
+        "content": "What is my name",
+        "role": "user"
+    }
+]
+
+# Call the chat pipeline
+result = chat_pipeline(messages, get_chat_history=True)
+```
+
+```typescript TypeScript
+// Continue the conversation.
+const messages: Message[] = [{ role: "user", content: "What is my name" }];
+
+await chatPipeline({ messages, get_chat_history: true });
+```
+
+<ThreadsContinueNameJava />
+
+<ThreadsContinueNameKt />
+</CodeGroup>
+
+继续让对话进行下去。由于会带上过去的消息，LLM 会记住之前的对话内容：
+
+<CodeGroup>
+
+```python Python
+# Continue the conversation.
+messages = [
+    {
+        "content": "What was the first message I sent you?",
+        "role": "user"
+    }
+]
+
+chat_pipeline(messages, get_chat_history=True)
+```
+
+```typescript TypeScript
+// Continue the conversation.
+const messages: Message[] = [{ role: "user", content: "What was the first message I sent you?" }];
+
+await chatPipeline({ messages, get_chat_history: true });
+```
+
+<ThreadsContinueFirstMessageJava />
+<ThreadsContinueFirstMessageKt />
+</CodeGroup>
+
+## View threads
+
+你可以在 [UI](https://smith.langchain.com) 中，通过任意 [project details](https://smith.langchain.com/tracing) 页面上的 **Threads** 标签页查看 thread。表格会展示每个 thread 的 first input、last output、start times、turn count、latency，P50/P99，token usage、cost 和 feedback score。
+
+右侧面板会显示项目级聚合统计信息，包括 thread 和 trace 数量、token usage 的总量和中位数、error rate，以及 P50/P99 latency。
+
+<Callout type="info" icon="feather">
+在 thread 视图中使用 **[Chat](/langsmith/chat)**，可以分析对话线程、理解用户情绪、识别痛点，并追踪问题是否已经解决。
+</Callout>
+
+之后你可以点进某个具体 thread。你可以通过三种不同方式查看 thread：
+
+- **Messages** view，beta：对话层。以聊天线程的方式逐轮查看 user 和 assistant 消息、tool call，以及 subagent activity。
+- **Turns** view：逐轮摘要层。将每一轮显示为一张 card，展示其输入和输出，并支持展开、折叠，以及自定义输入输出字段。
+- **Details** view：调试层。深入查看某个特定 run 的 inputs、outputs、metadata、timing、errors 和 child runs。thread 的上下文会保持可见，因此你可以知道这个 run 在整段对话中的位置。
+
+你可以通过页面顶部的按钮切换视图，也可以使用键盘快捷键 `M`，Messages，`T`，Turns，和 `D`，Details。由于 Messages view 仍处于 beta，thread 侧边面板默认会显示 Details view。右侧面板展示 thread 级统计信息，包括 turn count、first 和 last start time、P50/P99 latency，以及按输入和输出 token 拆分的 cost 明细。各个视图的完整说明请参阅 [View traces](/langsmith/view-traces)。
+
+### View feedback
+
+Feedback score 会显示在项目 **Threads** 标签页表格的 **Feedback** 列中。
+
+在某个 thread 内，打开 Messages view，并点击某一轮 metadata 行中的 **LLM call** 链接，即可跳转到该 run 的 Details view，在那里查看该 run 的 feedback。你也可以在那里查看 [thread-level feedback](/langsmith/online-evaluations-multi-turn)。
+
+### Save thread-level filter
+
+<Note>
+Thread filter 会在所有 run 中查找，只要至少有 1 个 run 匹配过滤条件，就会返回该 thread。
+</Note>
+
+在项目的 **Threads** 标签页中，你可以保存常用 filter：先通过 **Add filter** 按钮 [Set a filter](/langsmith/filter-traces-in-application#create-and-apply-filters)，然后点击 **Save view**。
+
+## Related
+
+- [Observability concepts](/langsmith/observability-concepts#threads)：了解 threads 以及它们与 runs、traces 的关系。
+- [Add metadata and tags to traces](/langsmith/add-metadata-tags)：了解如何传递 `thread_id` 和其他 metadata key。
+- [Filter traces](/langsmith/filter-traces-in-application)：在 tracing UI 中按 thread metadata 进行筛选。
+- [Set up multi-turn online evaluators](/langsmith/online-evaluations-multi-turn)：评估 thread，而不是单个 run。
+- [Log user feedback using the SDK](/langsmith/attach-user-feedback)：为 thread 中的 run 附加 feedback。

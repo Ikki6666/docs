@@ -1,0 +1,180 @@
+---
+title: Self-hosted 部署故障排查
+sidebarTitle: 故障排查
+icon: "stethoscope"
+description: 在联系支持团队之前，用于排查 self-hosted LangSmith Deployment 问题的诊断步骤。
+---
+
+本页提供一套诊断步骤，帮助你在联系支持团队之前，先自行排查 self-hosted [LangSmith Deployment](/langsmith/deployment) 中的问题。请按顺序执行这些步骤，以系统性识别并解决常见部署问题。
+
+<Callout icon="headset" iconType="solid" color="#9333ea">
+如果你已经完成这些诊断步骤，但仍然需要帮助，请查看文末的[支持](#support)，了解在联系支持团队前需要准备哪些信息。
+</Callout>
+
+## 前置条件
+
+在开始诊断步骤之前，请确认你具备：
+
+- 对 Kubernetes 集群的 `kubectl` 访问权限。
+- 查看 pods、deployments、services 等资源所需的适当权限。
+- 对你的 [Helm chart configuration](/langsmith/kubernetes#configure-your-helm-charts:) 有基本了解。
+
+## 第 1 步：理解你的部署
+
+确认实际部署了哪些内容，并理解系统的基线状态。这能帮助你识别什么是“正常工作状态”，从而在出现问题时发现偏差。
+
+运行以下命令，查看所有已部署的 Kubernetes 资源。
+
+<Note>
+请确保执行本节命令时，你处于正确的 namespace 中，或者显式使用 `-n` 参数指定 namespace。例如：`kubectl get deployments -n langsmith`。
+</Note>
+
+列出所有 deployments：
+
+```bash
+kubectl get deployments
+```
+
+列出所有 pods：
+
+```bash
+kubectl get pods
+```
+
+列出所有 services：
+
+```bash
+kubectl get services
+```
+
+列出所有 `lgps` 资源（只有在创建 [Agent Server](/langsmith/agent-server) 后才会出现）：
+
+```bash
+kubectl get lgps
+```
+
+### 已部署的关键组件
+
+你的部署包含以下核心组件：
+
+- **`langsmith-frontend`**：LangSmith 前端 UI，你会在这里创建 Agent Server deployments。这个应用会调用 `langsmith-host-backend` 的 API。属于 [control plane](/langsmith/control-plane) 的一部分。
+- **`langsmith-host-backend`**：LangSmith Deployment 的 [control plane](/langsmith/control-plane)，负责接收来自 `langsmith-frontend` 的请求，并把 deployment 请求持久化到 control plane 的 Postgres 数据库中。
+- **`langsmith-listener`**：LangSmith Deployment [data plane](/langsmith/data-plane) 的一部分。它会通过 HTTP API 轮询 `langsmith-host-backend`，查找需要创建、更新或删除的 deployments，并把任务放入队列，让 worker 处理。
+- **`langsmith-redis`**：作为 `langsmith-listener` 任务队列使用的 [Redis](/langsmith/data-plane#redis) 实例。listener 把任务写入这里，worker 再从中取出任务。
+- **`langsmith-operator`**：负责协调 `lgps` 底层 Kubernetes 资源的 operator。属于 data plane 基础设施的一部分。
+
+<Note>
+根据你的配置不同，部署中还可能包含其他组件。完整概览请参阅 [LangSmith Deployment components](/langsmith/components)。
+</Note>
+
+## 第 2 步：启用 debug 日志
+
+排查问题时，第一步通常是启用 debug 级别日志，以便获取更详细的系统运行信息。
+
+### 针对 control plane 或 data plane deployments
+
+如果你遇到的是 control plane deployment（例如 `langsmith-host-backend`）或 data plane deployment（例如 `langsmith-listener`）的问题，请使用 `LOG_LEVEL=DEBUG` 环境变量重新安装 Helm chart。在你的 `values.yaml` 中添加：
+
+```yaml
+extraEnv:
+  - name: LOG_LEVEL
+    value: DEBUG
+```
+
+### 针对 Agent Server deployments
+
+如果问题出在某个具体 Agent Server deployment 上：
+
+1. 打开 [LangSmith UI](https://smith.langchain.com) 的 **Deployments** 标签页。
+1. 进入某个 deployment 详情页，点击 **+ New Revision**。
+1. 新增一个环境变量 `LOG_LEVEL`，并将其值设为 `DEBUG`。
+
+<Note>
+你也可以在 UI 中查看 debug 日志：进入 deployment 详情页，点击 **Server Logs**，然后把 **Log level: Info** 下拉菜单切换为 **Debug**。
+</Note>
+
+### 针对范围较广的问题
+
+如果你暂时无法判断问题到底来自哪里，可以在所有地方都启用 `DEBUG` 日志，包括 control plane、data plane，以及所有 Agent Server deployments。
+
+### 查看应用日志
+
+Tail 每个 pod 的日志，了解它们的基线行为：
+
+```bash
+kubectl logs -f <pod_name>
+```
+
+然后重点留意以下日志行：
+
+- **`langsmith-listener`**：`Reconciling projects...`（每 10 秒出现一次）
+- **`langsmith-operator`**：`Starting reconciliation`（周期性出现）
+
+在健康的部署中，你通常不应看到任何错误，所有日志都应表现为正常、规律的运行信息。
+
+### 解读 debug 日志
+
+重点关注以下问题信号：
+
+- 异常或 stack trace
+- 错误消息，例如包含 `"ERROR"` 的日志
+- 与正常运行模式明显不同的异常模式
+
+根据你发现的错误类型：
+
+- **配置问题**：如果怀疑是配置问题，请联系执行 [`helm install`](/langsmith/kubernetes) 的相关人员。
+- **用户代码 bug**：如果怀疑问题来自用户代码，例如 LangGraph OSS graph 实现本身，请联系创建 [`langgraph.json`](/langsmith/application-structure#configuration-file) 文件的 Agent Server 应用负责人。
+
+## 第 3 步：Describe deployments 和 pods
+
+对 Kubernetes 资源执行 describe，可以看到应用日志里未必会出现的错误事件和状态。这类问题通常更偏向配置或基础设施问题，而不一定是应用代码 bug。Describe 还能直接展示资源配置，例如环境变量，也很利于调试。
+
+运行以下命令查看资源详情。
+
+查看某个 Kubernetes deployment：
+
+```bash
+kubectl describe deployment <deployment_name>
+```
+
+查看某个 Kubernetes pod：
+
+```bash
+kubectl describe pod <pod_name>
+```
+
+查看某个 `lgps` 资源（仅在创建 Agent Server 后相关）：
+
+```bash
+kubectl describe lgps <lgps_name>
+```
+
+### 解读结果
+
+请重点查看输出中的 `Events:` 区域，并确认所有内容都处于正常状态。常见问题包括：
+
+- liveness 或 readiness probe 失败
+- 镜像拉取错误
+- 资源不足，例如 CPU、内存限制
+- volume mount 问题
+- 配置错误
+
+确认没有错误事件，并且所有事件都表明资源处于健康状态。
+
+## 其他资源
+
+更多排障信息请参阅：
+
+- [Troubleshooting](/langsmith/troubleshooting)：通用故障排查指南，包含常见问题和解决方法。
+- [Self-hosted overview](/langsmith/self-hosted)：了解系统架构和组件交互关系。
+
+## 支持
+
+如果你已经完成以上诊断步骤，但仍需要帮助，请在联系支持团队前准备以下信息：
+
+- [诊断步骤](#step-1-understand-your-deployment)中的命令输出
+- 你的 Helm chart configuration
+- 相关错误信息和日志
+- 问题发生时你正在做什么的简要说明
+
+提前准备好这些信息，可以帮助[支持团队](https://support.langchain.com)更快定位和解决问题。

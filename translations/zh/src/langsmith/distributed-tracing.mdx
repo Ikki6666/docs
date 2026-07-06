@@ -1,0 +1,182 @@
+---
+title: 实现分布式 tracing
+sidebarTitle: 实现分布式 tracing
+---
+
+有时，你需要在多个服务之间追踪同一个请求。
+
+LangSmith 原生支持 distributed tracing，它可以通过上下文传播 headers（`langsmith-trace`，以及可选的 `baggage` 用于 metadata / tags），在多个服务之间把同一条 trace 下的 runs 串联起来。
+
+一个典型的 client-server 结构如下：
+
+* Trace 从 client 开始
+* 在 server 上继续
+
+<Warning>
+**只接受来自可信服务的 distributed-tracing headers。** `langsmith-trace` 和 `baggage` headers 会被当作可信 tracing 上下文直接消费。对于直接接收不可信第三方请求或公网请求的服务，不要添加 `TracingMiddleware`，也不要把入站请求 headers 作为 tracing `parent` 传入。Distributed tracing 只应存在于内部服务到服务调用之间；对于来自不可信来源的入站请求，应在 gateway 或 proxy 层剥离这些 headers。否则，外部调用方就能通过 `baggage` 影响你的 runs 是如何被记录的。
+</Warning>
+
+## Python 中的 distributed tracing
+
+```python
+# client.py
+from langsmith.run_helpers import get_current_run_tree, traceable
+import httpx
+
+@traceable
+async def my_client_function():
+    headers = {}
+    async with httpx.AsyncClient(base_url="...") as client:
+        if run_tree := get_current_run_tree():
+            # add langsmith-id to headers
+            headers.update(run_tree.to_headers())
+        return await client.post("/my-route", headers=headers)
+```
+
+接着，server（或其他服务）就可以通过正确处理这些 headers 来继续这条 trace。如果你使用的是 Starlette 或 FastAPI 这类 asgi 应用，可以借助 LangSmith 的 `TracingMiddleware` 把 distributed trace 接起来。
+
+<Info>
+`TracingMiddleware` 类是在 `langsmith==0.1.133` 中引入的。
+</Info>
+
+以 FastAPI 为例：
+
+```python
+from langsmith import traceable
+from langsmith.middleware import TracingMiddleware
+from fastapi import FastAPI, Request
+
+app = FastAPI()  # Or Flask, Django, or any other framework
+app.add_middleware(TracingMiddleware)
+
+@traceable
+async def some_function():
+    ...
+
+@app.post("/my-route")
+async def fake_route(request: Request):
+    return await some_function()
+```
+
+或者在 Starlette 中：
+
+```python
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from langsmith.middleware import TracingMiddleware
+
+routes = ...
+middleware = [
+    Middleware(TracingMiddleware),
+]
+app = Starlette(..., middleware=middleware)
+```
+
+如果你使用的是其他 server framework，也可以通过 `langsmith_extra` 手动“接收”这条 distributed trace，把 headers 传进去：
+
+```python
+# server.py
+import langsmith as ls
+from fastapi import FastAPI, Request
+
+@ls.traceable
+async def my_application():
+    ...
+
+app = FastAPI()  # Or Flask, Django, or any other framework
+
+@app.post("/my-route")
+async def fake_route(request: Request):
+    # request.headers:  {"langsmith-trace": "..."}
+    # as well as optional metadata/tags in `baggage`
+    with ls.tracing_context(parent=request.headers):
+        return await my_application()
+```
+
+上面的例子使用了 `tracing_context` context manager。你也可以直接通过 `@traceable` 包装方法的 `langsmith_extra` 参数来指定 parent run context。
+
+```python
+# ... same as above
+
+@app.post("/my-route")
+async def fake_route(request: Request):
+    # request.headers:  {"langsmith-trace": "..."}
+    my_application(langsmith_extra={"parent": request.headers})
+```
+
+## TypeScript 中的 distributed tracing
+
+<Note>
+TypeScript 中的 distributed tracing 需要 `langsmith` 版本 `>=0.1.31`
+</Note>
+
+首先，在 client 侧获取当前 run tree，并将它转换成 `langsmith-trace` 和 `baggage` header 值，然后把它们传给 server：
+
+```typescript
+// client.mts
+import { getCurrentRunTree, traceable } from "langsmith/traceable";
+
+const client = traceable(
+    async () => {
+        const runTree = getCurrentRunTree();
+        return await fetch("...", {
+            method: "POST",
+            headers: runTree.toHeaders(),
+        }).then((a) => a.text());
+    },
+    { name: "client" }
+);
+
+await client();
+```
+
+接着，server 会把这些 headers 再转回一个 run tree，然后用它继续 tracing。
+
+为了把新建出来的 run tree 传给某个 traceable function，我们可以使用 `withRunTree` helper，它可以确保这个 run tree 会在 traceable 调用链中继续传播。
+
+<CodeGroup>
+
+```typescript Express.JS
+// server.mts
+import { RunTree } from "langsmith";
+import { traceable, withRunTree } from "langsmith/traceable";
+import express from "express";
+import bodyParser from "body-parser";
+
+    const server = traceable(
+        (text: string) => `Hello from the server! Received "${text}"`,
+        { name: "server" }
+    );
+
+    const app = express();
+    app.use(bodyParser.text());
+
+app.post("/", async (req, res) => {
+    const runTree = RunTree.fromHeaders(req.headers);
+    const result = await withRunTree(runTree, () => server(req.body));
+    res.send(result);
+});
+```
+
+```typescript Hono
+// server.mts
+import { RunTree } from "langsmith";
+import { traceable, withRunTree } from "langsmith/traceable";
+import { Hono } from "hono";
+
+    const server = traceable(
+        (text: string) => `Hello from the server! Received "${text}"`,
+        { name: "server" }
+    );
+
+    const app = new Hono();
+
+app.post("/", async (c) => {
+    const body = await c.req.text();
+    const runTree = RunTree.fromHeaders(c.req.raw.headers);
+    const result = await withRunTree(runTree, () => server(body));
+    return c.body(result);
+});
+```
+
+</CodeGroup>

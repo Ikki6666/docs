@@ -1,0 +1,168 @@
+---
+title: 配置 checkpointer backend
+sidebarTitle: 配置 checkpointer backend
+description: 配置 Agent Server 使用 PostgreSQL、MongoDB 或自定义实现来存储 checkpoints。
+---
+
+[Agent Server](/langsmith/agent-server) 使用 checkpointer backend 持久化 graph state。默认情况下，LangSmith 会把 checkpoints 和其他服务端数据一起存储在 PostgreSQL 中。你也可以切换到 MongoDB，或者提供自定义实现。
+
+<Note>
+无论使用哪种 checkpointer backend，LangSmith 始终都要求使用 PostgreSQL 来存储 threads、runs、assistants、crons，以及 [memory store](/oss/langgraph/stores)。checkpointer backend 只负责决定 checkpoint 数据存放在哪里。
+</Note>
+
+## 可用 backends
+
+| Backend | Storage | Configuration | Use case |
+|---------|---------|---------------|----------|
+| `default` | PostgreSQL | None（内置） | 标准部署 |
+| `mongo` | MongoDB | `langgraph.json` 或 `LS_DEFAULT_CHECKPOINTER_BACKEND` 环境变量 | 已有 MongoDB 基础设施的团队 |
+| `custom` | 用户自定义 | `langgraph.json` | 自定义存储后端（见 [custom checkpointer](/langsmith/custom-checkpointer)） |
+
+## Default（PostgreSQL）
+
+PostgreSQL 是默认的 checkpointer backend，无需额外配置。如果你想使用自定义 PostgreSQL 实例，请设置 [`POSTGRES_URI_CUSTOM`](/langsmith/env-var-self-hosted) 环境变量。
+
+## 配置 MongoDB checkpointing
+
+<Info>
+Requires Agent Server v0.7.64 or later.
+</Info>
+
+### 前置条件
+
+- 一个 MongoDB **replica set**（不支持 standalone `mongod`）。这可以是自建 replica set、`mongos` router，或 MongoDB Atlas 之类的托管服务。
+- 一个在路径中包含数据库名的连接 URI（例如 `/langgraph`）。
+
+### 选择 backend
+
+使用以下任一方式，将 backend 设为 `"mongo"`：
+
+**在 `langgraph.json` 中**（应用级别，随应用代码一起打包）：
+
+```json
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./agent.py:graph"
+  },
+  "checkpointer": {
+    "backend": "mongo",
+    "ttl": {
+      "strategy": "delete",
+      "default_ttl": 43200,
+      "sweep_interval_minutes": 10
+    }
+  }
+}
+```
+
+**通过环境变量**（平台级别，适用于运维人员管理独立部署）：
+
+```shell
+LS_DEFAULT_CHECKPOINTER_BACKEND=mongo
+```
+
+环境变量会为那些未在 `langgraph.json` 中指定 backend 的 agent servers 设定默认 backend。如果 `langgraph.json` 中包含 `backend` 值，则它的优先级更高。
+
+### 提供 MongoDB URI
+
+在部署时设置 `LS_MONGODB_URI` 环境变量：
+
+```shell
+LS_MONGODB_URI="mongodb://user:password@host:27017/langgraph?replicaSet=rs0"
+```
+
+### 连接 URI 要求
+
+该 URI 必须：
+
+- 指向 replica set 成员或 `mongos` router
+- 在路径中包含目标数据库名
+
+有效示例：
+
+```
+mongodb://user:password@host:27017/langgraph?replicaSet=rs0
+mongodb://host1:27017,host2:27017,host3:27017/mydb?replicaSet=prod-rs
+mongodb+srv://user:password@cluster.example.net/langgraph
+```
+
+### 按部署环境配置
+
+<Tabs>
+  <Tab title="Standalone (Kubernetes)">
+  [langgraph-cloud Helm chart](https://github.com/langchain-ai/helm/blob/main/charts/langgraph-cloud/README.md)（v0.2.6+）内置支持 MongoDB。你可以在 values 文件中启用它：
+
+  **Bundled MongoDB**（开发与测试）：
+
+  ```yaml
+  mongo:
+    enabled: true
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+    persistence:
+      size: 8Gi
+  ```
+
+  该 chart 会部署一个单节点 MongoDB replica set，并自动把服务端配置为使用它。
+
+  **External MongoDB**（生产）：
+
+  ```yaml
+  mongo:
+    enabled: true
+    external:
+      enabled: true
+      connectionUrl: "mongodb://user:password@mongo.example.net:27017/langgraph?replicaSet=rs0"
+  ```
+
+  或者引用一个现有 Kubernetes secret：
+
+  ```yaml
+  mongo:
+    enabled: true
+    external:
+      enabled: true
+      existingSecretName: "my-mongo-secret"
+  ```
+
+  该 secret 必须包含一个 `mongodb_connection_url` key。
+  </Tab>
+  <Tab title="Standalone (Docker)">
+  如果你的 `langgraph.json` 已经把 `backend` 设为了 `"mongo"`，那你只需提供 URI。否则，需要同时设置这两个环境变量：
+
+  ```shell
+  docker run \
+      --env-file .env \
+      -p 8123:8000 \
+      -e REDIS_URI="redis://redis:6379" \
+      -e DATABASE_URI="postgres://postgres:postgres@postgres:5432/postgres" \
+      -e LS_DEFAULT_CHECKPOINTER_BACKEND=mongo \
+      -e LS_MONGODB_URI="mongodb://mongo:27017/langgraph?replicaSet=rs0" \
+      -e LANGSMITH_API_KEY="..." \
+      my-image
+  ```
+
+  参考[standalone server guide](/langsmith/deploy-standalone-server)，其中包含完整的 Docker Compose + MongoDB 示例。
+  </Tab>
+  <Tab title="Cloud">
+  在 `langgraph.json` 中把 `backend` 设为 `"mongo"`，然后在 LangSmith UI 的 deployment settings 中把 `LS_MONGODB_URI` 作为环境变量添加进去。
+
+  你的 MongoDB 实例必须能从 Cloud data plane 访问到。像 [MongoDB Atlas](https://www.mongodb.com/atlas) 这样的托管服务会比较合适。
+
+  对于非 checkpoint 数据，PostgreSQL 仍然会自动预配。
+  </Tab>
+</Tabs>
+
+## 自定义 checkpointer
+
+如果你想使用 PostgreSQL 或 MongoDB 以外的存储后端，请实现一个自定义 @[BaseCheckpointSaver]。更多细节请参阅[添加自定义 checkpointer](/langsmith/custom-checkpointer)。
+
+## 相关内容
+
+- [配置 TTLs](/langsmith/configure-ttl)，用于 checkpoint 和 store item 的过期管理
+- LangGraph 中的[持久化概念](/oss/langgraph/persistence)
+- [Data plane](/langsmith/data-plane) 架构
+- [Environment variables](/langsmith/env-var-cloud) 参考

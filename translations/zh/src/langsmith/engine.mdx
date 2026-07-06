@@ -1,0 +1,228 @@
+---
+title: Find and fix your agent's failures with LangSmith Engine
+sidebarTitle: Find and fix issues
+description: 使用 LangSmith Engine 在 tracing project 中自动检测并解决重复出现的问题。
+---
+
+LangSmith Engine 会把你的 trace 转化为一个持续改进工作流。它会识别反复出现的问题、诊断其根因，并引导你修复这些问题，同时防止它们再次出现。
+
+每个问题都会进入一个闭环：在 trace 中检测到重复失败 → 诊断根因 → 提出修复方案 → 部署 evaluator 以捕获回归 → 如果问题在关闭后再次出现，则会被自动重新打开。
+
+对于每个问题，LangSmith Engine 都会展示相关 trace、提出修复方案、生成用于防止回归的自定义 evaluator，并根据生产 trace 输入创建自定义 ground truth [dataset examples](/langsmith/manage-datasets)，用于离线评估。
+
+## What you can do
+
+<CardGroup cols={2}>
+  <Card title="Build: Open a pull request" icon="git-pull-request" href="#open-a-pull-request">
+    通过在已连接仓库中创建 pull request 来应用建议的修复。
+  </Card>
+  <Card title="Test: Add offline examples to a dataset" icon="database" href="#add-offline-examples">
+    从生产 trace 中生成自定义 ground truth dataset example，用于离线评估。
+  </Card>
+  <Card title="Monitor: Create an online evaluator" icon="chart-line" href="#create-an-evaluator">
+    部署自定义 evaluator，用于在未来 trace 中捕获回归。
+  </Card>
+</CardGroup>
+
+## Set up LangSmith Engine
+
+设置 LangSmith Engine 分为两步：先由 [Organization Admin](/langsmith/rbac#organization-admin) 为 workspace 启用 Engine，然后任意用户都可以为各自的 tracing project 配置 Engine。
+
+### Enable Engine for your organization
+
+<Note>你必须是 [**Organization Admin**](/langsmith/rbac#organization-admin) 才能启用 Engine。要查看管理员，请打开 **Settings**，在 **Access and Security** 下选择 **Members**，然后查找具有 **Organization Admin** 角色的成员。</Note>
+
+<Steps>
+  <Step title="Open Engine enablement">
+    在 [LangSmith console](https://smith.langchain.com) 中，点击左下角的 **Settings**，然后在 **Engine** 下选择 **Engine enablement**。
+  </Step>
+  <Step title="Toggle Enable Engine">
+    打开 **Enable Engine** 开关，并确认 AI features 使用条款：
+
+    > LangSmith AI features, powered by LangChain-managed inference, bring intelligence to your observability workflow. With LangSmith AI enabled, your team can surface issues faster, run smarter evaluations, and build more reliable LLM applications. By enabling this feature, your organization's trace data will be processed using LangChain-managed LLM keys. Subject to our Terms of Service.
+  </Step>
+</Steps>
+
+一旦 Engine 启用，你组织中的任何团队成员都可以为自己的 tracing project 设置它。
+
+<Tip>
+  如果你想关闭 Engine，请将同一设置切回 off。这会停止 Engine 的所有自动运行，并终止未来在你账户中的计费。
+</Tip>
+
+### Understand LCU costs
+
+Engine 按 **LangChain Compute Units (LCUs)** 收费。LCU 是一种标准化工作量单位，综合了计算、存储、内存和 LLM 开销。所需 trace 越多、分析越深入、处理工作越复杂，Engine 消耗的 LCU 就越多。每个 LCU 的价格是 **1.50 美元**。
+
+Engine 分两个阶段运行：
+
+| Phase | Trigger | Typical LCU usage |
+|---|---|---|
+| **Initialization** | 首次在某个 project 上启用 Engine | 30–40 LCUs |
+| **Recurring scans** | 每 6 小时自动运行一次 | 10–15 LCUs |
+
+实际用量会根据 trace 数量和复杂度而变化。
+
+在初始化阶段，Engine 会审计历史 trace，按严重性聚类并排序问题优先级，并对你的 prompt 或代码提出修复建议，如果已连接代码仓库。后续的定期扫描则会发现此前未识别的新改进点。
+
+### Set spend limits and monitor usage
+
+Organization Admin 可以在两个层级设置支出上限：
+
+- **Org-wide limit**：打开 **Settings**，在 **Engine** 下选择 **Engine enablement**，然后在 **Monthly LCU spend limit** 中输入数值。
+- **Per-project limit**：打开 tracing project 中的 **Engine** 标签页，点击 **Engine settings** 齿轮图标，然后在 **Monthly LCU spend limit** 中设置限制。
+
+你可以用 LCU 或 USD 输入上限，1 LCU = $1.50。当达到限制后，LangSmith 会暂停新的 Engine 运行，直到你提高限制，或下一个月度计费周期开始。
+
+如果留空，则表示允许无限制使用 Engine。若要完全停止 Engine，请使用 **Settings > Engine enablement** 中的 **Enable Engine** 开关。
+
+如需监控用量，你可以在 **Settings** 中的 **Engine enablement** 页面查看整个组织的月度 LCU 支出，或在每个 tracing project 的 **Engine settings** 面板中查看项目级支出。
+
+### Set up Engine for a tracing project
+
+<Steps>
+  <Step title="Open the Engine tab">
+    在 [LangSmith console](https://smith.langchain.com) 中，进入 UI 侧边栏的 **Tracing**，选择一个项目，然后点击项目导航中的 **Engine** 标签页。
+  </Step>
+  <Step title="Connect a code repository (optional)">
+    虽然是可选项，但推荐连接一个 GitHub 仓库。LangSmith Engine 会使用你的源代码来诊断问题、生成更高质量的修复方案，并可直接从 issue 创建 pull request。在 **Connect your agent's code repository** 下选择一个仓库。这里只会显示 GitHub app 有权限访问的仓库。点击 **Manage app access →** 可更新权限。你也可以随时从 [**Engine settings**](#configure-langsmith-engine) 更新 **Code repository**。
+  </Step>
+  <Step title="Select priority categories (optional)">
+    在 **What matters most to you?** 下，选择你希望优先审查的类别，例如 **Tool Call Failures** 或 **Latency**。点击 **+ Add something specific** 可描述自定义关注点。你也可以随时从 [**Engine settings**](#configure-langsmith-engine) 更新 **Priorities**。
+  </Step>
+  <Step title="Start analyzing">
+    点击 **Start Analyzing**。LangSmith Engine 最多可能需要 20 分钟来分析项目的 trace 并开始提出建议。在等待期间，你可以在 settings 面板中 [set up notifications](#get-notified-about-new-issues)，让系统在发现不同优先级问题时通过 Slack 或 webhook 提醒你。
+  </Step>
+  <Step title="Review the agent overview document">
+    在开始展示问题之前，LangSmith Engine 会先生成一份 agent overview 文档，根据 trace 描述你的项目目的、架构和关键指标。请审阅并编辑该文档，然后点击 **Accept & Continue** 继续。如果 overview 不准确，请先编辑，因为 LangSmith Engine 会把它作为后续全部分析的上下文，因此准确性会直接影响问题检测质量。你可以随时从 [**Engine settings**](#configure-langsmith-engine) 更新它。
+  </Step>
+</Steps>
+
+<Frame caption="Setup dialog">
+  <img
+    className="block dark:hidden"
+    src="/langsmith/images/langsmith-engine-setup-light.png"
+    alt="Setup dialog showing the code repository field and category selections for prioritizing issue types"
+  />
+  <img
+    className="hidden dark:block"
+    src="/langsmith/images/langsmith-engine-setup-dark.png"
+    alt="Setup dialog showing the code repository field and category selections for prioritizing issue types"
+  />
+</Frame>
+
+## Browse and filter issues
+
+设置完成后，**Engine** 标签页会在左侧面板显示自动检测到的问题列表。每条记录都包含标题、简短描述、相关 trace 数量，以及该问题最近一次出现的时间。
+
+在列表顶部，你可以点击：
+
+- **Filter issues** 图标，按 **Priority**、**Status** 和 **Tags** 筛选。
+- **Sort issues** 图标，按 **Severity**、**Last Updated** 和 **Created** 排序。
+- **Engine settings** 齿轮图标，以 [configure LangSmith Engine](#configure-langsmith-engine)。
+
+点击任意问题，可在右侧面板中查看详情。
+
+如果设置完成后没有出现任何问题，说明 LangSmith Engine 没有在已分析的 trace 中发现重复模式。可以等积累更多 trace 后再回来查看。
+
+## Review an issue
+
+点击列表中的任意问题以打开详情面板。顶部的 diagnosis 会描述该问题及其影响。
+
+**Linked traces** 部分列出了支撑该 diagnosis 的 trace。点击任意 trace 可以打开其详情面板。更多信息请参阅 [Manage a trace](/langsmith/manage-trace)。点击该部分右下角的 [**Add offline examples**](#add-offline-examples)，可根据生产 trace 输入生成自定义 ground truth [dataset examples](/langsmith/manage-datasets)，用于离线评估。
+
+**Proposed Fix** 部分描述了该问题，并给出修复建议。如果已连接仓库，建议中还可能包含具体代码或 prompt 修改。
+
+**Suggested Evaluator** 部分提供了可直接部署的 evaluator，用于在未来 trace 中捕获该问题。如果你在关闭问题后，该 evaluator 再次触发，则该问题会被自动重新打开，表示问题仍然存在。
+
+**Offline Examples** 部分会基于触发该问题的生产 trace 输入，建议可用于离线评估的数据集 example。
+
+## Take action on an issue
+
+### Change priority
+
+从优先级下拉菜单中选择 **Low**、**Medium** 或 **High**，即可更新问题优先级。你还可以选择性提供原因，LangSmith Engine 会将其作为反馈，以便逐步提升分析质量。
+
+### Create an evaluator
+
+1. 点击 **Create Evaluator**，为该问题部署建议的 evaluator。
+2. 配置名称、run filter 和采样率。如有需要，可直接在内置编辑器中修改代码。
+3. 启用 **Apply to past runs**，在部署前查看历史 trace 中有多少会被该 evaluator 标记出来。
+
+更多信息请参阅 [Evaluators](/langsmith/evaluators)。
+
+### Add offline examples
+
+1. 点击 **Linked traces** 列表底部的 **Add offline examples**，打开 **Add as offline example** 对话框。
+2. 审查每条 trace。对话框会展示输入、agent 产生的错误输出，以及建议的期望输出，它会作为自定义 ground truth example。
+3. 点击 **Add to Dataset** 可直接添加，或点击 **Edit in annotation queue** 先审查。
+4. 在 annotation queue 中，每个 example 都会展示 run 输入，以及 LangSmith Engine 根据 trace 分析提出的参考输出，它们会被结构化为命名的 [assertions](/langsmith/assertions)。每条 assertion 都是对正确答案应包含或不应包含内容的简短陈述。你可以按需编辑 assertion，用 **+ Add assertion** 添加新的 assertion，然后点击 **Add to Dataset & Continue** 逐条处理 example。
+
+更多信息请参阅 [Manage datasets](/langsmith/manage-datasets)、[Use annotation queues](/langsmith/annotation-queues) 和 [Use assertions](/langsmith/assertions)。
+
+### Copy the issue prompt
+
+点击 **Copy Fix Context** 复制图标，把包含问题详情的 prompt 保存到剪贴板。之后你可以将它交给 LLM 或 coding assistant，帮助解决该问题。
+
+### Open a pull request
+
+点击 **Open PR**，在已连接仓库中创建一个包含建议修复的 GitHub pull request。创建成功后，该按钮会变为 **View PR**。LangSmith Engine 可以对任意已连接仓库提出代码修改建议，包括基于 [Deep Agents](/oss/deepagents/overview)、[LangChain](/oss/langchain/overview) 和 [LangGraph](/oss/langgraph/overview) 构建的 agent。
+
+### Resolve or ignore an issue
+
+点击 **Resolve** 将问题标记为已修复，或点击 **Ignore** 将其视为误报或不值得修复。你可以选择性地为任一操作提供原因。
+
+### Reopen an issue
+
+如需重新打开之前关闭的问题，请打开该问题的详情视图并点击 **Reopen**。
+
+## List issues via the CLI
+
+你可以通过 [LangSmith CLI](/langsmith/cli) 以编程方式列出问题。
+
+```bash
+# List issues for a project
+langsmith project issues list --project <project-name>
+```
+
+## Get notified about new issues
+
+当 LangSmith Engine 打开新问题、把新的 trace 关联到已有问题，或运行失败时，它可以向你发送通知。你可以把这些通知投递到 **Slack channel**、**HTTP webhook endpoint**，或两者同时使用。每个目标都可以单独设置 event type 和最低优先级，因此你可以把高优先级问题路由到 paging webhook，同时把所有问题发往 Slack。
+
+可在 **Engine Settings** 面板中管理通知目标：打开 tracing project 的 **Engine** 标签页，点击 **Engine settings** 齿轮图标，然后在 **Notifications** 下点击 **+ Add destination**。
+
+### Notify a Slack channel
+
+<Steps>
+  <Step title="Connect a Slack workspace">
+    连接 Slack workspace 是组织级操作，只需执行一次，而不是每个 project 都要做。连接或断开 workspace 需要 `organization:manage` 权限。在 [LangSmith console](https://smith.langchain.com) 中，打开 **Settings**，进入组织的 **General** 设置，然后在 **Slack** 下点击 **Connect Slack**。在 Slack 中授权 LangSmith app。一个 organization 可以连接多个 Slack workspace。
+  </Step>
+  <Step title="Add a Slack destination">
+    在 tracing project 的 **Engine** 标签页中，点击 **Engine settings** 齿轮图标，然后点击 **Add destination**。将 **Deliver to** 字段设为 **Slack**，再在 **Channel** 下选择 workspace 和 channel。
+  </Step>
+  <Step title="Choose events and priority">
+    在 **Notify when** 下，选择哪些 [event types](/langsmith/engine-webhooks#event-types) 会向 channel 发送消息。在 **Minimum priority** 下，选择触发通知的最低 [severity](/langsmith/engine-webhooks#severity-filtering)。点击 **Add destination** 保存。
+  </Step>
+</Steps>
+
+LangSmith 会自动加入你选择的公开 channel。如果要发往私有 channel，请先在 Slack 中把 LangSmith app 邀请进去。
+
+每条 Slack 消息都会包含问题标题、描述、严重性、返回 LangSmith 的 **View issue** 链接，以及，针对 issue event，还会包含该问题随时间重复出现的图表。如果某个 workspace 的连接失效，例如 app 被从 Slack 中移除，那么该 workspace 下的目标会停止投递，直到你在组织的 **General** 设置中重新连接它。
+
+### Send to a webhook
+
+如果你想把 Engine event 转发到自己的 incident-management、paging 或 chat 工具，请添加一个目标，并将 **Deliver to** 设为 **Webhook**。输入 URL，并可选填写自定义 header。Webhook 投递会带有签名，因此你可以校验其真实性。关于完整 event payload 参考、signing secret 校验和投递语义，请参阅 [Engine webhook events](/langsmith/engine-webhooks)。
+
+## Configure LangSmith Engine
+
+<Note>
+LangSmith Engine **只使用 LangChain-managed inference**。不支持 Bring Your Own Key (BYOK)，你不能为 Engine 提供自己的 provider API key。
+</Note>
+
+在 tracing project 中，点击 **Engine** 标签页上的 **Engine settings** 齿轮图标，打开 **Edit Engine Settings** 面板。你可以在这里配置：
+
+- **Agent Overview**：编辑 agent overview 文档，以便随着应用演进，持续保持 LangSmith Engine 对项目理解的准确性。
+- **Priorities**：LangSmith Engine 在扫描 trace 时应额外关注的领域。变更会在下一次扫描时生效。
+- **Code repository**：更新已连接的 GitHub 仓库或子目录。
+- **Notifications**：添加 Slack channel 或 webhook 目标，在 LangSmith Engine 检测到新问题时接收通知。你可以按目标设置最低优先级，以控制哪些问题会触发通知。详见 [Get notified about new issues](#get-notified-about-new-issues)。
+- **Pause Engine**：LangSmith Engine 默认每 6 小时扫描一次 trace。点击 **Pause** 可暂停扫描，点击 **Resume** 可恢复扫描。
+- **Delete all issues**：此操作无法撤销。所有问题和设置都会被永久删除。

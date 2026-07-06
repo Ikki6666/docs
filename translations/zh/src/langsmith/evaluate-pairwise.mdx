@@ -1,0 +1,242 @@
+---
+title: 如何运行成对评估
+sidebarTitle: 成对评估
+---
+
+<Info>
+Concept: [Pairwise evaluations](/langsmith/evaluation-concepts#pairwise)
+</Info>
+
+LangSmith 支持以对比方式评估**已有的** experiments。你不必一次只评估一个输出，而是可以把多个 experiments 的输出相互对照评分。在本指南中，你将使用 [`evaluate()`](https://docs.smith.langchain.com/reference/python/evaluation/langsmith.evaluation._runner.evaluate) 基于两个已有 experiments 来[定义 evaluator](#define-a-pairwise-evaluator)，并[运行成对评估](#run-a-pairwise-evaluation)。最后，你还会通过 LangSmith UI 来[查看成对 experiments](#view-pairwise-experiments)。
+
+## 前置条件
+
+* 如果你还没有创建要比较的 experiments，请先查看[quick start](/langsmith/evaluation-quickstart)或[how-to guide](/langsmith/evaluate-llm-application)以开始使用 evaluations。
+* 本指南要求 Python 版 `langsmith` 为 `>=0.2.0`，或 JS 版为 `>=0.2.9`。
+
+<Info>
+你也可以使用 [`evaluate_comparative()`](https://docs.smith.langchain.com/reference/python/evaluation/langsmith.evaluation._runner.evaluate_comparative) 对两个以上的已有 experiments 做比较评估。
+</Info>
+
+## `evaluate()` 的 comparative 参数
+
+最简单的情况下，`evaluate` / `aevaluate` 函数需要以下参数：
+
+| Argument     | Description                                                                                                                        |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `target`     | 一个列表，包含你想互相比较评估的两个**已有 experiments**。它们可以是 UUID，也可以是 experiment 名称。  |
+| `evaluators` | 一个列表，包含你想附加到本次评估中的 pairwise evaluators。如何定义这类 evaluator，请参阅下文。 |
+
+除此之外，你还可以传入以下可选参数：
+
+| Argument                                 | Description                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `randomize_order` / `randomizeOrder`     | 一个可选布尔值，表示是否要在每次评估时打乱两个输出的顺序。这是一种降低位置偏差的策略：很多时候，LLM 会因为回答排列顺序而偏向其中一个。最佳做法仍然是通过 prompt engineering 来缓解这种问题，但这里提供了另一种可选手段。默认值为 False。 |
+| `experiment_prefix` / `experimentPrefix` | 会被加在 pairwise experiment 名称前面的前缀。默认值为 None。                                                                                                                                                                                                                                                                                    |
+| `description`                            | pairwise experiment 的描述。默认值为 None。                                                                                                                                                                                                                                                                                                                    |
+| `max_concurrency` / `maxConcurrency`     | 同时运行的评估最大并发数。默认值为 5。                                                                                                                                                                                                                                                                                                            |
+| `client`                                 | 使用的 LangSmith client。默认值为 None。                                                                                                                                                                                                                                                                                                                                 |
+| `metadata`                               | 附加到 pairwise experiment 上的 metadata。默认值为 None。                                                                                                                                                                                                                                                                                                              |
+| `load_nested` / `loadNested`             | 是否加载 experiment 的所有子 runs。若为 False，则传给 evaluator 的只有 root trace。默认值为 False。                                                                                                                                                                                                                                        |
+
+## 定义 pairwise evaluator
+
+Pairwise evaluators 本质上只是签名固定的函数。
+
+### Evaluator 参数
+
+自定义 evaluator functions 必须使用特定的参数名。它们可以接收以下参数中的任意子集：
+
+* `inputs: dict`：对应数据集中某个 example 的输入字典。
+* `outputs: list[dict]`：一个包含两个元素的列表，分别是两个 experiments 在该输入上生成的 dict 输出。
+* `reference_outputs` / `referenceOutputs: dict`：与该 example 关联的参考输出字典（如果有）。
+* `runs: list[Run]`：一个包含两个元素的列表，分别是这两个 experiments 在该 example 上生成的完整 [Run](/langsmith/run-data-format) 对象。如果你需要读取中间步骤或每个 run 的 metadata，可以使用它。
+* `example: Example`：完整的数据集 [Example](/langsmith/example-data-format)，其中包含 example 的 inputs、outputs（如果有）和 metadata（如果有）。
+
+大多数场景中，你只需要 `inputs`、`outputs` 和 `reference_outputs` / `referenceOutputs`。只有当你确实需要使用应用真实输入输出之外的额外 trace 或 example metadata 时，才需要 `runs` 与 `example`。
+
+### Evaluator 输出
+
+自定义 evaluators 预期返回以下类型之一：
+
+Python 和 JS/TS
+
+* `dict`：包含以下 keys 的字典：
+
+  * `key`：将要记录的 feedback key
+  * `scores`：一个从 run ID 映射到该 run 分数的映射表
+  * `comment`：字符串，最常见用法是记录模型的 reasoning
+
+当前仅 Python 支持
+
+* `list[int | float | bool]`：一个包含两个元素的分数列表。该列表默认与 `runs` / `outputs` evaluator 参数的顺序一致。evaluator 函数名会作为 feedback key 使用。
+
+请注意，你应该选择一个与普通 run feedback 不冲突的 feedback key。我们建议为 pairwise feedback keys 加上 `pairwise_` 或 `ranked_` 前缀。
+
+## 运行成对评估
+
+下面的例子使用了[一个 prompt](https://smith.langchain.com/hub/langchain-ai/pairwise-evaluation-2)，它要求 LLM 在两个 AI assistant 响应之间判断哪个更好。示例中通过结构化输出解析 AI 的结论：0、1 或 2。
+
+<Info>
+下面的 Python 示例中，我们从 [LangChain Hub](/langsmith/manage-prompts#public-prompt-hub) 拉取了[这个结构化 prompt](https://smith.langchain.com/hub/langchain-ai/pairwise-evaluation-2)，并结合 LangChain chat model wrapper 使用。
+
+**使用 LangChain 完全是可选的。**为了说明这一点，TypeScript 示例直接使用了 OpenAI SDK。
+</Info>
+
+- Python：Requires `langsmith>=0.2.0`
+- TypeScript：Requires `langsmith>=0.2.9`
+
+<CodeGroup>
+
+```python Python
+from langchain_classic import hub
+from langchain.chat_models import init_chat_model
+from langsmith import evaluate
+
+# See the prompt: https://smith.langchain.com/hub/langchain-ai/pairwise-evaluation-2
+prompt = hub.pull("langchain-ai/pairwise-evaluation-2")
+model = init_chat_model("gpt-5.5")
+chain = prompt | model
+
+def ranked_preference(inputs: dict, outputs: list[dict]) -> list:
+    # Assumes example inputs have a 'question' key and experiment
+    # outputs have an 'answer' key.
+    response = chain.invoke({
+        "question": inputs["question"],
+        "answer_a": outputs[0].get("answer", "N/A"),
+        "answer_b": outputs[1].get("answer", "N/A"),
+    })
+    if response["Preference"] == 1:
+        scores = [1, 0]
+    elif response["Preference"] == 2:
+        scores = [0, 1]
+    else:
+        scores = [0, 0]
+    return scores
+
+evaluate(
+    ("experiment-1", "experiment-2"),  # Replace with the names/IDs of your experiments
+    evaluators=[ranked_preference],
+    randomize_order=True,
+    max_concurrency=4,
+)
+```
+
+```typescript TypeScript
+import { evaluate} from "langsmith/evaluation";
+import { Run } from "langsmith/schemas";
+import { wrapOpenAI } from "langsmith/wrappers";
+import OpenAI from "openai";
+import { z } from "zod";
+
+const openai = wrapOpenAI(new OpenAI());
+
+async function rankedPreference({
+  inputs,
+  runs,
+}: {
+  inputs: Record<string, any>;
+  runs: Run[];
+}) {
+  const scores: Record<string, number> = {};
+  const [runA, runB] = runs;
+  if (!runA || !runB) throw new Error("Expected at least two runs");
+
+  const payload = {
+    question: inputs.question,
+    answer_a: runA?.outputs?.output ?? "N/A",
+    answer_b: runB?.outputs?.output ?? "N/A",
+  };
+
+  const output = await openai.chat.completions.create({
+    model: "gpt-4-turbo",
+    messages: [
+      {
+        role: "system",
+        content: [
+          "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question displayed below.",
+          "You should choose the assistant that follows the user's instructions and answers the user's question better.",
+          "Your evaluation should consider factors such as the helpfulness, relevance, accuracy, depth, creativity, and level of detail of their responses.",
+          "Begin your evaluation by comparing the two responses and provide a short explanation.",
+          "Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision.",
+          "Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. Be as objective as possible.",
+        ].join(" "),
+      },
+      {
+        role: "user",
+        content: [
+          `[User Question] ${payload.question}`,
+          `[The Start of Assistant A's Answer] ${payload.answer_a} [The End of Assistant A's Answer]`,
+          `The Start of Assistant B's Answer] ${payload.answer_b} [The End of Assistant B's Answer]`,
+        ].join("\n\n"),
+      },
+    ],
+    tool_choice: {
+      type: "function",
+      function: { name: "Score" },
+    },
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "Score",
+          description: [
+            `After providing your explanation, output your final verdict by strictly following this format:`,
+            `Output "1" if Assistant A answer is better based upon the factors above.`,
+            `Output "2" if Assistant B answer is better based upon the factors above.`,
+            `Output "0" if it is a tie.`,
+          ].join(" "),
+          parameters: {
+            type: "object",
+            properties: {
+              Preference: {
+                type: "integer",
+                description: "Which assistant answer is preferred?",
+              },
+            },
+          },
+        },
+      },
+    ],
+  });
+
+  const { Preference } = z
+    .object({ Preference: z.number() })
+    .parse(
+      JSON.parse(output.choices[0].message.tool_calls[0].function.arguments)
+    );
+
+  if (Preference === 1) {
+    scores[runA.id] = 1;
+    scores[runB.id] = 0;
+  } else if (Preference === 2) {
+    scores[runA.id] = 0;
+    scores[runB.id] = 1;
+  } else {
+    scores[runA.id] = 0;
+    scores[runB.id] = 0;
+  }
+
+  return { key: "ranked_preference", scores };
+}
+
+await evaluate(["earnest-name-40", "reflecting-pump-91"], {
+  evaluators: [rankedPreference],
+});
+```
+
+</CodeGroup>
+
+## 查看 pairwise experiments
+
+从数据集页面进入 “Pairwise Experiments” 标签页：
+
+![Pairwise Experiments Tab](/langsmith/images/pairwise-from-dataset.png)
+
+点击你想查看的某个 pairwise experiment，即可进入 Comparison View：
+
+![Pairwise Comparison View](/langsmith/images/pairwise-comparison-view.png)
+
+你还可以点击表头中的 thumbs up / thumbs down 按钮，将 runs 筛选为第一个 experiment 更好，或相反的情况：
+
+![Pairwise Filtering](/langsmith/images/filter-pairwise.png)

@@ -1,0 +1,470 @@
+---
+title: How to cancel a run
+sidebarTitle: Cancel a run
+description: 通过 API 取消单个 run 或多个 run，并在 interrupt 和 rollback 动作之间做出选择。
+---
+本指南介绍如何通过 [LangSmith Deployment API](/langsmith/server-api-ref) 为 agent 取消 run。你既可以按 ID 取消单个 run，也可以按 thread 或 status 批量取消多个 run。取消功能适合用于停止长时间运行或卡住的 run，或者用户放弃请求时的场景。
+
+## Setup
+
+创建一个 client 和 thread：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    from langgraph_sdk import get_client
+
+    client = get_client(url=<DEPLOYMENT_URL>)
+    assistant_id = "agent"
+    thread = await client.threads.create()
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    import { Client } from "@langchain/langgraph-sdk";
+
+    const client = new Client({ apiUrl: <DEPLOYMENT_URL> });
+    const assistantID = "agent";
+    const thread = await client.threads.create();
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads \
+      --header 'Content-Type: application/json' \
+      --data '{}'
+    ```
+    </Tab>
+</Tabs>
+
+## Cancel a single run
+
+下面的示例会创建一个 run，再使用不同选项取消它，并打印 run，以展示各种方式下的结果。你可以取消处于 `pending` 或 `running` 状态的 run。如果尝试取消不处于 `pending` 或 `running` 状态的 run，会报错。
+
+### Cancel with interrupt (default)
+
+**interrupt** 会停止执行该 run 的 worker，并将 run 标记为 `interrupted`。不会删除任何内容：
+
+- run 记录仍然保留，状态为 `interrupted`。你可以继续获取它、查看输入输出以及执行历史。
+- 该 run 的所有 checkpoint 都会保留。thread state 会保存在最后一个完成步骤的位置。
+- 你之后仍可以从 checkpoint 恢复，例如通过 [time travel](/langsmith/human-in-the-loop-time-travel)，或者查看部分 state。
+
+当你想停止一个 run，但又希望保留它以便调试、审计或从 checkpoint 恢复时，请使用 **interrupt**。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    run = await client.runs.create(
+        thread["thread_id"],
+        assistant_id,
+        input={"messages": [{"role": "user", "content": "Long task"}]},
+    )
+    await client.runs.cancel(thread["thread_id"], run["run_id"])
+
+    run_after = await client.runs.get(thread["thread_id"], run["run_id"], wait=True)
+    print(run_after["status"])   # "interrupted"
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    const run = await client.runs.create(
+        thread["thread_id"],
+        assistantID,
+        { input: { messages: [{ role: "user", content: "Long task" }] } }
+    );
+    await client.runs.cancel(thread["thread_id"], run["run_id"], wait=true);
+
+    const runAfter = await client.runs.get(thread["thread_id"], run["run_id"]);
+    console.log(runAfter["status"]);   // "interrupted"
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    # Create a run (use the run_id and thread_id from the response)
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs \
+      --header 'Content-Type: application/json' \
+      --data '{"assistant_id": "agent", "input": {"messages": [{"role": "user", "content": "Summarize the docs"}]}}'
+
+    # Cancel with default action (interrupt)
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/<RUN_ID>/cancel?wait=true
+
+    # Get the run to see status "interrupted" and that the run still exists
+    curl --request GET \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/<RUN_ID>
+    ```
+    </Tab>
+</Tabs>
+
+### Cancel with rollback
+
+**rollback** 会先停止 run，然后把它及其 checkpoint 一起从存储中删除：
+
+- run 记录会被删除。该 run 不再出现在该 thread 的 run 列表或历史记录中。
+- 该 run 创建的所有 checkpoint 都会被删除。thread state 会回退到该 run 启动之前的状态，就像这个 run 从未执行过一样。
+- rollback 后，你无法再恢复或查看该 run。
+
+当你希望彻底丢弃一个 run 及其影响时，请使用 **rollback**，例如用户放弃请求，且你不需要保留部分工作成果时。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    run = await client.runs.create(
+        thread["thread_id"],
+        assistant_id,
+        input={"messages": [{"role": "user", "content": "Long task"}]},
+    )
+    await client.runs.cancel(thread["thread_id"], run["run_id"], action="rollback", wait=True)
+
+    # Throws an error because the run is deleted
+    try:
+        await client.runs.get(thread["thread_id"], run["run_id"])
+    except Exception:
+        print("Run was correctly deleted")
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    const run = await client.runs.create(
+        thread["thread_id"],
+        assistantID,
+        { input: { messages: [{ role: "user", content: "Long task" }] } }
+    );
+    await client.runs.cancel(thread["thread_id"], run["run_id"], wait=true, action="rollback");
+
+    // Throws an error because the run is deleted
+    try {
+        await client.runs.get(thread["thread_id"], run["run_id"]);
+    } catch (e) {
+        console.log("Run was correctly deleted");
+    }
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    # Create a run, then cancel with rollback
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs \
+      --header 'Content-Type: application/json' \
+      --data '{"assistant_id": "agent", "input": {"messages": [{"role": "user", "content": "Summarize the docs"}]}}'
+
+    curl --request POST \
+      --url "<DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/<RUN_ID>/cancel?action=rollback"
+
+    # Throws an error because the run is deleted
+    curl --request GET \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/<RUN_ID>
+    ```
+    </Tab>
+</Tabs>
+
+### Cancel with wait
+
+默认情况下，取消请求会在提出取消后立即返回，而实际取消会异步完成。`wait=True` 会让取消请求阻塞，直到 run 已经被完全取消。当你想知道取消完成后的最终 run 状态时，这会很有用，例如创建了哪些 checkpoint、最终输出是什么。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    run = await client.runs.create(
+        thread["thread_id"],
+        assistant_id,
+        input={"messages": [{"role": "user", "content": "Long task"}]},
+    )
+    # Cancel the run asynchronously
+    await client.runs.cancel(thread["thread_id"], run["run_id"])
+    # Get the status of the run
+    run_after = await client.runs.get(thread["thread_id"], run["run_id"])
+    print(run_after["status"])  # "pending" or "running"
+
+    # Wait for the run to be properly cancelled
+    await client.runs.join(thread["thread_id"], run["run_id"])
+    run_after = await client.runs.get(thread["thread_id"], run["run_id"])
+    print(run_after["status"])  # "interrupted"
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    const run = await client.runs.create(
+        thread["thread_id"],
+        assistantID,
+        { input: { messages: [{ role: "user", content: "Long task" }] } }
+    );
+    // Cancel the run asynchronously
+    await client.runs.cancel(thread["thread_id"], run["run_id"]);
+    // Get the status of the run
+    const runRunning = await client.runs.get(thread["thread_id"], run["run_id"])
+    console.log(runRunning["status"])  // "pending" or "running"
+
+    // Wait for the run to be properly cancelled
+    await client.runs.join(thread["thread_id"], run["run_id"])
+    const runInterrupted = await client.runs.get(thread["thread_id"], run["run_id"])
+    console.log(runInterrupted["status"])  // "interrupted"
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    # Create a run
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs \
+      --header 'Content-Type: application/json' \
+      --data '{"assistant_id": "agent", "input": {"messages": [{"role": "user", "content": "Summarize the docs"}]}}'
+
+    # Cancel the run asynchronously
+    curl --request POST \
+      --url "<DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/<RUN_ID>/cancel"
+
+    # Get the status of the run, should be "pending" or "running" until cancellation completes, then "interrupted"
+    curl --request GET \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/<RUN_ID>
+    ```
+    </Tab>
+</Tabs>
+
+## Cancel multiple runs
+
+使用 bulk cancel endpoint，可以在一次请求中取消多个 run。它同时支持 interrupt 和 rollback 两种 action。
+
+### Cancel by thread ID and run IDs
+
+通过传入 run ID 列表来取消特定 run。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    run1 = await client.runs.create(
+        thread["thread_id"],
+        assistant_id,
+        input={"messages": [{"role": "user", "content": "First request"}]},
+    )
+    run2 = await client.runs.create(
+        thread["thread_id"],
+        assistant_id,
+        input={"messages": [{"role": "user", "content": "Second request"}]},
+        multitask_strategy="enqueue",
+    )
+
+    await client.runs.cancel_many(
+        thread_id=thread["thread_id"],
+        run_ids=[run1["run_id"], run2["run_id"]]
+    )
+
+    # Wait for the runs to be cancelled
+    await client.runs.join(thread["thread_id"], run2["run_id"])
+    runs_after = await client.runs.list(thread["thread_id"])
+    for run in runs_after:
+        if run["run_id"] in (run1["run_id"], run2["run_id"]):
+            print(run["run_id"], run["status"])  # "interrupted"
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    // Bulk delete by run IDs is not supported in the Javascript SDK
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    # Create two runs (capture run_id from each response)
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs \
+      --header 'Content-Type: application/json' \
+      --data '{"assistant_id": "agent", "input": {"messages": [{"role": "user", "content": "First request"}]}}'
+
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs \
+      --header 'Content-Type: application/json' \
+      --data '{"assistant_id": "agent", "input": {"messages": [{"role": "user", "content": "Second request"}]}}'
+
+    # Cancel both by run IDs
+    curl --request POST \
+      --url "<DEPLOYMENT_URL>/runs/cancel?action=interrupt" \
+      --header 'Content-Type: application/json' \
+      --data '{"thread_id": "<THREAD_ID>", "run_ids": ["<RUN_ID_1>", "<RUN_ID_2>"]}'
+
+    # List runs to confirm
+    curl --request GET \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs
+    ```
+    </Tab>
+</Tabs>
+
+### Cancel by status
+
+取消 deployment 中所有符合某个 status 的 run，覆盖所有 thread。可用 status 包括 `pending`、`running` 或 `all`。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    run1 = await client.runs.create(
+        thread["thread_id"],
+        assistant_id,
+        input={"messages": [{"role": "user", "content": "First request"}]},
+    )
+    thread2 = await client.threads.create()
+    run2 = await client.runs.create(
+        thread2["thread_id"],
+        assistant_id,
+        input={"messages": [{"role": "user", "content": "Second request"}]},
+    )
+
+    await client.runs.cancel_many(
+        status="running",
+    )
+
+    # Wait for the runs to be cancelled
+    await client.runs.join(thread2["thread_id"], run2["run_id"])
+    run_after = await client.runs.get(thread["thread_id"], run1["run_id"])
+    print(run_after["status"])  # running run is now "interrupted"
+    run_after2 = await client.runs.get(thread2["thread_id"], run2["run_id"])
+    print(run_after2["status"])  # runs are cancelled across all threads
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    // Bulk delete by status is not supported in the Javascript SDK
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    # Create a run
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs \
+      --header 'Content-Type: application/json' \
+      --data '{"assistant_id": "agent", "input": {"messages": [{"role": "user", "content": "First request"}]}}'
+
+    # Create a second thread
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads \
+      --header 'Content-Type: application/json' \
+      --data '{}'
+
+    # Create a run in the second thread
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID_2>/runs \
+      --header 'Content-Type: application/json' \
+      --data '{"assistant_id": "agent", "input": {"messages": [{"role": "user", "content": "Second request"}]}}'
+
+    # Cancel all running runs
+    curl --request POST \
+      --url "<DEPLOYMENT_URL>/runs/cancel?action=interrupt" \
+      --header 'Content-Type: application/json' \
+      --data '{"status": "running"}'
+
+    # Get the status of the runs to confirm
+    curl --request GET \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/<RUN_ID_1>
+    curl --request GET \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID_2>/runs/<RUN_ID_2>
+    ```
+    </Tab>
+</Tabs>
+
+## Cancel on disconnect
+
+在以 streaming 方式启动 run 时，或者等待 run 完成时，你可以设置 `on_disconnect="cancel"`，这样一旦 client 断开连接，该 run 就会被取消。这可以避免用户关闭应用或失去连接后，仍然留下正在运行的任务。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    # With runs.wait: run is cancelled if the client disconnects
+    result = await client.runs.wait(
+        thread["thread_id"],
+        assistant_id,
+        input={"messages": [{"role": "user", "content": "Long task"}]},
+        on_disconnect="cancel",
+    )
+
+    # With runs.stream: run is cancelled if the client disconnects
+    async for chunk in client.runs.stream(
+        thread["thread_id"],
+        assistant_id,
+        input={"messages": [{"role": "user", "content": "Long task"}]},
+        on_disconnect="cancel",
+    ):
+        print(chunk)
+
+    # With runs.join: wait for an existing run; cancel if client disconnects
+    run = await client.runs.create(
+        thread["thread_id"],
+        assistant_id,
+        input={"messages": [{"role": "user", "content": "Long task"}]},
+    )
+    await client.runs.join(
+        thread["thread_id"],
+        run["run_id"],
+        on_disconnect="cancel",
+    )
+
+    # With runs.join_stream: join an existing run and stream; cancel if client disconnects
+    async for chunk in client.runs.join_stream(
+        thread["thread_id"],
+        run["run_id"],
+        on_disconnect="cancel",
+    ):
+        print(chunk)
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    // With runs.wait: run is cancelled if the client disconnects
+    const result = await client.runs.wait(
+        thread["thread_id"],
+        assistantID,
+        { input: { messages: [{ role: "user", content: "Long task" }] }, onDisconnect: "cancel" }
+    );
+
+    // With runs.stream: run is cancelled if the client disconnects
+    const streamResponse = client.runs.stream(
+        thread["thread_id"],
+        assistantID,
+        { input: { messages: [{ role: "user", content: "Long task" }] }, onDisconnect: "cancel" }
+    );
+    for await (const chunk of streamResponse) {
+        console.log(chunk);
+    }
+
+    // With runs.join does not support cancel on disconnect in the Javascript SDK
+
+    // With runs.joinStream: join an existing run and stream; cancel if client disconnects
+    const joinStreamResponse = client.runs.joinStream(
+        thread["thread_id"],
+        run["run_id"],
+        { cancelOnDisconnect: true }
+    );
+    for await (const chunk of joinStreamResponse) {
+        console.log(chunk);
+    }
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    # runs.wait: create run and wait for output; cancel if client disconnects
+    curl --request POST \
+      --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/wait \
+      --header 'Content-Type: application/json' \
+      --data '{"assistant_id": "agent", "input": {"messages": [{"role": "user", "content": "Long task"}]}, "on_disconnect": "cancel"}'
+
+    # Create and stream a run; cancel if client disconnects
+    curl --request POST \
+      --url "<DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/stream?on_disconnect=cancel" \
+      --header 'Content-Type: application/json' \
+      --data '{"assistant_id": "agent", "input": {"messages": [{"role": "user", "content": "Long task"}]}}'
+
+    # runs.join: wait on an existing run; cancel if client disconnects
+    curl --request GET \
+      --url "<DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/<RUN_ID>/join?cancel_on_disconnect=cancel"
+
+    # runs.join_stream: join an existing run and stream; cancel if client disconnects
+    curl --request GET \
+      --url "<DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/<RUN_ID>/stream?cancel_on_disconnect=cancel"
+    ```
+    </Tab>
+</Tabs>
+
+## Common scenarios
+
+- **Human-in-the-loop and interrupts**：agent 可以在 [interrupts](/langsmith/add-human-in-the-loop) 处暂停，等待人工输入。取消 run 会直接停止执行；它不同于 interrupt，interrupt 只是暂停 run，并且可以通过新的输入恢复执行。
+- **Time travel**：如果你以 `interrupt` action 取消 run，那么该 run 和 checkpoint 仍然保留。你可以 [resume from a checkpoint](/langsmith/human-in-the-loop-time-travel)，也就是 time travel，来重放或分支执行。
+- **Double-texting**：当用户在某个 run 尚未结束时又发送新的输入，[multitask strategy](/langsmith/double-texting)，例如 enqueue、reject、interrupt、rollback，会决定是中断还是回滚已有 run，以及如何处理新 run。如果你想在自己的应用中显式取消 run，请使用本页介绍的 cancel API。
+- **Studio**：在 [Studio](/langsmith/use-studio) 中，使用 run UI 上的 **Cancel** 按钮即可取消当前 run。

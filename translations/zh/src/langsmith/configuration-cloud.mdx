@@ -1,0 +1,425 @@
+---
+title: 管理 assistants
+sidebarTitle: 管理 assistants
+---
+
+本页介绍如何创建、配置和管理 [assistants](/langsmith/assistants)。assistants 让你可以通过配置来自定义[已部署](/langsmith/deployment) graph 的行为，例如模型选择、prompts 和 tools 可用性，而无需修改底层 graph 代码。
+
+你既可以使用 [SDK](https://reference.langchain.com/python/langsmith/deployment/sdk/)，也可以直接在 [LangSmith UI](https://smith.langchain.com) 中操作。
+
+## 理解 assistant 配置
+
+assistants 会保存一组 _context_ 值，用来在运行时定制 graph 行为。你需要先在 graph 代码里定义 context schema，然后在创建 assistant 时，通过 @[`context` parameter][AssistantsClient.create] 提供对应的具体值。
+
+看下面这个 `call_model` 节点示例，它会从 context 中读取 `model_name`：
+
+<CodeGroup>
+```python Python
+class ContextSchema(TypedDict):
+    model_name: str
+
+builder = StateGraph(AgentState, context_schema=ContextSchema)
+
+def call_model(state, runtime: Runtime[ContextSchema]):
+    messages = state["messages"]
+    model = _get_model(runtime.context.get("model_name", "anthropic"))
+    response = model.invoke(messages)
+    return {"messages": [response]}
+```
+
+```javascript JavaScript
+import { Annotation } from "@langchain/langgraph";
+
+const ContextSchema = Annotation.Root({
+    model_name: Annotation<string>,
+    system_prompt: Annotation<string>,
+});
+
+const builder = new StateGraph(AgentState, ContextSchema)
+
+function callModel(state: State, runtime: Runtime[ContextSchema]) {
+  const messages = state.messages;
+  const model = _getModel(runtime.context.model_name ?? "anthropic");
+  const response = model.invoke(messages);
+  return { messages: [response] };
+}
+```
+</CodeGroup>
+
+创建 assistant 时，你会为这些配置字段提供具体值。assistant 会保存这组配置，并在 graph 每次运行时自动应用。
+
+关于 [LangGraph](/oss/langgraph/overview) 中的配置机制，请参阅[runtime context 文档](/oss/langgraph/graph-api#runtime-context)。
+
+**请根据你的工作流选择 SDK 或 UI：**
+
+<Tabs>
+    <Tab title="SDK">
+
+## 创建 assistant
+
+使用 @[AssistantsClient.create][AssistantsClient.create] 方法创建新的 assistant。这个方法需要：
+- **Graph ID**：该 assistant 绑定的已部署 graph 名称，例如 `"agent"`。
+- **Context**：与你 graph context schema 对应的配置值。
+- **Name**：assistant 的描述性名称。
+
+下面的示例创建了一个 `model_name` 为 `openai` 的 assistant：
+
+<CodeGroup>
+```python Python
+from langgraph_sdk import get_client
+
+# Initialize the client with your deployment URL
+client = get_client(url=<DEPLOYMENT_URL>)
+
+# Create an assistant for the "agent" graph
+# The first parameter is the graph ID (also called graph name)
+openai_assistant = await client.assistants.create(
+    "agent",  # Graph ID of the deployed graph
+    context={"model_name": "openai"},
+    name="Open AI Assistant"
+)
+
+print(openai_assistant)
+# Output includes the assistant_id (UUID) that uniquely identifies this assistant
+```
+
+```javascript JavaScript
+import { Client } from "@langchain/langgraph-sdk";
+
+// Initialize the client with your deployment URL
+const client = new Client({ apiUrl: <DEPLOYMENT_URL> });
+
+// Create an assistant for the "agent" graph
+const openAIAssistant = await client.assistants.create({
+    graphId: 'agent',  // Graph ID of the deployed graph
+    name: "Open AI Assistant",
+    context: { "model_name": "openai" },
+});
+
+console.log(openAIAssistant);
+// Output includes the assistant_id (UUID) that uniquely identifies this assistant
+```
+
+```bash cURL
+curl --request POST \
+    --url <DEPLOYMENT_URL>/assistants \
+    --header 'Content-Type: application/json' \
+    --data '{"graph_id":"agent", "context":{"model_name":"openai"}, "name": "Open AI Assistant"}'
+```
+</CodeGroup>
+
+**响应：**
+
+API 会返回一个 assistant 对象，其中包含：
+- `assistant_id`：唯一标识该 assistant 的 UUID
+- `graph_id`：该 assistant 对应的 graph
+- `context`：你提供的配置值
+- `name`、`metadata`、时间戳，以及其他字段
+
+```json
+{
+  "assistant_id": "62e209ca-9154-432a-b9e9-2d75c7a9219b",
+  "graph_id": "agent",
+  "name": "Open AI Assistant",
+  "context": {
+    "model_name": "openai"
+  },
+  "metadata": {},
+  "created_at": "2024-08-31T03:09:10.230718+00:00",
+  "updated_at": "2024-08-31T03:09:10.230718+00:00"
+}
+```
+
+`assistant_id`（例如 `"62e209ca-9154-432a-b9e9-2d75c7a9219b"` 这样的 UUID）会唯一标识这一份 assistant 配置。当你运行 graph 时，就需要用这个 ID 来指定使用哪组配置。
+
+<Note>
+**Graph ID 与 Assistant ID**
+
+创建 assistant 时，你传入的是 **graph ID**（例如 `"agent"` 这样的 graph 名称）。它会返回一个 **assistant ID**（例如 `"62e209ca..."` 这样的 UUID）。运行 graph 时，你可以传其中任意一种：
+- **Graph ID**（例如 `"agent"`）：使用该 graph 的默认 assistant
+- **Assistant ID**（UUID）：使用特定的 assistant 配置
+
+示例请参阅[使用 assistant](#use-an-assistant)。
+</Note>
+
+## 使用 assistant
+
+要使用某个 assistant，在创建 run 时传入它的 `assistant_id` 即可。下面的示例使用了我们刚刚创建的 assistant：
+
+<CodeGroup>
+```python Python
+# Create a thread for the conversation
+thread = await client.threads.create()
+
+# Prepare the input
+input = {"messages": [{"role": "user", "content": "who made you?"}]}
+
+# Run the graph using the assistant's configuration
+# Pass the assistant_id (UUID) as the second parameter
+async for event in client.runs.stream(
+    thread["thread_id"],
+    openai_assistant["assistant_id"],  # Assistant ID (UUID)
+    input=input,
+    stream_mode="updates",
+):
+    print(f"Receiving event of type: {event.event}")
+    print(event.data)
+    print("\n\n")
+```
+
+```javascript JavaScript
+// Create a thread for the conversation
+const thread = await client.threads.create();
+
+// Prepare the input
+const input = { "messages": [{ "role": "user", "content": "who made you?" }] };
+
+// Run the graph using the assistant's configuration
+// Pass the assistant_id (UUID) as the second parameter
+const streamResponse = client.runs.stream(
+  thread["thread_id"],
+  openAIAssistant["assistant_id"],  // Assistant ID (UUID)
+  {
+    input,
+    streamMode: "updates"
+  }
+);
+
+for await (const event of streamResponse) {
+  console.log(`Receiving event of type: ${event.event}`);
+  console.log(event.data);
+  console.log("\n\n");
+}
+```
+
+```bash cURL
+# First, create a thread
+thread_id=$(curl --request POST \
+    --url <DEPLOYMENT_URL>/threads \
+    --header 'Content-Type: application/json' \
+    --data '{}' | jq -r '.thread_id')
+
+# Run the graph with the assistant ID (UUID)
+curl --request POST \
+    --url "<DEPLOYMENT_URL>/threads/${thread_id}/runs/stream" \
+    --header 'Content-Type: application/json' \
+    --data '{
+        "assistant_id": "<ASSISTANT_ID>",
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "who made you?"
+                }
+            ]
+        },
+        "stream_mode": ["updates"]
+    }' | \
+    sed 's/\r$//' | \
+    awk '
+    /^event:/ {
+        if (data_content != "") {
+            print data_content "\n"
+        }
+        sub(/^event: /, "Receiving event of type: ", $0)
+        printf "%s...\n", $0
+        data_content = ""
+    }
+    /^data:/ {
+        sub(/^data: /, "", $0)
+        data_content = $0
+    }
+    END {
+        if (data_content != "") {
+            print data_content "\n\n"
+        }
+    }
+'
+```
+</CodeGroup>
+
+**响应：**
+
+当 graph 带着 assistant 配置执行时，stream 会返回类似下面的事件：
+
+```
+Receiving event of type: metadata
+{'run_id': '1ef6746e-5893-67b1-978a-0f1cd4060e16'}
+
+Receiving event of type: updates
+{'agent': {'messages': [{'content': 'I was created by OpenAI...', ...}]}}
+```
+
+<Note>
+**使用 graph ID 还是 assistant ID**
+
+运行 graph 时，你既可以传 **graph ID**，也可以传 **assistant ID**：
+
+```python
+# Option 1: Use graph ID to get the default assistant
+client.runs.stream(thread_id, "agent", input=input)
+
+# Option 2: Use assistant ID (UUID) for a specific configuration
+client.runs.stream(thread_id, "62e209ca-9154-432a-b9e9-2d75c7a9219b", input=input)
+```
+</Note>
+
+## 为 assistant 创建新版本
+
+使用 @[AssistantsClient.update][AssistantsClient.update] 方法，可以为 assistant 创建一个新版本。
+
+<Warning>
+**更新时必须提供完整配置**
+
+更新时你必须传入**完整配置**。更新接口会从头创建一个新版本，不会和旧版本做合并。凡是你想保留的配置字段，都必须一并重新传入。
+</Warning>
+
+例如，如果你想给 assistant 增加一个 system prompt：
+
+<CodeGroup>
+```python Python
+# Update the assistant with a new configuration
+# IMPORTANT: Include ALL configuration fields, not just the ones you're changing
+openai_assistant_v2 = await client.assistants.update(
+    openai_assistant["assistant_id"],  # Assistant ID (UUID)
+    context={
+          "model_name": "openai",  # Must include existing fields
+          "system_prompt": "You are a mindful assistant!",  # New field
+    },
+)
+
+# This creates version 2 and sets it as the active version
+# Future runs using this assistant_id will use version 2
+```
+
+```javascript JavaScript
+// Update the assistant with a new configuration
+// IMPORTANT: Include ALL configuration fields, not just the ones you're changing
+const openaiAssistantV2 = await client.assistants.update(
+    openAIAssistant["assistant_id"],  // Assistant ID (UUID)
+    {
+        context: {
+            model_name: 'openai',  // Must include existing fields
+            system_prompt: 'You are a mindful assistant!',  // New field
+        },
+    },
+);
+
+// This creates version 2 and sets it as the active version
+// Future runs using this assistant_id will use version 2
+```
+
+```bash cURL
+curl --request PATCH \
+--url <DEPLOYMENT_URL>/assistants/<ASSISTANT_ID> \
+--header 'Content-Type: application/json' \
+--data '{
+"context": {"model_name": "openai", "system_prompt": "You are a mindful assistant!"}
+}'
+```
+</CodeGroup>
+
+更新操作会创建一个新版本，并自动将其设为 active。之后所有使用这个 assistant ID 的 runs，都会使用新配置。
+
+## 使用旧版本 assistant
+
+使用 `setLatest` 方法可以切换当前 active 的版本：
+
+<CodeGroup>
+```python Python
+# Roll back to version 1 of the assistant
+await client.assistants.set_latest(
+    openai_assistant['assistant_id'],  # Assistant ID (UUID)
+    1  # Version number
+)
+
+# All future runs using this assistant_id will now use version 1
+```
+
+```javascript JavaScript
+// Roll back to version 1 of the assistant
+await client.assistants.setLatest(
+    openaiAssistant['assistant_id'],  # Assistant ID (UUID)
+    1  // Version number
+);
+
+// All future runs using this assistant_id will now use version 1
+```
+
+```bash cURL
+curl --request POST \
+--url <DEPLOYMENT_URL>/assistants/<ASSISTANT_ID>/latest \
+--header 'Content-Type: application/json' \
+--data '{
+"version": 1
+}'
+```
+</CodeGroup>
+
+切换 active 版本后，所有使用这个 assistant ID 的后续 runs 都会采用该版本配置。
+
+</Tab>
+<Tab title="UI">
+
+## 创建 assistant
+
+你也可以直接在 [LangSmith UI](https://smith.langchain.com) 中创建 assistants：
+
+1. 进入你的 deployment，打开 **Assistants** 标签页。
+1. 点击 **+ New assistant**。
+1. 在打开的表单中：
+   - 选择这个 assistant 对应的 graph。
+   - 填写名称和描述。
+   - 按该 graph 的配置 schema 填写 assistant 配置。
+1. 点击 **Create assistant**。
+
+创建完成后，页面会跳转到 [Studio](/langsmith/studio)，你可以立即测试这个 assistant。之后返回 **Assistants** 标签页，就能在表格中看到它。
+
+## 使用 assistant
+
+要在 LangSmith UI 中使用 assistant：
+
+1. 进入你的 deployment，打开 **Assistants** 标签页。
+1. 找到你想使用的 assistant。
+1. 点击该 assistant 对应的 **Studio**。
+
+这会用所选 assistant 打开 [Studio](/langsmith/studio)。当你在 **Graph** 或 **Chat** 模式下提交输入时，该 assistant 的配置就会应用到这次 run 上。
+
+## 为 assistant 创建新版本
+
+如果你想通过 UI 更新 assistant 并创建新版本，可以在 Assistants 标签页或 Studio 中操作。无论哪种方式，都会创建新版本，并自动把它设为 active：
+
+<Tabs>
+<Tab title="Assistants tab">
+1. 进入你的 deployment，打开 **Assistants** 标签页。
+1. 找到你想编辑的 assistant。
+1. 点击 **Edit**。
+1. 修改 assistant 的名称、描述或配置。
+1. 保存更改。
+</Tab>
+
+<Tab title="Studio">
+1. 为该 assistant 打开 Studio。
+1. 点击 **Manage Assistants**。
+1. 编辑 assistant 配置。
+1. 保存更改。
+</Tab>
+</Tabs>
+
+## 使用旧版本 assistant
+
+如果你想在 Studio 中把某个旧版本设为 active：
+
+1. 为该 assistant 打开 Studio。
+2. 点击 **Manage Assistants**。
+3. 找到这个 assistant，并选中你想使用的版本。
+4. 打开该版本对应的 **Active** 开关。
+
+这样之后所有 runs 都会使用你选中的版本。
+
+<Warning>
+删除 assistant 会删除它的**所有**版本。目前还不支持只删除单个版本。如果你只是想跳过某个版本，只需将其他版本设为 active 即可。
+</Warning>
+
+</Tab>
+</Tabs>

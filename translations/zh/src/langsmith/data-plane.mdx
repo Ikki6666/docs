@@ -1,0 +1,101 @@
+---
+title: LangSmith data plane
+sidebarTitle: Data plane
+---
+
+_Data plane_ 由你的 [Agent Servers](/langsmith/agent-server)（deployments）、它们的配套基础设施，以及持续轮询 [LangSmith control plane](/langsmith/control-plane) 更新的 “listener” application 构成。
+
+## 服务基础设施
+
+除了 [Agent Server](/langsmith/agent-server) 本身之外，以下每个服务实例所需的基础设施组件，也都属于广义上 “data plane” 的一部分：
+
+- **PostgreSQL**：用户、run 和 memory 数据的持久化层。
+- **Redis**：workers 之间的通信与临时 metadata 存储。
+- **Secrets store**：环境 secrets 的安全管理。
+- **Autoscalers**：根据负载对服务容器进行扩缩容。
+
+## “Listener” application
+
+Data plane 的 “listener” application 会定期调用 [control plane APIs](/langsmith/control-plane#control-plane-api)，以便：
+
+* 判断是否需要创建新的 deployments。
+* 判断是否需要更新已有 deployments（即新的 revisions）。
+* 判断是否需要删除已有 deployments。
+
+换句话说，data plane 的 “listener” 会读取 control plane 的最新状态（期望状态），并采取行动去协调尚未完成的 deployments（当前状态），使其与最新状态保持一致。
+
+## PostgreSQL
+
+PostgreSQL 用来存储服务资源（threads、runs、assistants、crons）以及保存在[长期记忆 store](/oss/langgraph/persistence#memory-store)中的内容。它同时也是 [checkpoints](/oss/langgraph/persistence)（graph 执行状态）的默认后端。你也可以选择把 checkpoints 存储到 MongoDB 中，详见[配置 checkpointer backend](/langsmith/configure-checkpointer)。无论 checkpointer 使用什么后端，PostgreSQL 都始终是必需的。
+
+## Redis
+
+Redis 在每个 Agent Server 中用于服务与 queue workers 之间的通信，以及存储临时 metadata。Redis 中不会保存任何用户数据或 run 数据。
+
+### 通信
+
+Agent Server 中的所有 runs 都由属于各个 deployment 的一组后台 workers 来执行。为了支持这些 runs 的某些功能（例如取消和流式输出），服务端与负责某个 run 的 worker 之间需要一个双向通信通道。我们用 Redis 来组织这种通信。
+
+1. 使用一个 Redis list，在新 run 创建后立即唤醒 worker。这个 list 中只存一个哨兵值，不包含真正的 run 信息。真正的 run 信息随后由 worker 从 PostgreSQL 中读取。
+2. 通过 Redis string 与 Redis PubSub channel 的组合，由服务端把 run 取消请求发给对应 worker。
+3. 当 worker 正在处理某个 run 时，会通过 Redis PubSub channel 广播 agent 的流式输出。服务端中任何打开的 `/stream` 请求都会订阅该 channel，并在事件到达时把它们转发到响应中。Redis 中不会在任何时刻存储这些事件。
+
+### 临时 metadata
+
+Agent Server 中的 runs 可能会因为特定故障而重试（目前仅针对 run 执行过程中遇到的瞬时 PostgreSQL 错误）。为了限制重试次数（当前每个 run 最多 3 次），系统会在 run 被 worker 拿起时，把尝试次数记录到一个 Redis string 中。这里除了 run 的 ID 外，不包含其他特定于 run 的信息，而且这个值会在短时间后自动过期。
+
+## Data plane 特性
+
+本节介绍 data plane 的各种特性。对于平台相关行为，请参阅[Cloud 平台特性](/langsmith/cloud-platform-features)或[部署到自托管环境](/langsmith/deploy-to-self-hosted-overview)。
+
+### Autoscaling
+
+[`Production` 类型](/langsmith/cloud-platform-features#deployment-types) deployments 会自动扩容到最多 10 个容器。扩缩容基于 3 个指标：
+
+1. CPU 利用率
+2. 内存利用率
+3. 待处理（进行中）[runs](/langsmith/runs) 数量
+
+对于 CPU 利用率，autoscaler 的目标是 75%。这意味着 autoscaler 会自动增加或减少容器数量，以保证 CPU 利用率接近或保持在 75%。对于内存利用率，目标同样是 75%。
+
+对于待处理 runs 的数量，autoscaler 的目标是 10 个 pending runs。例如，如果当前容器数是 1，但 pending runs 数量是 20，那么 autoscaler 会将 deployment 扩容到 2 个容器（20 个 pending runs / 2 个容器 = 每个容器 10 个 pending runs）。
+
+每个指标都会独立计算，而 autoscaler 会依据导致所需容器数最多的那个指标来决定扩缩容动作。
+
+这些指标并不适用于每种容器类型。[Queue workers](/langsmith/agent-server#runtime-architecture) 按 pending run 数扩缩容，当积压增加时，更多 workers 会启动来消化积压。[API servers](/langsmith/agent-server#runtime-architecture) 则按 CPU 和内存扩缩容，以应对客户端请求流量。这意味着 run 提交量激增时，不会拖慢诸如读取 thread state 之类的读操作。关于自托管的配置细节，请参阅[配置可扩展的 Agent Server](/langsmith/agent-server-scale)。
+
+缩容动作会延迟 30 分钟后才真正执行。换句话说，如果 autoscaler 决定缩小某个 deployment，它会先等待 30 分钟。30 分钟后会重新计算指标，若重算结果表明需要的容器数少于当前值，则 deployment 会缩容；否则将保持当前规模。这个 “cool down” 周期可以避免 deployments 过于频繁地来回扩缩。
+
+### MongoDB checkpointing
+
+<Info>
+适用于 [Cloud](/langsmith/cloud)（配合外部托管的 MongoDB 实例）和 [Standalone](/langsmith/deploy-standalone-server) deployments。
+</Info>
+
+你可以使用 MongoDB 作为 checkpoint 存储的替代后端。配置完成后，MongoDB 只负责 checkpoint 数据，其他所有服务资源仍然需要 PostgreSQL。
+
+设置说明请参阅[配置 checkpointer backend](/langsmith/configure-checkpointer)。
+
+### LangSmith tracing
+
+Agent Server 会被自动配置为把 traces 发送到 LangSmith。不同 deployment 方式下的行为如下表所示。
+
+| Cloud | Hybrid | Self-Hosted |
+|------------|------------------------|----------------------|
+| Required<br />Trace to LangSmith SaaS. | Optional<br />Disable tracing or trace to LangSmith SaaS. | Optional<br />Disable tracing, trace to LangSmith SaaS, or trace to Self-Hosted LangSmith. |
+
+### Telemetry
+
+Agent Server 会自动上报 telemetry metadata，用于计费。不同 deployment 方式下的行为如下表所示。
+
+| Cloud | Hybrid | Self-Hosted |
+|------------|------------------------|----------------------|
+| Telemetry sent to LangSmith SaaS. | Telemetry sent to LangSmith SaaS. | Self-reported usage (audit) for air-gapped license key.<br />Telemetry sent to LangSmith SaaS for LangSmith License Key. |
+
+### Licensing
+
+Agent Server 会自动执行 license key 校验。不同 deployment 方式下的行为如下表所示。
+
+| Cloud | Hybrid | Self-Hosted |
+|------------|------------------------|----------------------|
+| LangSmith API Key validated against LangSmith SaaS. | LangSmith API Key validated against LangSmith SaaS. | Air-gapped license key or Platform License Key validated against LangSmith SaaS. |

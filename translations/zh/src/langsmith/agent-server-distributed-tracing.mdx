@@ -1,0 +1,130 @@
+---
+title: 使用 Agent Server 进行分布式追踪
+sidebarTitle: 分布式追踪
+description: 当你通过 RemoteGraph 或 SDK 从其他服务调用已部署的 Agent Server 时，统一这些 trace。
+---
+
+当你从其他服务调用已部署的 [Agent Server](/langsmith/agent-server) 时，可以传播 trace context，让整个请求在 LangSmith 中显示为一条统一的 trace。这依赖 LangSmith 的[分布式追踪](/langsmith/distributed-tracing)能力，通过 HTTP headers 传播上下文。
+
+## 工作原理
+
+分布式追踪会使用 context propagation headers，把跨服务的 run 关联起来：
+
+1. **客户端**从当前 run 推断 trace context，并通过 HTTP headers 发送出去。
+2. **服务端**读取这些 headers，并把它们作为 `langsmith-trace` 和 `langsmith-project` configurable values 添加到 run 的 config 和 metadata 中。之后，你可以在 agent 被使用时用它们为指定 run 设置 tracing context。
+
+使用的 headers 如下：
+- `langsmith-trace`：包含 trace 的 dotted order。
+- `baggage`：指定 LangSmith project，以及其他可选的 tags 和 metadata。
+
+如果要启用分布式追踪，客户端和服务端都需要显式开启。
+
+## 配置服务端
+
+如果要接收分布式 trace context，你的 graph 必须从 config 中读取 trace headers，并设置 tracing context。这些 headers 会通过 `configurable` 字段传入，字段名为 `langsmith-trace` 和 `langsmith-project`。
+
+<Warning>
+分布式追踪 headers（`langsmith-trace`、`baggage`）会作为可信 tracing context 使用。只有当你的部署是被可信的内部服务调用时，才应配置服务端应用入站 trace context。如果你的 Agent Server 直接接收不可信第三方或公共互联网请求，请不要把这些 headers 传播到 tracing context 中，而应在 gateway 或 proxy 中将其剥离。信任来自外部调用方的 `baggage`，会让对方影响你的 runs 如何被记录。
+</Warning>
+
+```python
+import contextlib
+import langsmith as ls
+from langgraph.graph import StateGraph, MessagesState
+
+# Define your graph
+builder = StateGraph(MessagesState)
+# ... add nodes and edges ...
+my_graph = builder.compile()
+
+@contextlib.contextmanager
+async def graph(config):
+    configurable = config.get("configurable", {})
+    parent_trace = configurable.get("langsmith-trace")
+    parent_project = configurable.get("langsmith-project")
+    # If you want to also include metadata and tags from the client
+    metadata = configurable.get("langsmith-metadata")
+    tags = configurable.get("langsmith-tags")
+    with ls.tracing_context(parent=parent_trace, project_name=parent_project, metadata=metadata, tags=tags):
+        yield my_graph
+```
+
+在你的 `langgraph.json` 中导出这个 `graph` function：
+
+```json
+{
+  "graphs": {
+    "agent": "./src/agent.py:graph"
+  }
+}
+```
+
+## 从客户端连接
+
+<Tabs>
+<Tab title="RemoteGraph">
+
+初始化 @[`RemoteGraph`] 时，将 `distributed_tracing=True`。这样会在所有请求上自动传播 trace headers。
+
+```python
+from langgraph.graph import StateGraph
+from langgraph.pregel.remote import RemoteGraph
+
+remote_graph = RemoteGraph(
+    "agent",
+    url="<DEPLOYMENT_URL>",
+    distributed_tracing=True,  # Enable trace propagation
+)
+
+def subgraph_node(query: str):
+    # Trace context is automatically propagated
+    return remote_graph.invoke({
+        "messages": [{"role": "user", "content": query}]
+    })['messages'][-1]['content']
+
+# The RemoteGraph is called in the context of some on going work.
+# This could be a parent LangGraph agent, code traced with `@ls.traceable`,
+# or any other instrumented code.
+graph = (
+        StateGraph(str)
+            .add_node(subgraph_node)
+            .add_edge("__start__", "subgraph_node")
+            .compile()
+)
+# The remote graph's execution will appear as a child of this trace
+result = graph.invoke("What's the weather in SF?")
+```
+
+</Tab>
+<Tab title="SDK">
+
+如果你直接使用 [LangGraph SDK](/langsmith/reference)，可以通过 `run_tree.to_headers()` 手动传播 trace headers：
+
+```python
+from langgraph_sdk import get_client
+import langsmith as ls
+
+client = get_client(url="<DEPLOYMENT_URL>")
+
+with ls.trace("call_remote_agent", inputs={"query": query}) as rt:
+    headers = rt.to_headers()
+    async for chunk in client.runs.stream(
+        thread_id=None,
+        assistant_id="agent",
+        input={"messages": [{"role": "user", "content": query}]},
+        stream_mode="values",
+        headers=headers,  # Pass trace headers
+    ):
+        pass
+    return chunk
+
+result = await call_remote_agent("What's the weather in SF?")
+```
+
+</Tab>
+</Tabs>
+
+## 相关内容
+
+- [Distributed tracing](/langsmith/distributed-tracing)：分布式追踪的一般概念与模式
+- [RemoteGraph](/langsmith/use-remote-graph)：使用 RemoteGraph 与部署交互的完整指南

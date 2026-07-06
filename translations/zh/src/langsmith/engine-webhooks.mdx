@@ -1,0 +1,313 @@
+---
+title: LangSmith Engine webhook 事件
+sidebarTitle: Engine webhook 事件
+description: 参考 LangSmith Engine 在创建 issue 或将新 trace 关联到已有 issue 时发送的 webhook 事件。
+---
+
+把 LangSmith 检测到的 agent 问题转发到你的 incident management、paging 或聊天工具中。[LangSmith Engine](/langsmith/engine) 会在创建新 issue 时，或者在它把新的 trace 关联到一个已打开的 issue 时，向你的 endpoint 发送 webhook 事件。
+
+要配置 webhook 订阅，请在某个 tracing project 的 **Engine** 标签页中打开 **Engine Settings** 面板。详见[配置 LangSmith Engine](/langsmith/engine#configure-langsmith-engine)。
+
+<Note>
+一个 destination 只能投递到 webhook URL 或 **Slack channel** 其中之一。两者都使用本页描述的同一套[event types](#event-types)和[最低优先级过滤](#severity-filtering)。Slack destination 会通过 LangSmith 托管的 Slack app 发消息，而不是发送下方的 [JSON payload](#event-envelope)，因此[signing secret](#signing-secret) 和 [custom headers](#custom-headers) 不适用。
+
+如果你要配置 Slack 投递，请参阅[通知 Slack channel](/langsmith/engine#notify-a-slack-channel)。本页剩余内容仅适用于 **webhook URL** destinations。
+</Note>
+
+## 投递方式
+
+LangSmith 会向你的 webhook URL 发起一个带 JSON body 的 `POST` 请求。请求使用 `Content-Type: application/json`，并包含你在订阅上附加的任何自定义 headers。
+
+| Property | Value |
+| --- | --- |
+| Method | `POST` |
+| Body | JSON，格式见下方[通用 envelope](#event-envelope) |
+| Scheme | 支持 `http://` 和 `https://`，强烈推荐使用 `https://` |
+| Signature | `X-LangSmith-Signature` header，使用该订阅的 signing secret 签名 |
+| Timeout | 每次尝试 20 秒 |
+| Attempts | 遇到传输错误、HTTP `408`、`425`、`429`，以及任意 HTTP `5xx` 时，最多尝试 4 次（首次 1 次，加 3 次指数退避重试）。其他 `4xx` 会被视为永久失败，不会重试 |
+| Response | 只根据状态码判断成功与否，忽略响应体 |
+
+<Note>
+重试时会发送逐字节完全一致的 payload，包括相同的 `id`。请基于 `id` 做去重，避免重试造成下游重复处理。
+</Note>
+
+### Custom headers
+
+你可以为每个订阅附加任意 headers，例如 `Authorization: Bearer …`，以便在你的 endpoint 上进行鉴权。`Content-Type` 始终由 LangSmith 设置，不能被覆盖。
+
+### Signing secret
+
+每个订阅都有一个 signing secret。LangSmith 会用这个 secret 对 webhook 原始请求体签名，并把结果放到 `X-LangSmith-Signature` header 中。
+
+这个 header 的值格式如下：
+
+```text
+sha256=<hex-encoded HMAC-SHA256 digest>
+```
+
+在解析或处理 payload 之前，请先验证签名。HMAC 的输入必须是**原始请求体字节**，HMAC key 则是该订阅的 signing secret。不要在校验之前先解析 JSON 再重新序列化。
+
+<CodeGroup>
+
+```python Python
+import hashlib
+import hmac
+from typing import Optional
+
+
+def verify_langsmith_signature(
+    *,
+    body: bytes,
+    signing_secret: str,
+    signature_header: Optional[str],
+) -> bool:
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+
+    expected = "sha256=" + hmac.new(
+        signing_secret.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature_header)
+```
+
+```typescript TypeScript
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+export function verifyLangSmithSignature({
+  body,
+  signingSecret,
+  signatureHeader,
+}: {
+  body: Buffer;
+  signingSecret: string;
+  signatureHeader: string | undefined;
+}) {
+  if (!signatureHeader?.startsWith("sha256=")) {
+    return false;
+  }
+
+  const expected = `sha256=${createHmac("sha256", signingSecret)
+    .update(body)
+    .digest("hex")}`;
+
+  const expectedBytes = Buffer.from(expected);
+  const actualBytes = Buffer.from(signatureHeader);
+
+  return (
+    expectedBytes.length === actualBytes.length &&
+    timingSafeEqual(expectedBytes, actualBytes)
+  );
+}
+```
+
+</CodeGroup>
+
+### Roll 一个 signing secret
+
+当 signing secret 可能已经泄露，或你的组织凭据轮换策略要求更换 secret 时，就应该 roll 一个新 secret。
+
+要 roll secret，请在 **Engine Settings** 中打开对应订阅那一行，点击 **Roll signing secret** 并确认。LangSmith 会生成新的 signing secret，并立即用于后续 webhook 投递。旧 secret 会在 roll 完成后立刻停止使用。
+
+Roll 完成后，请记得把所有验证 `X-LangSmith-Signature` 的消费端同步更新为新的值。
+
+### 严重级别过滤
+
+每个订阅都有一个 `severity_threshold`，取值范围为 `0` 到 `3`。对于 issue 类事件，只有当 issue 的 `severity` 小于等于该阈值时，事件才会被投递。数值越小表示越紧急。
+
+| Severity | Meaning |
+| --- | --- |
+| `0` | Urgent |
+| `1` | High |
+| `2` | Medium |
+| `3` | Low |
+
+例如，当某个订阅的 `severity_threshold: 1` 时，它只会收到 `URGENT`（0）和 `HIGH`（1）级别的问题事件。
+
+严重级别阈值不适用于 [`issue.agent_run.failed`](#issue-agent_run-failed)，因为 run 失败事件是围绕 Engine session，而不是某个具体 issue 生成的。
+
+### 事件类型过滤
+
+每个订阅都可以指定它希望接收哪些[event types](#event-types)。如果创建订阅时没有显式指定，默认会使用 `["issue.created"]`。
+
+## Event envelope
+
+发送到你 endpoint 的每个事件，都使用同样的外层 JSON 结构。
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | UUID | 该次投递的唯一标识。重试时保持不变。请用它做去重。 |
+| `type` | string | 事件类型。可为 [`issue.created`](#issue-created)、[`issue.trace.added`](#issue-trace-added) 或 [`issue.agent_run.failed`](#issue-agent_run-failed)。 |
+| `created` | integer | 事件入队时的 Unix 秒级时间戳（UTC）。 |
+| `request_id` | UUID | 同一个上游动作触发的所有事件都会共享这个 ID。详见[批量合并](#batch-coalescing)。 |
+| `data` | object | 事件 payload。始终包含 `data.object`。只有在 [`issue.trace.added`](#issue-trace-added) 事件上才会额外包含 [`data.trace`](#data-trace)。 |
+
+### Issue `data.object`
+
+对于 [`issue.created`](#issue-created) 和 [`issue.trace.added`](#issue-trace-added)，`data.object` 是该 issue 的一个快照。你可以把它视为该事件生成时刻 issue 的权威状态。
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | UUID | Issue ID。 |
+| `name` | string | Issue 的短标题。 |
+| `description` | string | 面向人的问题描述。 |
+| `severity` | integer | 从 `0`（urgent）到 `3`（low）。详见[严重级别过滤](#severity-filtering)。 |
+| `tenant_id` | UUID | 该 issue 所属 workspace。 |
+| `tenant_name` | string | Workspace 展示名。 |
+| `session_id` | UUID | 该 issue 所属 tracing project。 |
+| `session_name` | string | Tracing project 名称。 |
+| `url` | string | 在 LangSmith UI 中直达该 issue 的深链接。 |
+
+### Run failure `data.object`
+
+对于 [`issue.agent_run.failed`](#issue-agent_run-failed)，`data.object` 描述的是失败的 Engine run。
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `tenant_id` | UUID | 该 run 所属 workspace。 |
+| `tenant_name` | string | Workspace 展示名。 |
+| `session_id` | UUID | 该 run 所属 tracing project。 |
+| `session_name` | string | Tracing project 名称。 |
+| `url` | string | 在 LangSmith UI 中直达该 project 的深链接。 |
+| `thread_id` | string | Engine thread ID。 |
+| `run_id` | string | Engine run ID；不可用时会省略。 |
+| `status` | string | 最终 run 状态。 |
+| `error_message` | string | 失败 run 的错误文本；不可用时会省略。 |
+| `occurred_at` | string | 失败发生时的 RFC 3339 时间戳。 |
+
+### `data.trace`
+
+`data.trace` 只会出现在 [`issue.trace.added`](#issue-trace-added) 事件中。
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `run_id` | UUID | 被关联到 issue 的 run ID。 |
+| `trace_id` | UUID | 包含该 run 的 trace ID。 |
+| `start_time` | string | 该 run 开始时间的 RFC 3339 时间戳。 |
+| `comment` | string \| null | 关联该 trace 时记录的可选备注。若为空则省略。 |
+
+### 批量合并
+
+单个上游动作可能会产生多个 webhook 事件。例如，当 Engine 新建一个 issue 并为它附加 5 条 trace 时，你会收到 1 个 [`issue.created`](#issue-created) 事件和 5 个 [`issue.trace.added`](#issue-trace-added) 事件，它们共享同一个 `request_id`。你可以使用 `request_id` 在下游把它们归并为一条通知。
+
+## Event types
+
+下面列出的事件类型是 LangSmith Engine 当前会发送的完整集合。未来可能还会新增其他类型，因此 handler 遇到未知 `type` 时，应直接忽略，而不是报错失败。
+
+### `issue.created`
+
+当 LangSmith Engine 创建新 issue 时发送。`data.trace` 不会出现。
+
+```json
+{
+  "id": "b91c1f0e-7c4a-4f53-9d3e-9f1c8e7a2b10",
+  "type": "issue.created",
+  "created": 1747238400,
+  "request_id": "0d2f4f6a-2a3a-4b6e-9b87-5d5b6e8c9a01",
+  "data": {
+    "object": {
+      "id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
+      "name": "Tool selection inconsistency",
+      "description": "Agent repeatedly calls the search tool with identical arguments before terminating.",
+      "severity": 1,
+      "tenant_id": "11111111-2222-3333-4444-555555555555",
+      "tenant_name": "Acme Workspace",
+      "session_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+      "session_name": "prod-api",
+      "url": "https://smith.langchain.com/o/11111111-2222-3333-4444-555555555555/projects/p/66666666-7777-8888-9999-aaaaaaaaaaaa?tab=5&issue=9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d"
+    }
+  }
+}
+```
+
+### `issue.trace.added`
+
+当一条新的 trace 被关联到已有 issue 时发送。`data.trace` 会描述这条新关联的 trace。
+
+```json
+{
+  "id": "c02e3a4b-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+  "type": "issue.trace.added",
+  "created": 1747238410,
+  "request_id": "0d2f4f6a-2a3a-4b6e-9b87-5d5b6e8c9a01",
+  "data": {
+    "object": {
+      "id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
+      "name": "Tool selection inconsistency",
+      "description": "Agent repeatedly calls the search tool with identical arguments before terminating.",
+      "severity": 1,
+      "tenant_id": "11111111-2222-3333-4444-555555555555",
+      "tenant_name": "Acme Workspace",
+      "session_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+      "session_name": "prod-api",
+      "url": "https://smith.langchain.com/o/11111111-2222-3333-4444-555555555555/projects/p/66666666-7777-8888-9999-aaaaaaaaaaaa?tab=5&issue=9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d"
+    },
+    "trace": {
+      "run_id": "f1e2d3c4-b5a6-9788-6655-44332211ffee",
+      "trace_id": "abcdefab-1234-5678-9abc-def012345678",
+      "start_time": "2026-05-14T12:30:00Z",
+      "comment": "Reproduces the same tool-loop pattern."
+    }
+  }
+}
+```
+
+### `issue.agent_run.failed`
+
+当 LangSmith Engine 无法完成某次 run 时发送。这个事件是以 session 为范围的，因此既不会包含 `data.trace`，也不受严重级别过滤控制。
+
+```json
+{
+  "id": "4d0e8db2-81e6-4491-b8e5-b13a8f5afc0d",
+  "type": "issue.agent_run.failed",
+  "created": 1747238500,
+  "request_id": "f6bbd48a-0386-403d-9344-31051264b45f",
+  "data": {
+    "object": {
+      "tenant_id": "11111111-2222-3333-4444-555555555555",
+      "tenant_name": "Acme Workspace",
+      "session_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+      "session_name": "prod-api",
+      "url": "https://smith.langchain.com/o/11111111-2222-3333-4444-555555555555/projects/p/66666666-7777-8888-9999-aaaaaaaaaaaa",
+      "thread_id": "thread-123",
+      "run_id": "run-456",
+      "status": "error",
+      "error_message": "RuntimeError: missing API key",
+      "occurred_at": "2026-05-14T12:45:00Z"
+    }
+  }
+}
+```
+
+## 测试你的 endpoint
+
+在把真实订阅指向你的 endpoint 之前，请先发送一份示例 payload，确认它能在 20 秒超时前正确接收并返回确认：
+
+```bash
+curl -X POST https://your-endpoint.example.com/webhook \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $WEBHOOK_SECRET" \
+  -d @sample-issue-created.json
+```
+
+你可以把 [`issue.created`](#issue-created) 中的示例 body 存成 `sample-issue-created.json`。请验证：
+
+- 自定义 `Authorization` header 是否正确到达，并与订阅中配置的 secret 一致。
+- handler 是否按 `id` 做持久化，从而对重试去重。
+- handler 是否会先返回 `2xx`，再启动较慢的下游工作。
+
+## 安全
+
+- 创建订阅时以及实际投递时，LangSmith 都会验证 webhook URL。在 SaaS 环境中，私有网段和 metadata IP 范围会被拦截。虽然支持 `http://` 和 `https://`，但请使用 `https://`，避免 payload 和任何自定义 headers 明文传输。
+- LangSmith 会使用订阅的 signing secret 对 webhook body 签名。处理 payload 前请先验证 `X-LangSmith-Signature`。
+- 你也可以在订阅上设置自定义 headers，例如 `Authorization: Bearer …`，用于路由或在 endpoint 上做额外鉴权。
+- 请基于事件 `id` 做去重，避免 webhook 重试造成重复通知。
+
+## 最佳实践
+
+- **快速确认。** 一旦你已经持久化事件，就立刻返回 `2xx`。把慢操作，例如 fan-out、paging、下游 API 调用，放到队列中异步处理，确保 handler 不会超过 20 秒超时。
+- **容忍未知事件类型。** 对 handler 不认识的 `type` 值直接忽略。未来可能会无通知新增事件类型。
+- **容忍新增字段。** 使用宽松 schema 解析 payload。已有事件类型未来也可能无通知新增字段。

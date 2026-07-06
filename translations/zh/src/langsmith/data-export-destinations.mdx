@@ -1,0 +1,370 @@
+---
+title: 管理 bulk export destinations
+description: 为 LangSmith bulk exports 配置和管理兼容 S3 的导出 destinations。
+---
+
+<Note>
+**适用于 self-hosted、GCP EU、GCP APAC 和 AWS US SaaS**
+
+如果你使用的是 self-hosted、GCP EU（`eu.api.smith.langchain.com`）、GCP APAC（`apac.api.smith.langchain.com`）或 AWS US（`aws.api.smith.langchain.com`），请将下面请求中的 LangSmith URL 替换为对应地址。
+</Note>
+
+destination 是一个具名配置，用来告诉 LangSmith 应该把导出的 trace 数据写到哪里。你只需要[创建一次 destination](/langsmith/data-export#1-create-a-destination)，之后在[创建 export jobs](/langsmith/data-export#2-create-an-export-job)时通过 ID 引用即可。LangSmith 当前支持 S3 以及所有兼容 S3 的 bucket（例如 GCS 或 MinIO）作为 destination。导出的数据使用列式 [Parquet](https://parquet.apache.org/docs/overview/) 格式，字段与 [Run data format](/langsmith/run-data-format) 对应。
+
+本页包含：
+
+- 配置 destination 所需的[配置字段](#configuration-fields)。
+- AWS S3 与 GCS 所需的 bucket [权限](#permissions-required)。
+- 如何通过 API [创建 destination](#create-a-destination)，包括 provider 专属示例和凭证选项。
+- 如何在不重建 destination 的前提下[轮换 destination 凭证](#rotate-destination-credentials)。
+- 如何[排查 destination 错误](#debug-destination-errors)。
+
+## 配置字段
+
+配置一个 destination 需要以下信息：
+
+- **Bucket Name**：S3 bucket 名称，导出数据会写入其中。
+- **Prefix**：bucket 中的根路径前缀，导出的数据会写到这里。
+- **S3 Region**：bucket 所在区域，对于 AWS S3 bucket 必填。
+- **Endpoint URL**：S3 bucket 的 endpoint URL，对于兼容 S3 API 的 bucket 必填。
+- **Access Key**：S3 bucket 的 access key。
+- **Secret Key**：S3 bucket 的 secret key。
+- **Include Bucket in Prefix**（可选）：是否把 bucket 名也作为路径前缀的一部分。默认值为 `true`。当你使用 virtual-hosted style endpoints，且 bucket 名已经包含在 endpoint URL 中时，请设为 `false`。
+- **S3 Config Options**（`config_kwargs_s3`，可选）：传递给 botocore 的高级 S3 addressing style 与请求设置。最常见用途是为要求 virtual-hosted 或 path-style 请求的兼容 S3 服务设置 `addressing_style`：
+  - `"virtual"`：bucket 名作为 hostname 的一部分（例如 `bucket.endpoint/key`）。某些兼容 S3 服务（如 Volcengine TOS）要求使用该模式。
+  - `"path"`：bucket 名作为 URL path 的一部分（例如 `endpoint/bucket/key`）。
+  - `"auto"`（默认）：由 boto3 自行决定。
+
+我们支持任意兼容 S3 的 bucket。对于 GCS、MinIO 等非 AWS buckets，你需要显式提供 endpoint URL。
+
+## 所需权限
+
+`backend` 与 `queue` 两个服务都需要 destination bucket 的写权限：
+
+- `backend` 服务会在创建 export destination 时尝试向 bucket 写入测试文件。如果它还具备删除权限，则会删除该测试文件（删除权限是可选的）。
+- `queue` 服务负责执行 bulk export，并把文件上传到 bucket。
+
+### AWS S3 权限
+
+最小 AWS S3 权限策略依赖以下权限：
+
+- `s3:PutObject`（必需）：允许向 bucket 写入 Parquet 文件。
+- `s3:DeleteObject`（可选）：在 destination 创建期间清理测试文件。如果缺少该权限，测试文件会保留在 `/tmp` 目录下。
+- `s3:GetObject`（可选但推荐）：写入后用于校验文件大小。
+- `s3:AbortMultipartUpload`（可选但推荐）：避免残留 multipart uploads。
+
+最小 IAM policy 示例：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+      ]
+    }
+  ]
+}
+```
+
+包含更多推荐权限的 IAM policy 示例：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:GetObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+      ]
+    }
+  ]
+}
+```
+
+### Google Cloud Storage (GCS) 权限
+
+当你通过兼容 S3 的 XML API 使用 GCS 时，需要以下 IAM 权限：
+
+- `storage.objects.create`（必需）：允许向 bucket 写入文件。
+- `storage.objects.delete`（可选）：在 destination 创建时清理测试文件。如果缺少该权限，测试文件会保留在 `/tmp` 目录下。
+- `storage.objects.get`（可选但推荐）：写入后用于校验文件大小。
+
+这些权限可以通过预定义的 "Storage Object Admin" 角色，或自定义角色授予。
+
+## 创建 destination
+
+下面的示例演示如何使用 cURL 创建 destination。请将占位符替换为你自己的实际配置。
+请注意，凭证会以加密形式安全存储在我们的系统中。
+
+```bash
+curl --request POST \
+  --url 'https://api.smith.langchain.com/api/v1/bulk-exports/destinations' \
+  --header 'Content-Type: application/json' \
+  --header 'X-API-Key: YOUR_API_KEY' \
+  --header 'X-Tenant-Id: YOUR_WORKSPACE_ID' \
+  --data '{
+    "destination_type": "s3",
+    "display_name": "My S3 Destination",
+    "config": {
+      "bucket_name": "your-s3-bucket-name",
+      "prefix": "root_folder_prefix",
+      "region": "your aws s3 region",
+      "endpoint_url": "your endpoint url for s3 compatible buckets",
+      "include_bucket_in_prefix": true // defaults to true, can be omitted
+    },
+    "credentials": {
+      "access_key_id": "YOUR_S3_ACCESS_KEY_ID",
+      "secret_access_key": "YOUR_S3_SECRET_ACCESS_KEY"
+    }
+  }'
+```
+
+请使用返回的 `id` 在后续 bulk export 操作中引用这个 destination。
+
+**如果你在创建 destination 时收到错误，请参阅[排查 destination 错误](#debug-destination-errors)了解如何调试。**
+
+### 凭证配置
+
+<Note>**Requires LangSmith Helm version >= `0.10.34` (application version >= `0.10.91`)**</Note>
+
+除了静态 `access_key_id` 和 `secret_access_key` 之外，我们还支持以下凭证格式：
+
+- 如果你要使用包含 AWS session token 的[临时凭证](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp_use-resources.html)，请在创建 bulk export destination 时额外提供 `credentials.session_token` key。
+- （仅限 self-hosted）：如果你想使用基于环境的凭证，例如 [AWS IAM Roles for Service Accounts](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html)（IRSA），在创建 bulk export destination 时可以省略 `credentials` key。
+  在这种情况下，系统会按照 [Boto3 标准凭证查找顺序](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/configuration.html#credentials) 自动查找凭证。
+
+### AWS S3 bucket
+
+对于 AWS S3，你可以省略 `endpoint_url`，只需提供与 bucket 区域一致的 region。
+
+```bash
+curl --request POST \
+  --url 'https://api.smith.langchain.com/api/v1/bulk-exports/destinations' \
+  --header 'Content-Type: application/json' \
+  --header 'X-API-Key: YOUR_API_KEY' \
+  --header 'X-Tenant-Id: YOUR_WORKSPACE_ID' \
+  --data '{
+    "destination_type": "s3",
+    "display_name": "My AWS S3 Destination",
+    "config": {
+      "bucket_name": "my_bucket",
+      "prefix": "data_exports",
+      "region": "us-east-1"
+    },
+    "credentials": {
+      "access_key_id": "YOUR_S3_ACCESS_KEY_ID",
+      "secret_access_key": "YOUR_S3_SECRET_ACCESS_KEY"
+    }
+  }'
+```
+
+### Google GCS XML S3 compatible bucket
+
+使用 Google GCS bucket 时，你需要使用兼容 S3 的 XML API，并提供 `endpoint_url`，
+通常是 `https://storage.googleapis.com`。
+下面是使用 GCS XML API（兼容 S3）时的 API 请求示例：
+
+```bash
+curl --request POST \
+  --url 'https://api.smith.langchain.com/api/v1/bulk-exports/destinations' \
+  --header 'Content-Type: application/json' \
+  --header 'X-API-Key: YOUR_API_KEY' \
+  --header 'X-Tenant-Id: YOUR_WORKSPACE_ID' \
+  --data '{
+    "destination_type": "s3",
+    "display_name": "My GCS Destination",
+    "config": {
+      "bucket_name": "my_bucket",
+      "prefix": "data_exports",
+      "endpoint_url": "https://storage.googleapis.com"
+      "include_bucket_in_prefix": true // defaults to true, can be omitted
+    },
+    "credentials": {
+      "access_key_id": "YOUR_S3_ACCESS_KEY_ID",
+      "secret_access_key": "YOUR_S3_SECRET_ACCESS_KEY"
+    }
+  }'
+```
+
+更多信息请参阅 [Google documentation](https://cloud.google.com/storage/docs/interoperability#xml_api)
+
+### 使用 virtual-hosted style addressing 的兼容 S3 bucket
+
+某些兼容 S3 的服务（例如 Volcengine TOS）要求使用 virtual-hosted style addressing，也就是 bucket 名放在 hostname 中，而不是 URL path 中。你可以通过 `config_kwargs_s3` 配置 `addressing_style: "virtual"` 来启用它：
+
+```bash
+curl --request POST \
+  --url 'https://api.smith.langchain.com/api/v1/bulk-exports/destinations' \
+  --header 'Content-Type: application/json' \
+  --header 'X-API-Key: YOUR_API_KEY' \
+  --header 'X-Tenant-Id: YOUR_WORKSPACE_ID' \
+  --data '{
+    "destination_type": "s3",
+    "display_name": "My Volcengine TOS Destination",
+    "config": {
+      "bucket_name": "my_bucket",
+      "prefix": "data_exports",
+      "endpoint_url": "https://tos-s3-cn-beijing.volces.com",
+      "config_kwargs_s3": {
+        "addressing_style": "virtual"
+      }
+    },
+    "credentials": {
+      "access_key_id": "YOUR_ACCESS_KEY_ID",
+      "secret_access_key": "YOUR_SECRET_ACCESS_KEY"
+    }
+  }'
+```
+
+### 使用 virtual-hosted style endpoint 的兼容 S3 bucket
+
+如果你的 endpoint URL 本身已经包含 bucket 名（virtual-hosted style），请将 `include_bucket_in_prefix` 设为 `false`，以避免在路径中重复拼接 bucket 名：
+
+```bash
+curl --request POST \
+  --url 'https://api.smith.langchain.com/api/v1/bulk-exports/destinations' \
+  --header 'Content-Type: application/json' \
+  --header 'X-API-Key: YOUR_API_KEY' \
+  --header 'X-Tenant-Id: YOUR_WORKSPACE_ID' \
+  --data '{
+    "destination_type": "s3",
+    "display_name": "My Virtual-Hosted Destination",
+    "config": {
+      "bucket_name": "my_bucket",
+      "prefix": "data_exports",
+      "endpoint_url": "https://my_bucket.s3.us-east-1.amazonaws.com",
+      "include_bucket_in_prefix": false
+    },
+    "credentials": {
+      "access_key_id": "YOUR_S3_ACCESS_KEY_ID",
+      "secret_access_key": "YOUR_S3_SECRET_ACCESS_KEY"
+    }
+  }'
+```
+
+## 轮换 destination 凭证
+
+使用 `PATCH /api/v1/bulk-exports/destinations/{destination_id}` 可以更新已有 destination 的凭证。这样你就可以在不重建 destination 以及其关联 bulk exports 的情况下，完成凭证轮换或替换。destination 配置本身（bucket、prefix、region、endpoint 等）不会变，只有凭证会被替换。
+
+### 凭证轮换行为
+
+切换并不是瞬时完成的：
+
+- **新启动的 bulk export runs** 会在 PATCH 完成后立即使用更新后的凭证。
+- **已经在运行中的 bulk export runs** 会继续使用旧凭证，直到它们结束。
+- **两套凭证会在过渡期内同时有效**。这个窗口可能持续到单个 bulk export run 的最大运行时长结束。
+
+因此，请提前规划好轮换过程：旧凭证必须保持有效，直到所有 in-flight runs 都已完成。
+
+### 请求
+
+```bash
+curl --request PATCH \
+  --url 'https://api.smith.langchain.com/api/v1/bulk-exports/destinations/{destination_id}' \
+  --header 'Content-Type: application/json' \
+  --header 'X-API-Key: YOUR_API_KEY' \
+  --header 'X-Tenant-Id: YOUR_WORKSPACE_ID' \
+  --data '{
+    "credentials": {
+      "access_key_id": "YOUR_NEW_ACCESS_KEY_ID",
+      "secret_access_key": "YOUR_NEW_SECRET_ACCESS_KEY"
+    }
+  }'
+```
+
+`session_token` 字段是可选的，适用于[临时凭证](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp_use-resources.html)。
+
+[**Required permission**](/langsmith/organization-workspace-operations)：`bulk-exports:manage`（或历史上同样授予该权限的 `workspaces:manage`）。
+
+在保存新凭证之前，LangSmith 会用现有 destination 配置对 bucket 执行一次测试写入，以验证凭证是否有效。如果凭证没有足够写权限，请求会返回 `400`。此时请参阅[排查 destination 错误](#debug-destination-errors)。
+
+### 响应
+
+返回更新后的 destination 对象。凭证值本身永远不会返回，响应中只会在 `credentials_keys` 下列出凭证字段名。
+
+```json
+{
+  "id": "destination-uuid",
+  "tenant_id": "tenant-uuid",
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-06-01T00:00:00Z",
+  "credentials_keys": ["access_key_id", "secret_access_key"]
+}
+```
+
+### 轮换检查清单
+
+1. 在你的云服务商中创建新的凭证，并确保它们对 destination bucket 与 prefix 拥有写权限。
+1. 调用 PATCH endpoint 提交新凭证。LangSmith 会在保存前先完成校验。
+1. 保留旧凭证，直到所有 in-flight bulk export runs 完成（最长可达[单 run 最大时长](/langsmith/data-export-monitor#automatic-retry-behavior)）。
+1. 在确认没有 runs 仍在使用旧凭证后，再吊销旧凭证。
+
+## 排查 destination 错误
+
+destinations API endpoint 会验证 destination 与 credentials 是否有效，以及 bucket 是否具备写权限。
+
+如果你收到了错误，并想进一步排查，可以使用 [AWS CLI](https://aws.amazon.com/cli/)
+测试与 bucket 的连通性。你应该能够使用与上面 destinations API 相同的参数，通过 CLI 成功写入文件。
+
+**AWS S3:**
+
+```bash
+aws configure
+
+# set the same access key credentials and region as you used for the destination
+> AWS Access Key ID: <access_key_id>
+> AWS Secret Access Key: <secret_access_key>
+> Default region name [us-east-1]: <region>
+
+# List buckets
+aws s3 ls /
+
+# test write permissions
+touch ./test.txt
+aws s3 cp ./test.txt s3://<bucket-name>/tmp/test.txt
+```
+
+**GCS Compatible Buckets:**
+
+你需要通过 `--endpoint-url` 参数提供 endpoint_url。
+对于 GCS，`endpoint_url` 通常是 `https://storage.googleapis.com`：
+
+```bash
+aws configure
+
+# set the same access key credentials and region as you used for the destination
+> AWS Access Key ID: <access_key_id>
+> AWS Secret Access Key: <secret_access_key>
+> Default region name [us-east-1]: <region>
+
+# List buckets
+aws s3 --endpoint-url=<endpoint_url> ls /
+
+# test write permissions
+touch ./test.txt
+aws s3 --endpoint-url=<endpoint_url> cp ./test.txt s3://<bucket-name>/tmp/test.txt
+```
+
+### 常见错误
+
+以下是一些常见错误：
+
+| Error                              | Description                                                                                                                                                                                                                                                                                            |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Access denied                      | blob store 凭证或 bucket 无效。当提供的 access key 与 secret key 组合没有足够权限访问指定 bucket 或执行所需操作时，就会出现该错误。                                                                |
+| Bucket is not valid                | 指定的 blob store bucket 无效。当 bucket 不存在，或你没有足够权限向 bucket 写入时，会抛出该错误。                                                                                                                                        |
+| Key ID you provided does not exist | 提供的 blob store 凭证无效。当用于认证的 access key ID 不是一个有效 key 时，就会出现该错误。                                                                                                                                                                |
+| Invalid endpoint                   | 提供的 endpoint_url 无效。当指定 endpoint 不是合法 endpoint 时，会出现该错误。仅支持兼容 S3 的 endpoint，例如 GCS 对应的 `https://storage.googleapis.com`、MinIO 对应的 `https://play.min.io` 等。如果使用 AWS，则应省略 endpoint_url。 |
+| InvalidBucketName                  | 兼容 S3 的服务因 addressing style 不匹配而拒绝请求。某些服务要求使用 virtual-hosted style addressing。请在 destination config 中设置 `config_kwargs_s3: {"addressing_style": "virtual"}` 以解决该问题。 |

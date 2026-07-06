@@ -1,0 +1,114 @@
+---
+title: 数据集 transformations
+sidebarTitle: 数据集 transformations
+---
+
+LangSmith 允许你为数据集 schema 中的字段附加 transformations。这些 transformations 会在数据被加入数据集之前生效，无论数据来源是 UI、API，还是 run rules。
+
+结合 [LangSmith 预构建的 JSON schema types](/langsmith/dataset-json-types)，你可以在将数据保存到数据集之前，轻松完成预处理。
+
+## Transformation 类型
+
+| Transformation Type          | Target Types                                                              | Functionality                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ---------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `remove_system_messages`     | `Array[Message]`                                                           | 过滤消息列表，移除所有 system messages。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `convert_to_openai_message` | Message `Array[Message]`                                                   | 使用 langchain 的 [`convert_to_openai_messages`](https://reference.langchain.com/python/langchain_core/utils/#langchain_core.utils.function_calling.convert_to_openai_messages)，把任何传入数据从 LangChain 内部序列化格式转换为 OpenAI 标准消息格式。如果目标字段被标记为 required，而在输入时没有找到匹配消息，系统会尝试从一些已知的 LangSmith tracing 格式中提取消息（或消息列表），例如任意被追踪的 LangChain @[`BaseChatModel`] run，或来自 [LangSmith OpenAI wrapper](/langsmith/annotate-code#use-%40traceable-%2F-traceable) 的 traced run，并移除原本包含该消息的 key。 |
+| `convert_to_openai_tool`    | `Array[Tool]` Only available on top level fields in the inputs dictionary. | 使用 langchain 的 @[`convert_to_openai_tool`]，把传入数据转换为 OpenAI 标准 tool 格式。如果指定 key 下没有找到 tools，则会尝试从 run 的 invocation parameters 中提取 tool definitions。这很有用，因为 LangChain chat models 会把 tool definitions 追踪到 run 的 `extra.invocation_params` 字段，而不是 inputs 中。                                                                                                                                                                                                                                                                                                                                               |
+| `remove_extra_fields`        | `Object`                                                                    | 移除所有未在 schema 中定义的字段。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+
+## Chat model 预构建 schema
+
+transformations 的主要使用场景，是将生产 traces 收集为数据集，并将其标准化为跨模型提供商都统一可用的格式，以便后续评估、few-shot prompting 等使用。
+
+为了简化终端用户配置 transformations 的过程，LangSmith 提供了一个预定义 schema，可自动完成以下操作：
+
+* 从收集到的 runs 中提取 messages，并将其转换为 OpenAI 标准格式，使其兼容所有 LangChain ChatModels 以及大多数模型提供商的 SDK，便于后续评估和实验
+* 提取 LLM 使用到的 tools，并将它们加入 example 的输入中，以便在后续评估中复现
+
+<Check>
+希望迭代 system prompts 的用户，通常还会在使用 Chat Model schema 时，对输入 messages 添加 Remove System Messages transformation，这样就不会把 system prompt 保存进数据集。
+</Check>
+
+### 兼容性
+
+LLM run collection schema 目前用于收集 LangChain @[`BaseChatModel`] runs，或来自 [LangSmith OpenAI wrapper](/langsmith/annotate-code#use-%40traceable-%2F-traceable) 的 traced runs。
+
+如果你正在追踪某个与之不兼容的 LLM run，请通过 [support.langchain.com](https://support.langchain.com) 联系支持团队，我们可以扩展支持。
+
+如果你希望把 transformations 应用于其他类型的 runs（例如带有消息历史的 LangGraph state），请自行定义 schema，并手动添加相应 transformations。
+
+### 启用方式
+
+当你把某条 run 从 tracing project 或 annotation queue 加入数据集时，如果它属于 LLM run type，我们会默认应用 Chat Model schema。
+
+关于如何在新数据集上启用它，请参阅[数据集管理 how-to guide](/langsmith/manage-datasets-in-application)。
+
+### 规格
+
+关于该预构建 schema 的完整 API 规格，请参阅以下内容：
+
+#### Input schema
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "items": {
+        "$ref": "https://api.smith.langchain.com/public/schemas/v1/message.json"
+      }
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "$ref": "https://api.smith.langchain.com/public/schemas/v1/tooldef.json"
+      }
+    }
+  },
+  "required": ["messages"]
+}
+```
+
+#### Output schema
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "message": {
+      "$ref": "https://api.smith.langchain.com/public/schemas/v1/message.json"
+    }
+  },
+  "required": ["message"]
+}
+```
+
+#### Transformations
+
+对应的 transformations 如下：
+
+```json
+[
+  {
+    "path": ["inputs"],
+    "transformation_type": "remove_extra_fields"
+  },
+  {
+    "path": ["inputs", "messages"],
+    "transformation_type": "convert_to_openai_message"
+  },
+  {
+    "path": ["inputs", "tools"],
+    "transformation_type": "convert_to_openai_tool"
+  },
+  {
+    "path": ["outputs"],
+    "transformation_type": "remove_extra_fields"
+  },
+  {
+    "path": ["outputs", "message"],
+    "transformation_type": "convert_to_openai_message"
+  }
+]
+```

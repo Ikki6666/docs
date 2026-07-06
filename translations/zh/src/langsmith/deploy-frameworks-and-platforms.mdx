@@ -1,0 +1,105 @@
+---
+title: 部署全栈 Web 应用
+sidebarTitle: 概览
+description: 将 LangChain agents 部署为运行在 Next.js、SvelteKit、Nuxt、Cloudflare Workers、Deno Deploy 和 Vite 上的全栈 Web 应用，支持流式 UI 和 thread history。
+mode: wide
+---
+
+以下页面提供参考实现，展示如何在 JavaScript 框架和托管平台上把 LangChain agents 运行到生产环境中。[deployment cookbook repository](https://github.com/langchain-ai/deployment-cookbook) 里的每个示例，都是一个完整的全栈聊天应用，具备流式 UI、subagents 和 thread history，并通过相同的 [Agent Streaming Protocol](https://github.com/langchain-ai/agent-protocol/tree/main/streaming) 部署在不同平台上。
+
+当你需要交付一个由 agent 驱动的产品时，可以使用这些指南：复制与你托管环境匹配的技术栈，换成你自己的 tools 和 models，并在不再满足于单实例时升级持久化能力。
+
+## 示例
+
+### 与 LangSmith Deployment 配合
+
+Agent 运行在 LangSmith Deployment 上，另有一个独立的 Web 应用从 Agent Server API 拉取流。
+
+<CardGroup cols={3}>
+
+<Card title="LangSmith + Vite" icon="/images/providers/light/langchain.svg" href="/langsmith/deploy-vite-langsmith">
+Agent graph 运行在 LangSmith Deployment 上；Vite + React UI 从 Agent Server API 获取流式响应。
+</Card>
+
+</CardGroup>
+
+### 嵌入你的 Web 框架
+
+Agent 运行在框架的 route handlers 中，并作为一个可部署应用整体发布到目标平台。
+
+<CardGroup cols={3}>
+
+<Card title="Next.js" icon="/images/providers/light/nextjs.svg" href="/langsmith/deploy-nextjs">
+App Router route handlers 在 `/api/threads/...` 下实现协议。可一键部署到 Vercel。
+</Card>
+
+<Card title="SvelteKit" icon="/images/providers/light/svelte.svg" href="/langsmith/deploy-sveltekit">
+SvelteKit server routes 运行在 Cloudflare Workers 上，配合 `@langchain/svelte` 和按 thread 划分的 Durable Objects 做 SSE 回放。
+</Card>
+
+<Card title="Nuxt" icon="/images/providers/light/nuxt.svg" href="/langsmith/deploy-nuxt">
+Nitro route handlers 与 `@langchain/vue` composables 一起组成一个可部署的 Nuxt 4 应用。
+</Card>
+
+<Card title="Cloudflare Workers" icon="/images/providers/light/cloudflare.svg" href="/langsmith/deploy-cloudflare-workers">
+Vite + React SPA 和 Hono API 一起运行在单个 Worker 上，并配合 Workers Assets 与 Durable Objects。
+</Card>
+
+<Card title="Deno Deploy" icon="/images/providers/light/deno.svg" href="/langsmith/deploy-deno">
+Deno.serve + Hono 从同一个入口同时提供协议 API 和一个由 Vite 构建的 React SPA。
+</Card>
+
+</CardGroup>
+
+<Tip>
+每个 cookbook 示例都共享同一个演示 agent：一个会把任务委派给 `researcher` 和 `math-whiz` subagents 的协调器，并带有 mock tools。这样你就可以在不改变应用行为的前提下，对比不同托管选择。
+</Tip>
+
+## 一个 agent deployment 由哪些部分组成
+
+每个示例都遵循相同的结构。变化的是框架和托管方式，不变的是职责分工。
+
+### Agent runtime
+
+Agent 本身，通常是一个 LangGraph graph 或 [`deepagents`](https://www.npmjs.com/package/deepagents) 协调器，包含 tools、可选 subagents 和 middleware。它会结合 **checkpointer** 一起编译，使会话状态能够跨轮次保留。示例中为了简洁，通常从内存版 `MemorySaver` 开始；生产部署则会切换到 Redis（[`@langchain/langgraph-checkpoint-redis`](https://www.npmjs.com/package/@langchain/langgraph-checkpoint-redis)）、Postgres（[`@langchain/langgraph-checkpoint-postgres`](https://www.npmjs.com/package/@langchain/langgraph-checkpoint-postgres)）、SQLite（[`@langchain/langgraph-checkpoint-sqlite`](https://www.npmjs.com/package/@langchain/langgraph-checkpoint-sqlite)）或平台特定存储。
+
+### Protocol server
+
+HTTP route handlers 会在 `/api/threads/...` 下实现 [Agent Streaming Protocol](https://github.com/langchain-ai/agent-protocol/tree/main/streaming)。
+
+#### 最小集合（流式聊天）
+
+对于 `HttpAgentServerAdapter` 来说，以下三个 endpoints 就足以支撑一个单 thread 的流式聊天：
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/threads/:threadId/commands` | 接收命令（`run.start` 等）并启动 runs |
+| `POST` | `/api/threads/:threadId/stream` | 提供某个 run 的协议事件 SSE 流 |
+| `GET` / `POST` | `/api/threads/:threadId/state` | 读取并初始化带 checkpoint 的 thread state |
+
+#### Thread 侧边栏（所有示例）
+
+每个示例还实现了 thread history 侧边栏所需的 endpoints：
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/threads` | 列出 checkpointer 中已知的 threads |
+| `DELETE` | `/api/threads/:threadId` | 删除某个 thread 的 session 与 checkpoints |
+| `POST` | `/api/threads/:threadId/history` | 分页返回 checkpoint history |
+
+### Session 和 run 管理
+
+服务端逻辑会跟踪活跃 runs，把命令桥接给 agent，并通过 SSE 广播实时事件。借助 registry 或 session store，客户端可以重新连接到进行中的流。在 serverless 或多实例托管平台上，这一层必须是共享的，或者与 checkpointer 共址。
+
+### Chat frontend
+
+浏览器 UI 通过 [`@langchain/react`](https://www.npmjs.com/package/@langchain/react)、[`@langchain/vue`](https://www.npmjs.com/package/@langchain/vue)、[`@langchain/svelte`](https://www.npmjs.com/package/@langchain/svelte) 或 [`@langchain/angular`](https://www.npmjs.com/package/@langchain/angular) 中的 `HttpAgentServerAdapter` 接入协议。客户端会初始化 thread state、提交消息、消费 SSE 流，并渲染 tokens、tool calls、reasoning 和 subagent activity。
+
+这些绑定本身不附带任何组件。像 `useStream` 这样的 hooks 只会返回普通的响应式状态（messages、tool calls、loading flags、thread metadata），具体如何接到视觉层，由你自己决定。关于 adapter 模式及其取舍，请参阅[frontend integrations 概览](/oss/langchain/frontend/integrations/overview)。
+
+## 另请参阅
+
+- [LangSmith Deployment 概览](/langsmith/deployment)
+- [Agent Server](/langsmith/agent-server)
+- [配置 checkpointer](/langsmith/configure-checkpointer)
+- [Frontend 概览](/oss/langchain/frontend/overview)

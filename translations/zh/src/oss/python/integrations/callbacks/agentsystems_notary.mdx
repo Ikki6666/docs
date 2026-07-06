@@ -1,0 +1,160 @@
+---
+title: AgentSystems Notary
+description: 适用于 LangChain 应用的可通过密码学验证的审计追踪。
+---
+
+## 概览
+
+AgentSystems Notary 为 AI 代理交互创建防篡改的审计追踪。
+
+## 为什么使用它
+
+当客户、审计人员、监管机构、保险公司等质疑 AI 行为时，需要证明实际发生了什么。传统日志做不到这一点，因为日志由你控制，第三方必须相信你没有修改过它们。
+
+防篡改日志消除了这种信任前提。
+
+## 工作原理
+
+原始 LLM 交互保留在你的存储中。正常运行期间，没有第三方会看到这些数据。但每次交互的密码学哈希值会同时写入独立的防篡改存储中，可以是 Arweave，也可以是 AgentSystems 托管的服务。
+
+如果后续出现审计或争议，你可以提供原始日志。审计人员会重新计算哈希值，并与已存储的哈希进行比较。匹配表示日志未被改动，不匹配则表示存在篡改或损坏。
+
+你控制自己的数据，但无法在不被发现的情况下修改它。
+
+**记录内容包括：**
+- 存入你的存储：完整的原始 LLM 负载，包括提示、响应、元数据和时间戳
+- 存入哈希存储：SHA-256 哈希值和元数据，例如命名空间、会话 ID 和时间戳
+
+## 哈希存储选项
+
+哈希值，而不是原始数据，可以写入以下两种存储选项之一：
+
+| Storage | Best For | Features |
+|---------|----------|----------|
+| [Decentralized (Arweave)](https://docs.agentsystems.ai/notary/configuration/hash-storage?utm_source=langchain-docs&utm_medium=docs) | No vendor lock-in | Public append-only ledger, open-source verification, no account needed |
+| [`Custodied`](https://agentsystems.ai/notary?utm_source=langchain-docs&utm_medium=docs) | Managed compliance | Write-once storage, verification UI, signed attestations for audits |
+
+<Info>
+[Custodied plans](https://agentsystems.ai/notary?utm_source=langchain-docs&utm_medium=docs) 提供符合 WORM 要求的哈希存储、托管签名以及用于审计的签名证明。
+</Info>
+
+## 前置条件
+
+```shell
+pip install agentsystems-notary langchain langchain-anthropic python-dotenv
+```
+
+## 示例（去中心化）
+
+<Steps>
+  <Step title="生成签名密钥">
+    ```shell
+    openssl genrsa -out arweave-key.pem 4096
+    ```
+    <Warning>
+    请妥善保存此密钥。验证时需要它来证明你对链上哈希的所有权。
+    </Warning>
+
+    生产环境中，使用[云密钥管理服务](https://docs.agentsystems.ai/notary/configuration/signing?utm_source=langchain-docs&utm_medium=docs)。
+  </Step>
+  <Step title="创建 .env 文件">
+    在项目根目录创建一个 `.env` 文件：
+    ```
+    # 用于原始负载存储的 AWS S3
+    ORG_AWS_S3_BUCKET_NAME=your-bucket
+    ORG_AWS_S3_ACCESS_KEY_ID=AKIA...
+    ORG_AWS_S3_SECRET_ACCESS_KEY=...
+    ORG_AWS_S3_REGION=us-east-1
+
+    # 签名密钥路径
+    ARWEAVE_PRIVATE_KEY_PATH=./arweave-key.pem
+
+    # Anthropic
+    ANTHROPIC_API_KEY=sk-ant-...
+    ```
+  </Step>
+  <Step title="运行示例">
+    ```python
+    import os
+
+    from agentsystems_notary import (
+        LangChainNotary,
+        ArweaveHashStorage,
+        AwsS3StorageConfig,
+        LocalKeySignerConfig,
+        RawPayloadStorage,
+    )
+    from langchain_anthropic import ChatAnthropic
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    # 用于存储原始 LLM 负载的 S3 bucket
+    s3_config = AwsS3StorageConfig(
+        bucket_name=os.environ["ORG_AWS_S3_BUCKET_NAME"],
+        aws_access_key_id=os.environ["ORG_AWS_S3_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["ORG_AWS_S3_SECRET_ACCESS_KEY"],
+        aws_region=os.environ["ORG_AWS_S3_REGION"],
+    )
+    raw_payload_storage = RawPayloadStorage(storage=s3_config)
+
+    # 用于签名的本地 RSA 密钥
+    signer = LocalKeySignerConfig(
+        private_key_path=os.environ["ARWEAVE_PRIVATE_KEY_PATH"],
+    )
+
+    # 使用 Arweave 作为去中心化哈希存储
+    # Namespace 是公开的，会写入账本，并用于分隔存储数据
+    # Namespace 应为每个客户、代理或环境使用一个匿名 ID
+    # 请保留 namespace 映射记录
+    arweave_storage = ArweaveHashStorage(
+        namespace="tenant_a1b2c3d4",  # 参见上面的 namespace 注释
+        signer=signer,
+    )
+
+    # 创建 notary 回调
+    notary = LangChainNotary(
+        raw_payload_storage=raw_payload_storage,
+        hash_storage=[arweave_storage],
+        debug=True,
+    )
+
+    # 挂载到模型
+    model = ChatAnthropic(
+        model="claude-sonnet-4-6",
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        callbacks=[notary],
+    )
+
+    response = model.invoke("What is the capital of France?")
+    print(response.content)
+    ```
+  </Step>
+</Steps>
+
+## 验证
+
+**去中心化（Arweave）**：从你的存储 bucket 下载原始负载，打包为 zip，然后使用开源 CLI 进行验证：
+
+```shell
+aws s3 sync s3://your-bucket/arweave/tenant_a1b2c3d4/ ./logs
+zip -r logs.zip logs
+npm install -g agentsystems-verify
+agentsystems-verify --logs logs.zip
+```
+
+该 CLI 会重新计算每个负载的哈希，并与存储在 Arweave 上的哈希进行比较。详情参见[完整验证指南](https://docs.agentsystems.ai/notary/verification/arweave?utm_source=langchain-docs&utm_medium=docs)。
+
+另外，[Verify UI](https://verify.agentsystems.ai?utm_source=langchain-docs&utm_medium=docs) 同时支持去中心化和托管式验证。
+
+## 配置
+
+- [原始负载存储选项](https://docs.agentsystems.ai/notary/configuration/raw-payload-storage?utm_source=langchain-docs&utm_medium=docs)
+- [签名配置](https://docs.agentsystems.ai/notary/configuration/signing?utm_source=langchain-docs&utm_medium=docs)
+- [哈希存储选项](https://docs.agentsystems.ai/notary/configuration/hash-storage?utm_source=langchain-docs&utm_medium=docs)
+
+## 资源
+
+- [Website](https://agentsystems.ai/notary?utm_source=langchain-docs&utm_medium=docs)
+- [Documentation](https://docs.agentsystems.ai/notary/?utm_source=langchain-docs&utm_medium=docs)
+- [GitHub](https://github.com/agentsystems/agentsystems-notary?utm_source=langchain-docs&utm_medium=docs)

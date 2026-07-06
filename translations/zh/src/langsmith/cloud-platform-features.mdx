@@ -1,0 +1,87 @@
+---
+title: Cloud 平台特性
+sidebarTitle: 平台特性
+icon: "list-check"
+description: LangSmith Deployment 的 Cloud 专属平台特性，包括数据区域、静态 IP 地址、payload 限制和 deployment 类型。
+---
+
+本页介绍仅适用于 [Cloud](/langsmith/cloud) 部署的平台特性。对应的自托管能力请参阅[部署到自托管环境](/langsmith/deploy-to-self-hosted-overview)。
+
+## 数据区域
+
+Deployments 可以创建在两个数据区域中：US 和 EU。
+
+某个 deployment 的数据区域由其创建所在 LangSmith organization 的数据区域决定。Deployments 及其底层数据库都不能在不同数据区域之间迁移。
+
+## 静态 IP 地址
+
+所有在 2025 年 1 月 6 日之后创建的 deployments，其流量都会经过 NAT gateway。该 NAT gateway 会根据数据区域拥有若干静态 IP 地址。静态 IP 地址列表请参阅[Allowlist IP addresses table](/langsmith/deploy-to-cloud#allowlist-ip-addresses)。
+
+## Payload 大小
+
+发送到 Cloud deployments 的所有请求，其最大 payload 大小为 25MB。超过 25MB 的请求会返回 `413 Payload Too Large` 错误。
+
+## Deployment 类型
+
+为了简化使用，control plane 提供两种 deployment 类型，它们有不同的资源分配：`Development` 和 `Production`。
+
+| **Deployment Type** | **CPU/Memory**  | **Scaling**         | **Database**                                                                     |
+|---------------------|-----------------|---------------------|----------------------------------------------------------------------------------|
+| Development         | 1 CPU, 1GB RAM | Up to 1 replica   | 10GB disk, no backups                                                           |
+| Production          | 2 CPU, 2GB RAM | Up to 10 replicas | Autoscaling disk, automatic backups, highly available (multi-zone configuration) |
+
+CPU 和内存资源均按每个 replica 计算。
+
+<Warning>
+**不可变 deployment 类型**
+一旦 deployment 创建完成，就无法更改 deployment 类型。
+</Warning>
+
+### Production
+
+`Production` 类型 deployment 适用于生产工作负载。例如，面向客户且处于关键路径上的应用应选择 `Production`。
+
+对于 `Production` 类型 deployments，可以根据具体用例和容量约束按个案手动增加资源。如需申请增加资源，请通过 [support.langchain.com](https://support.langchain.com) 联系支持团队。
+
+### Development
+
+`Development` 类型 deployment 适用于开发和测试。例如，内部测试环境可选择 `Development`。`Development` 类型 deployment 不适合生产工作负载。
+
+<Danger>
+**可抢占计算基础设施**
+`Development` 类型 deployments（API server、queue server 和 database）会部署在可抢占计算基础设施上。这意味着这些计算资源**可能在任意时间被无预警终止**。这可能导致间歇性出现：
+
+* Redis 连接超时或错误
+* Postgres 连接超时或错误
+* 后台 runs 失败或重试
+
+这种行为是预期中的。可抢占计算基础设施**显著降低了为 `Development` 类型 deployment 提供资源的成本**。从设计上讲，Agent Server 是具备容错能力的，其实现会自动尝试从 Redis/Postgres 连接错误中恢复，并重试失败的后台 runs。
+
+`Production` 类型 deployments 使用的是持久型计算基础设施，而不是可抢占计算基础设施。
+</Danger>
+
+对于 `Development` 类型 deployments，数据库磁盘大小也可以根据具体用例和容量约束按个案手动增加。对于大多数场景，应配置 [TTLs](/langsmith/configure-ttl) 来管理磁盘用量。如需申请增加资源，请通过 [support.langchain.com](https://support.langchain.com) 联系支持团队。
+
+## 数据库配置
+
+Control plane 与 [data plane](/langsmith/data-plane) listener application 会协同工作，为每个 Cloud deployment 自动创建一个 Postgres 数据库。该数据库充当 deployment 的[持久化层](/oss/langgraph/persistence#memory-store)。
+
+在实现 LangGraph 应用时，无需手动配置 [checkpointer](/oss/langgraph/persistence#checkpointer-libraries)。系统会自动为 graph 配置一个 checkpointer。任何为 graph 显式配置的 checkpointer，都会被自动配置的那个替换。
+
+无法直接访问数据库。所有数据库访问都必须通过 [Agent Server](/langsmith/agent-server)。
+
+只有当 deployment 自身被删除时，数据库才会被删除。
+
+关于自托管部署，请参阅[自定义 PostgreSQL 配置](/langsmith/self-hosted-platform-features#custom-postgresql)。
+
+## 扩缩容
+
+Cloud deployments 会自动扩缩容；你不需要直接配置 queue workers、replicas 或 pool sizes。`Production` deployments 会基于三个指标自动扩展，最多到 10 个 replicas：
+
+- **CPU utilization** — autoscaler 目标为 75%。
+- **Memory utilization** — autoscaler 目标为 75%。
+- **Pending runs** — autoscaler 目标为每个容器 10 个 pending runs。
+
+每个指标都会独立计算，最终采用那个需要最多容器数的指标来决定扩容动作。为避免在突发负载下频繁抖动，缩容动作会等待 30 分钟后才生效。[Queue workers](/langsmith/agent-server#runtime-architecture) 按 pending run 数量扩缩容，而 [API servers](/langsmith/agent-server#runtime-architecture) 按 CPU 和内存扩缩容，因此读取流量不会拖慢 run 提交，反之亦然。
+
+应用层的扩缩容手段（durability modes、异步模式、避免同步阻塞、使用 `/join` 而非轮询）对 Cloud 和自托管同样适用。底层概念请参阅[自托管环境下的扩缩容](/langsmith/agent-server-scale)；但其中涉及的 Helm 和资源配置不适用于 Cloud。

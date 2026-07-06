@@ -1,0 +1,151 @@
+---
+title: "记录、追踪与监控 Portkey 集成"
+description: "使用 LangChain Python 集成记录、追踪与监控 Portkey。"
+---
+
+当您使用 LangChain 构建应用或 agents 时，通常需要多次 API 调用才能完成一次用户请求。然而，在您想分析这些请求时，它们往往并不会被串联起来。借助 [**Portkey**](/oss/integrations/providers/portkey/)，来自同一用户请求的所有 embeddings、completions 和其他请求都会被记录并追踪到同一个 ID 下，从而让您对用户交互获得完整可见性。
+
+本 notebook 是一个分步指南，介绍如何在 LangChain 应用中使用 `Portkey` 记录、追踪和监控 LangChain 的 LLM 调用。
+
+首先，让我们导入 Portkey、OpenAI 和 Agent 工具
+
+```python
+import os
+
+from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain_openai import ChatOpenAI
+from portkey_ai import PORTKEY_GATEWAY_URL, createHeaders
+```
+
+在下面粘贴您的 OpenAI API key。[(您可以在这里找到)](https://platform.openai.com/account/api-keys)
+
+```python
+os.environ["OPENAI_API_KEY"] = "..."
+```
+
+## 获取 portkey API Key
+
+1. 在[这里注册 Portkey](https://app.portkey.ai/signup)
+2. 在您的 [dashboard](https://app.portkey.ai/) 中，点击左下角个人资料图标，然后点击 “Copy API Key”
+3. 将其粘贴到下面
+
+```python
+PORTKEY_API_KEY = "..."  # Paste your Portkey API Key here
+```
+
+## 设置 trace ID
+
+1. 在下面为您的请求设置 trace id
+2. 对于来自同一个请求的所有 API 调用，Trace ID 可以共用
+
+```python
+TRACE_ID = "uuid-trace-id"  # Set trace id here
+```
+
+## 生成 portkey headers
+
+```python
+portkey_headers = createHeaders(
+    api_key=PORTKEY_API_KEY, provider="openai", trace_id=TRACE_ID
+)
+```
+
+定义要使用的 prompts 和 tools
+
+```python
+from langchain_classic import hub
+from langchain.tools import tool
+
+prompt = hub.pull("hwchase17/openai-tools-agent")
+
+
+@tool
+def multiply(first_int: int, second_int: int) -> int:
+    """Multiply two integers together."""
+    return first_int * second_int
+
+
+@tool
+def exponentiate(base: int, exponent: int) -> int:
+    "Exponentiate the base to the exponent power."
+    return base**exponent
+
+
+tools = [multiply, exponentiate]
+```
+
+像平常一样运行 agent。**唯一**的变化是，现在我们会在请求中**包含上面的 headers**。
+
+```python
+model = ChatOpenAI(
+    base_url=PORTKEY_GATEWAY_URL, default_headers=portkey_headers, temperature=0
+)
+
+# Construct the OpenAI Tools agent
+agent = create_openai_tools_agent(model, tools, prompt)
+
+# Create an agent executor by passing in the agent and tools
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+agent_executor.invoke(
+    {
+        "input": "Take 3 to the fifth power and multiply that by thirty six, then square the result"
+    }
+)
+```
+
+```text
+> Entering new AgentExecutor chain...
+
+Invoking: `exponentiate` with `{'base': 3, 'exponent': 5}`
+
+
+243
+Invoking: `multiply` with `{'first_int': 243, 'second_int': 36}`
+
+
+8748
+Invoking: `exponentiate` with `{'base': 8748, 'exponent': 2}`
+
+
+76527504The result of taking 3 to the fifth power, multiplying it by 36, and then squaring the result is 76,527,504.
+
+> Finished chain.
+```
+
+```text
+{'input': 'Take 3 to the fifth power and multiply that by thirty six, then square the result',
+ 'output': 'The result of taking 3 to the fifth power, multiplying it by 36, and then squaring the result is 76,527,504.'}
+```
+
+## logging 与 tracing 在 portkey 中如何工作
+
+**Logging**
+
+- 通过 Portkey 发送请求可确保所有请求默认都会被记录
+- 每条请求日志都包含 `timestamp`、`model name`、`total cost`、`request time`、`request json`、`response json` 以及其他 Portkey 特性
+
+**[Tracing](https://portkey.ai/docs/product/observability-modern-monitoring-for-llms/traces)**
+
+- Trace id 会随每个请求一起传递，并显示在 Portkey dashboard 的日志中
+- 如果您愿意，也可以为每个请求设置一个**不同的 trace id**
+- 您还可以将用户反馈附加到某个 trace id 上。[更多信息请见这里](https://portkey.ai/docs/product/observability-modern-monitoring-for-llms/feedback)
+
+对于上述请求，您将能够像这样查看完整的日志追踪
+![View LangChain traces on Portkey](https://assets.portkey.ai/docs/agent_tracing.gif)
+
+## 高级 LLMOps 特性 - 缓存、标签、重试
+
+除了 logging 和 tracing，Portkey 还提供更多特性，为现有工作流增加生产能力：
+
+**Caching**
+
+对先前已响应过的用户查询直接从缓存返回，而无需再次发送到 OpenAI。可匹配完全相同的字符串，也可匹配语义相似的字符串。缓存可节省成本，并将延迟降低 20 倍。[Docs](https://portkey.ai/docs/product/ai-gateway-streamline-llm-integrations/cache-simple-and-semantic)
+
+**Retries**
+
+对任何失败的 API 请求自动重新处理，**最多 `5` 次**。采用**`指数退避`**策略，以拉开重试间隔，防止网络过载。[Docs](https://portkey.ai/docs/product/ai-gateway-streamline-llm-integrations)
+
+**Tagging**
+
+使用预定义标签，以高细粒度追踪和审计每一次用户交互。[Docs](https://portkey.ai/docs/product/observability-modern-monitoring-for-llms/metadata)

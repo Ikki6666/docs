@@ -1,0 +1,98 @@
+---
+title: 如何使用自定义 store
+sidebarTitle: 添加自定义 store
+tag: "Alpha"
+description: 在 agent deployment 中，用自定义 BaseStore 实现替换内置的 Postgres store。
+---
+
+当把 agents 部署到 LangSmith 时，服务默认会提供一个基于 Postgres 的长期记忆 store，并可选通过 pgvector 支持向量搜索。你可以用自己的 @[BaseStore] 实现替换它，以使用不同的存储后端、自定义索引方式，或专门的搜索能力。
+
+你只需要提供一个 async context manager 的路径，让它 yield 一个 `BaseStore` 实例，服务就会自动管理这个 store 的生命周期。
+
+<Warning>
+Custom stores 目前处于 **alpha**。该功能在次版本更新中可能会发生破坏性变更。
+</Warning>
+
+## 定义 store
+
+从一个**已有的** LangSmith 应用开始，创建一个文件，在其中定义一个会 yield 自定义 store 的 async context manager。如果你是在新项目中开始，也可以通过 CLI 从模板创建应用。
+
+```bash
+langgraph new --template=new-langgraph-project-python my_new_project
+```
+
+Async context manager 这种模式让服务可以在应用生命周期的恰当时机打开和关闭 store 连接。下面的示例使用 `AsyncSqliteStore` 并启用语义搜索：
+
+<Note>
+不建议在生产部署中使用 SQLite。
+</Note>
+
+```python
+# ./src/agent/store.py
+import contextlib
+
+from langchain.embeddings import init_embeddings
+from langgraph.store.base import IndexConfig
+from langgraph.store.sqlite import AsyncSqliteStore
+
+embeddings = init_embeddings("openai:text-embedding-3-small")
+
+
+@contextlib.asynccontextmanager
+async def generate_store():
+    """Yield a BaseStore, open for the duration of the server."""
+    async with AsyncSqliteStore.from_conn_string(
+        "./custom_store.sql",
+        index=IndexConfig(
+            dims=1536,
+            embed=embeddings,
+            fields=["$"],
+        ),
+    ) as store:
+        await store.setup()
+        yield store
+```
+
+<Note>
+一旦配置了 custom store，它会**完全替代**内置的 Postgres store。像语义搜索和 TTL 清理这类能力是否可用，将取决于你的实现。
+</Note>
+
+## 配置 `langgraph.json`
+
+在 [`langgraph.json` 配置文件](/langsmith/application-structure#configuration-file-concepts)中加入 `store` 键。`path` 指向你[前面定义的](#define-the-store) async context manager。
+
+```json
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./src/agent/graph.py:graph"
+  },
+  "env": ".env",
+  "store": {
+    "path": "./src/agent/store.py:generate_store"
+  }
+}
+```
+
+## 启动服务
+
+先在本地测试服务：
+
+```bash
+langgraph dev --no-browser
+```
+
+服务日志会确认你的 custom store 已经生效：
+
+```
+Using custom store. Skipping store TTL sweeper.
+```
+
+## 部署
+
+你可以保持原样将这个 app 部署到 LangSmith，或者部署到自己的自托管平台。
+
+## 下一步
+
+- 使用[自定义 checkpointer](/langsmith/custom-checkpointer)来替换内置 checkpoint 存储。
+- 了解 LangGraph 中的[持久化与记忆](/oss/langgraph/persistence)。

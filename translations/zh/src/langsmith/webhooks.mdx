@@ -1,0 +1,287 @@
+---
+title: Configure webhook notifications for rules
+sidebarTitle: Configure webhook notifications for rules
+description: 配置 webhook 通知，以便当 LangSmith 中的 automation rule 匹配到新的 run 时接收 POST 请求。
+---
+
+当你在 automation action 上添加 webhook URL 后，只要你定义的规则匹配到新的 run，LangSmith 就会向你的 webhook endpoint 发起一个 POST 请求。
+
+![Webhook](/langsmith/images/webhook.png)
+
+## Webhook payload
+
+LangSmith 发送到你的 webhook endpoint 的 payload 包含：
+
+- `"rule_id"`：发送该 payload 的 automation 的 ID。
+- `"start_time"` 和 `"end_time"`：LangSmith 找到匹配 run 的时间边界。
+- `"runs"`：一个 run 数组，其中每个 run 都是一个 dictionary。如果你需要每个 run 的更多信息，可以在 endpoint 中使用 SDK 从 API 获取。
+- `"feedback_stats"`：包含这些 run 的 feedback 统计信息的 dictionary。下方代码块展示了该字段的示例 payload。
+
+```json
+"feedback_stats": {
+    "about_langchain": {
+        "n": 1,
+        "avg": 0.0,
+        "show_feedback_arrow": true,
+        "values": {}
+    },
+    "category": {
+        "n": 0,
+        "avg": null,
+        "show_feedback_arrow": true,
+        "values": {
+            "CONCEPTUAL": 1
+        }
+    },
+    "user_score": {
+        "n": 2,
+        "avg": 0.0,
+        "show_feedback_arrow": false,
+        "values": {}
+    },
+    "vagueness": {
+        "n": 1,
+        "avg": 0.0,
+        "show_feedback_arrow": true,
+        "values": {}
+    }
+}
+```
+
+<Note>
+**fetching from S3 URLs**
+
+根据你的 run 新旧程度，`inputs_s3_urls` 和 `outputs_s3_urls` 字段里可能会是指向真实数据的 S3 URL，而不是数据本身。
+
+你可以分别通过 `inputs_s3_urls` 和 `outputs_s3_urls` 中提供的 `ROOT.presigned_url` 获取 `inputs` 和 `outputs`。
+</Note>
+
+下面是 LangSmith 发送到 webhook endpoint 的完整 payload 示例：
+
+```json
+{
+  "rule_id": "d75d7417-0c57-4655-88fe-1db3cda3a47a",
+  "start_time": "2024-04-05T01:28:54.734491+00:00",
+  "end_time": "2024-04-05T01:28:56.492563+00:00",
+  "runs": [
+    {
+      "status": "success",
+      "is_root": true,
+      "trace_id": "6ab80f10-d79c-4fa2-b441-922ed6feb630",
+      "dotted_order": "20230505T051324571809Z6ab80f10-d79c-4fa2-b441-922ed6feb630",
+      "run_type": "tool",
+      "modified_at": "2024-04-05T01:28:54.145062",
+      "tenant_id": "2ebda79f-2946-4491-a9ad-d642f49e0815",
+      "end_time": "2024-04-05T01:28:54.085649",
+      "name": "Search",
+      "start_time": "2024-04-05T01:28:54.085646",
+      "id": "6ab80f10-d79c-4fa2-b441-922ed6feb630",
+      "session_id": "6a3be6a2-9a8c-4fc8-b4c6-a8983b286cc5",
+      "parent_run_ids": [],
+      "child_run_ids": null,
+      "direct_child_run_ids": null,
+      "total_tokens": 0,
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "total_cost": null,
+      "completion_cost": null,
+      "prompt_cost": null,
+      "first_token_time": null,
+      "app_path": "/o/2ebda79f-2946-4491-a9ad-d642f49e0815/projects/p/6a3be6a2-9a8c-4fc8-b4c6-a8983b286cc5/r/6ab80f10-d79c-4fa2-b441-922ed6feb630?trace_id=6ab80f10-d79c-4fa2-b441-922ed6feb630&start_time=2023-05-05T05:13:24.571809",
+      "in_dataset": false,
+      "last_queued_at": null,
+      "inputs": null,
+      "inputs_s3_urls": null,
+      "outputs": null,
+      "outputs_s3_urls": null,
+      "extra": null,
+      "events": null,
+      "feedback_stats": null,
+      "serialized": null,
+      "share_token": null
+    }
+  ]
+}
+```
+
+## Security
+
+在 webhook URL 中添加一个 secret query string parameter，并在每个传入请求上进行校验。这样即使有人发现了你的 webhook URL，你也可以区分哪些调用是真正的 webhook 通知。
+
+例如：
+
+```
+https://api.example.com/langsmith_webhook?secret=38ee77617c3a489ab6e871fbeb2ec87d
+```
+
+### Webhook custom HTTP headers
+
+如果你希望 webhook 带上特定 header，可以为每个 URL 单独配置。设置方式是点击 URL 字段旁边的 `Headers` 选项，然后添加你的 header。
+
+<Note>
+Headers 会以加密格式存储。
+</Note>
+
+![Webhook headers](/langsmith/images/webhook-headers.png)
+
+### Webhook delivery
+
+当 LangSmith 向你的 webhook endpoint 投递事件时，会遵循以下规则：
+
+- 如果 LangSmith 无法连接到你的 endpoint，会在声明投递失败前最多重试 2 次传输连接。
+- 如果你的 endpoint 超过 5 秒才响应，LangSmith 会将该次投递视为失败，并且不会重试。
+- 如果你的 endpoint 在 5 秒内返回 5xx 状态码，LangSmith 会以指数退避方式最多重试 2 次。
+- 如果你的 endpoint 返回 4xx 状态码，LangSmith 会将该次投递视为失败，并且不会重试。
+- 你的 endpoint 在 response body 中返回的任何内容都会被忽略。
+
+## Ensuring evaluations complete before the webhook fires
+
+默认情况下，automation rule 会按彼此独立的调度运行。如果 webhook rule 和 online evaluator rule 扫描的是同一个 project，它们可能会在不同时间拾取到同一个 run，因此 webhook 可能会在 evaluator 来得及为该 run 打分之前就先触发。
+
+推荐做法是为 webhook rule 添加一个 _feedback filter_。这样 LangSmith 只有在 run 已经带有预期 score 时，才会把它发送到你的 webhook，而不依赖该分数具体是何时生成的。
+
+例如，你有一个 online evaluator 会生成 `answer_usefulness` 分数，而某个 webhook rule 应该只在该分数已经存在后才触发。
+
+1. 在 tracing project 的 **Automations** 标签页中打开这个 webhook automation rule。
+1. 编辑 rule 的 filter，要求必须存在该 feedback key。在 filter builder 中加入条件：
+
+   ```
+   has(feedback_key, "answer_usefulness")
+   ```
+
+1. 保存该 rule。
+
+这样，webhook rule 就会跳过任何尚未具有 `answer_usefulness` 分数的 run。当 evaluator rule 运行并附加分数后，webhook rule 的下一次 polling cycle 就会拾取这些 run，并将它们发送到你的 endpoint。
+
+<Tip>
+你也可以按 score 的具体值进行过滤，而不仅仅是它是否存在。例如，如果你只想把 usefulness score 较低的 run 发送到你的 endpoint：
+
+```
+has(feedback_key, "answer_usefulness") and feedback_score < 0.5
+```
+
+完整 filter 语法请参阅 [Filter traces](/langsmith/filter-traces-in-application)。
+</Tip>
+
+<Note>
+在同一个 automation rule 内，action 按固定顺序执行：annotation queue → dataset → webhook → evaluation。这意味着，如果 webhook 和 evaluator 配置在 **同一条** rule 上，那么 webhook 一定会在该 rule 上的 evaluation 完成之前触发。为了确保 webhook 能收到 evaluation score，请将 webhook 和 evaluator 拆成 **两条独立规则**，并像上面的示例那样，在 webhook rule 上使用 feedback filter。
+</Note>
+
+## Example with Modal
+
+### Setup
+
+下面这个示例使用 [Modal](https://modal.com/) 进行演示。Modal 提供可自动伸缩的 GPU 用于 inference 和 fine-tuning，也提供用于 code agent 的安全容器化，以及 serverless Python web endpoint。本指南聚焦于 web endpoint 的部分。
+
+首先创建一个 Modal account。然后在本地安装 Modal SDK：
+
+<CodeGroup>
+```bash pip
+pip install modal
+```
+
+```bash uv
+uv add modal
+```
+</CodeGroup>
+
+为完成账户初始化，请运行以下命令：
+
+```shell
+modal setup
+```
+
+按照提示完成账户设置。
+
+### Secrets
+
+接下来，你需要在 Modal 中配置一些 secret。
+
+首先，LangSmith 需要通过传入一个 secret 来对 Modal 进行认证。
+最简单的做法，是把 secret 放在 query parameter 中传入。
+为了校验这个 secret，请在 _Modal_ 中添加一个对应 secret。
+具体做法是 [creating a Modal secret](https://modal.com/docs/guide/secrets)。
+将 secret 命名为 `ls-webhook`，并设置一个名为 `LS_WEBHOOK` 的环境变量。
+
+你也可以配置一个 LangSmith secret，幸运的是，这里已经有现成的 integration template 可用。
+
+![LangSmith Modal Template](/langsmith/images/modal-langsmith-secret.png)
+
+### Service
+
+之后，你可以创建一个 Python 文件来作为你的 endpoint。
+下面的代码块展示了一个示例，并附带解释性注释：
+
+```python
+from fastapi import HTTPException, status, Request, Query
+from modal import Secret, Stub, web_endpoint, Image
+
+stub = Stub("auth-example", image=Image.debian_slim().pip_install("langsmith"))
+
+
+@stub.function(
+    secrets=[Secret.from_name("ls-webhook"), Secret.from_name("my-langsmith-secret")]
+)
+# We want this to be a `POST` endpoint since we will post data here
+@web_endpoint(method="POST")
+# We set up a `secret` query parameter
+def f(data: dict, secret: str = Query(...)):
+    # You can import dependencies you don't have locally inside Modal functions
+    from langsmith import Client
+
+    # First, we validate the secret key we pass
+    import os
+
+    if secret != os.environ["LS_WEBHOOK"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # This is where we put the logic for what should happen inside this webhook
+    ls_client = Client()
+    runs = data["runs"]
+    ids = [r["id"] for r in runs]
+    feedback = list(ls_client.list_feedback(run_ids=ids))
+    for r, f in zip(runs, feedback):
+        try:
+            ls_client.create_example(
+                inputs=r["inputs"],
+                outputs={"output": f.correction},
+                dataset_name="classifier-github-issues",
+            )
+        except Exception:
+            raise ValueError(f"{r} and {f}")
+    # Function body
+    return "success!"
+```
+
+使用 `modal deploy ...` 部署它，参阅 [managing Modal deployments](https://modal.com/docs/guide/managing-deployments)。
+
+你现在应该会看到类似如下输出：
+
+```
+✓ Created objects.
+├── 🔨 Created mount /Users/harrisonchase/workplace/langsmith-docs/example-webhook.py
+├── 🔨 Created mount PythonPackage:langsmith
+└── 🔨 Created f => https://hwchase17--auth-example-f.modal.run
+✓ App deployed! 🎉
+
+View Deployment: https://modal.com/apps/hwchase17/auth-example
+```
+
+注意其中的 function URL：`https://hwchase17--auth-example-f.modal.run`。
+注意：这 **不是** 最终部署 URL，请不要误用它。
+
+### Hooking it up
+
+取用你刚刚创建的 function URL，并把它添加为 webhook。
+记得同时把 secret key 作为 query parameter 传进去。
+组合起来之后，它应该像这样：
+
+```
+https://hwchase17--auth-example-f-dev.modal.run?secret={SECRET}
+```
+
+将 `{SECRET}` 替换为你为访问 Modal service 而创建的 secret key。

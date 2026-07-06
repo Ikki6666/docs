@@ -1,0 +1,275 @@
+---
+title: Use cron jobs
+sidebarTitle: Cron jobs
+---
+
+在很多场景中，按计划定时运行 assistant 都很有用。
+
+例如，假设你正在构建一个每天运行并发送当日新闻邮件摘要的 assistant。你可以使用 cron job 让 assistant 每天晚上 8:00 运行一次。
+
+LangSmith Deployment 支持 cron job，它会按照用户定义的 schedule 运行。用户需要指定 schedule、assistant 和某些输入。之后，server 会在指定时间：
+
+* 使用指定 assistant 创建一个新 thread
+* 向该 thread 发送指定输入
+
+注意，这意味着每次都会向 thread 发送同一份输入。
+
+LangSmith Deployment API 提供了多个用于创建和管理 cron job 的 endpoint。更多信息请参阅 [API reference](https://langchain-ai.github.io/langgraph/cloud/reference/api/api_ref/)。
+
+有时你并不希望 graph 基于用户交互运行，而是希望按固定时间运行，例如让 graph 每周为团队汇总并发送一次待办邮件。LangSmith Deployment 允许你通过 `Crons` client 实现这一点，而无需自己写脚本。要调度 graph job，你需要传入一个 [cron expression](https://crontab.cronhub.io/)，用于告诉 client 何时运行 graph。`Cron` job 在后台运行，不会影响 graph 的正常调用。
+
+<Note>
+所有 cron schedule 都按 **UTC** 解释。指定 schedule 时，请确保把目标执行时间换算成 UTC。
+</Note>
+
+## Setup
+
+首先，先设置 SDK client、assistant 和 thread：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    from langgraph_sdk import get_client
+
+    client = get_client(url=<DEPLOYMENT_URL>)
+    # Using the graph deployed with the name "agent"
+    assistant_id = "agent"
+    # create thread
+    thread = await client.threads.create()
+    print(thread)
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    import { Client } from "@langchain/langgraph-sdk";
+
+    const client = new Client({ apiUrl: <DEPLOYMENT_URL> });
+    // Using the graph deployed with the name "agent"
+    const assistantId = "agent";
+    // create thread
+    const thread = await client.threads.create();
+    console.log(thread);
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    curl --request POST \
+        --url <DEPLOYMENT_URL>/assistants/search \
+        --header 'Content-Type: application/json' \
+        --data '{
+            "limit": 10,
+            "offset": 0
+        }' | jq -c 'map(select(.config == null or .config == {})) | .[0].graph_id' && \
+    curl --request POST \
+        --url <DEPLOYMENT_URL>/threads \
+        --header 'Content-Type: application/json' \
+        --data '{}'
+    ```
+    </Tab>
+</Tabs>
+
+输出如下：
+
+```
+{
+'thread_id': '9dde5490-2b67-47c8-aa14-4bfec88af217',
+'created_at': '2024-08-30T23:07:38.242730+00:00',
+'updated_at': '2024-08-30T23:07:38.242730+00:00',
+'metadata': {},
+'status': 'idle',
+'config': {},
+'values': None
+}
+```
+
+## Cron job on a thread
+
+如果你想创建一个绑定到特定 thread 的 cron job，可以这样写：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    # This schedules a job to run at 15:27 (3:27PM) UTC every day
+    cron_job = await client.crons.create_for_thread(
+        thread["thread_id"],
+        assistant_id,
+        schedule="27 15 * * *",
+        input={"messages": [{"role": "user", "content": "What time is it?"}]},
+    )
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    // This schedules a job to run at 15:27 (3:27PM) UTC every day
+    const cronJob = await client.crons.create_for_thread(
+      thread["thread_id"],
+      assistantId,
+      {
+        schedule: "27 15 * * *",
+        input: { messages: [{ role: "user", content: "What time is it?" }] }
+      }
+    );
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    curl --request POST \
+        --url <DEPLOYMENT_URL>/threads/<THREAD_ID>/runs/crons \
+        --header 'Content-Type: application/json' \
+        --data '{
+            "assistant_id": <ASSISTANT_ID>,
+        }'
+    ```
+    </Tab>
+</Tabs>
+
+请注意，删除不再有用的 `Cron` job **非常** 重要。否则你可能会为 LLM 累积出不必要的 API 成本。你可以用下面的代码删除 `Cron` job：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    await client.crons.delete(cron_job["cron_id"])
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    await client.crons.delete(cronJob["cron_id"]);
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    curl --request DELETE \
+        --url <DEPLOYMENT_URL>/runs/crons/<CRON_ID>
+    ```
+    </Tab>
+</Tabs>
+
+## Cron job stateless
+
+你也可以用下面的方式创建 stateless cron job。Stateless cron job 会在每次执行时创建一个新的 thread：
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    # This schedules a job to run at 15:27 (3:27PM) UTC every day
+    cron_job_stateless = await client.crons.create(
+        assistant_id,
+        schedule="27 15 * * *",
+        input={"messages": [{"role": "user", "content": "What time is it?"}]},
+    )
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    // This schedules a job to run at 15:27 (3:27PM) UTC every day
+    const cronJobStateless = await client.crons.create(
+      assistantId,
+      {
+        schedule: "27 15 * * *",
+        input: { messages: [{ role: "user", content: "What time is it?" }] }
+      }
+    );
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    curl --request POST \
+        --url <DEPLOYMENT_URL>/runs/crons \
+        --header 'Content-Type: application/json' \
+        --data '{
+            "assistant_id": <ASSISTANT_ID>,
+        }'
+    ```
+    </Tab>
+</Tabs>
+
+同样地，记得在不再需要该 job 时删除它。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    await client.crons.delete(cron_job_stateless["cron_id"])
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    await client.crons.delete(cronJobStateless["cron_id"]);
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    curl --request DELETE \
+        --url <DEPLOYMENT_URL>/runs/crons/<CRON_ID>
+    ```
+    </Tab>
+</Tabs>
+
+## Thread cleanup for stateless crons
+
+<Note>
+该功能要求 LangGraph API 版本 **0.5.18** 或更高，并且 Python SDK 为 **0.3.2** 或更高，或 JavaScript SDK 为 **1.4.0** 或更高。
+</Note>
+
+每次 stateless cron 被触发时，都会创建一个新的 thread。你可以使用 `on_run_completed` 参数控制 run 完成后该 thread 的处理方式：
+
+- **`"delete"`**，默认值：在 run 完成后自动删除该 thread。
+- **`"keep"`**：保留该 thread，便于后续查询。此时需要你自行负责清理这些 thread。推荐做法请参阅 [how to add TTLs to your application](/langsmith/configure-ttl)。
+
+### Example: Keeping threads for later retrieval
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    # Create a stateless cron that keeps threads after execution.
+    # Configure checkpointer.ttl in langgraph.json to auto-delete old threads.
+    # See: https://docs.langchain.com/langsmith/configure-ttl
+    cron_job = await client.crons.create(
+        assistant_id,
+        schedule="27 15 * * *",
+        input={"messages": [{"role": "user", "content": "Daily report"}]},
+        on_run_completed="keep"
+    )
+
+    # You can later retrieve the runs and their results
+    runs = await client.runs.search(
+        metadata={"cron_id": cron_job["cron_id"]}
+    )
+    ```
+    </Tab>
+    <Tab title="Javascript">
+    ```js
+    // Create a stateless cron that keeps threads after execution.
+    // Configure checkpointer.ttl in langgraph.json to auto-delete old threads.
+    // See: https://docs.langchain.com/langsmith/configure-ttl
+    const cronJob = await client.crons.create(
+      assistantId,
+      {
+        schedule: "27 15 * * *",
+        input: { messages: [{ role: "user", content: "Daily report" }] },
+        onRunCompleted: "keep"
+      }
+    );
+
+    // You can later retrieve the runs and their results
+    const runs = await client.runs.search({
+      metadata: { cron_id: cronJob["cron_id"] }
+    });
+    ```
+    </Tab>
+    <Tab title="CURL">
+    ```bash
+    # Create a stateless cron that keeps threads after execution.
+    # Configure checkpointer.ttl in langgraph.json to auto-delete old threads.
+    # See: https://docs.langchain.com/langsmith/configure-ttl
+    curl --request POST \
+        --url <DEPLOYMENT_URL>/runs/crons \
+        --header 'Content-Type: application/json' \
+        --data '{
+            "assistant_id": "<ASSISTANT_ID>",
+            "schedule": "27 15 * * *",
+            "input": {"messages": [{"role": "user", "content": "Daily report"}]},
+            "on_run_completed": "keep"
+        }'
+    ```
+    </Tab>
+</Tabs>

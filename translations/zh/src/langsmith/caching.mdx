@@ -1,0 +1,167 @@
+---
+title: Use server-side caching
+sidebarTitle: Caching
+description: 在 agent deployment 中使用 stale-while-revalidate 和 key-value cache API 在服务端缓存值。
+---
+
+[Agent Server](/langsmith/agent-server) 内置了一个 cache，你可以在已部署的 graph 中使用。调用 `swr` 并传入 key 和 loader function 后，server 会缓存结果、在后台重新验证 stale entry，并在每次读取时返回最新数据。
+
+所有 cache API 都是 **仅限服务端** 的，并且要求使用 LangGraph Agent Server runtime。缓存值必须可被 JSON 序列化。
+
+<Note>
+`swr` 要求 Agent Server runtime **v0.7.79** 或更高版本，目前处于 **[beta](/langsmith/release-stages)**。
+`cache_get` 和 `cache_set` 要求 **v0.7.29** 或更高版本。
+</Note>
+
+## Quick start
+
+传入一个 key 和一个异步 loader function。如果缓存中已有值，`swr` 会返回缓存值；否则会调用 loader 获取它：
+
+```python
+from langgraph_sdk.cache import swr
+
+result = await swr("config:global", load_config)
+config_data = result.value
+```
+
+第一次调用时，`swr` 会等待 `load_config()` 完成并缓存结果。后续调用会立即返回缓存值，并在后台重新验证。
+
+## Configure freshness
+
+控制缓存值保持 fresh 的时间，以及其何时过期：
+
+```python
+from datetime import timedelta
+from langgraph_sdk.cache import swr
+
+result = await swr(
+    "config:global",
+    load_config,
+    fresh_for=timedelta(minutes=5),
+    max_age=timedelta(hours=1),
+)
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `fresh_for` | `timedelta(0)` | 缓存值被视为 fresh 的持续时间。在此时间窗口内，`swr` 直接返回缓存值，不做 revalidation。 |
+| `max_age` | `timedelta(days=1)` | 缓存 entry 的最长生命周期。超过该时间后，`swr` 会先等待 loader 完成，再返回结果。上限为 1 天。 |
+
+### How revalidation works
+
+| Cache state | Condition | Behavior |
+|---|---|---|
+| **Miss** | key 不在 cache 中 | 等待 `loader()`，存储结果并返回。 |
+| **Fresh** | `age < fresh_for` | 返回缓存值，不做 revalidation。 |
+| **Stale** | `fresh_for <= age < max_age` | 立即返回缓存值，并触发后台刷新。 |
+| **Expired** | `age >= max_age` | 等待 `loader()`，存储结果并返回。 |
+
+## Use with Pydantic models
+
+传入 `model` 参数后，可以自动序列化和反序列化 Pydantic model：
+
+```python
+from pydantic import BaseModel
+from langgraph_sdk.cache import swr
+
+class UserProfile(BaseModel):
+    name: str
+    email: str
+    role: str
+
+result = await swr(
+    f"profile:{user_id}",
+    lambda: fetch_profile(user_id),
+    model=UserProfile,
+)
+profile: UserProfile = result.value  # deserialized automatically
+```
+
+`swr` 会在存储前调用 `model_dump(mode="json")`，并在读取时调用 `model.model_validate()`。
+
+## Cache auth credentials
+
+你可以在 [custom auth handler](/langsmith/custom-auth) 中缓存 credential validation，避免每个请求都访问 identity provider：
+
+```python
+from datetime import timedelta
+from langgraph_sdk import Auth
+from langgraph_sdk.cache import swr
+
+auth = Auth()
+
+@auth.authenticate
+async def authenticate(headers: dict) -> Auth.types.MinimalUserDict:
+    token = (headers.get(b"authorization") or b"").decode()
+    if not token:
+        raise Auth.exceptions.HTTPException(status_code=401, detail="Missing token")
+
+    result = await swr(
+        f"auth:token:{token}",
+        lambda: validate_and_fetch_user(token),
+        fresh_for=timedelta(minutes=5),
+        max_age=timedelta(hours=1),
+    )
+    return result.value
+```
+
+在这个设置下，server 会在 5 分钟内直接返回缓存的 user 而不做 revalidation，然后在最长 1 小时内进行后台 revalidation。1 小时后，下一个请求会阻塞，直到 `validate_and_fetch_user` 完成。
+
+## Inspect cache status
+
+`swr` 返回一个 `SWRResult` 对象，包含 value 和 cache status：
+
+```python
+result = await swr("my-key", my_loader)
+
+result.value   # the cached or freshly loaded value
+result.status  # "miss" | "fresh" | "stale" | "expired"
+```
+
+调用 `.mutate()` 可以更新缓存值，或强制 revalidation：
+
+```python
+await result.mutate(new_value)  # update the cache with a new value
+await result.mutate()           # force revalidation by calling the loader
+```
+
+## Low-level cache API
+
+如果你只需要简单的 get/set 缓存，而不需要 revalidation，可以直接使用 `cache_get` 和 `cache_set`：
+
+```python
+from datetime import timedelta
+from langgraph_sdk.cache import cache_get, cache_set
+
+value = await cache_get("my-key")
+
+if value is None:
+    value = await expensive_computation()
+    await cache_set("my-key", value, ttl=timedelta(hours=1))
+```
+
+### `cache_get`
+
+```python
+async def cache_get(key: str) -> Any | None
+```
+
+返回反序列化后的值；如果 key 不存在或已过期，则返回 `None`。
+
+### `cache_set`
+
+```python
+async def cache_set(key: str, value: Any, *, ttl: timedelta | None = None) -> None
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `key` | `str` | required | cache key |
+| `value` | `Any` | required | 要缓存的值，必须可被 JSON 序列化 |
+| `ttl` | `timedelta \| None` | `None` | time-to-live。server 会将其上限限制为 1 天。`None` 或零值默认按 1 天处理 |
+
+## Next steps
+
+- [Add custom authentication](/langsmith/custom-auth) 到你的 deployment。
+- [Add custom lifespan events](/langsmith/custom-lifespan) 以在 server 启动时初始化资源。
+- 了解 [agent server architecture](/langsmith/agent-server)。
