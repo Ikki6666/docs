@@ -26,7 +26,9 @@ mkdir -p "$STATIC_DIR"
 unzip -q "$EXPORT_ZIP" -d "$STATIC_DIR"
 
 echo "==> Starting static container"
-docker compose up -d "$SERVICE_NAME"
+# --force-recreate ensures the bind-mount is re-established after rm -rf rebuilt
+# the static-site directory above; otherwise the container keeps the old (empty) inode.
+docker compose up -d --force-recreate "$SERVICE_NAME"
 
 echo "==> Waiting for site: $HEALTH_URL"
 for attempt in $(seq 1 30); do
