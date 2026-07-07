@@ -1,0 +1,135 @@
+---
+title: "Dell powerscale 集成"
+description: "使用 LangChain Python 集成 Dell powerscale 文档加载器。"
+---
+
+[Dell PowerScale](https://www.dell.com/en-us/shop/powerscale-family/sf/powerscale) 是一套企业级横向扩展存储系统，承载业界领先的 OneFS 文件系统，可部署在本地或云端。
+
+这个 document loader 利用了 PowerScale 的独特能力，可判断自应用上次运行以来哪些文件发生了修改，并且只返回已修改文件进行处理。这样可以避免重新处理（chunk 和 embed）未发生变化的文件，从而提升整体数据摄取工作流。
+
+该 loader 需要启用 PowerScale 的 MetadataIQ 功能。更多信息可参阅我们的 GitHub Repo：[https://github.com/dell/powerscale-rag-connector](https://github.com/dell/powerscale-rag-connector)
+
+## 概览
+
+### 集成详情
+
+| Class | Package | Local | Serializable | [JS support](https://js.langchain.com/docs/integrations/document_loaders/web_loaders/__module_name___loader)|
+| :--- | :--- | :---: | :---: |  :---: |
+| [`PowerScaleDocumentLoader`](https://github.com/dell/powerscale-rag-connector/blob/main/src/powerscale_rag_connector/PowerScaleDocumentLoader.py) | [`powerscale-rag-connector`](https://github.com/dell/powerscale-rag-connector) | ✅ | ❌ | ❌ |
+| [`PowerScaleUnstructuredLoader`](https://github.com/dell/powerscale-rag-connector/blob/main/src/powerscale_rag_connector/PowerScaleUnstructuredLoader.py) | [`powerscale-rag-connector`](https://github.com/dell/powerscale-rag-connector) | ✅ | ❌ | ❌ |
+
+### Loader 特性
+
+| Source | Document Lazy Loading | Native Async Support
+| :---: | :---: | :---: |
+| `PowerScaleDocumentLoader` | ✅ | ✅ |
+| `PowerScaleUnstructuredLoader` | ✅ | ✅ |
+
+## 设置
+
+这个 document loader 需要使用启用了 MetadataIQ 的 Dell PowerScale 系统。更多信息可参阅我们的 github 页面：[https://github.com/dell/powerscale-rag-connector](https://github.com/dell/powerscale-rag-connector)
+
+### 安装
+
+该 document loader 位于一个外部 pip 包中，可使用标准工具安装
+
+```python
+pip install -qU  powerscale-rag-connector
+```
+
+## 初始化
+
+现在可以实例化 document loader：
+
+### 通用 document loader
+
+我们的通用 document loader 可以按以下方式增量加载 PowerScale 中的全部文件：
+
+```python
+from powerscale_rag_connector import PowerScaleDocumentLoader
+
+loader = PowerScaleDocumentLoader(
+    es_host_url="http://elasticsearch:9200",
+    es_index_name="metadataiq",
+    es_api_key="your-api-key",
+    folder_path="/ifs/data",
+)
+```
+
+### UnstructuredLoader loader
+
+此外，你也可以使用 `PowerScaleUnstructuredLoader` 来定位变更文件，**并**自动处理这些文件，生成源文件的 elements。该能力基于 LangChain 的 `UnstructuredLoader` 类。
+
+```python
+from powerscale_rag_connector import PowerScaleUnstructuredLoader
+
+# Or load files with the Unstructured Loader
+loader = PowerScaleUnstructuredLoader(
+    es_host_url="http://elasticsearch:9200",
+    es_index_name="metadataiq",
+    es_api_key="your-api-key",
+    folder_path="/ifs/data",
+    # 'elements' mode splits the document into more granular chunks
+    # Use 'single' mode if you want the entire document as a single chunk
+    mode="elements",
+)
+```
+
+这些字段的含义如下：
+
+- `es_host_url` 是 MetadataIQ Elasticsearch 数据库的 endpoint
+- `es_index_index` 是 PowerScale 写入文件系统 metadata 的 index 名称
+- `es_api_key` 是你的 elasticsearch API key 的**编码后**版本
+- `folder_path` 是在 PowerScale 上用于查询变更的路径
+
+## 加载
+
+在内部，所有与 PowerScale 和 MetadataIQ 交互的代码都是异步的，而 `load` 与 `lazy_load` 方法都会返回一个 python generator。我们建议使用 `lazy_load`。
+
+```python
+for doc in loader.load():
+    print(doc)
+```
+
+```python
+[Document(page_content='' metadata={'source': '/ifs/pdfs/1994-Graph.Theoretic.Obstacles.to.Perfect.Hashing.TR0257.pdf', 'snapshot': 20834, 'change_types': ['ENTRY_ADDED']}),
+Document(page_content='' metadata={'source': '/ifs/pdfs/New.sendfile-FreeBSD.20.Feb.2015.pdf', 'snapshot': 20920, 'change_types': ['ENTRY_MODIFIED']}),
+Document(page_content='' metadata={'source': '/ifs/pdfs/FAST-Fast.Architecture.Sensitive.Tree.Search.on.Modern.CPUs.and.GPUs-Slides.pdf', 'snapshot': 20924, 'change_types': ['ENTRY_ADDED']})]
+```
+
+### 返回对象
+
+这两种 document loader 都会跟踪此前已经返回给应用的文件。当再次调用时，document loader 只会返回自上次运行以来新增或修改过的文件。
+
+- 返回的 @[`Document`] 中，`metadata` 字段会返回包含已修改文件的 PowerScale 路径。你可以用这个路径通过 NFS（或 S3）读取数据，并在应用中继续处理（例如生成 chunks 和 embeddings）。
+- `source` 字段表示的是 PowerScale 上的路径，并不一定是本地系统路径（取决于你的挂载策略）；OneFS 会将整个存储系统表示为一棵以 `/ifs` 为根的树。
+- `change_types` 属性会告诉你自上次以来发生了什么变化，例如新增、修改或删除。
+
+你的 RAG 应用可以使用 `change_types` 中的信息，对 chunk 和向量存储执行新增、更新或删除。
+
+当使用 `PowerScaleUnstructuredLoader` 时，`page_content` 字段会填入来自 Unstructured Loader 的数据。
+
+## 惰性加载
+
+在内部，所有与 PowerScale 和 MetadataIQ 交互的代码都是异步的，而 `load` 与 `lazy_load` 方法都会返回一个 python generator。我们建议使用 `lazy_load`。
+
+```python
+for doc in loader.lazy_load():
+    print(doc)  # do something specific with the document
+```
+
+返回的 @[`Document`] 与 `load` 函数相同，并具备上述所有相同属性。
+
+## 更多示例
+
+更多示例和代码可参阅我们的公开 github 页面：[https://github.com/dell/powerscale-rag-connector/tree/main/examples](https://github.com/dell/powerscale-rag-connector/tree/main/examples)，其中提供了可完整运行的示例。
+
+- [PowerScale LangChain Document Loader](https://github.com/dell/powerscale-rag-connector/blob/main/examples/powerscale_langchain_doc_loader.py) - 标准 document loader 的完整示例
+- [PowerScale LangChain Unstructured Loader](https://github.com/dell/powerscale-rag-connector/blob/main/examples/powerscale_langchain_unstructured_loader.py) - 使用 unstructured loader 做 chunking 和 embedding 的完整示例
+- [PowerScale NVIDIA Retriever Microservice Loader](https://github.com/dell/powerscale-rag-connector/blob/main/examples/powerscale_nvingest_example.py) - 结合 NVIDIA NeMo Retriever microservices 做 chunking 和 embedding 的完整示例
+
+---
+
+## API 参考
+
+如需了解 PowerScale Document Loader 全部特性与配置，请参阅 github 页面：[https://github.com/dell/powerscale-rag-connector/](https://github.com/dell/powerscale-rag-connector/)

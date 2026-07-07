@@ -1,0 +1,616 @@
+---
+title: Prompt template 格式指南
+sidebarTitle: Prompt template 格式
+---
+
+本页介绍 [Playground](/langsmith/prompt-engineering-concepts#playground)、[prompt hub](/langsmith/manage-prompts#public-prompt-hub) 和 [evaluators](/langsmith/evaluation-concepts#evaluators) 中支持的 [prompt template](/langsmith/prompt-engineering-concepts#prompts-vs-prompt-templates) 格式。Prompt templates 允许你创建可复用的 prompts，其中包含会在运行时填充的动态占位符。
+
+<Tip>
+如果你想先了解 prompt engineering 和 prompt templates 的总体概念，请参见 [Concepts](/langsmith/prompt-engineering-concepts#prompts-vs-prompt-templates) 页面。
+</Tip>
+
+LangSmith 支持两种 prompt template 格式，分别适用于不同复杂度的场景：
+
+| Format | Syntax | Best for |
+|--------|--------|----------|
+| **f-string** | `{variable}` | 只做基础变量替换的简单 prompts |
+| **mustache** | `{{variable}}` | 带循环、条件、嵌套数据或 evaluator 的复杂 prompts |
+
+[F-string syntax](#f-string-syntax) 很适合直接、简单的 prompts。[Mustache](#mustache-syntax) 则提供了处理复杂数据结构和逻辑所需的能力，这对于 evaluators 和高级场景尤其有帮助。
+
+你可以在 [UI](https://smith.langchain.com) 中切换格式。在可以转换时，LangSmith 会自动[转换你的模板](#conversion-between-formats)，但某些 mustache 特性（例如 loops 和 conditionals）无法转换成 f-string 格式。
+
+<Callout icon="test-pipe" color="#4F46E5" iconType="regular">
+你可以在 [Playground](https://smith.langchain.com/playground) 中测试本页示例。在 Playground 里打开 prompt settings <Icon icon="settings" color="#4F46E5" iconType="solid" /> 菜单，然后切换 **Prompt format**。
+</Callout>
+
+## F-string syntax
+
+F-string 模板使用 Python 风格的格式化语法，即单花括号 `{variable}`。LangSmith 使用的是 Python [f-string syntax](https://realpython.com/python-f-strings/) 的一个[简化子集](#limitations)：它只支持基础变量替换，不支持完整的 Python 表达式和格式化能力。当你的数据结构比较扁平，只需要把值插入 prompt 时，f-string 非常合适。
+
+### 基础变量
+
+变量会被输入数据中对应的值替换。变量名必须完全匹配，并且区分大小写：
+
+```python
+# Template
+Hello, {name}! Welcome to {company}.
+
+# Input
+{
+  "name": "Ashley",
+  "company": "LangChain"
+}
+
+# Output
+Hello, Ashley! Welcome to LangChain.
+```
+
+模板运行时，LangSmith 会在输入对象中查找每个变量名，并把 `{name}` 替换成 `name` 这个 key 对应的值。
+
+### 变量名
+
+F-string 变量名会被当作简单的字符串标识符处理。它们不能包含点号、方括号或特殊字符，只能包含字母数字和下划线。
+
+```python
+# Template
+Hello, {name}!
+Your topic is: {topic}
+
+# Input
+{
+  "name": "Ashley",
+  "topic": "LangSmith"
+}
+
+# Output
+Hello, Ashley!
+Your topic is: LangSmith
+```
+
+如果你的输入是嵌套对象，比如 `{"user": {"name": "Ashley"}}`，你**不能**在 f-string 格式中使用 `{user.name}` 来访问嵌套值。这里的点号会被视为变量名的一部分，也就是它会去找一个叫 `"user.name"` 的 key，而不会把点号当成路径分隔符。若要访问嵌套数据，请改用 [mustache format](#mustache-syntax)。
+
+### 字面花括号
+
+有时你需要在输出中包含真正的花括号，例如在 JSON 示例或代码片段中。这时请把花括号**写成双层**：
+
+```python
+# Template
+Use double braces for literals: {{not_a_variable}}
+But single braces for variables: {variable}
+
+# Input
+{
+  "variable": "value"
+}
+
+# Output
+Use double braces for literals: {not_a_variable}
+But single braces for variables: value
+```
+
+模板解析器会把 `{{` 识别为转义后的花括号，而不是变量占位符。只有单层花括号 `{...}` 才会被当作变量处理。
+
+### 限制
+
+LangSmith 对 f-string 的实现有意做了限制，以保持模板简单且行为可预测。以下特性**不受支持**：
+
+- **Dot notation for nested access：** 不能用 `{user.name}` 访问嵌套对象。整个字符串 `"user.name"` 会被当成一个变量名。
+- **Format specifiers：** 不能用 `{price:.2f}` 做数字格式化，也不能用 `{rate:.1%}` 表示百分比。
+- **Expressions：** 不能写 `{x + y}`、`{len(items)}` 或 `{value if condition else default}`。
+- **Function calls：** 不能写 `{str.upper()}` 这类方法调用。
+- **Loops or conditionals：** 不支持控制流结构。
+- **Array indexing：** 不能写 `{items[0]}` 访问数组元素。
+
+如果你需要这些高级能力，**请改用 mustache format**。
+
+## Mustache syntax
+
+[Mustache](https://mustache.github.io/mustache.5.html) 是一种“logic-less”模板语言，也就是它不允许任意代码执行，但会通过 sections 提供结构化控制流。之所以叫 “logic-less”，是因为你不能写复杂表达式，而是通过组织数据结构来控制最终渲染结果。
+
+Mustache 专为复杂数据结构和动态渲染而设计。它尤其适用于：
+
+- **Evaluators：** 处理 thread history 和对话上下文。
+- **Few-shot prompting：** 遍历 example 列表。
+- **Nested data：** 访问深层嵌套对象和数组。
+- **Conditional content：** 根据数据是否存在，显示不同内容。
+
+它使用双花括号语法 `{{variable}}`，以区别于 f-string。
+
+### 基础变量
+
+和 f-string 一样，mustache 也会把变量替换成对应值：
+
+```mustache
+{{!-- Template --}}
+Hello, {{name}}! Welcome to {{company}}.
+
+{{!-- Input --}}
+{
+  "name": "Ashley",
+  "company": "LangChain"
+}
+
+{{!-- Output --}}
+Hello, Ashley! Welcome to LangChain.
+```
+
+<Note>
+`{{!-- ... --}}` 是 mustache 注释，不会出现在输出里。请参见 [Comments](#comments) 一节。
+</Note>
+
+### 嵌套对象访问
+
+你可以使用点号来访问嵌套对象：
+
+```mustache
+{{!-- Template --}}
+User: {{user.name}}
+Email: {{user.profile.email}}
+
+{{!-- Input --}}
+{
+  "user": {
+    "name": "Billy",
+    "profile": {
+      "email": "billy@example.com"
+    }
+  }
+}
+
+{{!-- Output --}}
+User: Billy
+Email: billy@example.com
+```
+
+模板引擎会沿着 `user` → `profile` → `email` 的路径去读取数据结构。每个点号都代表一级嵌套。
+
+现实中的数据经常是嵌套的，比如 API 响应、数据库记录等。Mustache 让你可以直接使用这些结构，而不必先把它们拍平成扁平格式。
+
+### Sections
+
+Sections 是 mustache 最核心的能力。一个 section 以 `{{#name}}` 开始，以 `{{/name}}` 结束。它在不同值下的表现如下：
+
+- **Array：** 对数组中的每个元素重复渲染其中内容。
+- **Object：** 以该对象作为上下文渲染一次。
+- **Truthy value：** 渲染一次。
+- **Falsy value（false、null、undefined、空数组）：** 不渲染。
+
+在下面的示例中，section `{{#items}}` 会遍历 `items` 数组。每次迭代时，section 内部的变量（例如 `{{name}}` 和 `{{price}}`）都会基于当前数组元素来解析：
+
+```mustache
+{{!-- Template --}}
+Shopping List:
+{{#items}}
+  - {{name}}: ${{price}}
+{{/items}}
+
+{{!-- Input --}}
+{
+  "items": [
+    {"name": "Apple", "price": "1.50"},
+    {"name": "Banana", "price": "0.75"},
+    {"name": "Orange", "price": "2.00"}
+  ]
+}
+
+{{!-- Output --}}
+Shopping List:
+  - Apple: $1.50
+  - Banana: $0.75
+  - Orange: $2.00
+```
+
+Sections 让你不必手动拼接重复文本。在 evaluators 中，你会经常用 sections 来遍历对话消息或 [few-shot examples](#few-shot-examples)。
+
+对于更深层级的层次结构数据，你还可以嵌套多个 sections，以处理多层数组和对象组成的复杂结构：
+
+```mustache
+{{!-- Template --}}
+{{#company}}
+Company: {{name}}
+{{#departments}}
+  Department: {{dept_name}}
+  {{#employees}}
+    - {{employee_name}} ({{role}})
+  {{/employees}}
+{{/departments}}
+{{/company}}
+
+{{!-- Input --}}
+{
+  "company": {
+    "name": "TechCorp",
+    "departments": [
+      {
+        "dept_name": "Engineering",
+        "employees": [
+          {"employee_name": "Ashley", "role": "Senior Engineer"},
+          {"employee_name": "Billy", "role": "Engineer"}
+        ]
+      },
+      {
+        "dept_name": "Sales",
+        "employees": [
+          {"employee_name": "Carol", "role": "Sales Manager"}
+        ]
+      }
+    ]
+  }
+}
+
+{{!-- Output --}}
+Company: TechCorp
+  Department: Engineering
+    - Ashley (Senior Engineer)
+    - Billy (Engineer)
+  Department: Sales
+    - Carol (Sales Manager)
+```
+
+<Tip>
+你可以按需要构建任意深度的结构，但为了可读性，面对特别深的结构时，通常更建议先在模板外做一层扁平化处理。这个方式很适合表示嵌套分类、带 metadata 的对话线程，或任何层级型数据。
+</Tip>
+
+### 嵌套循环
+
+你可以嵌套 sections 来处理多层数据结构：
+
+```mustache
+{{#categories}}
+Category: {{name}}
+{{#products}}
+  - {{title}} ({{price}})
+{{/products}}
+{{/categories}}
+
+{{!-- Input --}}
+{
+  "categories": [
+    {
+      "name": "Fruits",
+      "products": [
+        {"title": "Apple", "price": "$1.50"},
+        {"title": "Banana", "price": "$0.75"}
+      ]
+    },
+    {
+      "name": "Vegetables",
+      "products": [
+        {"title": "Carrot", "price": "$0.50"},
+        {"title": "Lettuce", "price": "$1.25"}
+      ]
+    }
+  ]
+}
+
+{{!-- Output --}}
+Category: Fruits
+  - Apple ($1.50)
+  - Banana ($0.75)
+Category: Vegetables
+  - Carrot ($0.50)
+  - Lettuce ($1.25)
+```
+
+外层 section `{{#categories}}` 会把上下文切换到每个 category 对象。在这个上下文内，`{{name}}` 指向 category 名称，内层 section `{{#products}}` 则遍历该分类下的 products。
+
+当你的数据存在层级关系，例如分类下有商品、部门下有员工，或一个对话线程下有多轮交流时，就可以使用嵌套循环。
+
+### 通过索引访问数组元素
+
+有时你只需要某个特定元素，而不是整段循环。这时可以使用带数字索引的点号语法：
+
+```mustache
+{{!-- Template --}}
+First item: {{items.0}}
+Second item: {{items.1}}
+Last item: {{items.2}}
+
+{{!-- Input --}}
+{
+  "items": ["Apple", "Banana", "Orange"]
+}
+
+{{!-- Output --}}
+First item: Apple
+Second item: Banana
+Last item: Orange
+```
+
+不过这要求你在编写模板时就知道对应索引。
+
+Evaluators 常常需要拿到对话线程中的第一条用户消息或最后一条 AI 响应。你可以用 `{{all_messages.0}}` 访问第一条消息，或者先在数据层预先计算出最后一条消息。
+
+### 条件渲染
+
+你也可以把 sections 当作条件分支来用。当某个值存在、非空且不为 `false` 时，section 才会渲染：
+
+```mustache
+{{!-- Template --}}
+{{#user}}
+Welcome back, {{name}}!
+{{/user}}
+
+{{!-- Input (user exists) --}}
+{
+  "user": {
+    "name": "Ashley"
+  }
+}
+
+{{!-- Output --}}
+Welcome back, Ashley!
+
+{{!-- Input (no user) --}}
+{}
+
+{{!-- Output --}}
+(empty - section doesn't render)
+```
+
+Section `{{#user}}` 会检查 `user` 是否存在且为 truthy。如果是，就会以 `user` 作为上下文渲染内部内容，因此 `{{name}}` 会去 `user` 里找 `name`。
+
+这很适合展示可选内容，比如只有在存在用户信息时才显示 “Welcome back”，或者只有在存在错误信息时才显示错误提示。
+
+### Inverted sections
+
+Inverted sections 只有在某个值不存在、为 false、null、undefined 或空数组时才会渲染。它们通常用来处理空状态，例如缺失数据或空列表。
+
+在下面的示例中：
+
+- `{{#results}}` 会遍历每个结果，并为每一项渲染一行。
+- `{{^results}}` 只会在结果数组为空或不存在时渲染。
+- 这个 inverted section 为“没有结果可显示”的场景提供了明确兜底。
+
+```mustache
+{{!-- Template --}}
+Search results for "{{query}}":
+
+{{#results}}
+  - {{title}} ({{year}})
+{{/results}}
+
+{{^results}}
+No results found. Try a different search term.
+{{/results}}
+
+{{!-- Input (with results)--}}
+{
+  "query": "matrix",
+  "results": [
+    {"title": "The Matrix", "year": 1999},
+    {"title": "The Matrix Reloaded", "year": 2003}
+  ]
+}
+
+{{!-- Output --}}
+Search results for "matrix":
+
+  - The Matrix (1999)
+  - The Matrix Reloaded (2003)
+
+{{!-- Input (no results) --}}
+{
+    "query": "asdlkjasd",
+    "results": []
+}
+
+{{!-- Output --}}
+Search results for "asdlkjasd":
+
+No results found. Try a different search term.
+```
+
+你也可以把普通 section 和 inverted section 配合起来，形成 if/else 逻辑，在变量缺失时给出默认值。
+
+普通 section `{{#username}}` 只在 `username` 存在时渲染；inverted section `{{^username}}` 则只在它不存在时渲染。两者组合起来，就相当于一个 if/else 分支。这对于用户数据是可选的场景很实用，比如用户存在时做个性化问候，不存在时使用默认文案：
+
+```mustache
+{{!-- Template --}}
+{{#username}}
+Hello, {{username}}!
+{{/username}}
+{{^username}}
+Hello, Guest!
+{{/username}}
+
+{{!-- Input (with username) --}}
+{"username": "Ashley"}
+{{!-- Output: Hello, Ashley! --}}
+
+{{!-- Input (no username) --}}
+{}
+{{!-- Output: Hello, Guest! --}}
+```
+
+这种模式也可以扩展到 boolean flags 上，根据数据条件切换输出格式：
+
+```mustache
+{{!-- Template --}}
+Status: {{status}}
+{{#is_urgent}}
+⚠️ URGENT - Immediate attention required!
+{{/is_urgent}}
+{{^is_urgent}}
+Standard priority
+{{/is_urgent}}
+
+{{!-- Input --}}
+{
+  "status": "Open",
+  "is_urgent": true
+}
+
+{{!-- Output --}}
+Status: Open
+⚠️ URGENT - Immediate attention required!
+```
+
+通过在数据中设置 boolean flags，就可以控制哪些内容块会被渲染。这样可以把格式逻辑留在模板里，而不必写回应用代码。它很适合用来高亮重要信息、根据上下文调整语气（正式或随意），或者为不同类型用户显示不同说明。
+
+### Comments
+
+注释可以帮助你记录模板意图，而不会影响输出。使用 `{{! comment }}` 或 `{{!-- comment --}}`：
+
+```mustache
+{{!-- Template --}}
+Hello, {{name}}!
+{{! This is a comment and won't appear in output }}
+Welcome to our service.
+
+{{!-- Input --}}
+{
+  "name": "Ashley"
+}
+
+{{!-- Output --}}
+Hello, Ashley!
+Welcome to our service.
+```
+
+你可以用注释来解释复杂 sections、记录期望的数据结构，或说明某段逻辑存在的原因，这会让协作者更容易理解你的模板。
+
+## Evaluators 和 threads 的特殊变量
+
+当你构建 [evaluators](/langsmith/evaluation-concepts#evaluators) 或处理对话式 AI 时，LangSmith 会自动提供一些特殊变量，以便用更方便的结构来表示对话数据。这些变量**只在 evaluator 场景中可用**，不会出现在普通 Playground prompts 中。
+
+Evaluators 通常需要从整体上分析一段对话，比如观察多条消息之间的模式、比较第一问和最终答案，或评估 AI 在多轮追问中的应对效果。这些变量能让你直接访问对话结构，而不必手动整理数据。
+
+### Thread message variables
+
+LangSmith 会为对话 [threads](/langsmith/evaluation-concepts#threads) 提供三种预结构化视图：
+
+```mustache
+{{!-- Access all messages in the thread --}}
+{{#all_messages}}
+{{role}}: {{content}}
+{{/all_messages}}
+
+{{!-- Access human-AI message pairs --}}
+{{#human_ai_pairs}}
+Human: {{human}}
+AI: {{ai}}
+{{/human_ai_pairs}}
+
+{{!-- Access first human and last AI message --}}
+{{#first_human_last_ai}}
+Original question: {{first_human}}
+Final answer: {{last_ai}}
+{{/first_human_last_ai}}
+
+{{!-- Access specific message by index --}}
+First message: {{all_messages.0}}
+Second message: {{all_messages.1}}
+```
+
+- **`all_messages`**：按时间顺序排列的全部消息，每条都有 `role`（user/assistant/system）和 `content` 字段。适合展示完整对话流。
+- **`human_ai_pairs`**：把消息整理成问答对。每对包含 `human`（用户消息）和 `ai`（助手响应）。适合评估回答质量。
+- **`first_human_last_ai`**：只保留初始问题（`first_human`）和最终答案（`last_ai`）。适合忽略中间对话，只检查 AI 最终是否回答了原始问题。
+
+### 结合 thread context 的示例
+
+下面的例子展示了一个使用 thread context 的 evaluator prompt：
+
+```mustache
+{{!-- Template --}}
+Evaluate this conversation:
+
+{{#all_messages}}
+{{role}}: {{content}}
+{{/all_messages}}
+
+Was the AI helpful? Rate from 1-5.
+
+{{!-- Input (provided by LangSmith) --}}
+{
+  "all_messages": [
+    {"role": "user", "content": "What's the weather?"},
+    {"role": "assistant", "content": "I don't have access to weather data."},
+    {"role": "user", "content": "Can you tell me a joke instead?"},
+    {"role": "assistant", "content": "Why did the chicken cross the road?"}
+  ]
+}
+
+{{!-- Output --}}
+Evaluate this conversation:
+
+user: What's the weather?
+assistant: I don't have access to weather data.
+user: Can you tell me a joke instead?
+assistant: Why did the chicken cross the road?
+
+Was the AI helpful? Rate from 1-5.
+```
+
+这个模板使用 mustache section `{{#all_messages}}` 来遍历对话数组。每次迭代时，section 都会把上下文切换到当前消息对象，因此 `{{role}}` 和 `{{content}}` 会访问该消息的对应属性。循环会按顺序遍历全部四条消息，并以 `"role: content"` 的形式输出。这样 evaluator LLM 就能拿到完整对话历史，从而判断整体帮助程度。
+
+当你在 LangSmith 中创建 evaluator 时，可以选择要包含哪些 thread variables。LangSmith 会自动从被评估的对话中填充这些变量。
+
+## Few-shot examples
+
+Few-shot prompting 通过示例来“教会” LLM 任务。你会先提供若干输入-输出样例，再让它在新的输入上执行同类任务。
+
+[Few-shot examples](/langsmith/create-few-shot-evaluators#how-few-shot-examples-work) 能帮助 LLM 理解：
+
+- **格式预期**，例如“请返回 JSON”或“请使用这种语气”
+- **边界场景**，例如如何处理歧义输入
+- **任务细节**，例如 “positive” 和 “very positive” 之间的差别
+
+它特别适用于分类、格式化和风格类任务，因为“给示例看”往往比“纯文字说明”更清楚。
+
+### Few-shot placeholder
+
+在 LangSmith 中，你可以使用 `{{few_shot_examples}}` 占位符，把 few-shot examples 插入到你希望出现的位置：
+
+```mustache
+{{!-- Template --}}
+You are a sentiment classifier.
+
+{{few_shot_examples}}
+
+Now classify this text:
+Text: {{text}}
+Sentiment:
+```
+
+当你在 [LangSmith UI](https://smith.langchain.com) 中启用 few-shot examples（例如在 evaluators 或 Prompt Hub 中）时，示例格式是单独配置的。LangSmith 会自动把格式化后的 examples 注入到 `{{few_shot_examples}}` 所在位置。这样既能保持 prompt template 本身干净，也能让 examples 独立维护。
+
+**配置示例后可能得到的输出：**
+
+```
+You are a sentiment classifier.
+
+Text: I love this!
+Sentiment: positive
+Text: This is terrible.
+Sentiment: negative
+Text: It's okay.
+Sentiment: neutral
+
+Now classify this text:
+Text: This is amazing!
+Sentiment:
+```
+
+请在 LangSmith UI 中把 few-shot examples 配置成与你实际任务格式一致的样子。这种一致性有助于 LLM 正确泛化。使用占位符的方式，也让 prompt 结构和 example 数据分离开来，二者都更容易维护。
+
+## 格式之间的转换
+
+**F-string 转 mustache**：对于基础变量总是可行的。格式说明符虽然会被转换，但具体格式化效果会被移除。
+
+**Mustache 转 f-string**：只对基础变量有效。Mustache 中的 dot notation、sections、conditionals 和 comments 在 f-string 中都没有等价表达：
+
+- **Dot notation：** `{{user.name}}`。而在 f-string 中，`"user.name"` 会被当成单个变量名，而不是嵌套访问路径。
+- **Sections/loops：** `{{#items}}...{{/items}}`。f-string 中没有对应能力。
+- **Conditionals：** `{{#value}}...{{/value}}`。f-string 中没有对应能力。
+- **Inverted sections：** `{{^value}}...{{/value}}`。f-string 中没有对应能力。
+- **Comments：** `{{! comment }}`。f-string 中没有对应能力。
+
+如果你尝试把带这些特性的 mustache 模板转换成 f-string，LangSmith 要么会拒绝转换，要么只转换简单部分，从而破坏模板原有功能。因此请在转换后务必预览结果。
+
+## 额外资源
+
+- **[LangSmith Prompt Engineering Concepts](https://docs.langchain.com/langsmith/prompt-engineering-concepts)**：更高层次的 prompt 设计思路与建议。
+- **[Mustache Manual](https://mustache.github.io/mustache.5.html)**：包含全部特性的完整 mustache 规范。
+- **[Python f-string Documentation](https://docs.python.org/3/reference/lexical_analysis.html#f-strings)**：官方 Python f-string 语法说明（注意：LangSmith 使用的是其简化子集）。

@@ -1,0 +1,140 @@
+---
+title: Monorepo 支持
+sidebarTitle: Monorepo 支持
+---
+
+LangSmith 支持从 monorepo 结构中部署 agent，即使你的 agent 代码依赖仓库中其他位置的共享包也没有问题。本指南将展示如何组织 monorepo，并配置 `langgraph.json` 文件以正确处理共享依赖。
+
+## 仓库结构
+
+完整可运行示例请参见：
+- [Python monorepo 示例](https://github.com/langchain-ai/python-langraph-monorepo-example)
+- [JS monorepo 示例](https://github.com/langchain-ai/js-langgraph-monorepo-example)
+
+<CodeGroup>
+```plaintext Python
+my-monorepo/
+├── shared-utils/           # Shared Python package
+│   ├── __init__.py
+│   ├── common.py
+│   └── pyproject.toml      # Or setup.py
+├── agents/
+│   └── customer-support/   # Agent directory
+│       ├── agent/
+│       │   ├── __init__.py
+│       │   └── graph.py
+│       ├── langgraph.json  # Config file in agent directory
+│       ├── .env
+│       └── pyproject.toml  # Agent dependencies
+└── other-service/
+    └── ...
+```
+```plaintext JS
+my-monorepo/
+├── package.json            # Root package.json with workspaces
+├── shared-utils/           # Shared TypeScript package
+│   ├── package.json
+│   ├── src/
+│   │   └── index.ts
+│   └── tsconfig.json
+├── agents/
+│   └── customer-support/   # Agent directory
+│       ├── src/
+│       │   └── agent.ts
+│       ├── langgraph.json  # Config file in agent directory
+│       ├── package.json    # Agent dependencies
+│       ├── .env
+│       └── tsconfig.json
+└── other-service/
+    └── ...
+```
+</CodeGroup>
+
+## LangGraph.json 配置
+
+将 `langgraph.json` 放在 agent 所在目录中，而不是 monorepo 根目录。并确保文件遵循如下结构：
+
+<CodeGroup>
+```json Python
+{
+  "dependencies": [
+    ".",                    # Current agent package
+    "../../shared-utils"    # Relative path to shared package
+  ],
+  "graphs": {
+    "customer_support": "./agent/graph.py:graph"
+  },
+  "env": ".env"
+}
+```
+```json JS
+{
+  "node_version": "20",
+  "graphs": {
+    "customer_support": "./src/agent.ts:graph"
+  },
+  "env": ".env"
+}
+```
+</CodeGroup>
+
+Python 实现会自动处理位于父目录中的包，具体方式包括：
+- 检测以 `"."` 开头的相对路径。
+- 在需要时将父目录加入 Docker build context。
+- 同时支持真实 Python 包（包含 `pyproject.toml` / `setup.py`）和简单 Python 模块。
+
+对于 JavaScript monorepo：
+- 共享的 workspace 依赖会由包管理器自动解析。
+- 你的 `package.json` 应使用 workspace 语法来引用共享包。
+
+Agent 目录中的 `package.json` 示例：
+```json
+{
+  "name": "customer-support-agent",
+  "dependencies": {
+    "@company/shared-utils": "workspace:*",
+    "@langchain/langgraph": "^0.2.0"
+  }
+}
+```
+
+## 构建应用
+
+运行 `langgraph build`：
+
+<CodeGroup>
+```bash Python
+cd agents/customer-support
+langgraph build -t my-customer-support-agent
+```
+```bash JS
+# Run from the root of the monorepo
+langgraph build -t my-customer-support-agent -c agents/customer-support/langgraph.json --build-command "yarn run turbo build" --install-command "yarn install"
+```
+</CodeGroup>
+
+Python 构建流程会：
+1. 自动检测相对依赖路径。
+2. 将共享包复制到 Docker build context 中。
+3. 按正确顺序安装所有依赖。
+4. 不需要额外的特殊参数或命令。
+
+JavaScript 构建流程会：
+1. 将你执行 `langgraph build` 时所在的目录（在这个例子中是 monorepo 根目录）作为 build context。
+2. 自动检测你的包管理器（yarn、npm、pnpm、bun）。
+3. 运行相应的安装命令。
+    - 如果你自定义了 build/install 命令中的任意一个或两个，这些命令会在你执行 `langgraph build` 的目录中运行。
+    - 否则，它会在 `langgraph.json` 所在目录中运行。
+4. 可选地，在 `langgraph.json` 所在目录中执行自定义 build 命令（只有传入 `--build-command` 时才会执行）。
+
+## 提示与最佳实践
+
+1. **将 agent 配置保存在 agent 目录中**：把 `langgraph.json` 放在具体 agent 目录里，而不是 monorepo 根目录。这样你就可以在同一个 monorepo 中支持多个 agent，而不必把它们全部部署到同一个 LangSmith deployment 中。
+
+2. **Python 使用相对路径**：对于 Python monorepo，在 `dependencies` 数组中使用诸如 `"../../shared-package"` 这样的相对路径。
+
+3. **JS 使用 workspace 特性**：对于 JavaScript/TypeScript，使用包管理器的 workspace 特性来管理各包之间的依赖。
+
+4. **先在本地测试**：在部署前务必先本地测试构建，确保所有依赖都能被正确解析。
+
+5. **环境变量**：将环境文件（`.env`）保存在 agent 目录中，以便做环境级配置。

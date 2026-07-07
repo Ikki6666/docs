@@ -1,0 +1,542 @@
+---
+title: 将 MCP tools 连接到 Managed Deep Agents
+sidebarTitle: 连接 tools
+description: 为 Managed Deep Agents 注册、连接和引用 MCP tools。
+---
+
+[Managed Deep Agents](/langsmith/managed-deep-agents-overview) 可以调用你通过 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/docs/getting-started/intro) 暴露的外部 tools，例如 GitHub、内部服务或第三方 API。LangSmith 会管理与每个 MCP server 的连接，包括按用户维度处理 OAuth，因此 agents 无需自定义客户端代码就能完成鉴权。
+
+MCP servers 是 [workspace 级别](/langsmith/administration-overview#workspaces) 的资源。在部署引用这些 server 的 agent 之前，请先注册或连接对应 server。你可以在 [LangSmith > Settings > MCP Servers](https://smith.langchain.com/settings/workspaces/mcp-servers) 查看所有 MCP servers。
+
+<Note>
+Managed Deep Agents 目前处于 **private beta**，仅在美国区域的 [LangSmith Cloud](/langsmith/cloud) 提供。[加入候补名单](https://www.langchain.com/langsmith-managed-deep-agents-waitlist)以申请访问权限。
+</Note>
+
+## 前置条件
+
+- 拥有 Managed Deep Agents 的 [private beta 访问权限](https://www.langchain.com/langsmith-managed-deep-agents-waitlist)。
+- 一个可访问 private beta workspace 的 [LangSmith API key](/langsmith/create-account-api-key)。
+- MCP server 的 URL，以及该 server 所需的任何静态 headers 或 OAuth 凭据。
+- 一个适合你交互方式的客户端：CLI 使用 `deepagents-cli`，SDK 工作流使用 `managed-deepagents`（Python）或 `@langchain/managed-deepagents`（TypeScript），REST API 则使用 curl 之类的 HTTP 客户端。安装命令和版本要求请参见 quickstart 中的 [Install a client](/langsmith/managed-deep-agents-quickstart#install-a-client)。
+
+## Quickstart
+
+在由 [`deepagents init`](/langsmith/managed-deep-agents-cli#initialize-projects) 创建的项目目录中，连接一个静态 header 工具并部署：
+
+```bash
+# 1. Register the MCP server.
+deepagents mcp-servers add --url https://example.com/mcp --name my-tools
+
+# 2. List its tools and copy the printed tools.json snippet.
+deepagents mcp-servers tools my-tools
+
+# 3. Paste the tool entries into tools.json (manual step).
+
+# 4. Deploy the agent.
+deepagents deploy
+```
+
+对于 OAuth server，请在注册步骤（第 1 步）之后、列出 tools 之前（第 2 步）运行 `deepagents mcp-servers connect <id|name|url>`。下面的章节会分别展开每一步的细节。
+
+大多数场景推荐使用 [CLI](/langsmith/managed-deep-agents-cli)。如果你需要用 Python 或 TypeScript 做自动化，请使用 [SDKs](/langsmith/managed-deep-agents-sdk)。如果你需要直接控制请求 payload，则使用 [REST API](/langsmith/managed-deep-agents-api-overview)。
+
+## 使用 CLI 连接 tools
+
+在 CLI 中，`add` 用于注册 server，`connect` 用于为已注册 server 完成 OAuth。所有 MCP server 相关命令和 flags 请参见 [CLI reference](/langsmith/managed-deep-agents-cli#manage-mcp-servers)。
+
+### 添加带静态 headers 的 MCP server
+
+注册一个 server：
+
+```bash
+deepagents mcp-servers add \
+  --url https://example.com/mcp \
+  --name my-tools
+```
+
+如果 server 需要静态凭据，可以传入 headers：
+
+```bash
+deepagents mcp-servers add \
+  --url https://example.com/mcp \
+  --name my-tools \
+  --header Authorization="Bearer <token>"
+```
+
+如果有多个 headers，可以重复使用 `--header`：
+
+```bash
+deepagents mcp-servers add \
+  --url https://example.com/mcp \
+  --name my-tools \
+  --header Authorization="Bearer <token>" \
+  --header X-Workspace-ID="<workspace-id>"
+```
+
+如果 CLI 能连到该 server，它会在注册后列出 server 暴露的 tools，并打印一个 `tools.json` 代码片段。如果想跳过这一步，传入 `--no-tools`。
+
+### 添加 OAuth MCP server
+
+注册并连接一个 OAuth MCP server：
+
+```bash
+deepagents mcp-servers add \
+  --url https://example.com/mcp \
+  --name github-tools \
+  --auth-type oauth \
+  --connect
+```
+
+这个命令会执行完整的按用户 OAuth 流程：
+
+1. 为按用户 OAuth 注册 MCP server。
+2. 打印并打开一个 verification URL。
+3. 在你通过浏览器批准访问期间等待。
+4. 在授权完成后确认连接成功。
+
+如果要连接一个已存在的 OAuth MCP server，请运行：
+
+```bash
+deepagents mcp-servers connect <id|name|url>
+```
+
+使用 `--scope` 请求 OAuth scopes：
+
+```bash
+deepagents mcp-servers connect <id|name|url> \
+  --scope repo \
+  --scope read:user
+```
+
+使用 `--timeout 0` 可以在不轮询的情况下启动 OAuth 流程：
+
+```bash
+deepagents mcp-servers connect <id|name|url> --timeout 0
+```
+
+当命令启动授权 session 后，它会打印 verification URL。之后你可以重新运行 `deepagents mcp-servers connect <id|name|url>` 来完成或复用连接。
+
+### 列出可用 tools
+
+列出某个已注册 MCP server 暴露的 tools：
+
+```bash
+deepagents mcp-servers tools <id|name|url>
+```
+
+命令会打印每个 tool 的名称和描述第一行，然后给出一个 `tools.json` 片段。复制你想要的条目，并在后续[引用它们](#reference-tools)。如果 server 的 tools 发生变化，请重新执行该命令以刷新条目。如果没有列出任何 tools，请确认 server URL 可访问；对于 OAuth servers，还要确认你已经完成 `connect`。
+
+## 使用 SDK 或 API 连接 tools
+
+### 设置请求默认值
+
+如果使用 SDK，请先安装并配置 [Managed Deep Agents SDKs](/langsmith/managed-deep-agents-sdk)。如果直接发 REST 请求，请设置 base URL 和 API key：
+
+```bash
+export LANGSMITH_API_KEY="<LANGSMITH_API_KEY>"
+export LANGSMITH_API_URL="https://api.smith.langchain.com"
+export DEEPAGENTS_BASE_URL="$LANGSMITH_API_URL/v1/deepagents"
+```
+
+REST 请求需要 `X-Api-Key` header：
+
+```txt
+X-Api-Key: <LANGSMITH_API_KEY>
+```
+
+如果请求失败，SDK 会抛出对应的 SDK 错误。REST API 会返回非 2xx 状态，并在响应体中给出错误详情。关于鉴权错误（`401` 和 `403`），请参见 [API reference](/langsmith/managed-deep-agents-api-overview#set-request-defaults)。
+
+<Note>
+创建 MCP server 需要 `mcp-servers:create` 权限。如果你的 API key 对应角色只能读取 MCP servers，不能创建它们，请求会返回 `403`，并带有 `missing permission mcp-servers:create` 消息。SDK 会把这段字符串暴露在 `error.body` 中。此时 `code` 和 `detail` 字段为空。请联系 workspace admin 授予该权限，或改用具备此权限的 key。
+</Note>
+
+### 注册带静态 headers 的 MCP server
+
+使用 `POST /v1/deepagents/mcp-servers`：
+
+<Tabs>
+  <Tab title="Python SDK">
+
+```python
+from managed_deepagents import Client
+
+with Client() as client:
+    mcp_server = client.mcp_servers.create(
+        name="my-tools",
+        url="https://example.com/mcp",
+        headers=[
+            {"key": "Authorization", "value": "Bearer <token>"},
+        ],
+    )
+
+print(mcp_server)
+```
+
+  </Tab>
+  <Tab title="TypeScript SDK">
+
+```ts
+import { Client } from "@langchain/managed-deepagents";
+
+const client = new Client();
+
+const mcpServer = await client.mcpServers.create({
+  name: "my-tools",
+  url: "https://example.com/mcp",
+  headers: [{ key: "Authorization", value: "Bearer <token>" }],
+});
+
+console.log(mcpServer);
+```
+
+  </Tab>
+  <Tab title="cURL">
+
+```bash
+curl --request POST \
+  --url "$DEEPAGENTS_BASE_URL/mcp-servers" \
+  --header "X-Api-Key: $LANGSMITH_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "name": "my-tools",
+    "url": "https://example.com/mcp",
+    "headers": [
+      {"key": "Authorization", "value": "Bearer <token>"}
+    ]
+  }'
+```
+
+  </Tab>
+</Tabs>
+
+### 注册 OAuth MCP server
+
+通过 SDK 或 API 注册并连接 OAuth server，与 CLI 中的 [`deepagents mcp-servers add --auth-type oauth --connect`](#add-an-oauth-mcp-server) 等价。流程分为三步：注册 server、为其注册 OAuth provider，然后为当前用户启动授权 session。
+
+<Tabs>
+  <Tab title="Python SDK">
+
+```python
+import time
+
+from managed_deepagents import Client
+
+with Client() as client:
+    mcp_server = client.mcp_servers.create(
+        name="github-tools",
+        url="https://example.com/mcp",
+        auth_type="oauth",
+        oauth_mode="per_user_dynamic_client",
+    )
+
+    provider = client.mcp_servers.register_oauth_provider(mcp_server["id"])
+    oauth_provider_id = provider["oauth_provider_id"]
+
+    auth_session = client.auth_sessions.create(
+        provider_id=oauth_provider_id,
+        scopes=["repo", "read:user"],
+        strategy="REUSE",
+        is_default=True,
+    )
+
+    if auth_session.get("verification_url"):
+        print(f"Open: {auth_session['verification_url']}")
+
+    session_id = auth_session.get("id")
+    while session_id:
+        session = client.auth_sessions.get(session_id)
+        if session.get("status") != "PENDING":
+            print(session)
+            break
+        time.sleep(2)
+```
+
+  </Tab>
+  <Tab title="TypeScript SDK">
+
+```ts
+import { Client } from "@langchain/managed-deepagents";
+
+const client = new Client();
+
+const mcpServer = await client.mcpServers.create({
+  name: "github-tools",
+  url: "https://example.com/mcp",
+  auth_type: "oauth",
+  oauth_mode: "per_user_dynamic_client",
+});
+
+const provider = await client.mcpServers.registerOAuthProvider(mcpServer.id);
+const oauthProviderId = provider.oauth_provider_id;
+
+const authSession = await client.authSessions.create({
+  provider_id: oauthProviderId,
+  scopes: ["repo", "read:user"],
+  strategy: "REUSE",
+  is_default: true,
+});
+
+if (authSession.verification_url) {
+  console.log(`Open: ${authSession.verification_url}`);
+}
+
+let sessionId = authSession.id;
+while (sessionId) {
+  const session = await client.authSessions.get(sessionId);
+  if (session.status !== "PENDING") {
+    console.log(session);
+    break;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+}
+```
+
+  </Tab>
+  <Tab title="cURL">
+
+```bash
+MCP_SERVER_ID="$(
+  curl --silent --request POST \
+    --url "$DEEPAGENTS_BASE_URL/mcp-servers" \
+    --header "X-Api-Key: $LANGSMITH_API_KEY" \
+    --header 'Content-Type: application/json' \
+    --data '{
+      "name": "github-tools",
+      "url": "https://example.com/mcp",
+      "auth_type": "oauth",
+      "oauth_mode": "per_user_dynamic_client"
+    }' | jq -r '.id'
+)"
+
+OAUTH_PROVIDER_ID="$(
+  curl --silent --request POST \
+    --url "$DEEPAGENTS_BASE_URL/mcp-servers/$MCP_SERVER_ID/oauth-provider" \
+    --header "X-Api-Key: $LANGSMITH_API_KEY" \
+    --header 'Content-Type: application/json' \
+    --data '{}' | jq -r '.oauth_provider_id'
+)"
+
+AUTH_SESSION="$(
+  curl --silent --request POST \
+    --url "$DEEPAGENTS_BASE_URL/auth-sessions" \
+    --header "X-Api-Key: $LANGSMITH_API_KEY" \
+    --header 'Content-Type: application/json' \
+    --data "{
+      \"provider_id\": \"$OAUTH_PROVIDER_ID\",
+      \"scopes\": [\"repo\", \"read:user\"],
+      \"strategy\": \"REUSE\",
+      \"is_default\": true
+    }"
+)"
+
+echo "$AUTH_SESSION" | jq .
+```
+
+  </Tab>
+</Tabs>
+
+使用 `strategy="CREATE"` 可以强制创建新的 OAuth session。使用 `strategy="REUSE"` 则会在可用时复用已有的有效 token。如果 start-auth-session 的响应中包含 `verification_url`，请打开它，并轮询该 auth session，直到其状态变成 `COMPLETED`。
+
+### 列出某个 server 的 tools
+
+在 agent 中引用 tool 之前，先列出已注册 MCP server 暴露的 tools：
+
+<Tabs>
+  <Tab title="Python SDK">
+
+```python
+from managed_deepagents import Client
+
+with Client() as client:
+    tools = client.mcp_servers.list_tools(
+        url="https://example.com/mcp",
+    )
+
+print(tools)
+```
+
+  </Tab>
+  <Tab title="TypeScript SDK">
+
+```ts
+import { Client } from "@langchain/managed-deepagents";
+
+const client = new Client();
+
+const tools = await client.mcpServers.listTools({
+  url: "https://example.com/mcp",
+});
+
+console.log(tools);
+```
+
+  </Tab>
+  <Tab title="cURL">
+
+```bash
+curl --get \
+  --url "$DEEPAGENTS_BASE_URL/mcp/tools" \
+  --header "X-Api-Key: $LANGSMITH_API_KEY" \
+  --data-urlencode "url=https://example.com/mcp"
+```
+
+  </Tab>
+</Tabs>
+
+对于 OAuth servers，还需要同时传入在 OAuth provider 注册步骤中返回的 `oauth_provider_id`：
+
+<Tabs>
+  <Tab title="Python SDK">
+
+```python
+from managed_deepagents import Client
+
+with Client() as client:
+    tools = client.mcp_servers.list_tools(
+        url="https://example.com/mcp",
+        oauth_provider_id=oauth_provider_id,
+    )
+```
+
+  </Tab>
+  <Tab title="TypeScript SDK">
+
+```ts
+const tools = await client.mcpServers.listTools({
+  url: "https://example.com/mcp",
+  oauthProviderId,
+});
+```
+
+  </Tab>
+  <Tab title="cURL">
+
+```bash
+curl --get \
+  --url "$DEEPAGENTS_BASE_URL/mcp/tools" \
+  --header "X-Api-Key: $LANGSMITH_API_KEY" \
+  --data-urlencode "url=https://example.com/mcp" \
+  --data-urlencode "oauth_provider_id=$OAUTH_PROVIDER_ID"
+```
+
+  </Tab>
+</Tabs>
+
+如果你想绕过缓存的 tool 定义、直接从 MCP server 获取最新结果，请在 Python 中设置 `force_refresh=True`，在 TypeScript 中设置 `forceRefresh: true`，或在 REST 中设置 `force_refresh=true`。从响应中挑好 tool names 之后，再去[引用它们](#reference-tools)。
+
+## 引用 tools
+
+一个 tool 条目至少需要 `name`，也就是已注册 MCP server 暴露的某个 tool 名称，以及 `mcp_server_url`，用于指向这个 server。`mcp_server_name` 和 `display_name` 是可选字段。
+
+```json
+{
+  "tools": [
+    {
+      "name": "example_tool",
+      "mcp_server_url": "https://example.com/mcp",
+      "mcp_server_name": "my-tools",
+      "display_name": "example_tool"
+    }
+  ],
+  "interrupt_config": {
+    "https://example.com/mcp::example_tool": true
+  }
+}
+```
+
+在 CLI 中，把这些条目加入项目根目录下的 `tools.json` 文件，`deepagents init` 会用一个空的 `tools` 数组初始化它。使用 SDK 或 API 时，则把同样的对象作为 agent 创建或更新请求的 `tools` 字段传入：
+
+<Tabs>
+  <Tab title="Python SDK">
+
+```python
+from managed_deepagents import Client
+
+tools_config = {
+    "tools": [
+        {
+            "name": "example_tool",
+            "mcp_server_url": "https://example.com/mcp",
+            "mcp_server_name": "my-tools",
+            "display_name": "example_tool",
+        }
+    ],
+    "interrupt_config": {
+        "https://example.com/mcp::example_tool": True,
+    },
+}
+
+with Client() as client:
+    agent = client.agents.update(
+        "<agent_id>",
+        tools=tools_config,
+        include_files=True,
+    )
+```
+
+  </Tab>
+  <Tab title="TypeScript SDK">
+
+```ts
+import { Client } from "@langchain/managed-deepagents";
+
+const client = new Client();
+
+const toolsConfig = {
+  tools: [
+    {
+      name: "example_tool",
+      mcp_server_url: "https://example.com/mcp",
+      mcp_server_name: "my-tools",
+      display_name: "example_tool",
+    },
+  ],
+  interrupt_config: {
+    "https://example.com/mcp::example_tool": true,
+  },
+};
+
+const agent = await client.agents.update(
+  "<agent_id>",
+  { tools: toolsConfig },
+  { includeFiles: true },
+);
+```
+
+  </Tab>
+  <Tab title="cURL">
+
+```bash
+curl --request PATCH \
+  --url "$DEEPAGENTS_BASE_URL/agents/<agent_id>?include_files=true" \
+  --header "X-Api-Key: $LANGSMITH_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "tools": {
+      "tools": [
+        {
+          "name": "example_tool",
+          "mcp_server_url": "https://example.com/mcp",
+          "mcp_server_name": "my-tools",
+          "display_name": "example_tool"
+        }
+      ],
+      "interrupt_config": {
+        "https://example.com/mcp::example_tool": true
+      }
+    }
+  }'
+```
+
+  </Tab>
+</Tabs>
+
+`interrupt_config` 会将某个 tool 标记为可中断。key 的格式为 `<mcp_server_url>::<tool_name>`。关于 interrupts 的更多内容，请参见 [Run an agent](/langsmith/managed-deep-agents-invoke#interrupts)。
+
+部署或更新 agent 后，运行 agent 时会自动使用这些 tools。
+
+## 下一步
+
+- 参见 [Deploy an agent](/langsmith/managed-deep-agents-deploy) 创建或更新 Managed Deep Agent。
+- 参见 [Run an agent](/langsmith/managed-deep-agents-invoke) 创建 threads、启动 runs 和处理 interrupts。
+- 参见 [Managed Deep Agents API overview](/langsmith/managed-deep-agents-api-overview) 查看完整 REST endpoint 列表。

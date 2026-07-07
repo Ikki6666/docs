@@ -1,0 +1,529 @@
+---
+title: 如何使用 LangGraph 实现生成式用户界面
+sidebarTitle: 使用 LangGraph 实现生成式用户界面
+---
+<Info>
+**前置条件**
+* [LangSmith](/langsmith/observability)
+* [Agent Server](/langsmith/agent-server)
+* [`useStream()` React Hook](/oss/langchain/frontend/overview)
+</Info>
+
+生成式用户界面（Generative UI）让 agent 能够超越纯文本输出，直接生成丰富的用户界面。这使你能够构建更具交互性、上下文感知能力更强的应用，让 UI 能随着对话流程和 AI 响应动态变化。
+
+![Agent Chat showing a prompt about booking/lodging and a generated set of hotel listing cards (images, titles, prices, locations) rendered inline as UI components.](/langsmith/images/generative-ui-sample.jpg)
+
+LangSmith 支持将 React 组件与图代码共置。这样你就可以专注于为图构建特定 UI 组件，同时又能轻松接入现成的聊天界面，例如 [Agent Chat](https://agentchat.vercel.app)，并且只在真正需要时才加载这些代码。
+
+## 教程
+
+### 1. 定义并配置 UI 组件
+
+首先，创建你的第一个 UI 组件。对于每个组件，你都需要提供一个唯一标识符，用于在图代码中引用该组件。
+
+```tsx title="src/agent/ui.tsx"
+const WeatherComponent = (props: { city: string }) => {
+  return <div>Weather for {props.city}</div>;
+};
+
+export default {
+  weather: WeatherComponent,
+};
+```
+
+接着，在 `langgraph.json` 配置中声明这些 UI 组件：
+
+```json
+{
+  "node_version": "20",
+  "graphs": {
+    "agent": "./src/agent/index.ts:graph"
+  },
+  "ui": {
+    "agent": "./src/agent/ui.tsx"
+  }
+}
+```
+
+`ui` 段定义了图将使用的 UI 组件。默认建议使用与图名称相同的 key，不过你也可以按自己的方式拆分组件，详见 [Customise the namespace of UI components](#customise-the-namespace-of-ui-components)。
+
+LangSmith 会自动打包你的 UI 组件代码和样式，并将其作为外部资源提供给 `LoadExternalComponent` 组件加载。某些依赖，例如 `react` 和 `react-dom`，会自动从打包结果中排除。
+
+同时，系统也原生支持 CSS 和 Tailwind 4.x，因此你可以在 UI 组件中自由使用 Tailwind class 和 `shadcn/ui`。
+
+<Tabs>
+    <Tab title="src/agent/ui.tsx">
+    ```tsx
+    import "./styles.css";
+
+    const WeatherComponent = (props: { city: string }) => {
+      return <div className="bg-red-500">Weather for {props.city}</div>;
+    };
+
+    export default {
+      weather: WeatherComponent,
+    };
+    ```
+    </Tab>
+    <Tab title="src/agent/styles.css">
+    ```css
+    @import "tailwindcss";
+    ```
+    </Tab>
+</Tabs>
+
+### 2. 在图中发送 UI 组件
+
+<Tabs>
+    <Tab title="Python">
+    ```python title="src/agent.py"
+    import uuid
+    from typing import Annotated, Sequence, TypedDict
+
+    from langchain.messages import AIMessage
+    from langchain_core.messages import BaseMessage
+    from langchain_openai import ChatOpenAI
+    from langgraph.graph import StateGraph
+    from langgraph.graph.message import add_messages
+    from langgraph.graph.ui import AnyUIMessage, ui_message_reducer, push_ui_message
+
+
+    class AgentState(TypedDict):  # noqa: D101
+        messages: Annotated[Sequence[BaseMessage], add_messages]
+        ui: Annotated[Sequence[AnyUIMessage], ui_message_reducer]
+
+
+    async def weather(state: AgentState):
+        class WeatherOutput(TypedDict):
+            city: str
+
+        weather: WeatherOutput = (
+            await ChatOpenAI(model="gpt-5.4-mini")
+            .with_structured_output(WeatherOutput)
+            .with_config({"tags": ["nostream"]})
+            .ainvoke(state["messages"])
+        )
+
+        message = AIMessage(
+            id=str(uuid.uuid4()),
+            content=f"Here's the weather for {weather['city']}",
+        )
+
+        # Emit UI elements associated with the message
+        push_ui_message("weather", weather, message=message)
+        return {"messages": [message]}
+
+
+    workflow = StateGraph(AgentState)
+    workflow.add_node(weather)
+    workflow.add_edge("__start__", "weather")
+    graph = workflow.compile()
+    ```
+    </Tab>
+    <Tab title="JS">
+    使用 `typedUi` 工具在 agent 节点中发出 UI 元素：
+
+    ```typescript title="src/agent/index.ts"
+    import {
+      typedUi,
+      uiMessageReducer,
+    } from "@langchain/langgraph-sdk/react-ui/server";
+
+    import { ChatOpenAI } from "@langchain/openai";
+    import { z } from "zod";
+
+    import type ComponentMap from "./ui.js";
+
+    import {
+      Annotation,
+      MessagesAnnotation,
+      StateGraph,
+      type LangGraphRunnableConfig,
+    } from "@langchain/langgraph";
+
+    const AgentState = Annotation.Root({
+      ...MessagesAnnotation.spec,
+      ui: Annotation({ reducer: uiMessageReducer, default: () => [] }),
+    });
+
+    export const graph = new StateGraph(AgentState)
+      .addNode("weather", async (state, config) => {
+        // Provide the type of the component map to ensure
+        // type safety of `ui.push()` calls as well as
+        // pushing the messages to the `ui` and sending a custom event as well.
+        const ui = typedUi<typeof ComponentMap>(config);
+
+        const weather = await new ChatOpenAI({ model: "gpt-5.4-mini" })
+          .withStructuredOutput(z.object({ city: z.string() }))
+          .withConfig({ tags: ["nostream"] })
+          .invoke(state.messages);
+
+        const response = {
+          id: crypto.randomUUID(),
+          type: "ai",
+          content: `Here's the weather for ${weather.city}`,
+        };
+
+        // Emit UI elements associated with the AI message
+        ui.push({ name: "weather", props: weather }, { message: response });
+
+        return { messages: [response] };
+      })
+      .addEdge("__start__", "weather")
+      .compile();
+    ```
+    </Tab>
+</Tabs>
+
+### 3. 在 React 应用中处理 UI 元素
+
+在客户端侧，你可以使用 `useStream()` 和 `LoadExternalComponent` 来显示这些 UI 元素。
+
+```tsx title="src/app/page.tsx"
+"use client";
+
+import { useStream } from "@langchain/langgraph-sdk/react";
+import { LoadExternalComponent } from "@langchain/langgraph-sdk/react-ui";
+
+export default function Page() {
+  const { thread, values } = useStream({
+    apiUrl: "http://localhost:2024",
+    assistantId: "agent",
+  });
+
+  return (
+    <div>
+      {thread.messages.map((message) => (
+        <div key={message.id}>
+          {message.content}
+          {values.ui
+            ?.filter((ui) => ui.metadata?.message_id === message.id)
+            .map((ui) => (
+              <LoadExternalComponent key={ui.id} stream={thread} message={ui} />
+            ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+在底层，`LoadExternalComponent` 会从 LangSmith 拉取 UI 组件所需的 JS 和 CSS，并将它们渲染在 shadow DOM 中，从而确保这些样式不会污染应用的其他部分。
+
+## 操作指南
+
+### 在客户端侧提供自定义组件
+
+如果你的客户端应用中已经加载了这些组件，可以直接传入一个组件映射，而不必再从 LangSmith 拉取 UI 代码。
+
+```tsx
+const clientComponents = {
+  weather: WeatherComponent,
+};
+
+<LoadExternalComponent
+  stream={thread}
+  message={ui}
+  components={clientComponents}
+/>;
+```
+
+### 在组件加载时显示 loading UI
+
+你可以提供一个 fallback UI，在组件加载过程中进行渲染。
+
+```tsx
+<LoadExternalComponent
+  stream={thread}
+  message={ui}
+  fallback={<div>Loading...</div>}
+/>
+```
+
+### 自定义 UI 组件的命名空间
+
+默认情况下，`LoadExternalComponent` 会使用 `useStream()` hook 中的 `assistantId` 来获取 UI 组件代码。你也可以通过给 `LoadExternalComponent` 传入 `namespace` 属性来自定义这一点。
+
+<Tabs>
+    <Tab title="src/app/page.tsx">
+    ```tsx
+    <LoadExternalComponent
+      stream={thread}
+      message={ui}
+      namespace="custom-namespace"
+    />
+    ```
+    </Tab>
+    <Tab title="langgraph.json">
+    ```json
+    {
+      "ui": {
+        "custom-namespace": "./src/agent/ui.tsx"
+      }
+    }
+    ```
+    </Tab>
+</Tabs>
+
+### 在 UI 组件中访问并操作线程状态
+
+你可以使用 `useStreamContext` hook 在 UI 组件内部访问线程状态。
+
+```tsx
+import { useStreamContext } from "@langchain/langgraph-sdk/react-ui";
+
+const WeatherComponent = (props: { city: string }) => {
+  const { thread, submit } = useStreamContext();
+  return (
+    <>
+      <div>Weather for {props.city}</div>
+
+      <button
+        onClick={() => {
+          const newMessage = {
+            type: "human",
+            content: `What's the weather in ${props.city}?`,
+          };
+
+          submit({ messages: [newMessage] });
+        }}
+      >
+        Retry
+      </button>
+    </>
+  );
+};
+```
+
+### 向客户端组件传递额外上下文
+
+你可以通过给 `LoadExternalComponent` 传入 `meta` 属性，把额外上下文传递给客户端组件。
+
+```tsx
+<LoadExternalComponent stream={thread} message={ui} meta={{ userId: "123" }} />
+```
+
+之后，你可以在 UI 组件中使用 `useStreamContext` hook 读取这个 `meta`。
+
+```tsx
+import { useStreamContext } from "@langchain/langgraph-sdk/react-ui";
+
+const WeatherComponent = (props: { city: string }) => {
+  const { meta } = useStreamContext<
+    { city: string },
+    { MetaType: { userId?: string } }
+  >();
+
+  return (
+    <div>
+      Weather for {props.city} (user: {meta?.userId})
+    </div>
+  );
+};
+```
+
+### 从服务端流式发送 UI messages
+
+你可以使用 `useStream()` hook 的 `onCustomEvent` 回调，在节点执行尚未完成前就流式发送 UI messages。这在你希望 UI 组件随着 LLM 生成响应逐步更新时尤其有用。
+
+```tsx
+import { uiMessageReducer } from "@langchain/langgraph-sdk/react-ui";
+
+const { thread, submit } = useStream({
+  apiUrl: "http://localhost:2024",
+  assistantId: "agent",
+  onCustomEvent: (event, options) => {
+    options.mutate((prev) => {
+      const ui = uiMessageReducer(prev.ui ?? [], event);
+      return { ...prev, ui };
+    });
+  },
+});
+```
+
+之后，你可以通过使用同一个 UI message ID 调用 `ui.push()` / `push_ui_message()` 来向该 UI 组件推送更新。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    from typing import Annotated, Sequence, TypedDict
+
+    from langchain_anthropic import ChatAnthropic
+    from langchain.messages import AIMessage, AIMessageChunk, BaseMessage
+    from langgraph.graph import StateGraph
+    from langgraph.graph.message import add_messages
+    from langgraph.graph.ui import AnyUIMessage, push_ui_message, ui_message_reducer
+
+
+    class AgentState(TypedDict):  # noqa: D101
+        messages: Annotated[Sequence[BaseMessage], add_messages]
+        ui: Annotated[Sequence[AnyUIMessage], ui_message_reducer]
+
+
+    class CreateTextDocument(TypedDict):
+        """Prepare a document heading for the user."""
+
+        title: str
+
+
+    async def writer_node(state: AgentState):
+        model = ChatAnthropic(model="claude-sonnet-4-6")
+        message: AIMessage = await model.bind_tools(
+            tools=[CreateTextDocument],
+            tool_choice={"type": "tool", "name": "CreateTextDocument"},
+        ).ainvoke(state["messages"])
+
+        tool_call = next(
+            (x["args"] for x in message.tool_calls if x["name"] == "CreateTextDocument"),
+            None,
+        )
+
+        if tool_call:
+            ui_message = push_ui_message("writer", tool_call, message=message)
+            ui_message_id = ui_message["id"]
+
+            # We're already streaming the LLM response to the client through UI messages
+            # so we don't need to stream it again to the `messages` stream mode.
+            content_stream = model.with_config({"tags": ["nostream"]}).astream(
+                f"Create a document with the title: {tool_call['title']}"
+            )
+
+            content: AIMessageChunk | None = None
+            async for chunk in content_stream:
+                content = content + chunk if content else chunk
+
+                push_ui_message(
+                    "writer",
+                    {"content": content.text()},
+                    id=ui_message_id,
+                    message=message,
+                    # Use `merge=True` to merge props with the existing UI message
+                    merge=True,
+                )
+
+        return {"messages": [message]}
+    ```
+    </Tab>
+    <Tab title="JS">
+    ```tsx
+    import {
+      Annotation,
+      MessagesAnnotation,
+      type LangGraphRunnableConfig,
+    } from "@langchain/langgraph";
+    import { z } from "zod";
+    import { ChatAnthropic } from "@langchain/anthropic";
+    import {
+      typedUi,
+      uiMessageReducer,
+    } from "@langchain/langgraph-sdk/react-ui/server";
+    import type { AIMessageChunk } from "@langchain/core/messages";
+
+    import type ComponentMap from "./ui";
+
+    const AgentState = Annotation.Root({
+      ...MessagesAnnotation.spec,
+      ui: Annotation({ reducer: uiMessageReducer, default: () => [] }),
+    });
+
+    async function writerNode(
+      state: typeof AgentState.State,
+      config: LangGraphRunnableConfig
+    ): Promise<typeof AgentState.Update> {
+      const ui = typedUi<typeof ComponentMap>(config);
+
+      const model = new ChatAnthropic({ model: "claude-sonnet-4-6" });
+      const message = await model
+        .bindTools(
+          [
+            {
+              name: "create_text_document",
+              description: "Prepare a document heading for the user.",
+              schema: z.object({ title: z.string() }),
+            },
+          ],
+          { tool_choice: { type: "tool", name: "create_text_document" } }
+        )
+        .invoke(state.messages);
+
+      type ToolCall = { name: "create_text_document"; args: { title: string } };
+      const toolCall = message.tool_calls?.find(
+        (tool): tool is ToolCall => tool.name === "create_text_document"
+      );
+
+      if (toolCall) {
+        const { id, name } = ui.push(
+          { name: "writer", props: { title: toolCall.args.title } },
+          { message }
+        );
+
+        const contentStream = await model
+          // We're already streaming the LLM response to the client through UI messages
+          // so we don't need to stream it again to the `messages` stream mode.
+          .withConfig({ tags: ["nostream"] })
+          .stream(`Create a short poem with the topic: ${message.text}`);
+
+        let content: AIMessageChunk | undefined;
+        for await (const chunk of contentStream) {
+          content = content?.concat(chunk) ?? chunk;
+
+          ui.push(
+            { id, name, props: { content: content?.text } },
+            // Use `merge: true` to merge props with the existing UI message
+            { message, merge: true }
+          );
+        }
+      }
+
+      return { messages: [message] };
+    }
+    ```
+    </Tab>
+    <Tab title="ui.tsx">
+    ```tsx
+    function WriterComponent(props: { title: string; content?: string }) {
+      return (
+        <article>
+          <h2>{props.title}</h2>
+          <p style={{ whiteSpace: "pre-wrap" }}>{props.content}</p>
+        </article>
+      );
+    }
+
+    export default {
+      weather: WriterComponent,
+    };
+    ```
+    </Tab>
+</Tabs>
+
+### 从状态中移除 UI messages
+
+类似于通过追加 `RemoveMessage` 从状态中移除 message，你也可以通过对 UI message 的 ID 调用 `remove_ui_message` / `ui.delete`，把某个 UI message 从状态中删除。
+
+<Tabs>
+    <Tab title="Python">
+    ```python
+    from langgraph.graph.ui import push_ui_message, delete_ui_message
+
+    # push message
+    message = push_ui_message("weather", {"city": "London"})
+
+    # remove said message
+    delete_ui_message(message["id"])
+    ```
+    </Tab>
+    <Tab title="JS">
+    ```tsx
+    // push message
+    const message = ui.push({ name: "weather", props: { city: "London" } });
+
+    // remove said message
+    ui.delete(message.id);
+    ```
+    </Tab>
+</Tabs>
+
+## 了解更多
+
+* [JS/TS SDK Reference](https://langchain-ai.github.io/langgraphjs/reference/modules/sdk.html)

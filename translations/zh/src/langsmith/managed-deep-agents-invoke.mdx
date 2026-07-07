@@ -1,0 +1,413 @@
+---
+title: 运行一个 Managed Deep Agent
+sidebarTitle: 运行 agent
+description: 为 Managed Deep Agent 创建 threads 并流式运行。
+---
+
+运行一个 [Managed Deep Agent](/langsmith/managed-deep-agents-overview) 包括创建 thread、启动 run，以及流式接收输出。请先[部署 agent](/langsmith/managed-deep-agents-deploy)，然后再通过 SDK 或 REST API 调用它。
+
+如果你想走一条更短的端到端路径，请参见 [quickstart](/langsmith/managed-deep-agents-quickstart)。
+
+<Note>
+Managed Deep Agents 当前处于 **private beta**，仅在美国区域的 [LangSmith Cloud](/langsmith/cloud) 中可用。你可以[加入候补名单](https://www.langchain.com/langsmith-managed-deep-agents-waitlist)来申请访问权限。
+</Note>
+
+## 设置
+
+为你的运行时安装对应 SDK：
+
+<CodeGroup>
+
+```bash Python
+uv add managed-deepagents
+
+# Or with pip:
+pip install managed-deepagents
+```
+
+```bash TypeScript
+npm install @langchain/managed-deepagents
+```
+
+</CodeGroup>
+
+设置请求默认值：
+
+```bash
+export LANGSMITH_API_KEY="<LANGSMITH_API_KEY>"
+export LANGSMITH_API_URL="https://api.smith.langchain.com"
+export DEEPAGENTS_BASE_URL="$LANGSMITH_API_URL/v1/deepagents"
+```
+
+SDK 默认会读取 `LANGSMITH_API_KEY`。如果你直接发 REST 请求，则需要在 header 中带上 `X-Api-Key`：
+
+```txt
+X-Api-Key: <LANGSMITH_API_KEY>
+```
+
+## 查找 agent ID
+
+你可以通过 CLI、SDK 或 REST API 查找 agent ID。
+
+<Tabs>
+  <Tab title="CLI">
+
+需要 `deepagents-cli`。安装方法见 [Install a client](/langsmith/managed-deep-agents-quickstart#install-a-client)。
+
+列出 agents：
+
+```bash
+deepagents agents list
+```
+
+查看单个 agent：
+
+```bash
+deepagents agents get <agent_id>
+```
+
+  </Tab>
+  <Tab title="SDK">
+
+列出 agents，并读取你要用的那个 agent 的 `id`：
+
+<CodeGroup>
+
+```python Python
+from managed_deepagents import Client
+
+with Client() as client:
+    agents = client.agents.list()
+
+print("Existing agents:")
+for item in agents["items"]:
+    print(f"  {item['id']}  {item['name']}")
+```
+
+```ts TypeScript
+import { Client } from "@langchain/managed-deepagents";
+
+const client = new Client();
+
+const agents = await client.agents.list();
+
+console.log("Existing agents:");
+for (const item of agents.items ?? []) {
+  console.log(`  ${item.id}  ${item.name}`);
+}
+```
+
+</CodeGroup>
+
+查看单个 agent：
+
+<CodeGroup>
+
+```python Python
+import json
+
+from managed_deepagents import Client
+
+agent_id = "<agent_id>"
+
+with Client() as client:
+    # include_files=True returns file and skill contents, not just metadata.
+    agent = client.agents.get(agent_id, include_files=True)
+
+print(json.dumps(agent, indent=2))
+```
+
+```ts TypeScript
+import { Client } from "@langchain/managed-deepagents";
+
+const client = new Client();
+
+const agentId = "<agent_id>";
+
+// includeFiles: true returns file and skill contents, not just metadata.
+const agent = await client.agents.get(agentId, { includeFiles: true });
+
+console.log(JSON.stringify(agent, null, 2));
+```
+
+</CodeGroup>
+
+  </Tab>
+  <Tab title="API">
+
+通过 `GET /v1/deepagents/agents` 列出 agents，然后读取你目标 agent 的 `id`：
+
+```bash
+curl --request GET \
+  --url "$DEEPAGENTS_BASE_URL/agents" \
+  --header "X-Api-Key: $LANGSMITH_API_KEY"
+```
+
+如果要查看单个 agent，请调用 [`GET /v1/deepagents/agents/{agent_id}`](/langsmith/managed-deep-agents-api/agents/get-agent)。
+
+  </Tab>
+</Tabs>
+
+## 创建 threads 并流式运行
+
+你可以通过 SDK 或 REST API 创建 threads 并流式运行。当前还没有用于运行 Managed Deep Agents 的 CLI 命令。
+
+完成[设置](#set-up)后，导出你在[查找 agent ID](#find-the-agent-id)中获得的 agent ID：
+
+```bash
+export AGENT_ID="<agent_id>"
+```
+
+下面的示例会复用这些变量：
+
+<Tabs>
+  <Tab title="Python SDK">
+
+```python
+import os
+
+from managed_deepagents import Client
+
+agent_id = os.environ["AGENT_ID"]
+client = Client()
+```
+
+  </Tab>
+  <Tab title="TypeScript SDK">
+
+```ts
+import { Client } from "@langchain/managed-deepagents";
+
+const agentId = process.env.AGENT_ID!;
+const client = new Client();
+```
+
+  </Tab>
+  <Tab title="cURL">
+
+```bash
+# The cURL examples below reuse the shell variables exported above.
+# No additional setup is required.
+```
+
+  </Tab>
+</Tabs>
+
+### 创建 thread
+
+在运行 agent 前先创建一个 thread。Threads 会为长任务保留会话和执行状态。
+
+`options` 对象是可选的，这两个字段默认都为 `false`。将 `test_run` 设为 `true`，可以把该 thread 标记为测试运行，并将其从用量和分析中排除。默认情况下，`skip_memory_write_protection` 会让运行时在 agent 写入长期记忆前触发一次 human-in-the-loop interrupt，以便你批准或拒绝该写入。若设为 `true`，记忆写入将直接执行，适用于没有人工可进行批准的 headless 场景。完整字段说明请参见 [API reference](/langsmith/managed-deep-agents-api-overview)。
+
+<Tabs>
+  <Tab title="Python SDK">
+
+```python
+thread = client.threads.create(
+    agent_id=agent_id,
+    options={
+        "test_run": False,
+        "skip_memory_write_protection": False,
+    },
+)
+thread_id = thread["id"]
+print(f"Thread ID: {thread_id}")
+```
+
+  </Tab>
+  <Tab title="TypeScript SDK">
+
+```ts
+const thread = await client.threads.create({
+  agent_id: agentId,
+  options: {
+    test_run: false,
+    skip_memory_write_protection: false,
+  },
+});
+const threadId = thread.id;
+console.log(`Thread ID: ${threadId}`);
+```
+
+  </Tab>
+  <Tab title="cURL">
+
+```bash
+curl --request POST \
+  --url "$DEEPAGENTS_BASE_URL/threads" \
+  --header "X-Api-Key: $LANGSMITH_API_KEY" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "agent_id": "'"$AGENT_ID"'",
+    "options": {
+      "test_run": false,
+      "skip_memory_write_protection": false
+    }
+  }'
+```
+
+将返回的 thread ID 设为环境变量，后续流式运行会用到：
+
+```bash
+export THREAD_ID="<thread_id>"
+```
+
+  </Tab>
+</Tabs>
+
+### 从 thread 流式运行
+
+启动 thread 中的工作，并流式获取结果：
+
+<Tabs>
+  <Tab title="Python SDK">
+
+```python
+for event in client.threads.stream(
+    thread_id,
+    agent_id=agent_id,
+    messages=[
+        {
+            "role": "user",
+            "content": "Research recent approaches to agent memory and summarize the main trade-offs.",
+        }
+    ],
+    stream_mode=["values", "updates", "messages-tuple"],
+    stream_subgraphs=True,
+    user_timezone="America/Los_Angeles",
+):
+    print(event.event, event.data)
+```
+
+  </Tab>
+  <Tab title="TypeScript SDK">
+
+```ts
+const langGraphClient = client.getLangGraphClient({ agentId });
+const stream = langGraphClient.runs.stream(threadId, agentId, {
+  input: {
+    messages: [
+      {
+        role: "user",
+        content:
+          "Research recent approaches to agent memory and summarize the main trade-offs.",
+      },
+    ],
+  },
+  streamMode: ["values", "updates", "messages-tuple"],
+  streamSubgraphs: true,
+});
+
+for await (const event of stream) {
+  console.log(event.event, event.data);
+}
+```
+
+  </Tab>
+  <Tab title="cURL">
+
+```bash
+curl --request POST \
+  --url "$DEEPAGENTS_BASE_URL/threads/$THREAD_ID/runs/stream" \
+  --header "X-Api-Key: $LANGSMITH_API_KEY" \
+  --header 'Accept: text/event-stream' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "agent_id": "'"$AGENT_ID"'",
+    "input": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Research recent approaches to agent memory and summarize the main trade-offs."
+        }
+      ]
+    },
+    "stream_mode": ["values", "updates", "messages-tuple"],
+    "stream_subgraphs": true,
+    "user_timezone": "America/Los_Angeles"
+  }'
+```
+
+  </Tab>
+</Tabs>
+
+该 endpoint 会以 Server-Sent Events（`text/event-stream`）形式流式输出。在这里展示的 stream mode（`stream_mode` / `streamMode`）下，你会先收到增量的 `updates` 和 `messages-tuple` 事件，最终再收到一个 `values` 事件，其中包含该 run 的完整状态以及 agent 的响应。将 `stream_subgraphs`（`streamSubgraphs`）设为 `true`，还会一起流出 subgraph（例如 subagent）的事件。可选的 `user_timezone` 用于告诉 agent 调用方的 IANA 时区，让它能按本地时间推理日期；默认则使用 agent 配置的时区，若未配置则为 `UTC`。
+
+<Note>
+Python SDK 和 cURL 示例支持为单次运行传入 `user_timezone`。TypeScript 示例是通过 LangGraph client adapter 流式运行的，而该适配器没有单次运行的时区字段，因此 agent 会使用自己的配置时区。如果你想在 TypeScript 中为单次运行指定时区，请使用 cURL 标签页中展示的 REST endpoint，并在请求体中传入 `user_timezone`。
+</Note>
+
+cURL 示例会打印原始 SSE 行。若你要驱动 UI，请将其中的 `data:` payload 解析为 JSON。Python 和 TypeScript SDK 则会直接产出已经解码好的事件对象，其中包含 `event.event` 和 `event.data`。
+
+可以按需选择 stream mode：
+
+| Stream mode | Use for |
+| --- | --- |
+| `values` | 每一步后的完整状态快照。 |
+| `updates` | agent 运行过程中的增量状态更新。 |
+| `messages-tuple` | 面向聊天 UI 的 token 级消息输出。会发出 `messages` 事件，其 payload 是一个 `[chunk, metadata]` 元组。 |
+
+### 配合 React `useStream` 进行流式运行
+
+前面的 Python SDK 和 TypeScript SDK 示例展示的是路由级事件流。下面这个 React `useStream` 示例则会暴露 LangGraph 的投影结果，例如 `stream.messages`、`stream.values` 和输出状态，更适合构建聊天 UI。
+
+在 React 应用中，可以将 TypeScript SDK 的 LangGraph client adapter 与 `@langchain/react` 一起使用：
+
+<Warning>
+不要把 LangSmith API key 下发到浏览器。在生产环境 React 应用中，请通过自定义 `fetch` 把请求转发到你的后端，而不是直接传入 `apiKey`。
+</Warning>
+
+```tsx
+import { Client } from "@langchain/managed-deepagents";
+import { useStream } from "@langchain/react";
+
+const agentId = "<agent_id>";
+
+const managedDeepAgents = new Client();
+
+const client = managedDeepAgents.getLangGraphClient({ agentId });
+
+export function ManagedDeepAgentStream() {
+  const stream = useStream({
+    client,
+    assistantId: agentId
+  });
+
+  return (
+    <section>
+      <button
+        type="button"
+        disabled={stream.isLoading}
+        onClick={() => {
+          void stream.submit({
+            messages: [
+              { role: "user", content: "Write a short status update." },
+            ],
+          });
+        }}
+      >
+        Run agent
+      </button>
+
+      {stream.messages.map((message, index) => (
+        <p key={message.id ?? index}>{String(message.content)}</p>
+      ))}
+    </section>
+  );
+}
+```
+
+## 下一步
+
+<CardGroup cols={2}>
+  <Card title="SDK reference" icon="book" href="/langsmith/managed-deep-agents-sdk">
+    查看 Python 和 TypeScript 客户端的 SDK 配置细节。
+  </Card>
+  <Card title="API reference" icon="api" href="/langsmith/managed-deep-agents-api-overview">
+    查看各路由级别的请求与响应细节。
+  </Card>
+</CardGroup>
+
+<Note>
+如果请求失败，请确认你的 API key 有效、工作区具备 [private beta access](https://www.langchain.com/langsmith-managed-deep-agents-waitlist)，并且你访问的是当前支持的区域。有关响应状态码和错误结构，请参见 [API reference](/langsmith/managed-deep-agents-api-overview)。
+</Note>

@@ -1,0 +1,222 @@
+---
+title: Studio 中的 observability
+sidebarTitle: Traces、datasets、prompts
+---
+
+LangSmith [Studio](/langsmith/studio) 提供了一组工具，帮助你在执行之外进一步检查、调试和改进应用。通过 traces、datasets 和 prompts，你可以更细致地了解应用行为、衡量其性能，并持续优化输出效果：
+
+- [迭代 prompts](#iterate-on-prompts)：直接在 graph 节点中修改 prompts，或通过 Playground 调整。
+- [在 dataset 上运行实验](#run-experiments-over-a-dataset)：让 assistant 在 LangSmith dataset 上运行，并对结果打分和比较。
+- [调试 LangSmith traces](#debug-langsmith-traces)：把 tracing 过的 runs 导入 Studio，并可选择克隆到本地 agent。
+- [将节点加入 dataset](#add-node-to-dataset)：把线程历史中的部分内容转换为 dataset examples，用于评估或进一步分析。
+
+## 迭代 prompts
+
+Studio 支持以下方式修改 graph 中使用的 prompts：
+
+- [直接编辑节点](#direct-node-editing)
+- [Playground 界面](#playground)
+
+### 直接编辑节点
+
+Studio 允许你直接在 graph 界面中编辑单个节点内部使用的 prompts。
+
+### Graph 配置
+
+通过定义 [configuration](/oss/langgraph/use-graph-api#add-runtime-configuration)，你可以使用 `langgraph_nodes` 和 `langgraph_type` keys 来指定 prompt 字段以及它们对应的节点。
+
+#### `langgraph_nodes`
+
+- **Description**：指定某个配置字段与 graph 中哪些节点关联。
+- **Value Type**：字符串数组，数组中的每个字符串都是 graph 中某个节点的名称。
+- **Usage Context**：对于 Pydantic model，请写在 `json_schema_extra` 字典中；对于 dataclass，请写在 `metadata["json_schema_extra"]` 字典中。
+- **Example**：
+  ```python
+  system_prompt: str = Field(
+      default="You are a helpful AI assistant.",
+      json_schema_extra={"langgraph_nodes": ["call_model", "other_node"]},
+  )
+  ```
+
+#### `langgraph_type`
+
+- **Description**：指定配置字段的类型，决定它在 UI 中如何处理。
+- **Value Type**：字符串
+- **Supported Values**：
+  * `"prompt"`：表示该字段包含 prompt 文本，UI 会对其做特殊处理。
+- **Usage Context**：对于 Pydantic model，请写在 `json_schema_extra` 字典中；对于 dataclass，请写在 `metadata["json_schema_extra"]` 字典中。
+- **Example**：
+  ```python
+  system_prompt: str = Field(
+      default="You are a helpful AI assistant.",
+      json_schema_extra={
+          "langgraph_nodes": ["call_model"],
+          "langgraph_type": "prompt",
+      },
+  )
+  ```
+
+<Accordion title="完整配置示例">
+
+```python
+## Using Pydantic
+from pydantic import BaseModel, Field
+from typing import Annotated, Literal
+
+class Configuration(BaseModel):
+    """The configuration for the agent."""
+
+    system_prompt: str = Field(
+        default="You are a helpful AI assistant.",
+        description="The system prompt to use for the agent's interactions. "
+        "This prompt sets the context and behavior for the agent.",
+        json_schema_extra={
+            "langgraph_nodes": ["call_model"],
+            "langgraph_type": "prompt",
+        },
+    )
+
+    model: Annotated[
+        Literal[
+            "anthropic/claude-sonnet-4-6",
+            "anthropic/claude-haiku-4-5-20251001",
+            "openai/o1",
+            "openai/gpt-5.4-mini",
+            "openai/o1-mini",
+            "openai/o3-mini",
+        ],
+        {"__template_metadata__": {"kind": "llm"}},
+    ] = Field(
+        default="openai/gpt-5.4-mini",
+        description="The name of the language model to use for the agent's main interactions. "
+        "Should be in the form: provider/model-name.",
+        json_schema_extra={"langgraph_nodes": ["call_model"]},
+    )
+
+## Using Dataclasses
+from dataclasses import dataclass, field
+
+@dataclass(kw_only=True)
+class Configuration:
+    """The configuration for the agent."""
+
+    system_prompt: str = field(
+        default="You are a helpful AI assistant.",
+        metadata={
+            "description": "The system prompt to use for the agent's interactions. "
+            "This prompt sets the context and behavior for the agent.",
+            "json_schema_extra": {"langgraph_nodes": ["call_model"]},
+        },
+    )
+
+    model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
+        default="anthropic/claude-3-5-sonnet-20240620",
+        metadata={
+            "description": "The name of the language model to use for the agent's main interactions. "
+            "Should be in the form: provider/model-name.",
+            "json_schema_extra": {"langgraph_nodes": ["call_model"]},
+        },
+    )
+
+```
+
+</Accordion>
+
+#### 在 UI 中编辑 prompts
+
+1. 在带有关联配置字段的节点上找到齿轮图标。
+1. 点击打开配置弹窗。
+1. 编辑对应的值。
+1. 保存，以更新当前 assistant 版本或创建新版本。
+
+### Playground
+
+[Playground](/langsmith/create-a-prompt) 界面允许你在不运行完整 graph 的情况下，单独测试某个 LLM 调用：
+
+1. 选择一个 thread。
+1. 在节点上点击 **View LLM Runs**。这会列出该节点内部发起的所有 LLM 调用（如果有）。
+1. 选择一个 LLM run，在 Playground 中打开。
+1. 修改 prompts，并测试不同的模型和 tool 设置。
+1. 将更新后的 prompts 复制回你的 graph。
+
+## 在 dataset 上运行实验
+
+Studio 允许你通过让 assistant 在预定义的 LangSmith [dataset](/langsmith/evaluation-concepts#datasets) 上运行，来执行[评估](/langsmith/evaluation-concepts)。这样你就可以在多种输入上测试性能、将输出与参考答案进行比较，并通过已配置的 [evaluators](/langsmith/evaluation-concepts#evaluators) 对结果打分。
+
+本指南将演示如何直接在 Studio 中运行一个完整的端到端实验。
+
+### 前置条件
+
+开始实验前，请确保你具备以下内容：
+
+- **一个 LangSmith dataset**：你的 dataset 应包含要测试的输入，并可选地包含用于对比的参考输出。输入 schema 必须与 assistant 所要求的输入 schema 匹配。关于 schema 的更多信息，请参见 [graph API schema documentation](/oss/langgraph/graph-api#schema)。关于如何创建 datasets，请参见 [How to Manage Datasets](/langsmith/manage-datasets-in-application#create-a-dataset-and-add-examples)。
+- **（可选）Evaluators**：你可以在 LangSmith 中把 evaluators（例如 LLM-as-a-Judge、heuristics 或自定义函数）绑定到 dataset 上。这样在 graph 完成所有输入处理后，它们会自动运行。
+- **一个正在运行的应用**：实验可以针对以下目标运行：
+  - 部署在 [LangSmith](/langsmith/deployment) 上的应用。
+  - 通过 [langgraph-cli](/langsmith/local-dev-testing) 启动的本地应用。
+
+<Note>
+Studio 中的实验与其他实验遵循相同的[data retention](/langsmith/usage-and-billing#data-retention)规则。默认情况下，traces 使用基础保留层级（14 天）。但如果给 trace 添加了反馈，它会自动升级为 extended tier retention（400 天）。反馈可以通过以下两种方式之一加入：
+
+- [dataset 绑定了 evaluators](/langsmith/bind-evaluator-to-dataset)。
+- 手动向 trace 添加了 [feedback](/langsmith/observability-concepts#feedback)。
+
+这种自动升级会同时增加保留时长和 trace 成本。详情请参见 [Data retention auto-upgrades](/langsmith/usage-and-billing#how-it-works)。
+</Note>
+
+### 实验设置
+
+1. 启动实验。点击 Studio 页面右上角的 **Run experiment** 按钮。
+1. 选择 dataset。在弹出的对话框中，选择实验要使用的 dataset（或某个特定 split），然后点击 **Start**。
+1. 监控进度。dataset 中的所有输入都会在当前激活的 assistant 上运行。你可以通过右上角的状态标记查看实验进度。
+1. 实验在后台运行时，你仍然可以继续在 Studio 中工作。任何时候都可以点击箭头按钮跳转到 LangSmith，查看更详细的实验结果。
+
+## 调试 LangSmith traces
+
+本节说明如何在 Studio 中打开 LangSmith traces 进行交互式排查和调试。
+
+### 打开已部署的 threads
+
+1. 打开 LangSmith trace，并选中 root run。
+1. 点击 **Run in Studio**。
+
+这样会打开 Studio，并连接到对应的 deployment，同时选中该 trace 所属的 parent thread。
+
+### 使用远程 traces 测试本地 agents
+
+本节说明如何使用 LangSmith 中的远程 traces 来测试本地 agent。这让你可以把生产 traces 当作本地测试输入，便于在开发环境中调试和验证 agent 修改。
+
+#### 前置条件
+
+- 一条已经在 LangSmith 中记录的 traced thread
+- 一个[本地运行中的 agent](/langsmith/local-dev-testing)
+
+<Info>
+**本地 agent 要求**
+* langgraph>=0.3.18
+* langgraph-api>=0.0.32
+* 包含与远程 trace 中相同的一组 nodes
+</Info>
+
+#### 克隆 thread
+
+1. 打开 LangSmith trace，并选中 root run。
+2. 点击 **Run in Studio** 旁边的下拉菜单。
+3. 输入本地 agent 的 URL。
+4. 选择 **Clone thread locally**。
+5. 如果存在多个 graphs，请选择目标 graph。
+
+系统会在你的本地 agent 中创建一个新 thread，依据远程 thread 推断并复制 thread history，然后将你带到本地运行应用对应的 Studio 界面。
+
+## 将节点加入 dataset
+
+你可以从 thread log 中的节点，把内容加入到 [LangSmith datasets](/langsmith/manage-datasets) 里作为 [examples](/langsmith/evaluation-concepts#examples)。这对于评估 agent 的单个步骤特别有用。
+
+1. 选择一个 thread。
+1. 点击 **Add to Dataset**。
+1. 选择你想加入 dataset 的节点输入/输出。
+1. 对于每个已选节点，选择要创建 example 的目标 dataset。默认会选中一个针对当前 assistant 和节点的 dataset。如果这个 dataset 还不存在，会自动创建。
+1. 在添加到 dataset 之前，根据需要编辑 example 的输入/输出。
+1. 点击页面底部的 **Add to dataset**，将所有已选节点加入各自对应的 datasets。
+
+更多细节请参见 [How to evaluate an application's intermediate steps](/langsmith/evaluate-on-intermediate-steps)。

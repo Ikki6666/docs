@@ -1,0 +1,246 @@
+---
+title: 使用预签名 URL 收集反馈
+sidebarTitle: 使用预签名 URL 收集反馈
+description: 使用预签名反馈 token，在不暴露 LangSmith API key 的情况下，从客户端应用收集用户反馈。
+---
+
+预签名反馈 token 允许你在不暴露 [LangSmith API key](/langsmith/create-account-api-key) 的前提下，从客户端应用（浏览器、移动端应用等）收集[反馈](/langsmith/observability-concepts#feedback)。每个 token 都会生成一个绑定到特定 [run](/langsmith/observability-concepts#runs) 与反馈 key 的 URL。客户端可以直接调用该 URL 提交反馈，无需任何认证。
+
+这在以下场景中特别有用：
+
+- 你的前端需要收集终端用户的点赞/点踩或星级评分。
+- 你想在邮件、Slack 消息或其他外部渠道中嵌入反馈链接。
+- 你希望将反馈收集与后端逻辑解耦。
+
+<Note>
+如果你使用的是 [Agent Server](/langsmith/agent-server)，当你在 run 请求中传入 `feedback_keys` 时，预签名反馈 URL 会自动生成。关于这种工作流，请参见 [Collect user feedback for Agent Server runs](/langsmith/agent-server-feedback)。
+</Note>
+
+## 创建预签名反馈 token
+
+使用 @[`create_presigned_feedback_token()`][create_presigned_feedback_token] / [`createPresignedFeedbackToken`](https://reference.langchain.com/javascript/classes/langsmith.client.Client.html#createpresignedfeedbacktoken)，为某个特定 run 和反馈 key 生成 token。返回对象中会包含一个 `url`，客户端可以调用它来提交反馈：
+
+<CodeGroup>
+
+```python Python
+from langsmith import Client
+
+client = Client()
+
+run_id = "<run_id>"
+
+token = client.create_presigned_feedback_token(
+    run_id,
+    feedback_key="user_score",
+)
+
+print(token.url)
+# https://api.smith.langchain.com/api/v1/feedback/tokens/<token_id>
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+const runId = "<run_id>";
+
+const token = await client.createPresignedFeedbackToken(runId, "user_score");
+
+console.log(token.url);
+// https://api.smith.langchain.com/api/v1/feedback/tokens/<token_id>
+```
+
+</CodeGroup>
+
+### 设置 token 过期时间
+
+默认情况下，token 会在 3 小时后过期。你可以通过 `expiration` 自定义过期时间，既可以传入 `timedelta`（相对时间），也可以传入 `datetime`（绝对时间）：
+
+<CodeGroup>
+
+```python Python
+import datetime
+from langsmith import Client
+
+client = Client()
+
+run_id = "<run_id>"
+
+token = client.create_presigned_feedback_token(
+    run_id,
+    feedback_key="user_score",
+    expiration=datetime.timedelta(hours=24),
+)
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+const runId = "<run_id>";
+
+const token = await client.createPresignedFeedbackToken(runId, "user_score", {
+  expiration: { hours: 24 },
+});
+```
+
+</CodeGroup>
+
+### 约束反馈值
+
+你可以传入 `feedback_config` 来限制客户端允许提交的反馈值。这在你想强制执行特定反馈 schema 时非常有用，例如点赞/点踩、1–5 星，或离散类别标签：
+
+<CodeGroup>
+
+```python Python
+from langsmith import Client
+
+client = Client()
+
+run_id = "<run_id>"
+
+token = client.create_presigned_feedback_token(
+    run_id,
+    feedback_key="user_score",
+    feedback_config={
+        "type": "continuous",
+        "min": 0,
+        "max": 1,
+    },
+)
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+const runId = "<run_id>";
+
+const token = await client.createPresignedFeedbackToken(runId, "user_score", {
+  feedbackConfig: {
+    type: "continuous",
+    min: 0,
+    max: 1,
+  },
+});
+```
+
+</CodeGroup>
+
+### 批量创建 tokens（仅 Python）
+
+使用复数形式的 `create_presigned_feedback_tokens`，可以一次性为多个反馈 key 生成 token：
+
+```python Python
+from langsmith import Client
+
+client = Client()
+
+run_id = "<run_id>"
+
+tokens = client.create_presigned_feedback_tokens(
+    run_id,
+    feedback_keys=["thumbs_up", "thumbs_down"],
+)
+
+for token in tokens:
+    print(f"{token.id}: {token.url}")
+```
+
+## 通过预签名 URL 提交反馈
+
+拿到预签名 URL 后，你的前端代码或邮件客户端就可以通过向该 URL 发送 `POST` 或 `GET` 请求来提交反馈。这个 URL 不需要 API key 或其他认证，因为 token 本身已经完成了授权。
+
+### POST 请求
+
+当前端用户与某个反馈控件交互时（例如点击点赞按钮），请使用 `POST`。`POST` 支持 `score`、`value`、`comment`、`correction` 和 `metadata` 字段。
+
+```bash
+curl --request POST \
+  --url "https://api.smith.langchain.com/api/v1/feedback/tokens/<token_id>" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "score": 1,
+    "comment": "This response was helpful!"
+  }'
+```
+
+### GET 请求
+
+如果你是把反馈链接嵌入邮件或 Slack 消息中，请使用 `GET`。用户点击链接时就会触发请求。`GET` 支持通过 query parameter 传入 `score`、`value`、`comment` 和 `correction`。`GET` 不支持 `metadata`。
+
+```bash
+curl --request GET \
+  --url "https://api.smith.langchain.com/api/v1/feedback/tokens/<token_id>?score=1&comment=This%20response%20was%20helpful!"
+```
+
+### 使用 SDK 基于预签名 token 提交反馈
+
+你也可以通过 SDK 使用预签名 token 提交反馈。这适用于服务端工作流，例如你从另一个服务中拿到了 token URL。
+
+<CodeGroup>
+
+```python Python
+from langsmith import Client
+
+client = Client()
+
+client.create_feedback_from_token(
+    "<token_or_url>",
+    score=1,
+    comment="This response was helpful!",
+)
+```
+
+```typescript TypeScript
+// Use a direct HTTP request to the presigned URL
+await fetch(tokenUrl, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    score: 1,
+    comment: "This response was helpful!",
+  }),
+});
+```
+
+</CodeGroup>
+
+## 列出现有 token
+
+使用 `list_presigned_feedback_tokens` / `listPresignedFeedbackTokens` 获取某个 run 关联的所有预签名反馈 token。
+
+<CodeGroup>
+
+```python Python
+from langsmith import Client
+
+client = Client()
+
+run_id = "<run_id>"
+
+for token in client.list_presigned_feedback_tokens(run_id):
+    print(f"ID: {token.id}, URL: {token.url}, Expires: {token.expires_at}")
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+const runId = "<run_id>";
+
+for await (const token of client.listPresignedFeedbackTokens(runId)) {
+  console.log(`URL: ${token.url}, Expires: ${token.expires_at}`);
+}
+```
+
+</CodeGroup>
+
+## 相关内容
+
+- [反馈数据格式参考](/langsmith/feedback-data-format)
+- [使用 SDK 记录反馈](/langsmith/attach-user-feedback)

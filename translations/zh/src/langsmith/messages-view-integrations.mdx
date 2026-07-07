@@ -1,0 +1,217 @@
+---
+title: Messages view 集成
+description: 可在 LangSmith Messages view 中渲染的框架与 SDK。
+---
+
+[Messages view](/langsmith/view-traces#messages-view) 会将 agent 的 trace 渲染为类似聊天对话的形式：按照顺序展示用户提示、模型回复、工具调用和工具结果。对于本页表格中列出的所有集成，它都可以自动生效。另有少数集成（单独使用的 `wrap_anthropic`，以及 JavaScript Claude Agent SDK）需要手动设置一个 metadata key，这些要求在表格和[已知限制](#known-limitations)中都列了出来。
+
+## 支持的集成
+
+| Integration | Tracing SDK | Setup required |
+| --- | --- | --- |
+| LangChain chat models | langchain-core | None |
+| LangGraph | langgraph | None |
+| `langchain.create_agent` | langchain | None (see caveat in [Known limitations](#known-limitations)) |
+| Deep Agents | deepagents | None |
+| OpenAI Chat Completions | `wrap_openai` | None |
+| OpenAI Responses | `wrap_openai` (responses API) | None |
+| OpenAI Agents SDK | Python tracing processor | None |
+| Vercel AI SDK | `wrapAISDK` | None |
+| Anthropic Messages (`wrap_anthropic`) | `wrap_anthropic` | Set `ls_message_format: "anthropic"` |
+| Claude Agent SDK (Python) | claude-agent-sdk | None |
+| Claude Agent SDK (JS) | claude-agent-sdk-js | Set `ls_message_format: "anthropic"` |
+| Claude Code | claude-code | None |
+
+如需查看每种集成的完整检测规则、预期 payload 结构和具体 JSON 示例，请参见 [Trace format reference](/langsmith/messages-view-trace-format)。
+
+## 已知限制
+
+少数集成需要通过 metadata 覆盖，才能被正确识别：
+
+- **单独使用 `wrap_anthropic`：** 该 wrapper 当前不会自动设置 `ls_message_format`，因此检测逻辑无法命中。请在调用时（或通过 `RunnableConfig`）设置 `metadata={"ls_message_format": "anthropic"}`，这样该 run 才会被正确归类。
+- **Claude Agent SDK (JS)：** 当前自动检测逻辑只将 `"claude-agent-sdk"` 和 `"claude-code"` 列入 allowlist，并未包含 JS 发出的 `"claude-agent-sdk-js"`。请在 JS trace 上显式设置 `ls_message_format: "anthropic"`。
+- **`langchain.create_agent`：** 它不在显式检测 allowlist 中。目前之所以能被识别，是依赖 OpenAI / Anthropic 匹配逻辑中的 `ls_provider` / `ls_message_format` 兜底，或者在 agent 运行于 LangGraph 内部时通过 `graph_id` / `langgraph_node` 来匹配。如果路由不稳定，请显式设置 `metadata.ls_message_format: "langchain"`。
+
+## 将某些 runs 排除在 Messages view 之外
+
+如果在某个 run 的 metadata 上设置 `LS_MESSAGE_VIEW_EXCLUDE`，Messages view 就会跳过该 run。这里关键在于**这个 key 是否存在**，而不是它的值是否为真；通常大家会把它设为 `True`。该过滤发生在任何提取策略之前，因此一旦某个 LLM 或工具 run 被排除，它就不会参与检测、消息提取或工具调用配对。
+
+`LS_MESSAGE_VIEW_EXCLUDE` 是 `langsmith` 在 Python 和 JS 中导出的一个顶层常量，其值为字符串 `"ls_message_view_exclude"`。推荐优先使用该常量，以避免拼写错误；当然，直接使用字面字符串也同样有效。
+
+适用场景包括：那些并不属于会话轮次的内部 LLM 子 span，例如分类调用、embedding 查询、安全过滤或路由 / guardrail 决策。你依然希望这些运行在 LangSmith 其他地方可见，但不想让它们干扰聊天式对话记录。
+
+### Python
+
+**1. 在 `@traceable` 装饰器上使用**：排除整个函数的 run。
+
+```python
+from langsmith import LS_MESSAGE_VIEW_EXCLUDE, traceable
+
+@traceable(run_type="llm", metadata={LS_MESSAGE_VIEW_EXCLUDE: True})
+def classify_intent(query: str) -> str:
+    # This LLM call is internal routing, not part of the chat
+    return llm.predict(f"Classify the intent of: {query}")
+```
+
+**2. 通过 `trace` 上下文管理器使用**：排除一个临时 span。
+
+```python
+from langsmith import LS_MESSAGE_VIEW_EXCLUDE, trace
+
+with trace(
+    "safety_check",
+    run_type="llm",
+    metadata={LS_MESSAGE_VIEW_EXCLUDE: True},
+) as run:
+    result = safety_model.score(text)
+    run.end(outputs={"score": result})
+```
+
+**3. 在运行中的函数内部使用**：在 run 被 patch 之前的任意时刻，将该 key 写入当前 run tree。
+
+```python
+from langsmith import LS_MESSAGE_VIEW_EXCLUDE, get_current_run_tree, traceable
+
+@traceable(run_type="llm")
+def maybe_internal(query: str) -> str:
+    result = llm.predict(query)
+    if _looks_like_routing(query):
+        rt = get_current_run_tree()
+        if rt is not None:
+            rt.add_metadata({LS_MESSAGE_VIEW_EXCLUDE: True})
+    return result
+```
+
+**4. 在使用 `wrap_openai` / `wrap_anthropic` 时按调用设置**：通过 `langsmith_extra` 将配置透传给包装后的客户端调用。
+
+```python
+import openai
+from langsmith import LS_MESSAGE_VIEW_EXCLUDE
+from langsmith.wrappers import wrap_openai
+
+client = wrap_openai(openai.Client())
+
+resp = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Classify: ..."}],
+    langsmith_extra={"metadata": {LS_MESSAGE_VIEW_EXCLUDE: True}},
+)
+```
+
+**5. LangChain `RunnableConfig`**：排除某个 chain 或 chat model 的单次调用。
+
+```python
+from langchain_openai import ChatOpenAI
+from langsmith import LS_MESSAGE_VIEW_EXCLUDE
+
+llm = ChatOpenAI(model="gpt-4o")
+result = llm.invoke(
+    "Classify this query",
+    config={"metadata": {LS_MESSAGE_VIEW_EXCLUDE: True}},
+)
+```
+
+### TypeScript
+
+**1. 在 `traceable` 包装器上使用**：排除整个函数的 run。
+
+```typescript
+import { LS_MESSAGE_VIEW_EXCLUDE } from "langsmith";
+import { traceable } from "langsmith/traceable";
+
+const classifyIntent = traceable(
+  async (query: string) => {
+    return await llm.predict(`Classify the intent of: ${query}`);
+  },
+  {
+    name: "classify_intent",
+    run_type: "llm",
+    metadata: { [LS_MESSAGE_VIEW_EXCLUDE]: true },
+  },
+);
+```
+
+**2. 在运行中的函数内部使用**：修改当前 run tree。
+
+```typescript
+import { LS_MESSAGE_VIEW_EXCLUDE } from "langsmith";
+import { traceable, getCurrentRunTree } from "langsmith/traceable";
+
+const maybeInternal = traceable(
+  async (query: string) => {
+    const result = await llm.predict(query);
+    if (looksLikeRouting(query)) {
+      const rt = getCurrentRunTree();
+      rt.extra = rt.extra ?? {};
+      rt.extra.metadata = { ...rt.extra.metadata, [LS_MESSAGE_VIEW_EXCLUDE]: true };
+    }
+    return result;
+  },
+  { run_type: "llm" },
+);
+```
+
+**3. 在 `wrapOpenAI` 中按调用设置**：在调用时传入 `langsmithExtra`。
+
+```typescript
+import { LS_MESSAGE_VIEW_EXCLUDE } from "langsmith";
+import { wrapOpenAI } from "langsmith/wrappers";
+import OpenAI from "openai";
+
+const client = wrapOpenAI(new OpenAI());
+
+const resp = await client.chat.completions.create(
+  {
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "Classify: ..." }],
+  },
+  { langsmithExtra: { metadata: { [LS_MESSAGE_VIEW_EXCLUDE]: true } } },
+);
+```
+
+**4. Vercel AI SDK middleware**：在 `wrapAISDK` 中通过 `lsConfig.metadata` 传入该 key。这个 middleware 会将其合并到每个发出的 LLM run 上。
+
+```typescript
+import * as ai from "ai";
+import { LS_MESSAGE_VIEW_EXCLUDE } from "langsmith";
+import { wrapAISDK } from "langsmith/experimental/vercel";
+
+const { generateText } = wrapAISDK(ai, {
+  metadata: { [LS_MESSAGE_VIEW_EXCLUDE]: true },
+});
+```
+
+如果你只想排除部分调用而不是全部，可以正常使用 `wrapAISDK`，然后在调用 AI SDK 的父级 `traceable` 中修改 `getCurrentRunTree()`，或者创建一个子 `RunTree` 并传入 `createChild({ extra: { metadata: { [LS_MESSAGE_VIEW_EXCLUDE]: true } } })`。
+
+**5. 手动使用 `RunTree.createChild`**：适用于你手动构建 runs 的情况。
+
+```typescript
+import { LS_MESSAGE_VIEW_EXCLUDE } from "langsmith";
+import { RunTree } from "langsmith/run_trees";
+
+const parent = new RunTree({ name: "agent", run_type: "chain" });
+const child = parent.createChild({
+  name: "safety_check",
+  run_type: "llm",
+  extra: { metadata: { [LS_MESSAGE_VIEW_EXCLUDE]: true } },
+});
+```
+
+### 注意事项
+
+- 该过滤逻辑检查的是 **key 是否存在**，而不是值是否为真。即使写成 `{LS_MESSAGE_VIEW_EXCLUDE: false}`，该 run 依然会被排除。若想包含该 run，请完全省略这个 key。
+- 在 `@traceable`（Python）或 `traceable`（JS）父级运行内部执行的子 run，会通过共享 tracing context 继承该排除设置：Python 使用 `_METADATA` `ContextVar`，JS 使用 `AsyncLocalStorage`。子级自己的 decorator-time metadata 会在继承值之上继续叠加。
+- 被排除的 runs 仍然会出现在常规 trace 视图、runs explorer 和 metrics 中。只有 Messages view 会将它们过滤掉。
+
+## 手动埋点
+
+如果你不是通过[支持的集成](#supported-integrations)里的 wrapper 来追踪，而是通过 `RunTree`、REST API，或自定义 provider SDK 包装器来发出 runs，请在每个 LLM run 的 metadata 上设置 `ls_message_format`，以便将 trace 路由到正确的 extractor：
+
+| Trace shape | Set on metadata |
+| --- | --- |
+| LangChain messages (constructor envelope) | `ls_message_format: "langchain"` |
+| OpenAI Chat Completions | `ls_message_format: "completions"` |
+| OpenAI Responses API | `ls_message_format: "responses"` |
+| Anthropic Messages API | `ls_message_format: "anthropic"` |
+
+每种 extractor 预期的 JSON 结构，请参见 [Trace format reference](/langsmith/messages-view-trace-format)。

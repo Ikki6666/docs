@@ -1,0 +1,636 @@
+---
+title: Messages view trace format 参考
+sidebarTitle: Messages view 参考
+description: LangSmith Messages view 如何从 traces 中提取对话的检测规则、payload 结构和示例。
+---
+
+<Note>
+如果你使用[受支持的集成](/langsmith/messages-view-integrations)进行 tracing，trace 会自动在 [Messages view](/langsmith/view-traces#messages-view) 中渲染。
+</Note>
+
+当你要为未列入支持清单的 agent 框架或 LLM client 做 tracing、通过 `RunTree` 或 REST API 手动发送 runs，或者排查某个 trace 为什么没有在 [Messages view](/langsmith/view-traces#messages-view) 中正确渲染时，请参考本页。
+
+本页中的 [_Extraction strategy_](#extraction-strategy-resolution) 指的是针对每种集成的一套提取逻辑，它会读取 trace 中的 LLM 与工具 runs，并生成 Messages view 最终展示的有序对话。对于每个受支持的集成，本页都会说明 LangSmith 依靠哪些 metadata key 来决定采用哪种策略、策略期望 `inputs` 和 `outputs` 采用什么 JSON 结构，以及工具调用如何与其结果配对。
+
+<Note>
+本页中的 **Tracing default** 指的是，当你使用文档中列出的入口时，LangSmith SDK 会自动写入相应的 metadata key。除此之外的情况都属于集成供应方自己的埋点，或用户手动覆盖。
+</Note>
+
+## Extraction strategy resolution
+
+对于每个 trace，第一条命中的提取策略会生效。每种策略在检测时都会明确避让其他集成留下的标记。最常见的冲突是：`ls_provider: "openai"` 和 LangChain 风格的 payload 同时出现，这种情况下 OpenAI 策略会让位给 LangChain。如果 trace 的首个 run 没有命中任何策略，messages API 会返回 `400 no adapter pair found for trace format`。
+
+| 集成 | 策略 | 主要 metadata 信号 | Tracing default（LangSmith SDK） |
+| --- | --- | --- | --- |
+| [Vercel AI SDK](#vercel-ai-sdk) | vercel | `ls_integration: "vercel-ai-sdk"` 或 `ai_sdk_method` | 是（`wrapAISDK`） |
+| [OpenAI Chat Completions](#openai-wrap_openai) | openai | `ls_provider: "openai"` 或 `"azure"`（没有 `use_responses_api`） | 是（`wrap_openai`） |
+| [OpenAI Responses](#openai-wrap_openai) | openai | `ls_provider` 加 `ls_invocation_params.use_responses_api: true` | 是（`wrap_openai` responses） |
+| [OpenAI Agents SDK](#openai-wrap_openai) | openai | `ls_integration: "openai-agents-sdk"` | 是（Python tracing processor） |
+| [Anthropic Messages (`wrap_anthropic`)](#anthropic-messages-wrap_anthropic) | anthropic | `ls_message_format: "anthropic"`（目前需要显式设置） | 部分支持：provider 会自动设置，format key 需要 opt-in |
+| [Claude Agent SDK (Python)](#anthropic-messages-wrap_anthropic) | anthropic | `ls_integration: "claude-agent-sdk"` | 是 |
+| [Claude Code](#anthropic-messages-wrap_anthropic) | anthropic | `ls_integration: "claude-code"` | 由 claude-code 自身设置 |
+| [Claude Agent SDK (JS)](#anthropic-messages-wrap_anthropic) | anthropic | 当前**不会**自动命中（发出的是 `"claude-agent-sdk-js"`） | provider 会自动设置，format 不会（存在缺口） |
+| [LangChain chat models](#langchain-and-langgraph) | langchain | `ls_integration: "langchain_chat_model"` | 是（langchain-core） |
+| [LangGraph](#langchain-and-langgraph) | langchain | `graph_id` 或 `langgraph_node` | 是（langgraph） |
+| [`langchain.create_agent`](#langchain-and-langgraph) | langchain | `ls_integration: "langchain_create_agent"`（随后会落入其他信号的判断） | 是（langchain） |
+| [Deep Agents](#langchain-and-langgraph) | langchain | `ls_integration: "deepagents"` 或 `"deepagents-cli"` | 是（deepagents） |
+
+## LangChain and LangGraph
+
+这一部分覆盖 `BaseChatModel` 派生的 LLM runs、LangGraph graphs、`deepagents` 和 `langchain.create_agent`。
+
+### Detection
+
+只要 metadata 中满足以下任一条件，就会触发提取：
+
+- `ls_message_format` 是 `"langchain"`（显式覆盖）
+- `ls_integration` 是 `"langchain_chat_model"`、`"deepagents"` 或 `"deepagents-cli"`
+- 存在 `graph_id`（LangGraph root）
+- 存在 `langgraph_node`（LangGraph 子 run。即使 `graph_id` 只在 root 上，子 runs 也会带这个字段）
+
+当存在这些标记时，OpenAI 检测逻辑会明确让位给 LangChain，因此即便同时出现 `ls_provider: "openai"`，最终也会由 LangChain 提取逻辑接管。
+
+### Tracing defaults
+
+**`langchain-core`** 的 `BaseChatModel` 会在每个 chat-model run 上设置以下字段：
+
+- `metadata.ls_integration`: `"langchain_chat_model"`
+- 以及 provider 专属的 `_get_ls_params()` 输出（`ls_provider`、`ls_model_name`、`ls_model_type`、`ls_temperature`、`ls_max_tokens`、`ls_stop`）
+
+**`langchain.create_agent`** 会在 agent config 上设置 `metadata.ls_integration: "langchain_create_agent"`。
+
+<Note>
+`langchain_create_agent` 不在显式检测 allowlist 中。它当前之所以能被识别，是通过 OpenAI / Anthropic 检测中的 `ls_provider` / `ls_message_format` 兜底规则，或者在 agent 运行于 LangGraph 内部时依靠 `graph_id` / `langgraph_node`。如果路由不稳定，请显式设置 `metadata.ls_message_format: "langchain"`。
+</Note>
+
+**LangGraph** 会设置 `graph_id`（root）和 `langgraph_node`（每个子 run）。
+
+**Deep Agents** 会在根 chain run 上设置 `metadata.ls_integration: "deepagents"`，CLI 变体则使用 `"deepagents-cli"`。
+
+### Run shape
+
+LangChain 使用其构造器格式来序列化消息。`id` 数组的最后一个元素用来标识类名：
+
+```json
+{
+  "lc": 1,
+  "type": "constructor",
+  "id": ["langchain", "schema", "messages", "AIMessage"],
+  "kwargs": {
+    "content": "...",
+    "id": "run-abc-123",
+    "type": "ai",
+    "tool_calls": [
+      {"name": "search", "args": {}, "id": "call_1", "type": "tool_call"}
+    ],
+    "tool_call_id": "call_1"
+  }
+}
+```
+
+角色映射（`id` 的最后一个元素 → 标准 role）：
+
+- `SystemMessage` → system
+- `HumanMessage` → human
+- `AIMessage` → ai
+- `ToolMessage`、`FunctionMessage` → tool
+- `ChatMessage` → human
+
+**Inputs：**
+
+- `inputs.messages` 的结构是 `[[msg, msg, ...]]`。LangChain 会为了 batched generations 再套一层数组，提取阶段会把最外层解开。
+
+**Outputs**（按顺序尝试多个路径）：
+
+1. `outputs.generations[0][*].message`：标准 chat-model 输出
+2. `outputs.messages[]`：直接消息列表（例如 LangGraph state 输出）
+3. `outputs.output.update.messages[]`：deepagents-cli 子 agent 输出，内部消息上的 `tool_call_id` 会链接到该子 agent 调用
+4. `outputs.output`（对象）：工具 runs 的兜底格式
+
+### Tool-call matching
+
+assistant 消息上的 `tool_calls[*].id` 会匹配工具结果消息中的 `kwargs.tool_call_id`（构造器格式）或顶层 `tool_call_id`（扁平格式）。
+
+### Dedup
+
+优先使用 `kwargs.id`（构造器格式），其次使用顶层 `id`（扁平格式），最后回退到 `role + content` 的哈希。由于 LangChain run ID 通常稳定，跨多次重发去重的成本很低。
+
+### Example trace
+
+下面这个 LangChain chat-model run 先发出一个工具调用，接着是工具 run，最后再跟出后续回复。注意 `inputs.messages` 采用双层嵌套（`[[ ... ]]`），而输出则包在 `generations` 外壳中。
+
+```json
+[
+  {
+    "id": "0001",
+    "trace_id": "trace-0005",
+    "run_type": "llm",
+    "name": "ChatOpenAI",
+    "metadata": {
+      "ls_integration": "langchain_chat_model",
+      "ls_provider": "openai",
+      "ls_model_name": "gpt-4o"
+    },
+    "inputs": {
+      "messages": [[
+        {"lc": 1, "type": "constructor", "id": ["langchain","schema","messages","SystemMessage"],
+         "kwargs": {"content": "You are a helpful assistant.", "id": "sys-1"}},
+        {"lc": 1, "type": "constructor", "id": ["langchain","schema","messages","HumanMessage"],
+         "kwargs": {"content": "what is the weather in paris?", "id": "hu-1"}}
+      ]]
+    },
+    "outputs": {
+      "generations": [[{
+        "message": {
+          "lc": 1, "type": "constructor",
+          "id": ["langchain","schema","messages","AIMessage"],
+          "kwargs": {
+            "content": "",
+            "id": "ai-1",
+            "tool_calls": [
+              {"name": "get_weather", "args": {"city": "Paris"}, "id": "call_abc", "type": "tool_call"}
+            ]
+          }
+        }
+      }]]
+    }
+  },
+  {
+    "id": "0002",
+    "trace_id": "trace-0005",
+    "parent_run_id": "0001",
+    "run_type": "tool",
+    "name": "get_weather",
+    "metadata": {"ls_integration": "langchain_chat_model"},
+    "inputs": {"city": "Paris"},
+    "outputs": {
+      "output": {
+        "lc": 1, "type": "constructor",
+        "id": ["langchain","schema","messages","ToolMessage"],
+        "kwargs": {"content": "Sunny, 22C", "tool_call_id": "call_abc", "id": "tool-1"}
+      }
+    }
+  },
+  {
+    "id": "0003",
+    "trace_id": "trace-0005",
+    "run_type": "llm",
+    "name": "ChatOpenAI",
+    "metadata": {
+      "ls_integration": "langchain_chat_model",
+      "ls_provider": "openai",
+      "ls_model_name": "gpt-4o"
+    },
+    "inputs": {
+      "messages": [[
+        {"lc": 1, "type": "constructor", "id": ["langchain","schema","messages","SystemMessage"],
+         "kwargs": {"content": "You are a helpful assistant.", "id": "sys-1"}},
+        {"lc": 1, "type": "constructor", "id": ["langchain","schema","messages","HumanMessage"],
+         "kwargs": {"content": "what is the weather in paris?", "id": "hu-1"}},
+        {"lc": 1, "type": "constructor", "id": ["langchain","schema","messages","AIMessage"],
+         "kwargs": {"content": "", "id": "ai-1",
+                    "tool_calls": [{"name": "get_weather", "args": {"city": "Paris"}, "id": "call_abc", "type": "tool_call"}]}},
+        {"lc": 1, "type": "constructor", "id": ["langchain","schema","messages","ToolMessage"],
+         "kwargs": {"content": "Sunny, 22C", "tool_call_id": "call_abc", "id": "tool-1"}}
+      ]]
+    },
+    "outputs": {
+      "generations": [[{
+        "message": {
+          "lc": 1, "type": "constructor",
+          "id": ["langchain","schema","messages","AIMessage"],
+          "kwargs": {"content": "It's sunny and 22°C in Paris.", "id": "ai-2"}
+        }
+      }]]
+    }
+  }
+]
+```
+
+LangGraph traces 的整体形态类似，但 metadata 会额外带上 `graph_id` / `langgraph_node`，并且可能直接使用 `outputs.messages[]`，而不是 `outputs.generations`。
+
+## OpenAI (`wrap_openai`)
+
+同一套提取策略同时覆盖 OpenAI 的两种 API 结构（Chat Completions 与 Responses），以及采用 Responses 结构的 OpenAI Agents SDK。实际使用哪种 API 结构，由 metadata 决定。
+
+### Detection
+
+按顺序执行的判断树如下。第一条命中的规则会生效。
+
+1. `metadata.ls_integration`：
+    - `"openai-agents-sdk"` → Responses
+    - `"langchain_chat_model"`、`"deepagents"`、`"deepagents-cli"` → 不认领（这些会发出带 `ls_provider: "openai"` 的 LangChain 风格 payload，因此由 LangChain 提取逻辑接管）
+2. `metadata.ls_message_format`（显式覆盖，优先级高于 `ls_provider` 启发式）：
+    - `"responses"` → Responses
+    - `"completions"` → Completions
+    - `"langchain"`、`"anthropic"` → 不认领
+    - 未知值会继续落到规则 3，以便未来新增 format string 时仍可兼容
+3. 存在 `metadata.graph_id` 或 `metadata.langgraph_node` → 不认领（LangGraph 子树；即便有 `ls_provider: "openai"`，也由 LangChain 提取逻辑接管）
+4. `metadata.ls_provider` 是 `"openai"` 或 `"azure"`：
+    - 如果 `metadata.ls_invocation_params.use_responses_api == true` → Responses
+    - 否则 → Completions
+
+### Tracing defaults
+
+**`wrap_openai`** 会在每个 LLM run 上设置以下字段：
+
+- `metadata.ls_provider`: `"openai"`（如果 client 是 `AzureOpenAI` / `AsyncAzureOpenAI` 则为 `"azure"`）
+- `metadata.ls_model_type`: `"chat"` 或 `"llm"`
+- `metadata.ls_model_name`、`ls_temperature`、`ls_max_tokens`、`ls_stop`
+- `metadata.ls_invocation_params`：SDK 调用 kwargs 的 allowlisted 子集。当调用走 `client.responses.create` 或 `client.responses.parse` 时，这个字典会带上 `use_responses_api: true`
+- `run_type`: `"llm"`
+- `name`: `"ChatOpenAI"`、`"OpenAI"`、`"AzureChatOpenAI"` 或 `"AzureOpenAI"`（可覆盖）
+
+`wrap_openai` **不会**发出 `ls_integration` 或 `ls_message_format`。因此检测最终会落到规则 4（`ls_provider`）。
+
+**OpenAI Agents SDK** 使用 tracing processor，而不是 wrapper。它会在每个 span 上设置：
+
+- `metadata.ls_integration`: `"openai-agents-sdk"`
+- `metadata.ls_integration_version`: package version
+- `metadata.ls_agent_type`: root span 上为 `"root"`
+- LLM spans 还会带 `metadata.openai_trace_id` 和 `openai_span_id`
+
+Agents SDK 发出的 payload 形状与 Responses API 一致，但只会有 `outputs = {"output": [...]}`。Response 外层的其他字段（例如 `id`、`model`、`tools`、`usage`）放在 `extra.metadata` 中，而不在 `outputs` 里。
+
+### Run shape
+
+**Completions：**
+
+- `inputs.messages` 是一个数组，元素形如 `{role, content, tool_calls?, tool_call_id?, refusal?, name?, id?}`
+- `outputs.choices[*].message` 的结构相同（通常 `role: "assistant"`）
+- 工具调用 ID 位于 `tool_calls[*].id`，工具结果消息则通过顶层 `tool_call_id` 回链
+
+**Responses：**
+
+- 可选的顶层 `inputs.instructions`（字符串）会被提升为一条 synthetic system message，并插入到最前面
+- `inputs.input` 是一个数组，其中每一项可能是：
+    - 简单的 `{role, content}` 消息
+    - 带类型的 `{type: "message", role, content}`
+    - `{type: "function_call", call_id, name, arguments}`（assistant role）
+    - `{type: "function_call_output", call_id, output}`（tool role）
+    - `{type: "reasoning", ...}`（assistant role）
+- 对于 LLM runs，`outputs.output` 使用相同的数组结构。对于工具 runs，它可能是字符串、对象，或裸露的顶层对象（Agents SDK 的情况）；这些都会被包装成一条 tool role 消息，`content` 为其 JSON 文本
+
+### Tool-call matching
+
+- Completions：工具结果消息上的 `tool_call_id` 会匹配前一条 assistant 消息里的 `tool_calls[*].id`
+- Responses：`function_call` 上的 `call_id` 会匹配 `function_call_output` 上的 `call_id`。裸对象形态的工具输出，也可能把 `call_id` 放在 `outputs` 顶层
+
+### Dedup
+
+Responses items 在存在 `id` 时按 `id` 去重；否则按不同 item 类型的内容去重：`function_call` 使用 `call_id|arguments`，`function_call_output` 使用 `call_id|output`，普通消息使用 `content`。
+
+### Example traces
+
+**Chat Completions（`wrap_openai`）：** 三个 runs，分别是发起工具调用的 assistant 轮次、工具 run，以及给出最终答案的后续 assistant 轮次。
+
+```json
+[
+  {
+    "id": "0001",
+    "trace_id": "trace-0002",
+    "run_type": "llm",
+    "name": "ChatOpenAI",
+    "metadata": {"ls_provider": "openai", "ls_model_name": "gpt-4o"},
+    "inputs": {
+      "messages": [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "what is the weather in paris?"}
+      ]
+    },
+    "outputs": {
+      "choices": [{
+        "index": 0,
+        "finish_reason": "tool_calls",
+        "message": {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [{
+            "id": "call_abc123",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+          }]
+        }
+      }]
+    }
+  },
+  {
+    "id": "0002",
+    "trace_id": "trace-0002",
+    "parent_run_id": "0001",
+    "run_type": "tool",
+    "name": "get_weather",
+    "inputs": {"city": "Paris"},
+    "outputs": {"tool_call_id": "call_abc123", "role": "tool", "content": "Sunny, 22C"}
+  },
+  {
+    "id": "0003",
+    "trace_id": "trace-0002",
+    "run_type": "llm",
+    "name": "ChatOpenAI",
+    "metadata": {"ls_provider": "openai", "ls_model_name": "gpt-4o"},
+    "inputs": {
+      "messages": [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "what is the weather in paris?"},
+        {"role": "assistant", "content": null, "tool_calls": [
+          {"id": "call_abc123", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_abc123", "content": "Sunny, 22C"}
+      ]
+    },
+    "outputs": {
+      "choices": [{
+        "index": 0,
+        "finish_reason": "stop",
+        "message": {"role": "assistant", "content": "It's sunny and 22°C in Paris."}
+      }]
+    }
+  }
+]
+```
+
+**Responses API（OpenAI Agents SDK）：** items 带有明确类型（`function_call`、`function_call_output`、`message`），而不是单纯依赖 role。`inputs.instructions` 会被提升为一条 synthetic system message。
+
+```json
+[
+  {
+    "id": "0001",
+    "trace_id": "trace-0003",
+    "run_type": "llm",
+    "name": "Helpful Assistant Response",
+    "metadata": {"ls_integration": "openai-agents-sdk", "ls_model_name": "gpt-4.1"},
+    "inputs": {
+      "instructions": "You are a helpful assistant.",
+      "input": [{"role": "user", "content": "what time is it in san francisco?"}]
+    },
+    "outputs": {
+      "output": [{
+        "type": "function_call",
+        "call_id": "call_LVsl",
+        "name": "get_time",
+        "arguments": "{\"timezone\":\"America/Los_Angeles\"}",
+        "id": "fc_0ed8"
+      }]
+    }
+  },
+  {
+    "id": "0002",
+    "trace_id": "trace-0003",
+    "parent_run_id": "0001",
+    "run_type": "tool",
+    "name": "get_time",
+    "metadata": {"ls_integration": "openai-agents-sdk"},
+    "inputs": {"timezone": "America/Los_Angeles"},
+    "outputs": {"output": "12:00 PM (America/Los_Angeles)", "call_id": "call_LVsl"}
+  },
+  {
+    "id": "0003",
+    "trace_id": "trace-0003",
+    "run_type": "llm",
+    "name": "Helpful Assistant Response",
+    "metadata": {"ls_integration": "openai-agents-sdk", "ls_model_name": "gpt-4.1"},
+    "inputs": {
+      "instructions": "You are a helpful assistant.",
+      "input": [
+        {"role": "user", "content": "what time is it in san francisco?"},
+        {"type": "function_call", "call_id": "call_LVsl", "name": "get_time", "arguments": "{\"timezone\":\"America/Los_Angeles\"}", "id": "fc_0ed8"},
+        {"type": "function_call_output", "call_id": "call_LVsl", "output": "12:00 PM (America/Los_Angeles)"}
+      ]
+    },
+    "outputs": {
+      "output": [{
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "It is currently 12:00 PM in San Francisco.", "annotations": []}]
+      }]
+    }
+  }
+]
+```
+
+## Vercel AI SDK
+
+### Detection
+
+只要任意一个 LLM run 的 `extra.metadata` 满足以下任一条件，就会触发提取：
+
+- 存在 `ai_sdk_method` key（值是什么都可以），或
+- `ls_integration` 是 `"vercel-ai-sdk"`
+
+这两个字段都会由 LangSmith 的 Vercel AI SDK wrapper 自动设置。底层实际使用的语言模型 provider（OpenAI、Anthropic、Google 等）并不重要，因为 wrapper 会把它们统一规整成同一种消息 envelope。
+
+### Tracing defaults
+
+启用 Vercel AI SDK wrapper 后，SDK 会在每个 LLM run 上设置：
+
+- `metadata.ls_integration`: `"vercel-ai-sdk"`
+- `metadata.ai_sdk_method`: `"ai.doGenerate"` 或 `"ai.doStream"`
+- `metadata.ls_model_name`: model id
+- `run_type`: `"llm"`
+- `name`: `"ai.doGenerate"` 或 `"ai.doStream"`（可覆盖）
+
+### Run shape
+
+LLM runs：
+
+- `run_type: "llm"`
+- `inputs.messages` 或 `inputs.prompt` 包含对话内容
+- `outputs.role` 的值可能是 `assistant`、`tool`、`user`
+- `outputs.content` 包含生成出的内容。工具调用会作为 `content` 中的 block 出现，并带有 `toolCallId` 与 `toolName`
+
+工具 runs：
+
+- `run_type: "tool"`
+- `inputs.toolCallId` 会匹配 LLM 输出中的 `toolCallId`
+- `inputs.toolName` 或 `name` 用来标识工具
+- `outputs.output` 或 `outputs.result` 保存工具结果
+
+### Tool-call matching
+
+优先通过 `toolCallId` 匹配；当 ID 缺失时，再回退到工具名匹配。
+
+### Example trace
+
+下面是一个两段式 trace：一个 LLM run 请求工具调用，随后一个工具 run 返回结果。每个条目都代表一个 LangSmith run；在实际 wire format 中，`inputs`、`outputs` 和 `metadata` 都是 JSON 编码字符串，这里为了可读性展示为未转义形式。
+
+```json
+[
+  {
+    "id": "0001",
+    "trace_id": "trace-0001",
+    "run_type": "llm",
+    "name": "ai.doGenerate",
+    "metadata": {
+      "ls_integration": "vercel-ai-sdk",
+      "ai_sdk_method": "ai.doGenerate",
+      "ls_model_name": "gpt-4o"
+    },
+    "inputs": {
+      "prompt": [
+        {"role": "user", "content": [{"type": "text", "text": "what's the weather in paris?"}]}
+      ]
+    },
+    "outputs": {
+      "role": "assistant",
+      "content": [
+        {"type": "tool-call", "toolCallId": "call_abc", "toolName": "get_weather", "input": {"city": "Paris"}}
+      ]
+    }
+  },
+  {
+    "id": "0002",
+    "trace_id": "trace-0001",
+    "parent_run_id": "0001",
+    "run_type": "tool",
+    "name": "get_weather",
+    "inputs": {"toolCallId": "call_abc", "toolName": "get_weather", "args": {"city": "Paris"}},
+    "outputs": {"result": "Sunny, 22C"}
+  }
+]
+```
+
+## Anthropic Messages (`wrap_anthropic`)
+
+这一部分覆盖 `wrap_anthropic`（Messages API wrapper），以及 Claude Agent SDK / Claude Code 集成。
+
+### Detection
+
+只要 metadata 中满足以下任一条件，就会触发提取：
+
+- `ls_message_format` 是 `"anthropic"`
+- `ls_integration` 是 `"claude-agent-sdk"` 或 `"claude-code"`
+
+### Tracing defaults
+
+**`wrap_anthropic`** 会在每个 LLM run 上设置以下字段：
+
+- `metadata.ls_provider`: `"anthropic"`
+- `metadata.ls_model_type`: `"chat"`
+- `metadata.ls_model_name`、`ls_temperature`、`ls_max_tokens`、`ls_stop`
+- `metadata.ls_invocation_params`：allowlisted 子集（`mcp_servers`、`service_tier`、`tool_choice`、`top_k`、`top_p`、`stream`、`thinking`）
+- `run_type`: `"llm"`，`name`: `"ChatAnthropic"`（可覆盖）
+
+`wrap_anthropic` **不会**发出 `ls_integration` 或 `ls_message_format`。
+
+<Warning>
+**已知限制：** 只有 wrapper 时，当前检测逻辑不会自动命中。要让该 run 被识别，必须显式设置 `ls_message_format: "anthropic"`。
+</Warning>
+
+**Claude Agent SDK (Python)** 会在根 chain run 上设置：
+
+- `metadata.ls_integration`: `"claude-agent-sdk"`
+- `metadata.ls_integration_version`: package version
+- 可选的 `metadata.model`、`permission_mode`、`max_turns`
+
+它生成的 synthetic LLM child runs 会带 `metadata.ls_provider: "anthropic"`，并可选带上 `ls_model_name`，但不会带 `ls_integration`。它们能被识别，是因为父级 chain 已经在首个 run 上完成了认领（trace 的首个 run 决定策略选择）。
+
+**Claude Agent SDK (JS)** 会设置 `metadata.ls_integration: "claude-agent-sdk-js"` 和 `ls_agent_type: "root"`。
+
+<Warning>
+**已知限制：** 当前自动检测只识别 `"claude-agent-sdk"` 和 `"claude-code"`，不会自动识别 `"claude-agent-sdk-js"`。JS traces 需要显式设置 `ls_message_format: "anthropic"` 才能被纳入。
+</Warning>
+
+### Run shape
+
+**`wrap_anthropic`** Messages API：
+
+- `inputs.messages`: `[{role, content}, ...]`
+- 可选的 `inputs.system`：字符串或内容块数组，会被转换为置顶的 system message
+- `content` 可以是字符串，也可以是 `{type, ...}` 内容块数组，例如 `text`、`tool_use`、`tool_result`、`image`、`thinking`、`redacted_thinking`
+- 输出保留完整的 Anthropic `Message` 对象。内容会从以下位置之一读取：
+    - `outputs.message.content`（最常见的包装形式）
+    - `outputs.content`，当 `outputs.type == "message"` 时（裸对象）
+    - `outputs.content`，当 `outputs.role == "assistant"` 时（Agents SDK 裸对象）
+    - `outputs.output.messages[0].content`（JS SDK）
+    - `outputs.messages[0].content`（Claude Code）
+
+**Claude Agent SDK / Claude Code：**
+
+- `inputs.input`（消息数组，沿用 Anthropic message 结构）。如果 `inputs.messages` 同时存在且非空，则 `inputs.messages` 优先
+- 工具 run 的输出可能使用 `outputs.output`（对象）或 `outputs.content`（顶层数组，类似 subagent 风格）
+
+### Tool-call matching
+
+assistant 的 `tool_use` block 上的 `tool_use_id`，会匹配下一条 user 消息里对应 `tool_result.tool_use_id`。
+
+### Example trace
+
+下面是一个使用 `wrap_anthropic` Messages API 的示例，包含工具调用与后续回复。assistant 轮次会返回一个内容数组，其中含有 `tool_use` block；工具结果则通过下一条 user 消息中的 `tool_result` block 送回。
+
+```json
+[
+  {
+    "id": "0001",
+    "trace_id": "trace-0004",
+    "run_type": "llm",
+    "name": "ChatAnthropic",
+    "metadata": {
+      "ls_provider": "anthropic",
+      "ls_model_name": "claude-opus-4-7",
+      "ls_message_format": "anthropic"
+    },
+    "inputs": {
+      "system": "You are a helpful assistant.",
+      "messages": [
+        {"role": "user", "content": "what is the weather in paris?"}
+      ]
+    },
+    "outputs": {
+      "message": {
+        "id": "msg_01",
+        "role": "assistant",
+        "type": "message",
+        "content": [
+          {"type": "text", "text": "Let me check."},
+          {"type": "tool_use", "id": "toolu_01", "name": "get_weather", "input": {"city": "Paris"}}
+        ]
+      }
+    }
+  },
+  {
+    "id": "0002",
+    "trace_id": "trace-0004",
+    "parent_run_id": "0001",
+    "run_type": "tool",
+    "name": "get_weather",
+    "inputs": {"city": "Paris"},
+    "outputs": {"output": {"temperature": 22, "condition": "Sunny"}}
+  },
+  {
+    "id": "0003",
+    "trace_id": "trace-0004",
+    "run_type": "llm",
+    "name": "ChatAnthropic",
+    "metadata": {
+      "ls_provider": "anthropic",
+      "ls_model_name": "claude-opus-4-7",
+      "ls_message_format": "anthropic"
+    },
+    "inputs": {
+      "system": "You are a helpful assistant.",
+      "messages": [
+        {"role": "user", "content": "what is the weather in paris?"},
+        {"role": "assistant", "content": [
+          {"type": "text", "text": "Let me check."},
+          {"type": "tool_use", "id": "toolu_01", "name": "get_weather", "input": {"city": "Paris"}}
+        ]},
+        {"role": "user", "content": [
+          {"type": "tool_result", "tool_use_id": "toolu_01", "content": "Sunny, 22C"}
+        ]}
+      ]
+    },
+    "outputs": {
+      "message": {
+        "id": "msg_02",
+        "role": "assistant",
+        "type": "message",
+        "content": [{"type": "text", "text": "It's sunny and 22°C in Paris."}]
+      }
+    }
+  }
+]
+```
+
+Claude Agent SDK / Claude Code traces 的整体形态类似，但会使用 `inputs.input` 而不是 `inputs.messages`，并在根 chain run 上设置 `ls_integration: "claude-agent-sdk"`（或 `"claude-code"`）。

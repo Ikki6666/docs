@@ -1,0 +1,264 @@
+---
+title: 为 LangSmith 遥测配置你的 collector
+sidebarTitle: 为遥测配置你的 collector
+---
+
+LangSmith 部署中的各类服务都会以日志、指标和 traces 的形式产出遥测数据。你可能已经在 Kubernetes 集群中配置好了 telemetry collector，或者正准备部署一个来监控你的应用。
+
+本页介绍如何配置 [OTel Collector](https://opentelemetry.io/docs/collector/configuration/) 来采集 LangSmith 的遥测数据。请注意，下文中的所有概念也可以迁移到其他 collector，例如 [Fluentd](https://www.fluentd.org/) 或 [FluentBit](https://fluentbit.io/)。
+
+<Warning>
+**本节仅适用于 Kubernetes 部署。**
+</Warning>
+
+# Receivers
+
+## Logs
+
+下面是一个 ***Sidecar*** collector 的示例，它会读取当前 pod 的日志，并排除非领域相关容器的日志。这里使用 Sidecar 配置是因为我们需要访问每个容器的文件系统。当然，也可以使用 DaemonSet。
+
+```yaml
+filelog:
+  exclude:
+    - "**/otc-container/*.log"
+  include:
+    - /var/log/pods/${POD_NAMESPACE}_${POD_NAME}_${POD_UID}/*/*.log
+  include_file_name: false
+  include_file_path: true
+  operators:
+    - id: container-parser
+      type: container
+  retry_on_failure:
+    enabled: true
+  start_at: end
+env:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: POD_NAMESPACE
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+  - name: POD_UID
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.uid
+volumes:
+  - name: varlogpods
+    hostPath:
+      path: /var/log/pods
+volumeMounts:
+  - name: varlogpods
+    mountPath: /var/log/pods
+    readOnly: true
+```
+
+<Info>
+**此配置需要对给定 namespace 中的 pods 拥有 `get`、`list` 和 `watch` 权限。**
+</Info>
+
+## Metrics
+
+可以通过 Prometheus endpoint 抓取指标。为了避免拉取指标时产生重复查询，可以使用一个单实例的 ***Gateway*** collector。下面的配置会抓取所有默认命名的 LangSmith 服务：
+
+```yaml
+prometheus:
+  config:
+    scrape_configs:
+      - job_name: langsmith-services
+        metrics_path: /metrics
+        scrape_interval: 15s
+        # Only scrape endpoints in the LangSmith namespace
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names: [<langsmith-namespace>]
+        relabel_configs:
+          # Only scrape services with the name langsmith-.*
+          - source_labels: [__meta_kubernetes_service_name]
+            regex: "langsmith-.*"
+            action: keep
+          # Only scrape ports with the following names
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            regex: "(backend|platform|playground|redis-metrics|postgres-metrics|metrics)"
+            action: keep
+          # Promote useful metadata into regular labels
+          - source_labels: [__meta_kubernetes_service_name]
+            target_label: k8s_service
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: k8s_pod
+          # Replace the default "host:port" as Prom's instance label
+          - source_labels: [__address__]
+            target_label: instance
+```
+
+<Info>
+**此配置需要对给定 namespace 中的 pods、services 和 endpoints 拥有 `get`、`list` 和 `watch` 权限。**
+</Info>
+
+### Traces
+
+对于 traces，你需要启用 OTLP receiver。下面的配置会在 4318 端口监听 HTTP traces，在 4317 端口监听 GRPC：
+
+```yaml
+otlp:
+  protocols:
+    grpc:
+      endpoint: 0.0.0.0:4317
+    http:
+      endpoint: 0.0.0.0:4318
+```
+
+## Processors
+
+### 推荐的 OTEL processor
+
+使用 OTel collector 时，建议启用以下 processor：
+
+* [Batch Processor](https://github.com/open-telemetry/opentelemetry-collector/blob/main/processor/batchprocessor/README.md)：在发送给 exporter 之前将数据分批。
+* [Memory Limiter](https://github.com/open-telemetry/opentelemetry-collector/blob/main/processor/memorylimiterprocessor/README.md)：防止 collector 占用过多内存并崩溃。超过软限制后，collector 会停止接收新数据。
+* [Kubernetes Attributes Processor](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/k8sattributesprocessor)：向遥测数据中添加 pod 名等 Kubernetes 元数据。
+
+## Exporters
+
+Exporter 只需要指向你希望发送到的外部 endpoint。下面的配置允许你分别为日志、指标与 traces 设置不同 endpoint：
+
+```yaml
+otlphttp/logs:
+  endpoint: <your_logs_endpoint>
+otlphttp/metrics:
+  endpoint: <your_metrics_endpoint>
+otlphttp/traces:
+  endpoint: <your_traces_endpoint>
+```
+
+<Note>
+**OTel Collector 也支持直接导出到 [Datadog](https://docs.datadoghq.com/opentelemetry/setup/collector_exporter) endpoint。**
+</Note>
+
+# 示例 collector 配置：Logs sidecar
+
+```yaml
+mode: sidecar
+image: otel/opentelemetry-collector-contrib
+config:
+  receivers:
+    filelog:
+      exclude:
+        - "**/otc-container/*.log"
+      include:
+        - /var/log/pods/${POD_NAMESPACE}_${POD_NAME}_${POD_UID}/*/*.log
+      include_file_name: false
+      include_file_path: true
+      operators:
+        - id: container-parser
+          type: container
+      retry_on_failure:
+        enabled: true
+      start_at: end
+  processors:
+    batch:
+      send_batch_size: 8192
+      timeout: 10s
+    memory_limiter:
+      check_interval: 1m
+      limit_percentage: 90
+      spike_limit_percentage: 80
+  exporters:
+    otlphttp/logs:
+      endpoint: <your-endpoint>
+  service:
+    pipelines:
+      logs/langsmith:
+        receivers: [filelog]
+        processors: [batch, memory_limiter]
+        exporters: [otlphttp/logs]
+env:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: POD_NAMESPACE
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+  - name: POD_UID
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.uid
+volumes:
+  - name: varlogpods
+    hostPath:
+      path: /var/log/pods
+volumeMounts:
+  - name: varlogpods
+    mountPath: /var/log/pods
+    readOnly: true
+```
+
+# 示例 collector 配置：Metrics 与 traces Gateway
+
+```yaml
+mode: deployment
+image: otel/opentelemetry-collector-contrib
+config:
+  receivers:
+    prometheus:
+      config:
+        scrape_configs:
+          - job_name: langsmith-services
+            metrics_path: /metrics
+            scrape_interval: 15s
+            # Only scrape endpoints in the LangSmith namespace
+            kubernetes_sd_configs:
+              - role: endpoints
+                namespaces:
+                  names: [<langsmith-namespace>]
+            relabel_configs:
+              # Only scrape services with the name langsmith-.*
+              - source_labels: [__meta_kubernetes_service_name]
+                regex: "langsmith-.*"
+                action: keep
+              # Only scrape ports with the following names
+              - source_labels: [__meta_kubernetes_endpoint_port_name]
+                regex: "(backend|platform|playground|redis-metrics|postgres-metrics|metrics)"
+                action: keep
+              # Promote useful metadata into regular labels
+              - source_labels: [__meta_kubernetes_service_name]
+                target_label: k8s_service
+              - source_labels: [__meta_kubernetes_pod_name]
+                target_label: k8s_pod
+              # Replace the default "host:port" as Prom's instance label
+              - source_labels: [__address__]
+                target_label: instance
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  processors:
+    batch:
+      send_batch_size: 8192
+      timeout: 10s
+    memory_limiter:
+      check_interval: 1m
+      limit_percentage: 90
+      spike_limit_percentage: 80
+  exporters:
+    otlphttp/metrics:
+      endpoint: <metrics_endpoint>
+    otlphttp/traces:
+      endpoint: <traces_endpoint>
+  service:
+    pipelines:
+      metrics/langsmith:
+        receivers: [prometheus]
+        processors: [batch, memory_limiter]
+        exporters: [otlphttp/metrics]
+      traces/langsmith:
+        receivers: [otlp]
+        processors: [batch, memory_limiter]
+        exporters: [otlphttp/traces]
+```

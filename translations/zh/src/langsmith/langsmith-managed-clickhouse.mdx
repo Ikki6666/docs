@@ -1,0 +1,118 @@
+---
+title: LangSmith 托管的 ClickHouse
+sidebarTitle: LangSmith 托管的 ClickHouse
+---
+
+import FeedbackDataFields from '/snippets/langsmith/feedback-data-fields.mdx';
+
+<Check>
+继续阅读本指南之前，请先阅读 [LangSmith 架构概览](/langsmith/self-hosted) 和[连接外部 ClickHouse 的指南](/langsmith/self-host-external-clickhouse)。
+</Check>
+
+LangSmith 使用 ClickHouse 作为 **traces** 与 **feedback** 的主要存储引擎。为了更易于管理和扩展，建议将自托管 LangSmith 实例连接到一个外部 ClickHouse 实例。LangSmith 托管的 ClickHouse 是其中一种方案，它允许你使用由 LangSmith 团队监控和维护的全托管 ClickHouse 实例。
+
+## 架构概览
+
+在自托管 LangSmith 实例中使用 LangSmith 托管 ClickHouse，其整体架构与使用完全自托管的 ClickHouse 实例类似，但有几个关键差异：
+
+- 你需要在 LangSmith 实例与 LangSmith 托管的 ClickHouse 实例之间建立私有网络连接，以确保数据安全，并保证你的自托管 LangSmith 实例能够连接到该 ClickHouse 实例。
+- 在此方案下，你的 traces 中敏感信息（输入与输出）会存储在你自己云环境中的对象存储（S3 或 GCS）中，而不是 ClickHouse 中，以确保敏感信息不会离开你的 VPC。关于各字段具体存放位置，参见[数据存储](#data-storage)。
+- LangSmith 团队会监控你的 ClickHouse 实例并确保其平稳运行。这样我们就能跟踪诸如 run-ingestion 延迟和查询性能等指标。
+
+整体架构如下所示：
+
+<img
+    className="block dark:hidden"
+    src="/langsmith/images/managed-clickhouse-light.png"
+    alt="LangSmith managed ClickHouse architecture."
+/>
+
+<img
+    className="hidden dark:block"
+    src="/langsmith/images/managed-clickhouse-dark.png"
+    alt="LangSmith managed ClickHouse architecture."
+/>
+
+## 要求
+
+- **你必须使用受支持的 blob storage 方案。** 更多信息请参见 [blob storage 指南](/langsmith/self-host-blob-storage)。
+- 如果你想使用私有端点，请确保你的 VPC 位于 ClickHouse Cloud 支持的 [region](https://clickhouse.com/docs/en/cloud/reference/supported-regions) 中。否则，你需要使用我们通过防火墙规则保护的公共端点。你的 VPC 还需要具备 NAT gateway，以便我们将你的流量加入 allowlist。
+- 你必须拥有一个可以连接到 LangSmith 托管 ClickHouse 服务的 VPC。你需要与我们的团队协作完成所需网络配置。
+- 你必须已经运行了一个 LangSmith 自托管实例。该托管 ClickHouse 服务可与 [Kubernetes](/langsmith/kubernetes) 安装配合使用。
+
+## 数据存储
+
+ClickHouse 存储 **runs** 与 **feedback** 数据，具体包括：
+
+- 所有反馈数据字段。
+- 部分运行数据字段。
+
+字段列表请参见[存储的运行数据字段](#stored-run-data-fields)与[存储的反馈数据字段](#stored-feedback-data-fields)。
+
+LangChain 将运行中的 `inputs`、`outputs`、`errors`、`manifests`、`extras` 和 `events` 定义为敏感应用数据，因为这些字段可能包含 LLM prompt 与 completion。使用 LangSmith 托管 ClickHouse 时，这些敏感字段会存储在你云环境中的对象存储（S3 或 GCS）里，而其余运行数据则存储在 ClickHouse 中，从而确保敏感信息永远不会离开你的 VPC。
+
+### 存储的反馈数据字段
+
+<Note>
+由于所有反馈数据都存储在 ClickHouse 中，请不要在反馈中（分数、注释或评论），或在[存储的运行数据字段](#stored-run-data-fields)中提到的其他运行字段里发送敏感信息。
+</Note>
+
+在 LangSmith 托管 ClickHouse 方案中，**所有反馈数据字段都会存储在 ClickHouse 中**：
+
+<FeedbackDataFields/>
+
+这篇[参考文档](/langsmith/feedback-data-format)说明了反馈数据的存储格式，也就是 LangSmith 表示运行评估分数与标注的方式。
+
+### 存储的运行数据字段
+
+运行数据字段会分布在托管 ClickHouse 数据库和你的云对象存储（例如 S3 或 GCS）之间。
+
+<Note>
+对于存储在对象存储中的运行字段，ClickHouse 中只保留引用或指针。例如，`inputs` 和 `outputs` 的内容会卸载到 S3/GCS，而 ClickHouse 记录中会在 `inputs_s3_urls` 与 `outputs_s3_urls` 字段中保存相应的 S3 URL。
+</Note>
+
+下表列出了每个运行字段及其存储位置：
+
+| Field                     | Storage Location |
+|---------------------------|------------------|
+| `id`                      | ClickHouse       |
+| `name`                    | ClickHouse       |
+| `inputs`                  | **Object Storage**   |
+| `run_type`                | ClickHouse       |
+| `start_time`              | ClickHouse       |
+| `end_time`                | ClickHouse       |
+| `extra`                   | **Object Storage**   |
+| `error`                   | **Object Storage**   |
+| `outputs`                 | **Object Storage**   |
+| `events`                  | **Object Storage**   |
+| `tags`                    | ClickHouse       |
+| `trace_id`                | ClickHouse       |
+| `dotted_order`            | ClickHouse       |
+| `status`                  | ClickHouse       |
+| `child_run_ids`           | ClickHouse       |
+| `direct_child_run_ids`    | ClickHouse       |
+| `parent_run_ids`          | ClickHouse       |
+| `feedback_stats`         | ClickHouse       |
+| `reference_example_id`    | ClickHouse       |
+| `total_tokens`            | ClickHouse       |
+| `prompt_tokens`           | ClickHouse       |
+| `completion_tokens`       | ClickHouse       |
+| `total_cost`              | ClickHouse       |
+| `prompt_cost`             | ClickHouse       |
+| `completion_cost`         | ClickHouse       |
+| `first_token_time`        | ClickHouse       |
+| `session_id`              | ClickHouse       |
+| `in_dataset`              | ClickHouse       |
+| `parent_run_id`           | ClickHouse       |
+| `execution_order` (deprecated) | ClickHouse    |
+| `serialized`              | ClickHouse       |
+| `manifest_id` (deprecated) | ClickHouse       |
+| `manifest_s3_id`          | ClickHouse       |
+| `inputs_s3_urls`          | ClickHouse       |
+| `outputs_s3_urls`         | ClickHouse       |
+| `price_model_id`          | ClickHouse       |
+| `app_path`                | ClickHouse       |
+| `last_queued_at`          | ClickHouse       |
+| `share_token`             | ClickHouse       |
+
+这篇[参考文档](/langsmith/run-data-format)说明了存储的 run（span）格式，它们是 traces 的基础构成单元。

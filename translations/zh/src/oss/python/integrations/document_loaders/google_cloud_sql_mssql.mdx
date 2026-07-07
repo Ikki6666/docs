@@ -1,0 +1,384 @@
+---
+title: "Google cloud SQL for SQL server 集成"
+description: "使用 LangChain Python 集成 Google cloud SQL for SQL server 文档加载器。"
+---
+
+> [Cloud SQL](https://cloud.google.com/sql) 是一项全托管关系型数据库服务，具备高性能、无缝集成和出色的可扩展性。它支持 [MySQL](https://cloud.google.com/sql/mysql)、[PostgreSQL](https://cloud.google.com/sql/postgres) 和 [SQL Server](https://cloud.google.com/sql/sqlserver) 数据库引擎。你可以借助 Cloud SQL 的 LangChain 集成扩展数据库应用，构建 AI 驱动的体验。
+
+本文介绍如何使用 [Cloud SQL for SQL server](https://cloud.google.com/sql/sqlserver) 配合 `MSSQLLoader` 和 `MSSQLDocumentSaver` 来[保存、加载和删除 langchain documents](/oss/integrations/document_loaders)。
+
+可在 [GitHub](https://github.com/googleapis/langchain-google-cloud-sql-mssql-python/) 上了解此包的更多信息。
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/googleapis/langchain-google-cloud-sql-mssql-python/blob/main/docs/document_loader.ipynb)
+
+## 开始前准备
+
+要运行此 notebook，你需要完成以下步骤：
+
+* [Create a Google Cloud Project](https://developers.google.com/workspace/guides/create-project)
+* [Enable the Cloud SQL Admin API.](https://console.cloud.google.com/marketplace/product/google/sqladmin.googleapis.com)
+* [Create a Cloud SQL for SQL server instance](https://cloud.google.com/sql/docs/sqlserver/create-instance)
+* [Create a Cloud SQL database](https://cloud.google.com/sql/docs/sqlserver/create-manage-databases)
+* [Add an IAM database user to the database](https://cloud.google.com/sql/docs/sqlserver/create-manage-users) (Optional)
+
+确认此 notebook 的运行环境已具备数据库访问能力后，填写以下值，并在运行示例脚本前先执行该单元格。
+
+```python
+# @markdown Please fill in the both the Google Cloud region and name of your Cloud SQL instance.
+REGION = "us-central1"  # @param {type:"string"}
+INSTANCE = "test-instance"  # @param {type:"string"}
+
+# @markdown Please fill in user name and password of your Cloud SQL instance.
+DB_USER = "sqlserver"  # @param {type:"string"}
+DB_PASS = "password"  # @param {type:"string"}
+
+# @markdown Please specify a database and a table for demo purpose.
+DATABASE = "test"  # @param {type:"string"}
+TABLE_NAME = "test-default"  # @param {type:"string"}
+```
+
+### 🦜🔗 安装库
+
+该集成位于独立的 `langchain-google-cloud-sql-mssql` 包中，因此需要先安装它。
+
+```python
+pip install -qU langchain-google-cloud-sql-mssql
+```
+
+**仅限 Colab**：取消注释下面的单元格以重启内核，或使用按钮重启内核。对于 Vertex AI Workbench，你可以使用顶部按钮重启终端。
+
+```python
+# # Automatically restart kernel after installs so that your environment can access the new packages
+# import IPython
+
+# app = IPython.Application.instance()
+# app.kernel.do_shutdown(True)
+```
+
+### 🔐 认证
+
+以当前登录到此 notebook 的 IAM 用户身份认证到 Google Cloud，以便访问你的 Google Cloud Project。
+
+* 如果你使用 Colab 运行此 notebook，请执行下面的单元格后继续。
+* 如果你使用 Vertex AI Workbench，请参阅 [Vertex AI Workbench setup instructions](https://github.com/GoogleCloudPlatform/generative-ai/tree/main/setup-env)。
+
+```python
+from google.colab import auth
+
+auth.authenticate_user()
+```
+
+### ☁ 设置 Google Cloud project
+
+设置你的 Google Cloud project，以便在此 notebook 中使用 Google Cloud 资源。
+
+如果你不知道自己的 project ID，可以尝试以下方式：
+
+* 运行 `gcloud config list`。
+* 运行 `gcloud projects list`。
+* 查看支持页面：[Locate the project ID](https://support.google.com/googleapi/answer/7014113)。
+
+```python
+# @markdown Please fill in the value below with your Google Cloud project ID and then run the cell.
+
+PROJECT_ID = "my-project-id"  # @param {type:"string"}
+
+# Set the project id
+!gcloud config set project {PROJECT_ID}
+```
+
+### 💡 启用 API
+
+`langchain-google-cloud-sql-mssql` 包要求你先在 Google Cloud Project 中 [enable the Cloud SQL Admin API](https://console.cloud.google.com/flows/enableapi?apiid=sqladmin.googleapis.com)。
+
+```python
+# enable Cloud SQL Admin API
+!gcloud services enable sqladmin.googleapis.com
+```
+
+## 基础用法
+
+### MSSQLEngine 连接池
+
+在从 MSSQL 表保存或加载文档之前，首先需要为 Cloud SQL 数据库配置连接池。`MSSQLEngine` 会为你的 Cloud SQL 数据库配置一个 [SQLAlchemy connection pool](https://docs.sqlalchemy.org/en/20/core/pooling.html#module-sqlalchemy.pool)，从而让应用能够成功建立连接，并遵循行业最佳实践。
+
+使用 `MSSQLEngine.from_instance()` 创建 `MSSQLEngine` 时，需要提供以下 4 项信息：
+
+1. `project_id`：Cloud SQL instance 所在 Google Cloud Project 的 Project ID。
+1. `region`：Cloud SQL instance 所在区域。
+1. `instance`：Cloud SQL instance 名称。
+1. `database`：要连接到的 Cloud SQL instance 中的数据库名称。
+1. `user`：用于内置数据库认证和登录的数据库用户。
+1. `password`：用于内置数据库认证和登录的数据库密码。
+
+```python
+from langchain_google_cloud_sql_mssql import MSSQLEngine
+
+engine = MSSQLEngine.from_instance(
+    project_id=PROJECT_ID,
+    region=REGION,
+    instance=INSTANCE,
+    database=DATABASE,
+    user=DB_USER,
+    password=DB_PASS,
+)
+```
+
+### 初始化表
+
+使用 `MSSQLEngine.init_document_table(<table_name>)` 初始化一个默认 schema 的表。表列如下：
+
+* page_content（type: text）
+* langchain_metadata（type: JSON）
+
+`overwrite_existing=True` 表示新初始化的表会替换已有同名表。
+
+```python
+engine.init_document_table(TABLE_NAME, overwrite_existing=True)
+```
+
+### 保存文档
+
+使用 `MSSQLDocumentSaver.add_documents(<documents>)` 保存 langchain documents。初始化 `MSSQLDocumentSaver` 类时，需要提供 2 项信息：
+
+1. `engine` - 一个 `MSSQLEngine` 实例。
+2. `table_name` - Cloud SQL 数据库中用于存储 langchain documents 的表名。
+
+```python
+from langchain_core.documents import Document
+from langchain_google_cloud_sql_mssql import MSSQLDocumentSaver
+
+test_docs = [
+    Document(
+        page_content="Apple Granny Smith 150 0.99 1",
+        metadata={"fruit_id": 1},
+    ),
+    Document(
+        page_content="Banana Cavendish 200 0.59 0",
+        metadata={"fruit_id": 2},
+    ),
+    Document(
+        page_content="Orange Navel 80 1.29 1",
+        metadata={"fruit_id": 3},
+    ),
+]
+saver = MSSQLDocumentSaver(engine=engine, table_name=TABLE_NAME)
+saver.add_documents(test_docs)
+```
+
+### 加载文档
+
+使用 `MSSQLLoader.load()` 或 `MSSQLLoader.lazy_load()` 加载 langchain documents。`lazy_load` 返回一个 generator，只有在迭代时才会查询数据库。初始化 `MSSQLDocumentSaver` 类时，需要提供：
+
+1. `engine` - 一个 `MSSQLEngine` 实例。
+2. `table_name` - Cloud SQL 数据库中用于存储 langchain documents 的表名。
+
+```python
+from langchain_google_cloud_sql_mssql import MSSQLLoader
+
+loader = MSSQLLoader(engine=engine, table_name=TABLE_NAME)
+docs = loader.lazy_load()
+for doc in docs:
+    print("Loaded documents:", doc)
+```
+
+### 通过查询加载文档
+
+除了从表中加载文档，你也可以选择从 SQL 查询生成的视图中加载文档。例如：
+
+```python
+from langchain_google_cloud_sql_mssql import MSSQLLoader
+
+loader = MSSQLLoader(
+    engine=engine,
+    query=f"select * from \"{TABLE_NAME}\" where JSON_VALUE(langchain_metadata, '$.fruit_id') = 1;",
+)
+onedoc = loader.load()
+onedoc
+```
+
+由 SQL 查询生成的视图，其 schema 可能不同于默认表。在这种情况下，`MSSQLLoader` 的行为与从非默认 schema 的表加载时相同。请参阅 [Load documents with customized document page content & metadata](#load-documents-with-customized-document-page-content-and-metadata) 一节。
+
+### 删除文档
+
+使用 `MSSQLDocumentSaver.delete(<documents>)` 从 MSSQL 表中删除一组 langchain documents。
+
+对于默认 schema（`page_content`, `langchain_metadata`）的表，删除条件如下：
+
+当列表中存在某个 `document`，并且满足以下条件时，对应 `row` 会被删除：
+
+* `document.page_content` 等于 `row[page_content]`
+* `document.metadata` 等于 `row[langchain_metadata]`
+
+```python
+from langchain_google_cloud_sql_mssql import MSSQLLoader
+
+loader = MSSQLLoader(engine=engine, table_name=TABLE_NAME)
+docs = loader.load()
+print("Documents before delete:", docs)
+saver.delete(onedoc)
+print("Documents after delete:", loader.load())
+```
+
+## 高级用法
+
+### 使用自定义的 document page content 和 metadata 加载文档
+
+首先准备一个非默认 schema 的示例表，并写入一些任意数据。
+
+```python
+import sqlalchemy
+
+with engine.connect() as conn:
+    conn.execute(sqlalchemy.text(f'DROP TABLE IF EXISTS "{TABLE_NAME}"'))
+    conn.commit()
+    conn.execute(
+        sqlalchemy.text(
+            f"""
+            IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[{TABLE_NAME}]') AND type in (N'U'))
+                BEGIN
+                    CREATE TABLE [dbo].[{TABLE_NAME}](
+                        fruit_id INT IDENTITY(1,1) PRIMARY KEY,
+                        fruit_name VARCHAR(100) NOT NULL,
+                        variety VARCHAR(50),
+                        quantity_in_stock INT NOT NULL,
+                        price_per_unit DECIMAL(6,2) NOT NULL,
+                        organic BIT NOT NULL
+                    )
+                END
+            """
+        )
+    )
+    conn.execute(
+        sqlalchemy.text(
+            f"""
+            INSERT INTO "{TABLE_NAME}" (fruit_name, variety, quantity_in_stock, price_per_unit, organic)
+            VALUES
+                ('Apple', 'Granny Smith', 150, 0.99, 1),
+                ('Banana', 'Cavendish', 200, 0.59, 0),
+                ('Orange', 'Navel', 80, 1.29, 1);
+            """
+        )
+    )
+    conn.commit()
+```
+
+如果仍然使用 `MSSQLLoader` 的默认参数从这个示例表加载 langchain documents，则加载出的文档会把表的第一列作为 `page_content`，而 `metadata` 则由其余所有列组成键值对。
+
+```python
+loader = MSSQLLoader(
+    engine=engine,
+    table_name=TABLE_NAME,
+)
+loader.load()
+```
+
+你可以在初始化 `MSSQLLoader` 时，通过设置 `content_columns` 和 `metadata_columns` 指定要加载的内容和 metadata。
+
+1. `content_columns`：要写入文档 `page_content` 的列。
+2. `metadata_columns`：要写入文档 `metadata` 的列。
+
+例如在这里，`content_columns` 中各列的值会被拼接成一个以空格分隔的字符串，作为加载出的文档 `page_content`；而 `metadata` 中只会包含 `metadata_columns` 指定的列对应键值对。
+
+```python
+loader = MSSQLLoader(
+    engine=engine,
+    table_name=TABLE_NAME,
+    content_columns=[
+        "variety",
+        "quantity_in_stock",
+        "price_per_unit",
+        "organic",
+    ],
+    metadata_columns=["fruit_id", "fruit_name"],
+)
+loader.load()
+```
+
+### 使用自定义 page content 和 metadata 保存文档
+
+要将 langchain document 保存到带有自定义 metadata 字段的表中，首先需要通过 `MSSQLEngine.init_document_table()` 创建这样一个表，并显式指定所需的 `metadata_columns` 列表。在这个示例中，创建出的表将包含以下列：
+
+* description（type: text）：存储水果描述。
+* fruit_name（type text）：存储水果名称。
+* organic（type tinyint(1)）：表示该水果是否为有机。
+* other_metadata（type: JSON）：存储其他水果 metadata。
+
+你可以使用 `MSSQLEngine.init_document_table()` 的以下参数来创建该表：
+
+1. `table_name`：Cloud SQL 数据库中用于存储 langchain documents 的表名。
+2. `metadata_columns`：一个 `sqlalchemy.Column` 列表，表示我们需要的 metadata 列。
+3. `content_column`：用于存储 langchain document `page_content` 的列名。默认值：`page_content`。
+4. `metadata_json_column`：用于存储 langchain document 额外 `metadata` 的 JSON 列名。默认值：`langchain_metadata`。
+
+```python
+engine.init_document_table(
+    TABLE_NAME,
+    metadata_columns=[
+        sqlalchemy.Column(
+            "fruit_name",
+            sqlalchemy.UnicodeText,
+            primary_key=False,
+            nullable=True,
+        ),
+        sqlalchemy.Column(
+            "organic",
+            sqlalchemy.Boolean,
+            primary_key=False,
+            nullable=True,
+        ),
+    ],
+    content_column="description",
+    metadata_json_column="other_metadata",
+    overwrite_existing=True,
+)
+```
+
+使用 `MSSQLDocumentSaver.add_documents(<documents>)` 保存文档。正如这个示例所示：
+
+* `document.page_content` 会写入 `description` 列。
+* `document.metadata.fruit_name` 会写入 `fruit_name` 列。
+* `document.metadata.organic` 会写入 `organic` 列。
+* `document.metadata.fruit_id` 会以 JSON 格式写入 `other_metadata` 列。
+
+```python
+test_docs = [
+    Document(
+        page_content="Granny Smith 150 0.99",
+        metadata={"fruit_id": 1, "fruit_name": "Apple", "organic": 1},
+    ),
+]
+saver = MSSQLDocumentSaver(
+    engine=engine,
+    table_name=TABLE_NAME,
+    content_column="description",
+    metadata_json_column="other_metadata",
+)
+saver.add_documents(test_docs)
+```
+
+```python
+with engine.connect() as conn:
+    result = conn.execute(sqlalchemy.text(f'select * from "{TABLE_NAME}";'))
+    print(result.keys())
+    print(result.fetchall())
+```
+
+### 使用自定义 page content 和 metadata 删除文档
+
+我们也可以通过 `MSSQLDocumentSaver.delete(<documents>)` 从带有自定义 metadata 列的表中删除文档。删除条件如下：
+
+当列表中存在某个 `document`，并满足以下条件时，对应 `row` 会被删除：
+
+* `document.page_content` 等于 `row[page_content]`
+* 对于 `document.metadata` 中的每个 metadata 字段 `k`
+  * `document.metadata[k]` 等于 `row[k]`，或 `document.metadata[k]` 等于 `row[langchain_metadata][k]`
+* `row` 中不存在额外 metadata 字段，而这些字段不在 `document.metadata` 中
+
+```python
+loader = MSSQLLoader(engine=engine, table_name=TABLE_NAME)
+docs = loader.load()
+print("Documents before delete:", docs)
+saver.delete(docs)
+print("Documents after delete:", loader.load())
+```

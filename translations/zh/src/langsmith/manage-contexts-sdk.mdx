@@ -1,0 +1,383 @@
+---
+title: 使用 SDK 管理 contexts
+sidebarTitle: 管理 contexts
+description: 使用 LangSmith SDK 以编程方式在 Context Hub 中推送、拉取、列出和删除 agent repo 与 skill repo。
+tag: SDK
+---
+
+你可以使用 LangSmith 的 [Python](/langsmith/smith-python-sdk) 和 [TypeScript](/langsmith/smith-js-ts-sdk) SDK，以编程方式管理 [Context Hub](/langsmith/use-the-context-hub) 中的 **agent repos** 和 **skill repos**。你可以在 CI 中[推送](#push-an-agent)新版本，在运行时[拉取](#pull-an-agent)最新版本或固定 commit 的版本，将 context 注入到 agent 中；也可以使用额外方法来[检查是否存在](#check-whether-a-repo-exists)、[列出和搜索](#list-agents-and-skills) repos，以及[删除](#delete-an-agent-or-skill)不再需要的内容。
+
+<Note>
+Context Hub 方法要求 Python 使用 `langsmith>=0.7.35`，TypeScript 使用 `langsmith>=0.5.23`。
+</Note>
+
+## 设置
+
+1. 安装包：
+
+    <CodeGroup>
+    ```bash pip
+    pip install -U langsmith
+    ```
+
+    ```bash uv
+    uv add langsmith
+    ```
+
+    ```bash TypeScript
+    yarn add langsmith
+    ```
+    </CodeGroup>
+
+1. 配置环境变量。如果你的环境中已经设置好了 [`LANGSMITH_API_KEY`](/langsmith/create-account-api-key)，可以跳过这一步。否则，请先在 LangSmith 的 **Settings > API Keys > Create API Key** 中创建一个 key，并将其设置为环境变量：
+
+    ```bash
+    export LANGSMITH_API_KEY="lsv2_..."
+    ```
+
+<Note>
+**Python async：** 本页展示的所有方法，在 `AsyncClient`（从 `langsmith` 导入）上也都可用，签名完全一致，只需在每次调用前加上 `await`。TypeScript SDK 本身就是异步的，因此没有单独的 async client。
+</Note>
+
+## 推送 agent
+
+创建一个新的 agent repo，或者为现有 repo 提交一个新版本。如果 repo 还不存在，就会使用你提供的元数据（`description`、`readme`、`tags`、`is_public`）创建它；如果 repo 已存在，则只有在显式传入这些字段时才会对其进行 patch。
+
+该方法会返回一个 URL，指向 [LangSmith UI](https://smith.langchain.com) 中的新 commit：
+
+<CodeGroup>
+```python Python
+from langsmith import Client
+from langsmith.schemas import FileEntry
+
+client = Client()
+
+url = client.push_agent(
+    "email-assistant",
+    files={
+        "AGENTS.md": FileEntry(
+            content="You are an email triage assistant.",
+        ),
+        "tools.json": FileEntry(content='{"tools": []}'),
+    },
+    description="Triages and drafts replies to incoming email.",
+    tags=["email", "productivity"],
+    is_public=False,
+)
+print(url)
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+const url = await client.pushAgent("email-assistant", {
+  files: {
+    "AGENTS.md": {
+      type: "file",
+      content: "You are an email triage assistant.",
+    },
+    "tools.json": { type: "file", content: '{"tools": []}' },
+  },
+  description: "Triages and drafts replies to incoming email.",
+  tags: ["email", "productivity"],
+  isPublic: false,
+});
+console.log(url);
+```
+</CodeGroup>
+
+## 推送 skill
+
+它与 `push_agent` 具有相同的接口，但提交的是一个 skill repo。适用于那些可被其他 agent 依赖的可复用能力：
+
+<CodeGroup>
+```python Python
+from langsmith import Client
+from langsmith.schemas import FileEntry
+
+client = Client()
+
+url = client.push_skill(
+    "deep-research",
+    files={
+        "SKILL.md": FileEntry(content="Conduct deep multi-step research."),
+    },
+    description="Multi-step web research with citations.",
+    tags=["research"],
+)
+print(url)
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+const url = await client.pushSkill("deep-research", {
+  files: {
+    "SKILL.md": {
+      type: "file",
+      content: "Conduct deep multi-step research.",
+    },
+  },
+  description: "Multi-step web research with citations.",
+  tags: ["research"],
+});
+console.log(url);
+```
+</CodeGroup>
+
+### 链接到其他 repos
+
+除了直接内联文件内容之外，`files` 中的条目也可以是指向另一个 agent repo 或 skill repo 的链接。这样你就可以在不复制内容的情况下组合多个 contexts，例如让某个 agent 依赖一个共享 skill。
+
+如果你省略了 `commit_id`，那么在推送当前 commit 时，LangSmith 会把这个链接解析到目标 repo 的最新 commit。之后如果被链接 repo 又更新了，LangSmith 会把更新传播到所有引用它的父 repo。
+
+<CodeGroup>
+```python Python
+from langsmith import Client
+from langsmith.schemas import AgentEntry, FileEntry, SkillEntry
+
+client = Client()
+
+url = client.push_agent(
+    "email-assistant",
+    files={
+        "AGENTS.md": FileEntry(content="You are an email triage assistant."),
+        # Link to the deep-research skill repo. Omit commit_id to always
+        # resolve to the latest version, or pin it for reproducibility.
+        "skills/research": SkillEntry(repo_handle="deep-research"),
+        # Link to another agent repo.
+        "agents/scheduler": AgentEntry(repo_handle="calendar-agent"),
+    },
+)
+print(url)
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+const url = await client.pushAgent("email-assistant", {
+  files: {
+    "AGENTS.md": { type: "file", content: "You are an email triage assistant." },
+    // Link to the deep-research skill repo. Omit commit_id to always
+    // resolve to the latest version, or pin it for reproducibility.
+    "skills/research": { type: "skill", repo_handle: "deep-research" },
+    // Link to another agent repo.
+    "agents/scheduler": { type: "agent", repo_handle: "calendar-agent" },
+  },
+});
+console.log(url);
+```
+</CodeGroup>
+
+## 推送参数
+
+`push_agent` / `pushAgent` 与 `push_skill` / `pushSkill` 都接受以下参数：
+
+| Parameter                          | Type                                        | Description                                                                                  |
+| ---------------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `identifier`                       | `string`                                    | The repo's identifier.                                                                       |
+| `files`                            | `dict[str, Entry \| None]`                  | Map of file path to `Entry`. Pass `None` / `null` to delete a path in this commit.           |
+| `parent_commit` / `parentCommit`   | `string` (optional)                         | Parent commit hash prefix for optimistic concurrency. Must be 8–64 characters when provided. If it doesn't match the latest commit, the API returns a 409 conflict. |
+| `description`                      | `string` (optional)                         | Repo description. Set on creation or patched on update.                                      |
+| `readme`                           | `string` (optional)                         | Repo readme content.                                                                         |
+| `tags`                             | `string[]` (optional)                       | Repo tags.                                                                                   |
+| `is_public` / `isPublic`           | `boolean` (optional)                        | Whether the repo is publicly discoverable.                                                   |
+
+## 拉取 agent
+
+拉取某个 agent repo 的快照。默认返回最新 commit；你也可以通过 `version` 参数（或在 identifier 中写成 `owner/name:version` 的形式）拉取某个特定 commit 或 tag：
+
+<Note>
+**Identifier 格式：** `identifier` 参数支持三种写法：
+- `name`：会相对当前工作区 owner 解析。
+- `owner/name`：完整限定名。
+- `owner/name:version`：固定到某个特定 commit hash 或 tag。
+
+可选的 `version` 参数会覆盖 identifier 中内联的版本信息。如果两者都没提供，则返回最新 commit。
+</Note>
+
+<CodeGroup>
+```python Python
+from langsmith import Client
+
+client = Client()
+
+agent = client.pull_agent("email-assistant")
+print(agent.commit_hash)
+print(list(agent.files))
+
+# Pull a specific commit.
+pinned = client.pull_agent("email-assistant", version="7ca95573")
+
+# Pull a tagged commit (for example, the production tag).
+prod = client.pull_agent("email-assistant:production")
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+const agent = await client.pullAgent("email-assistant");
+console.log(agent.commit_hash);
+console.log(Object.keys(agent.files));
+
+// Pull a specific commit.
+const pinned = await client.pullAgent("email-assistant", {
+  version: "7ca95573",
+});
+
+// Pull a tagged commit.
+const prod = await client.pullAgent("email-assistant:production");
+```
+</CodeGroup>
+
+## 拉取 skill
+
+拉取 skill repo 的快照。其行为与 `pull_agent` 完全一致，只是返回值类型是 `SkillContext`：
+
+<CodeGroup>
+```python Python
+from langsmith import Client
+
+client = Client()
+
+skill = client.pull_skill("deep-research")
+print(skill.files["SKILL.md"].content)
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+const skill = await client.pullSkill("deep-research");
+const skillFile = skill.files["SKILL.md"];
+if (skillFile.type === "file") {
+  console.log(skillFile.content);
+}
+```
+</CodeGroup>
+
+## 拉取参数
+
+`pull_agent` / `pullAgent` 与 `pull_skill` / `pullSkill` 都支持以下参数：
+
+| Parameter    | Type                | Description                                                                       |
+| ------------ | ------------------- | --------------------------------------------------------------------------------- |
+| `identifier` | `string`            | The repo's identifier. May include an inline version: `owner/name:version`.       |
+| `version`    | `string` (optional) | Commit hash or tag to pull. Overrides any version embedded in the identifier.     |
+
+`pull_agent` 返回 `AgentContext`，`pull_skill` 返回 `SkillContext`。
+
+## 检查 repo 是否存在
+
+在推送或拉取前，你可以使用以下方法检查某个 agent repo 或 skill repo 是否存在于当前工作区中：
+
+<CodeGroup>
+```python Python
+from langsmith import Client
+
+client = Client()
+
+if client.agent_exists("email-assistant"):
+    print("agent already exists")
+
+if not client.skill_exists("deep-research"):
+    print("skill not found")
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+if (await client.agentExists("email-assistant")) {
+  console.log("agent already exists");
+}
+
+if (!(await client.skillExists("deep-research"))) {
+  console.log("skill not found");
+}
+```
+</CodeGroup>
+
+## 列出 agents 与 skills
+
+列出任意类型的 repo，并可选地按照可见性、归档状态和搜索词进行过滤：
+
+<CodeGroup>
+```python Python
+from langsmith import Client
+
+client = Client()
+
+# Python returns a paginated response.
+result = client.list_agents(limit=20, query="email")
+for repo in result.repos:
+    print(repo.repo_handle)
+
+skills = client.list_skills(is_public=True)
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+// TypeScript yields one repo at a time, auto-paginating.
+for await (const repo of client.listAgents({ query: "email" })) {
+  console.log(repo.repo_handle);
+}
+
+for await (const skill of client.listSkills({ isPublic: true })) {
+  console.log(skill.repo_handle);
+}
+```
+</CodeGroup>
+
+| Parameter                | Type                  | Description                                                  |
+| ------------------------ | --------------------- | ------------------------------------------------------------ |
+| `limit`                  | `int` (Python only)   | Maximum number of repos to return per page. Defaults to 100. |
+| `offset`                 | `int` (Python only)   | Number of repos to skip. Defaults to 0.                      |
+| `is_public` / `isPublic` | `boolean` (optional)  | Filter to only public (or only private) repos.               |
+| `is_archived` / `isArchived` | `boolean` (optional) | Filter by archived state. Defaults to `False`.            |
+| `query`                  | `string` (optional)   | Search query across repo handle, owner handle, description, and tags. |
+
+<Note>
+Python 的 `list_agents` / `list_skills` 返回带分页信息的响应对象，需要你手动处理 `limit` 和 `offset`。TypeScript 的 `listAgents` / `listSkills` 则返回 `AsyncIterableIterator`，在迭代时会自动处理分页。
+</Note>
+
+## 删除 agent 或 skill
+
+<Warning>
+该操作是永久性的，无法撤销。删除一个 repo 也会同时删除它拥有的子文件 repos。
+</Warning>
+
+从工作区中删除某个 agent 或 skill repo：
+
+<CodeGroup>
+```python Python
+from langsmith import Client
+
+client = Client()
+
+client.delete_agent("email-assistant")
+client.delete_skill("deep-research")
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+await client.deleteAgent("email-assistant");
+await client.deleteSkill("deep-research");
+```
+</CodeGroup>

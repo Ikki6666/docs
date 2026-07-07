@@ -1,0 +1,146 @@
+---
+title: 设置在线代码评估器
+sidebarTitle: 代码评估器
+---
+
+[在线评估](/langsmith/evaluation-concepts#online-evaluations) 为生产环境中的 [traces](/langsmith/observability-concepts#traces) 提供实时反馈。这非常适合持续监控应用表现：识别问题、衡量改进，并在长期内保持一致的质量。
+
+代码评估器允许你直接在 LangSmith 中使用 Python 或 JavaScript 编写评估逻辑。它通常用于验证数据的结构或某些统计属性。
+
+<Note>当任意在线评估器在某条 trace 中的任意 run 上运行时，该 trace 会被自动升级为[扩展数据保留](/langsmith/usage-and-billing#data-retention-auto-upgrades)。这会影响 trace 定价，但也能确保那些符合评估条件的 traces（通常也正是最值得分析的 traces）被保留下来供进一步调查。 </Note>
+
+## 查看在线评估器
+
+进入 **Tracing** 页面，并选择一个 tracing 项目。若要查看该项目下现有的在线评估器，点击 **Evaluators** 标签页。
+
+## 配置在线评估器
+
+### 1. 进入在线评估器
+
+进入 **Tracing** 页面并选择一个 tracing 项目。点击 **Evaluators** 标签页，再点击 **+ Evaluator** 打开 **Add Evaluator** 面板。在 **Create from scratch** 下选择 **Code Evaluator** 来创建新的评估器，或者从工作区已有的评估器中选择一个代码评估器，并在 **Attach an existing evaluator** 下附加它。
+
+### 2. 为评估器命名
+
+为评估器填写名称。这个名称既会在代码中引用该评估器时使用，也会作为该评估器生成的反馈名称。
+
+### 3. 创建过滤条件
+
+例如，你可能希望基于以下条件应用特定评估器：
+
+- 某些 runs 收到过[用户反馈](/langsmith/attach-user-feedback)，表明其回复不令人满意。
+- 某些 runs 调用了特定工具。更多信息请参见[按工具调用过滤](/langsmith/filter-traces-in-application#example-filtering-for-tool-calls)。
+- 某些 runs 的 metadata 满足特定条件（例如你记录了带有 `plan_type` 的 traces，并且只想对企业客户的 traces 运行评估）。相关信息请参见[为 traces 添加 metadata](/langsmith/add-metadata-tags)。
+
+评估器上的过滤逻辑与在项目中筛选 traces 时完全相同。关于过滤器的更多说明，请参见 [Filter traces](/langsmith/filter-traces-in-application)。
+
+<Tip>
+在为评估器创建过滤器时，通常先查看一些实际 runs 会更有帮助。保持 evaluator 配置面板打开的同时，你可以检查 runs 并对它们应用过滤条件。你在 runs 表格里施加的任何过滤器，都会自动同步到 evaluator 的过滤条件中。
+</Tip>
+
+### 4. （可选）配置采样率
+
+你可以配置采样率，以控制满足过滤条件的 runs 中，实际触发评估动作的比例。例如，为了控制成本，你可能只希望对 10% 的 traces 运行某个 evaluator。在这种情况下，可以将采样率设置为 `0.1`。
+
+### 5. （可选）将规则应用到历史 runs
+
+你可以通过开启 **Apply to past runs** 并填写一个 “Backfill from” 日期，将该规则应用到历史 runs。这个操作只允许在规则创建时设置。注意：backfill 是后台任务，因此结果不会立即可见。
+
+如果你想跟踪 backfill 进度，可进入 tracing 项目的 **Evaluators** 标签页，并点击你创建的 evaluator 对应的 Logs 按钮查看日志。在线评估器日志与 [automation rule logs](/langsmith/rules#view-logs-for-your-automations) 类似。
+
+- 添加一个 evaluator 名称
+- 可选地，为 evaluator 添加过滤条件，或配置采样率。
+- 选择 **Apply Evaluator**
+
+## 编写评估函数
+
+<Note>
+**代码评估器限制。**
+
+**允许的库**：你可以导入所有标准库函数，以及以下公共包：
+
+```
+numpy (v2.2.2): "numpy"
+pandas (v1.5.2): "pandas"
+jsonschema (v4.21.1): "jsonschema"
+scipy (v1.14.1): "scipy"
+sklearn (v1.26.4): "scikit-learn"
+```
+
+**网络访问**：代码评估器无法访问互联网。
+</Note>
+
+代码评估器必须以内联方式编写。我们建议你先在本地完成测试，再把代码评估器配置到 LangSmith 中。
+
+在 UI 中，你会看到一个可以直接编写内联代码的面板，里面还提供了一些起始示例代码。
+
+代码评估器接收一个参数：
+
+- 一个 `Run`（[reference](/langsmith/run-data-format)），表示当前被采样并需要评估的 run。
+
+它返回一个值：
+
+- 反馈字典：一个字典，key 表示你要返回的反馈类型，value 表示该反馈对应的分数。例如，`{"correctness": 1, "silliness": 0}` 会为该 run 创建两类反馈，一类表示它是正确的，另一类表示它并不“滑稽”。
+
+下面的示例展示了一个函数，它会验证实验中的每个 run 是否包含某个已知 JSON 字段：
+
+<CodeGroup>
+
+```python Python
+import json
+
+def perform_eval(run):
+  output_to_validate = run['outputs']
+  is_valid_json = 0
+
+  # assert you can serialize/deserialize as json
+  try:
+    json.loads(json.dumps(output_to_validate))
+  except Exception as e:
+    return { "formatted": False }
+
+  # assert output facts exist
+  if "facts" not in output_to_validate:
+    return { "formatted": False }
+
+  # assert required fields exist
+  if "years_mentioned" not in output_to_validate["facts"]:
+    return { "formatted": False }
+
+  return {"formatted": True}
+```
+
+```javascript JavaScript
+function perform_eval(run) {
+    const outputToValidate = run.outputs;
+
+    // Assert you can serialize/deserialize as json
+    try {
+        JSON.stringify(outputToValidate);
+        JSON.parse(JSON.stringify(outputToValidate));
+    } catch (e) {
+        return { "formatted": false };
+    }
+
+    // Assert output facts exist
+    if (!("facts" in outputToValidate)) {
+        return { "formatted": false };
+    }
+
+    // Assert required fields exist
+    if (!outputToValidate["facts"].hasOwnProperty("years_mentioned")) {
+        return { "formatted": false };
+    }
+
+    return { "formatted": true };
+}
+```
+
+</CodeGroup>
+
+## 测试并保存评估函数
+
+在保存前，你可以点击 **Test Code**，将 evaluator 函数在最近一次 run 上执行，以确保代码能够正确运行。
+
+一旦你点击 **Save**，这个在线评估器就会开始作用于新采样到的 runs（如果你启用了 backfill，也会同时处理历史 runs）。
+
+如果你更喜欢视频教程，可以查看 Introduction to LangSmith Course 中的 [Online Evaluations video](https://academy.langchain.com/pages/intro-to-langsmith-preview)。
