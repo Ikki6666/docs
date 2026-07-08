@@ -1,0 +1,252 @@
+---
+title: "Vectara integration"
+description: "Integrate with the Vectara vector store using LangChain Python."
+---
+
+[Vectara](https://vectara.com/) 是一个 RAG 平台，通过 API 提供索引、检索及相关服务。
+Vectara 的 serverless RAG-as-a-service 通过 API 提供 RAG 的核心组件，包括：
+
+1. 从文件中提取文本的方法（PDF、PPT、DOCX 等）
+2. 基于机器学习的文本分块
+3. [Boomerang](https://vectara.com/how-boomerang-takes-retrieval-augmented-generation-to-the-next-level-via-grounded-generation/) embeddings model
+4. 自有的内部向量数据库，用于存储文本分块和嵌入向量
+5. 查询服务，可自动把查询编码成嵌入，并检索最相关的文本片段，支持 [Hybrid Search](https://docs.vectara.com/docs/api-reference/search-apis/lexical-matching) 以及多种重排方式，例如 [multi-lingual relevance reranker](https://www.vectara.com/blog/deep-dive-into-vectara-multilingual-reranker-v1-state-of-the-art-reranker-across-100-languages)、[MMR](https://vectara.com/get-diverse-results-and-comprehensive-summaries-with-vectaras-mmr-reranker/) 和 [UDF reranker](https://www.vectara.com/blog/rag-with-user-defined-functions-based-reranking)
+6. 用于生成 [generative summary](https://docs.vectara.com/docs/learn/grounded-generation/grounded-generation-overview) 的 LLM，它会基于检索到的文档上下文生成回答，并附带引用
+
+更多信息：
+
+- [Documentation](https://docs.vectara.com/docs/)
+- [API Playground](https://docs.vectara.com/docs/rest-api/)
+- [Quickstart](https://docs.vectara.com/docs/quickstart)
+
+本笔记介绍如何在仅把 Vectara 当作向量存储使用时，完成基础检索功能，不使用 summarization，包括：`similarity_search`、`similarity_search_with_score` 以及 LangChain 的 `as_retriever` 功能。
+
+## 设置
+
+要使用 `VectaraVectorStore`，首先需要安装 partner package。
+
+```python
+!uv pip install -U pip && uv pip install -qU langchain-vectara
+```
+
+# Getting started
+
+开始前，请完成以下步骤：
+
+1. 如果还没有账号，请先 [Sign up](https://www.vectara.com/integrations/langchain) 获取免费的 Vectara trial。
+2. 在账号中可以创建一个或多个 corpus。每个 corpus 都代表一个用于存储文本数据的区域，你可以把输入文档摄取进去。要创建 corpus，请点击 **"Create Corpus"** 按钮，填写名称和描述。你还可以按需定义过滤属性和一些高级选项。点击创建好的 corpus 后，可以在顶部看到它的名称和 corpus ID。
+3. 接下来你需要创建 API keys 来访问该 corpus。进入 corpus 视图中的 **"Access Control"** 标签页，再点击 **"Create API Key"** 按钮。给 key 命名，并选择 query-only 或 query+index 权限。点击 "Create" 后，你就会得到一个可用的 API key。请妥善保管。
+
+要让 LangChain 与 Vectara 一起工作，你需要这两个值：`corpus_key` 和 `api_key`。
+你可以通过两种方式向 LangChain 提供 `VECTARA_API_KEY`：
+
+1. 在环境中设置这个变量：`VECTARA_API_KEY`。
+
+   例如，可以通过 `os.environ` 和 `getpass` 这样设置：
+
+```python
+import os
+import getpass
+
+os.environ["VECTARA_API_KEY"] = getpass.getpass("Vectara API Key:")
+```
+
+2. 直接传给 `Vectara` vectorstore 构造函数：
+
+```python
+vectara = Vectara(
+    vectara_api_key=vectara_api_key
+)
+```
+
+本笔记默认假定这些值已通过环境变量提供。
+
+```python
+import os
+
+os.environ["VECTARA_API_KEY"] = "<VECTARA_API_KEY>"
+os.environ["VECTARA_CORPUS_KEY"] = "VECTARA_CORPUS_KEY"
+
+from langchain_vectara import Vectara
+from langchain_vectara.vectorstores import (
+    ChainReranker,
+    CorpusConfig,
+    CustomerSpecificReranker,
+    File,
+    GenerationConfig,
+    MmrReranker,
+    SearchConfig,
+    VectaraQueryConfig,
+)
+
+vectara = Vectara(vectara_api_key=os.getenv("VECTARA_API_KEY"))
+```
+
+首先我们把 state-of-the-union 文本加载到 Vectara 中。
+
+注意这里使用的是 `add_files` 接口，它不需要本地进行任何预处理或分块。Vectara 会接收文件内容，并自动完成预处理、切分和嵌入。
+
+这里使用的是 `.txt` 文件，但它同样适用于许多其他 [file types](https://docs.vectara.com/docs/api-reference/indexing-apis/file-upload/file-upload-filetypes)。
+
+```python
+corpus_key = os.getenv("VECTARA_CORPUS_KEY")
+file_obj = File(
+    file_path="../document_loaders/example_data/state_of_the_union.txt",
+    metadata={"source": "text_file"},
+)
+vectara.add_files([file_obj], corpus_key)
+```
+
+```python
+['state_of_the_union.txt']
+```
+
+## Vectara RAG（retrieval augmented generation）
+
+现在我们创建一个 `VectaraQueryConfig` 对象，用来控制检索与总结选项：
+- 启用 summarization，并指定让 LLM 选取前 7 个最匹配的分块，并用英文回答
+
+基于这个配置，我们使用 `as_rag` 方法创建一个封装完整 Vectara RAG pipeline 的 LangChain `Runnable` 对象：
+
+```python
+generation_config = GenerationConfig(
+    max_used_search_results=7,
+    response_language="eng",
+    generation_preset_name="vectara-summary-ext-24-05-med-omni",
+    enable_factual_consistency_score=True,
+)
+search_config = SearchConfig(
+    corpora=[CorpusConfig(corpus_key=corpus_key)],
+    limit=25,
+    reranker=ChainReranker(
+        rerankers=[
+            CustomerSpecificReranker(reranker_id="rnk_272725719", limit=100),
+            MmrReranker(diversity_bias=0.2, limit=100),
+        ]
+    ),
+)
+
+config = VectaraQueryConfig(
+    search=search_config,
+    generation=generation_config,
+)
+
+query_str = "what did Biden say?"
+
+rag = vectara.as_rag(config)
+rag.invoke(query_str)["answer"]
+```
+
+```text
+"President Biden discussed several key issues in his recent statements. He emphasized the importance of keeping schools open and noted that with a high vaccination rate and reduced hospitalizations, most Americans can safely return to normal activities without masks [1]. He addressed the need to hold social media platforms accountable for their impact on children and called for stronger privacy protections and mental health services [2]. Biden also announced measures against Russian oligarchs, including closing American airspace to Russian flights and targeting their assets, as part of efforts to weaken Russia's economy [3], [7]. Additionally, he reaffirmed the need to protect women's rights, particularly the right to choose as affirmed in Roe v. Wade [5]."
+```
+
+你也可以使用流式接口：
+
+```python
+output = {}
+curr_key = None
+for chunk in rag.stream(query_str):
+    for key in chunk:
+        if key not in output:
+            output[key] = chunk[key]
+        else:
+            output[key] += chunk[key]
+        if key == "answer":
+            print(chunk[key], end="", flush=True)
+        curr_key = key
+```
+
+```text
+President Biden discussed several key issues in his recent statements. He emphasized the importance of keeping schools open and noted that with a high vaccination rate and reduced hospitalizations, most Americans can safely return to normal activities without masks [1]. He addressed the need to hold social media platforms accountable for their impact on children and called for stronger privacy protections and mental health services [2]. Biden also announced measures against Russia, including preventing its central bank from defending the Ruble and targeting Russian oligarchs' assets, as part of efforts to weaken Russia's economy and military [3]. Additionally, he reaffirmed the commitment to protect women's rights, particularly the right to choose as affirmed in Roe v. Wade [5]. Lastly, he advocated for funding the police with necessary resources and training to ensure community safety [6].
+```
+
+## 幻觉检测与 factual consistency score
+
+Vectara 创建了 [HHEM](https://huggingface.co/vectara/hallucination_evaluation_model)，这是一个开源模型，可用于评估 RAG 回答在事实一致性上的表现。
+
+在 Vectara RAG 中，"Factual Consistency Score"（或 FCS）是 HHEM 的改进版本，它通过 API 直接提供，并会自动包含在 RAG pipeline 的输出中。
+
+```python
+resp = rag.invoke(query_str)
+print(resp["answer"])
+print(f"Vectara FCS = {resp['fcs']}")
+```
+
+```text
+President Biden discussed several key topics in his recent statements. He emphasized the importance of keeping schools open and noted that with a high vaccination rate and reduced hospitalizations, most Americans can safely return to normal activities without masks [1]. He addressed the need to hold social media platforms accountable for their impact on children and called for stronger privacy protections and mental health services [2]. Biden also announced measures against Russian oligarchs, including closing American airspace to Russian flights and targeting their assets, as part of efforts to weaken Russia's economy [3], [7]. Additionally, he reaffirmed the need to protect women's rights, particularly the right to choose as affirmed in Roe v. Wade [5].
+Vectara FCS = 0.61621094
+```
+
+## 将 Vectara 作为 LangChain retriever
+
+Vectara 组件也可以单独作为 retriever 使用。
+
+这种情况下，它的行为与其他 LangChain retriever 一致。这个模式主要适合语义搜索，此时我们会关闭 summarization：
+
+```python
+config.generation = None
+config.search.limit = 5
+retriever = vectara.as_retriever(config=config)
+retriever.invoke(query_str)
+```
+
+```text
+[Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='The U.S. Department of Justice is assembling a dedicated task force to go after the crimes of Russian oligarchs. We are joining with our European allies to find and seize your yachts your luxury apartments your private jets. We are coming for your ill-begotten gains. And tonight I am announcing that we will join our allies in closing off American air space to all Russian flights – further isolating Russia – and adding an additional squeeze –on their economy. The Ruble has lost 30% of its value.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='When they came home, many of the world’s fittest and best trained warriors were never the same. Dizziness. \n\nA cancer that would put them in a flag-draped coffin. I know. \n\nOne of those soldiers was my son Major Beau Biden. We don’t know for sure if a burn pit was the cause of his brain cancer, or the diseases of so many of our troops. But I’m committed to finding out everything we can.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='He rejected repeated efforts at diplomacy. He thought the West and NATO wouldn’t respond. And he thought he could divide us at home. We were ready.  Here is what we did. We prepared extensively and carefully.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='And while you’re at it, pass the Disclose Act so Americans can know who is funding our elections. Tonight, I’d like to honor someone who has dedicated his life to serve this country: Justice Stephen Breyer—an Army veteran, Constitutional scholar, and retiring Justice of the United States Supreme Court. Justice Breyer, thank you for your service. One of the most serious constitutional responsibilities a President has is nominating someone to serve on the United States Supreme Court. And I did that 4 days ago, when I nominated Circuit Court of Appeals Judge Ketanji Brown Jackson.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='Putin’s latest attack on Ukraine was premeditated and unprovoked. He rejected repeated efforts at diplomacy. He thought the West and NATO wouldn’t respond. And he thought he could divide us at home. We were ready.  Here is what we did.')]
+```
+
+出于向后兼容考虑，你也可以在 retriever 中启用 summarization，此时 summary 会作为额外的 `Document` 对象附加到结果里：
+
+```python
+config.generation = GenerationConfig()
+config.search.limit = 10
+retriever = vectara.as_retriever(config=config)
+retriever.invoke(query_str)
+```
+
+```text
+[Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='We won’t be able to compete for the jobs of the 21st Century if we don’t fix that. That’s why it was so important to pass the Bipartisan Infrastructure Law—the most sweeping investment to rebuild America in history. This was a bipartisan effort, and I want to thank the members of both parties who worked to make it happen. We’re done talking about infrastructure weeks. We’re going to have an infrastructure decade.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='The U.S. Department of Justice is assembling a dedicated task force to go after the crimes of Russian oligarchs. We are joining with our European allies to find and seize your yachts your luxury apartments your private jets. We are coming for your ill-begotten gains. And tonight I am announcing that we will join our allies in closing off American air space to all Russian flights – further isolating Russia – and adding an additional squeeze –on their economy. The Ruble has lost 30% of its value.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='When they came home, many of the world’s fittest and best trained warriors were never the same. Dizziness. \n\nA cancer that would put them in a flag-draped coffin. I know. \n\nOne of those soldiers was my son Major Beau Biden. We don’t know for sure if a burn pit was the cause of his brain cancer, or the diseases of so many of our troops. But I’m committed to finding out everything we can.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='Preventing Russia’s central bank from defending the Russian Ruble making Putin’s $630 Billion “war fund” worthless. We are choking off Russia’s access to technology that will sap its economic strength and weaken its military for years to come. Tonight I say to the Russian oligarchs and corrupt leaders who have bilked billions of dollars off this violent regime no more. The U.S. Department of Justice is assembling a dedicated task force to go after the crimes of Russian oligarchs. We are joining with our European allies to find and seize your yachts your luxury apartments your private jets.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='He rejected repeated efforts at diplomacy. He thought the West and NATO wouldn’t respond. And he thought he could divide us at home. We were ready.  Here is what we did. We prepared extensively and carefully.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='It delivered immediate economic relief for tens of millions of Americans. Helped put food on their table, keep a roof over their heads, and cut the cost of health insurance. And as my Dad used to say, it gave people a little breathing room. And unlike the $2 Trillion tax cut passed in the previous administration that benefitted the top 1% of Americans, the American Rescue Plan helped working people—and left no one behind. Lots of jobs. \n\nIn fact—our economy created over 6.5 Million new jobs just last year, more jobs created in one year  \nthan ever before in the history of America.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='And while you’re at it, pass the Disclose Act so Americans can know who is funding our elections. Tonight, I’d like to honor someone who has dedicated his life to serve this country: Justice Stephen Breyer—an Army veteran, Constitutional scholar, and retiring Justice of the United States Supreme Court. Justice Breyer, thank you for your service. One of the most serious constitutional responsibilities a President has is nominating someone to serve on the United States Supreme Court. And I did that 4 days ago, when I nominated Circuit Court of Appeals Judge Ketanji Brown Jackson.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='All told, we created 369,000 new manufacturing jobs in America just last year. Powered by people I’ve met like JoJo Burgess, from generations of union steelworkers from Pittsburgh, who’s here with us tonight. As Ohio Senator Sherrod Brown says, “It’s time to bury the label “Rust Belt.” It’s time. \n\nBut with all the bright spots in our economy, record job growth and higher wages, too many families are struggling to keep up with the bills. Inflation is robbing them of the gains they might otherwise feel.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='Putin’s latest attack on Ukraine was premeditated and unprovoked. He rejected repeated efforts at diplomacy. He thought the West and NATO wouldn’t respond. And he thought he could divide us at home. We were ready.  Here is what we did.'),
+ Document(metadata={'X-TIKA:Parsed-By': 'org.apache.tika.parser.csv.TextAndCSVParser', 'Content-Encoding': 'UTF-8', 'X-TIKA:detectedEncoding': 'UTF-8', 'X-TIKA:encodingDetector': 'UniversalEncodingDetector', 'Content-Type': 'text/plain; charset=UTF-8', 'source': 'text_file', 'framework': 'langchain'}, page_content='Danielle says Heath was a fighter to the very end. He didn’t know how to stop fighting, and neither did she. Through her pain she found purpose to demand we do better. Tonight, Danielle—we are. The VA is pioneering new ways of linking toxic exposures to diseases, already helping more veterans get benefits.'),
+ Document(metadata={'summary': True, 'fcs': (0.54785156,)}, page_content='President Biden spoke about several key issues. He emphasized the importance of the Bipartisan Infrastructure Law, calling it the most significant investment to rebuild America and highlighting it as a bipartisan effort [1]. He also announced measures against Russian oligarchs, including assembling a task force to seize their assets and closing American airspace to Russian flights, further isolating Russia economically [2]. Additionally, he expressed a commitment to investigating the health impacts of burn pits on military personnel, referencing his son, Major Beau Biden, who suffered from brain cancer [3].')]
+```
+
+## 在 LangChain 中配合 Vectara 做高级查询预处理
+
+Vectara 的 “RAG as a service” 已经帮你完成了很多问答链或聊天链所需的繁重工作。与 LangChain 集成后，你还可以加入额外能力，例如查询预处理，比如 `SelfQueryRetriever` 或 `MultiQueryRetriever`。下面来看一个 [MultiQueryRetriever](https://python.langchain.com/docs/modules/data_connection/retrievers/MultiQueryRetriever) 的示例。
+
+由于 MQR 需要一个 LLM，这里我们选择 @[`ChatOpenAI`]：
+
+```python
+from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+from langchain_openai.chat_models import ChatOpenAI
+
+llm = ChatOpenAI(temperature=0)
+mqr = MultiQueryRetriever.from_llm(retriever=retriever, llm=llm)
+
+
+def get_summary(documents):
+    return documents[-1].page_content
+
+
+(mqr | get_summary).invoke(query_str)
+```
+
+```text
+'The remarks made by Biden include his emphasis on the importance of the Bipartisan Infrastructure Law, which he describes as the most significant investment to rebuild America in history. He highlights the bipartisan effort involved in passing this law and expresses gratitude to members of both parties for their collaboration. Biden also mentions the transition from "infrastructure weeks" to an "infrastructure decade" [1]. Additionally, he shares a personal story about his father having to leave their home in Scranton, Pennsylvania, to find work, which influenced his decision to fight for the American Rescue Plan to help those in need [2].'
+```
+
+```python
+
+```

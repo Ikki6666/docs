@@ -1,0 +1,168 @@
+---
+title: 跟踪 Amazon Bedrock 应用
+sidebarTitle: Bedrock
+---
+
+本指南介绍如何使用原生 AWS SDK，在 LangSmith 中跟踪 [Amazon Bedrock](https://aws.amazon.com/bedrock) 模型调用。LangSmith 也可以与 [LangChain 的 Bedrock 集成](/oss/integrations/providers/aws) 无缝配合。无论采用哪种方式，你都可以获得以下洞察：
+
+- 请求与响应 payloads
+- Token 用量和成本
+- 延迟与性能指标
+- 用于过滤和分析的自定义 tags 与 metadata
+- 多步骤 chains 与 agent workflows
+
+## 安装
+
+<CodeGroup>
+
+```bash pip
+pip install boto3 langsmith
+```
+
+```bash npm
+npm install @aws-sdk/client-bedrock-runtime langsmith
+```
+
+</CodeGroup>
+
+这个集成使用原生 AWS SDK，并结合 LangSmith 的 tracing 能力。在 Python 中，你会使用 [`boto3`](https://pypi.org/project/boto3/)，也就是 AWS Python SDK，配合 [`langsmith`](https://pypi.org/project/langsmith/) 来捕获 traces。在 JavaScript / TypeScript 中，你会使用 [`@aws-sdk/client-bedrock-runtime`](https://www.npmjs.org/package/@aws-sdk/client-bedrock-runtime) 与 [`langsmith`](https://www.npmjs.org/package/langsmith) 包。两种实现都使用 [Bedrock Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)，它为不同 foundation models 提供了统一的交互接口。
+
+## 设置
+
+如需启用 LangSmith tracing，请配置你的 [LangSmith API key](/langsmith/create-account-api-key) 和 project 设置。同时你还需要配置 AWS 凭证，以便与 Bedrock 认证。
+
+### LangSmith 配置
+
+```bash
+export LANGSMITH_API_KEY=<your_langsmith_api_key>
+export LANGSMITH_PROJECT=<your_project_name> # optional, defaults to "default"
+export LANGSMITH_TRACING=true
+```
+
+你可以登录 [smith.langchain.com](https://smith.langchain.com)，进入 **Settings** > **API Keys** 获取 LangSmith API key。`LANGSMITH_PROJECT` 变量可用于将 traces 组织到不同 project 中。
+
+### AWS 凭证
+
+配置你的 AWS 凭证以便与 Bedrock 认证。你需要一个已启用 Bedrock 访问权限的 AWS 账户。请按照 [AWS setup instructions](https://docs.aws.amazon.com/bedrock/latest/userguide/setting-up.html) 创建凭证，并按 [enable model access](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html) 启用模型访问：
+
+```bash
+export AWS_ACCESS_KEY_ID=<your_aws_access_key_id>
+export AWS_SECRET_ACCESS_KEY=<your_aws_secret_key>
+export AWS_SESSION_TOKEN=<your_session_token> # only if using temporary credentials
+export AWS_DEFAULT_REGION=<your_bedrock_region> # e.g., us-east-1 or us-west-2
+```
+
+## 配置 tracing
+
+环境变量准备好后，你可以通过 LangSmith 的 `@traceable` decorator，Python，或 `traceable` function，TypeScript，包装你的调用函数，从而跟踪 Bedrock 模型调用。
+
+下面的示例展示了如何在 LangSmith tracing 中使用 Bedrock Converse API。Converse API 是 AWS 官方推荐的 foundation models 统一接口，能够在不同模型提供方之间提供一致的请求与响应处理方式。你还可以通过自定义 tags 和 metadata 来增强 traces，tags 有助于按环境、功能或测试类型等维度对 traces 进行分类，而 metadata 则允许你附加任意键值对来补充细节上下文：
+
+<CodeGroup>
+
+```python Python
+import boto3
+from langsmith import traceable
+
+# Initialize Bedrock runtime client (ensure AWS creds and region are set)
+bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+model_id = "anthropic.claude-haiku-4-5-20251001-v1:0"  # Example Bedrock model ID
+
+# Decorate the model invocation function to auto-capture a trace with tags/metadata
+@traceable(tags=["aws-bedrock", "langsmith", "integration-test"],
+           metadata={"env": "dev", "model_provider": "bedrock", "model_id": "claude-3-haiku"})
+def generate_text(prompt: str) -> str:
+    # Prepare a single-turn conversation input for the Converse API
+    messages = [
+        {"role": "user", "content": [{"text": prompt}]}
+    ]
+    # Invoke the Bedrock model using the unified Converse API
+    response = bedrock.converse(
+        modelId=model_id,
+        messages=messages,
+        inferenceConfig={"maxTokens": 512, "temperature": 0.5, "topP": 0.9}
+    )
+    # Extract the model's reply text from the response
+    output_text = response["output"]["message"]["content"][0]["text"]
+    return output_text
+
+# Call the traced function with a prompt
+result = generate_text("How can I trace AWS Bedrock model outputs to LangSmith for debugging?")
+print(result)
+```
+
+```typescript TypeScript
+import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
+import { traceable } from "langsmith";
+
+const client = new BedrockRuntimeClient({ region: "us-east-1" });
+const modelId = "anthropic.claude-haiku-4-5-20251001-v1:0";
+
+// Wrap the Bedrock invocation in a traceable function with tags and metadata
+const invokeBedrock = traceable(
+  async (userInput: string) => {
+    // Prepare the conversation message for the Bedrock Converse API
+    const conversation = [
+      { role: "user", content: [{ text: userInput }] }
+    ];
+    // Create and send a Bedrock Converse command (single-turn chat)
+    const command = new ConverseCommand({
+      modelId,
+      messages: conversation,
+      inferenceConfig: { maxTokens: 512, temperature: 0.5, topP: 0.9 }
+    });
+    const response = await client.send(command);
+    // Extract the assistant's reply text from the response
+    const outputText = response.output?.message?.content[0]?.text;
+    return outputText;
+  },
+  {
+    tags: ["aws-bedrock", "langsmith", "integration-test"],
+    metadata: { env: "dev", model_provider: "bedrock", model_id: "claude-3-haiku" }
+  }
+);
+
+// Invoke the traced function with a prompt
+const answer = await invokeBedrock("How can I trace AWS Bedrock model outputs to LangSmith for debugging?");
+console.log(answer);
+```
+
+</CodeGroup>
+
+<Tabs>
+<Tab title="Python">
+- `boto3.client("bedrock-runtime")` 会创建一个 Bedrock Runtime client。
+- `converse` 方法会将一个 chat prompt，以消息列表形式，发送给指定模型，并返回结构化响应。
+- `generate_text` 函数使用 `@traceable` 装饰，因此每次调用都会作为一条 trace 记录到 LangSmith 中，默认使用函数名作为 trace 名称。
+- 你在 decorator 中传入的自定义 tags，`aws-bedrock`、`langsmith`、`integration-test`，和 metadata，环境、模型信息，会被附加到 trace 记录中，方便在 LangSmith UI 中进行筛选。
+- 当你运行这段代码时，只要设置了 `LANGSMITH_TRACING=true` 以及你的 API key，LangSmith 就会自动捕获输入 prompt、模型输出、token 用量和延迟。
+</Tab>
+
+<Tab title="TypeScript">
+- 来自 AWS SDK v3 的 `BedrockRuntimeClient` 提供了 Bedrock runtime 接口。
+- `ConverseCommand` 提供了统一的 chat 接口，能够发送用户消息，并以结构化格式返回 assistant 响应，无需手动解析 JSON。
+- Bedrock 调用通过 LangSmith 的 `traceable` function 包装，因此 `invokeBedrock` 会变成一个 traced function，并将执行过程记录到 LangSmith。
+- 自定义 tags 和 metadata 在 `traceable` 配置对象中提供，并附加到每条 trace 上。
+- 当你运行此脚本时，只要配置好 `LANGSMITH_TRACING=true` 和 API key，就可以在 LangSmith dashboard 中看到对应的 trace 条目，其中包含输入 prompt、模型输出、耗时信息，以及你指定的 tags / metadata。
+</Tab>
+</Tabs>
+
+
+## 在 LangSmith 中查看 traces
+
+运行代码后，前往 [smith.langchain.com](https://smith.langchain.com) 中对应的 LangSmith project 查看 traces。每条 trace 会包含：
+
+- **Request details**：输入消息、模型参数和配置
+- **Response details**：模型输出、token 用量和响应 metadata
+- **Performance metrics**：延迟、每秒 token 数和成本估算
+- **Custom metadata**：你在 `@traceable` decorator 中提供的 tags 和 metadata
+
+你可以按 tags，例如 `aws-bedrock` 或 `integration-test`，过滤 traces，也可以按 metadata 字段搜索，或进一步深入某条 trace 来调试问题。
+
+## 后续步骤
+
+- 进一步了解 [LangSmith features](/langsmith)，包括评估、datasets 和反馈
+- 探索 [Bedrock model capabilities](https://docs.aws.amazon.com/bedrock/latest/userguide/models-features.html)，例如工具调用、streaming 和 prompt caching
+:::python
+- 查看 [LangChain Bedrock integration documentation](/oss/integrations/chat/bedrock)，以了解 extended thinking 和 citations 等进阶能力
+:::

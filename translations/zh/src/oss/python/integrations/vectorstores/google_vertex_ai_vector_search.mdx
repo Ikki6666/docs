@@ -1,0 +1,908 @@
+---
+title: "Google Vertex AI vector search 集成"
+description: "使用 LangChain Python 集成 Google Vertex AI vector search 向量存储。"
+---
+
+import LangchainCommunityUnmaintained from '/snippets/oss/langchain-community-unmaintained.mdx';
+
+本页介绍如何在 LangChain 中将 Google Vertex AI Vector Search 用作向量存储。
+
+## 概览
+
+[Google Vertex AI Vector Search](https://cloud.google.com/vertex-ai/docs/vector-search/overview) 是一项完全托管的高扩展、低延迟相似向量检索方案。它基于 Google 的 ScaNN（Scalable Nearest Neighbors）技术，支持精确搜索和近似最近邻（ANN）搜索。
+
+Vertex AI Vector Search 提供两个版本：
+
+- **[Vector Search 2.0](https://docs.cloud.google.com/vertex-ai/docs/vector-search-2/overview)**：使用 Collections 存储 Data Objects，将向量、元数据和内容放在统一结构中，数据模型更统一，操作也更简单快捷。
+- **[Vector Search 1.0](https://docs.cloud.google.com/vertex-ai/docs/vector-search/overview)**：使用部署到 Endpoints 的 Indexes，并将文档单独存储在 Google Cloud Storage 或 Datastore 中。
+
+请根据你使用的版本查看对应部分：
+- [Vector Search 2.0](#vector-search-2-0) - 适用于使用 Collections 的场景
+- [Vector Search 1.0](#vector-search-1-0) - 适用于使用 Indexes 和 Endpoints 的场景
+
+如需从 Vertex AI Vector Search 1.0 迁移到 2.0，请参阅 [Migration Guide](https://cloud.google.com/vertex-ai/docs/vector-search-2/migration-from-vs-1_0)。
+
+## 安装
+
+安装 LangChain Google Vertex AI 集成：
+
+```bash
+pip install -U langchain-google-vertexai
+```
+
+---
+
+# Vector Search 2.0
+
+Vector Search 2.0 使用 Collections 存储 Data Objects。每个 Data Object 都会在统一结构中保存向量、元数据和内容。
+
+## 前置条件
+
+- 已启用 Vertex AI API 和 Vector Search APIs 的 Google Cloud 项目
+
+    ```bash
+    gcloud services enable vectorsearch.googleapis.com aiplatform.googleapis.com --project "{PROJECT_ID}"
+    ```
+
+- 已创建 Vector Search Collection（参见 [Creating a Collection](#creating-a-collection-v2)）
+- 具备适当的 IAM 权限（`Vertex AI User` 角色或等效权限）
+
+## 创建 Collection（V2）
+
+在使用 Vector Search 2.0 之前，需要先创建 collection。下面展示如何创建与 LangChain 兼容的 collection：
+
+```python
+from google.cloud import vectorsearch_v1beta
+
+# Configuration
+PROJECT_ID = "your-project-id"
+LOCATION = "us-central1"
+COLLECTION_ID = "langchain-test-collection"
+
+# Create the Vector Search service client
+vector_search_service_client = vectorsearch_v1beta.VectorSearchServiceClient()
+
+# Create the collection with schema compatible with LangChain
+# IMPORTANT: To enable filtering, you must define filterable fields in data_schema.properties
+request = vectorsearch_v1beta.CreateCollectionRequest(
+    parent=f"projects/{PROJECT_ID}/locations/{LOCATION}",
+    collection_id=COLLECTION_ID,
+    collection={
+        "display_name": "LangChain Test Collection",
+        "description": "Collection for testing LangChain VectorSearchVectorStore with filtering",
+        "data_schema": {
+            "type": "object",
+            "properties": {
+                # Define fields you want to filter on
+                "source": {"type": "string"},
+                "category": {"type": "string"},
+                "page": {"type": "number"},
+                # Add more fields as needed for your specific use case
+            },
+        },
+        "vector_schema": {
+            # Vector field must be named "embedding" to match LangChain's default
+            "embedding": {
+                "dense_vector": {
+                    "dimensions": 768  # For text-embedding-005
+                }
+            },
+        },
+    },
+)
+
+print(f"Creating collection: {COLLECTION_ID}")
+operation = vector_search_service_client.create_collection(request=request)
+print(f"Operation started: {operation.operation.name}")
+print("Waiting for operation to complete...")
+
+result = operation.result()
+print(f"Collection created successfully!")
+print(f"Resource name: {result.name}")
+```
+
+**重要说明：**
+- 向量字段必须命名为 `"embedding"`，以匹配 LangChain 默认值（除非你使用 `vector_field_name` 参数覆盖）
+- 只有在 `data_schema.properties` 中定义过的字段，才能在 V2 中用于过滤
+- 维度应与你的嵌入模型保持一致，例如 `text-embedding-005` 使用 768
+
+## 初始化
+
+```python
+from langchain_google_vertexai import VectorSearchVectorStore, VertexAIEmbeddings
+
+# Initialize embeddings
+embeddings = VertexAIEmbeddings(model_name="text-embedding-005")
+
+# Create vector store from a Collection
+# Use the same PROJECT_ID, LOCATION, and COLLECTION_ID from collection creation
+vector_store = VectorSearchVectorStore.from_components(
+    project_id=PROJECT_ID,
+    region=LOCATION,
+    collection_id=COLLECTION_ID,
+    embedding=embeddings,
+    api_version="v2",
+)
+```
+
+**关键参数：**
+- `collection_id`：你的 Vector Search Collection ID（必需）
+- `api_version`：必须设置为 `"v2"`（必需）
+- `project_id`：GCP 项目 ID（必需）
+- `region`：Collection 所在的 GCP 区域（必需）
+- `vector_field_name`：Collection schema 中的向量字段名称（默认值：`"embedding"`）
+
+## 添加文档
+
+```python
+from langchain_core.documents import Document
+
+# Create documents
+docs = [
+    Document(
+        page_content="Google Vertex AI is a managed machine learning platform",
+        metadata={"source": "docs", "category": "AI"}
+    ),
+    Document(
+        page_content="LangChain integrates with Vertex AI Vector Search",
+        metadata={"source": "blog", "category": "integration"}
+    ),
+]
+
+# Add documents to vector store
+ids = vector_store.add_documents(docs)
+print(f"Added documents with IDs: {ids}")
+```
+
+### 添加文本
+
+```python
+texts = [
+    "Vertex AI provides scalable ML infrastructure",
+    "Vector Search enables similarity search at scale",
+]
+
+metadatas = [
+    {"source": "website", "page": 1},
+    {"source": "website", "page": 2},
+]
+
+ids = vector_store.add_texts(texts=texts, metadatas=metadatas)
+```
+
+## 搜索
+
+### 基础相似度搜索
+
+```python
+# Basic similarity search
+query = "What is Vertex AI?"
+results = vector_store.similarity_search(query, k=5)
+
+for doc in results:
+    print(f"Content: {doc.page_content}")
+    print(f"Metadata: {doc.metadata}\n")
+```
+
+### 带分数的相似度搜索
+
+```python
+# Get similarity scores along with documents
+results_with_scores = vector_store.similarity_search_with_score(
+    "What is Vertex AI?",
+    k=5
+)
+
+for doc, score in results_with_scores:
+    print(f"Score: {score}")
+    print(f"Content: {doc.page_content}")
+    print(f"Metadata: {doc.metadata}\n")
+```
+
+### 按向量搜索
+
+```python
+# Search using a pre-computed embedding
+embedding = embeddings.embed_query("Vertex AI features")
+
+results = vector_store.similarity_search_by_vector_with_score(embedding, k=5)
+
+for doc, score in results:
+    print(f"Score: {score}")
+    print(f"Content: {doc.page_content}\n")
+```
+
+## 过滤
+
+Vector Search 2.0 使用基于字典的查询语法来过滤 Data Objects：
+
+```python
+# Simple equality filter
+results = vector_store.similarity_search(
+    "AI features",
+    k=5,
+    filter={"source": {"$eq": "docs"}}
+)
+
+# Comparison operators
+results = vector_store.similarity_search(
+    "recent pages",
+    k=5,
+    filter={"page": {"$gte": 10}}
+)
+
+# Logical AND
+results = vector_store.similarity_search(
+    "AI documentation",
+    k=5,
+    filter={
+        "$and": [
+            {"source": {"$eq": "docs"}},
+            {"category": {"$eq": "AI"}}
+        ]
+    }
+)
+
+# Logical OR
+results = vector_store.similarity_search(
+    "documentation",
+    k=5,
+    filter={
+        "$or": [
+            {"source": {"$eq": "docs"}},
+            {"source": {"$eq": "blog"}}
+        ]
+    }
+)
+
+# Less than
+results = vector_store.similarity_search(
+    "early pages",
+    k=5,
+    filter={"page": {"$lt": 5}}
+)
+```
+
+**支持的操作符：**
+- `$eq`：等于
+- `$ne`：不等于
+- `$lt`：小于
+- `$lte`：小于等于
+- `$gt`：大于
+- `$gte`：大于等于
+- `$and`：逻辑与
+- `$or`：逻辑或
+- `$not`：逻辑非
+
+更多信息请参阅 [Vector Search 2.0 query documentation](https://cloud.google.com/vertex-ai/docs/vector-search-2/query-search/query)。
+
+## 删除操作
+
+### 按 ID 删除
+
+```python
+# Delete specific documents by ID
+ids_to_delete = ["id1", "id2", "id3"]
+vector_store.delete(ids=ids_to_delete)
+```
+
+### 按元数据过滤删除
+
+**注意**：当前 V2 API 中，按元数据过滤删除存在一些限制。推荐做法是：
+1. 使用带过滤条件的 `similarity_search` 获取文档 ID
+2. 再按 ID 删除
+
+```python
+# Recommended: Search first, then delete by IDs
+results = vector_store.similarity_search(
+    "query",  # Use a broad query
+    k=1000,   # Get more results
+    filter={"source": {"$eq": "old_docs"}}
+)
+ids_to_delete = [doc.metadata.get("id") for doc in results if "id" in doc.metadata]
+vector_store.delete(ids=ids_to_delete)
+```
+
+或者，如果你的环境支持直接按元数据删除：
+
+```python
+# Direct deletion by metadata (may have limitations)
+try:
+    vector_store.delete(metadata={"source": {"$eq": "old_docs"}})
+except Exception as e:
+    # Fall back to search-then-delete approach
+    print(f"Direct deletion failed: {e}")
+```
+
+## 高级功能
+
+Vector Search 2.0 提供了多种高级搜索能力，超出了传统稠密向量搜索的范围。
+
+### 语义搜索
+
+语义搜索会使用 Vertex AI 模型自动从查询文本生成嵌入。你的 collection 必须在 vector schema 中配置 `vertex_embedding_config`。
+
+```python
+# Semantic search with auto-generated embeddings
+results = vector_store.semantic_search(
+    query="Tell me about animals",
+    k=5,
+    search_field="embedding",  # Vector field with auto-embedding config
+    task_type="RETRIEVAL_QUERY",  # Optimizes embeddings for search queries
+    filter={"category": {"$eq": "wildlife"}}  # Optional filtering
+)
+
+for doc in results:
+    print(f"Content: {doc.page_content}")
+    print(f"Metadata: {doc.metadata}\n")
+```
+
+**任务类型：**
+- `RETRIEVAL_QUERY`：用于搜索查询（默认）
+- `RETRIEVAL_DOCUMENT`：用于文档索引
+- `SEMANTIC_SIMILARITY`：用于语义相似度任务
+- `CLASSIFICATION`：用于分类任务
+- `CLUSTERING`：用于聚类任务
+
+### 文本搜索
+
+文本搜索会在数据字段上执行关键词或全文匹配，而不使用嵌入。
+
+```python
+# Keyword search on data fields
+results = vector_store.text_search(
+    query="Python programming",
+    k=10,
+    data_field_names=["page_content", "title"]  # Fields to search in
+)
+
+for doc in results:
+    print(f"Content: {doc.page_content}\n")
+```
+
+!!! note
+    文本搜索不支持过滤。如果你需要过滤，请使用 `semantic_search()` 或 `similarity_search()`。
+
+### 混合搜索
+
+混合搜索会把语义搜索（自动生成嵌入）与文本搜索（关键词匹配）结合起来，并使用 Reciprocal Rank Fusion（RRF）得到更优的排序结果。
+
+```python
+# Hybrid search: semantic understanding + keyword matching
+results = vector_store.hybrid_search(
+    query="Men's outfit for beach",
+    k=10,
+    search_field="embedding",  # Vector field with auto-embedding config
+    data_field_names=["page_content"],  # Fields for text search
+    task_type="RETRIEVAL_QUERY",
+    filter={"price": {"$lt": 100}},  # Optional filter for semantic search
+    semantic_weight=1.0,  # Weight for semantic results
+    text_weight=1.0  # Weight for keyword results
+)
+
+for doc in results:
+    print(f"Content: {doc.page_content}\n")
+```
+
+**权重参数：**
+- 更高的 `semantic_weight`：更偏向语义理解
+- 更高的 `text_weight`：更偏向精确关键词匹配
+- 默认相等权重：返回更均衡的结果
+
+在语义搜索和文本搜索中都排名靠前的商品，会在合并结果中获得更高排序。
+
+更多信息请参阅 [Vector Search 2.0 documentation](https://cloud.google.com/vertex-ai/docs/vector-search/overview)。
+
+### 自定义向量字段名称
+
+如果你的 Collection schema 使用了自定义向量字段名：
+
+```python
+vector_store = VectorSearchVectorStore.from_components(
+    project_id="your-project-id",
+    region="us-central1",
+    collection_id="your-collection-id",
+    embedding=embeddings,
+    api_version="v2",
+    vector_field_name="custom_embedding_field",  # Match your schema
+)
+```
+
+## 附加资源
+
+- [Vector Search 2.0 Overview](https://cloud.google.com/vertex-ai/docs/vector-search-2/overview)
+- [Vector Search 2.0 Collections](https://cloud.google.com/vertex-ai/docs/vector-search-2/collections/collections)
+- [Vector Search 2.0 Data Objects](https://cloud.google.com/vertex-ai/docs/vector-search-2/data-objects/data-objects)
+- [Vector Search 2.0 Search Guide](https://cloud.google.com/vertex-ai/docs/vector-search-2/query-search/search)
+- [Vector Search 2.0 Query Guide](https://cloud.google.com/vertex-ai/docs/vector-search-2/query-search/query)
+- [Vector Search 2.0 Migration Guide](https://cloud.google.com/vertex-ai/docs/vector-search-2/migration-from-vs-1_0)
+
+---
+
+# Vector Search 1.0
+
+本笔记介绍如何使用与 `Google Cloud Vertex AI Vector Search` 向量数据库相关的功能。
+
+> [Google Vertex AI Vector Search](https://cloud.google.com/vertex-ai/docs/vector-search/overview)，也就是此前的 Vertex AI Matching Engine，提供业界领先的高扩展、低延迟向量数据库能力。这类数据库通常也被称为向量相似度匹配或近似最近邻（ANN）服务。
+
+**注意**：LangChain API 假定 endpoint 和 deployed index 已经创建完成。索引创建可能需要长达一小时。
+
+> 如需了解如何创建索引，请参阅 [Create Index and deploy it to an Endpoint](#create-index-and-deploy-it-to-an-endpoint)
+如果你已经部署好索引，可直接跳到 [Create VectorStore from texts](#create-vector-store-from-texts)
+
+## 创建索引并部署到 Endpoint
+
+- 本节演示如何创建新索引并将其部署到 endpoint
+
+```python
+# TODO : Set values as per your requirements
+# Project and Storage Constants
+PROJECT_ID = "<my_project_id>"
+REGION = "<my_region>"
+BUCKET = "<my_gcs_bucket>"
+BUCKET_URI = f"gs://{BUCKET}"
+
+# The number of dimensions for the textembedding-gecko@003 is 768
+# If other embedder is used, the dimensions would probably need to change.
+DIMENSIONS = 768
+
+# Index Constants
+DISPLAY_NAME = "<my_matching_engine_index_id>"
+DEPLOYED_INDEX_ID = "<my_matching_engine_endpoint_id>"
+```
+
+```python
+# Create a bucket.
+! gsutil mb -l $REGION -p $PROJECT_ID $BUCKET_URI
+```
+
+### 使用 `VertexAIEmbeddings` 作为嵌入模型
+
+```python
+from google.cloud import aiplatform
+from langchain_google_vertexai import VertexAIEmbeddings
+```
+
+```python
+aiplatform.init(project=PROJECT_ID, location=REGION, staging_bucket=BUCKET_URI)
+```
+
+```python
+embedding_model = VertexAIEmbeddings(model_name="text-embedding-005")
+```
+
+### 创建空索引
+
+**注意：** 创建索引时，需要从 `"BATCH_UPDATE"` 或 `"STREAM_UPDATE"` 中指定一个 `index_update_method`
+> 批量索引用于按批次更新索引的数据，例如按周或按月处理的数据系统。流式索引用于在新数据加入数据存储后立即更新索引，例如书店希望新库存尽快上线。这两种类型的配置和要求不同，因此选择哪一种很重要。
+
+更多配置细节请参阅 [Official Documentation](https://cloud.google.com/vertex-ai/docs/vector-search/create-manage-index#create-index-batch)
+
+```python
+# NOTE : This operation can take upto 30 seconds
+my_index = aiplatform.MatchingEngineIndex.create_tree_ah_index(
+    display_name=DISPLAY_NAME,
+    dimensions=DIMENSIONS,
+    approximate_neighbors_count=150,
+    distance_measure_type="DOT_PRODUCT_DISTANCE",
+    index_update_method="STREAM_UPDATE",  # allowed values BATCH_UPDATE , STREAM_UPDATE
+)
+```
+
+### 创建 endpoint
+
+```python
+# Create an endpoint
+my_index_endpoint = aiplatform.MatchingEngineIndexEndpoint.create(
+    display_name=f"{DISPLAY_NAME}-endpoint", public_endpoint_enabled=True
+)
+```
+
+### 将索引部署到 endpoint
+
+```python
+# NOTE : This operation can take upto 20 minutes
+my_index_endpoint = my_index_endpoint.deploy_index(
+    index=my_index, deployed_index_id=DEPLOYED_INDEX_ID
+)
+
+my_index_endpoint.deployed_indexes
+```
+
+## 从文本创建向量存储
+
+注意：如果你已有 Index 和 Endpoint，可使用下面代码加载
+
+```python
+# TODO : replace 1234567890123456789 with your acutial index ID
+my_index = aiplatform.MatchingEngineIndex("1234567890123456789")
+
+# TODO : replace 1234567890123456789 with your acutial endpoint ID
+my_index_endpoint = aiplatform.MatchingEngineIndexEndpoint("1234567890123456789")
+```
+
+```python
+from langchain_google_vertexai import (
+    VectorSearchVectorStore,
+    VectorSearchVectorStoreDatastore,
+)
+```
+
+<p>Langchainassets.png</p>
+
+### 创建简单的 vectorstore（不带过滤）
+
+```python
+# Input texts
+texts = [
+    "The cat sat on",
+    "the mat.",
+    "I like to",
+    "eat pizza for",
+    "dinner.",
+    "The sun sets",
+    "in the west.",
+]
+
+# Create a Vector Store
+vector_store = VectorSearchVectorStore.from_components(
+    project_id=PROJECT_ID,
+    region=REGION,
+    gcs_bucket_name=BUCKET,
+    index_id=my_index.name,
+    endpoint_id=my_index_endpoint.name,
+    embedding=embedding_model,
+    stream_update=True,
+)
+
+# Add vectors and mapped text chunks to your vector store
+vector_store.add_texts(texts=texts)
+```
+
+### 可选：你也可以创建向量并把分块存储到 datastore
+
+```python
+# NOTE : This operation can take upto 20 mins
+vector_store = VectorSearchVectorStoreDatastore.from_components(
+    project_id=PROJECT_ID,
+    region=REGION,
+    index_id=my_index.name,
+    endpoint_id=my_index_endpoint.name,
+    embedding=embedding_model,
+    stream_update=True,
+)
+
+vector_store.add_texts(texts=texts, is_complete_overwrite=True)
+```
+
+```python
+# Try running a simialarity search
+vector_store.similarity_search("pizza")
+```
+
+### 创建带元数据过滤的 vectorstore
+
+```python
+# Input text with metadata
+record_data = [
+    {
+        "description": "A versatile pair of dark-wash denim jeans."
+        "Made from durable cotton with a classic straight-leg cut, these jeans"
+        " transition easily from casual days to dressier occasions.",
+        "price": 65.00,
+        "color": "blue",
+        "season": ["fall", "winter", "spring"],
+    },
+    {
+        "description": "A lightweight linen button-down shirt in a crisp white."
+        " Perfect for keeping cool with breathable fabric and a relaxed fit.",
+        "price": 34.99,
+        "color": "white",
+        "season": ["summer", "spring"],
+    },
+    {
+        "description": "A soft, chunky knit sweater in a vibrant forest green. "
+        "The oversized fit and cozy wool blend make this ideal for staying warm "
+        "when the temperature drops.",
+        "price": 89.99,
+        "color": "green",
+        "season": ["fall", "winter"],
+    },
+    {
+        "description": "A classic crewneck t-shirt in a soft, heathered blue. "
+        "Made from comfortable cotton jersey, this t-shirt is a wardrobe essential "
+        "that works for every season.",
+        "price": 19.99,
+        "color": "blue",
+        "season": ["fall", "winter", "summer", "spring"],
+    },
+    {
+        "description": "A flowing midi-skirt in a delicate floral print. "
+        "Lightweight and airy, this skirt adds a touch of feminine style "
+        "to warmer days.",
+        "price": 45.00,
+        "color": "white",
+        "season": ["spring", "summer"],
+    },
+]
+```
+
+```python
+# Parse and prepare input data
+
+texts = []
+metadatas = []
+for record in record_data:
+    record = record.copy()
+    page_content = record.pop("description")
+    texts.append(page_content)
+    if isinstance(page_content, str):
+        metadata = {**record}
+        metadatas.append(metadata)
+```
+
+```python
+# Inspect metadatas
+metadatas
+```
+
+```python
+# NOTE : This operation can take more than 20 mins
+vector_store = VectorSearchVectorStore.from_components(
+    project_id=PROJECT_ID,
+    region=REGION,
+    gcs_bucket_name=BUCKET,
+    index_id=my_index.name,
+    endpoint_id=my_index_endpoint.name,
+    embedding=embedding_model,
+)
+
+vector_store.add_texts(texts=texts, metadatas=metadatas, is_complete_overwrite=True)
+```
+
+```python
+from google.cloud.aiplatform.matching_engine.matching_engine_index_endpoint import (
+    Namespace,
+    NumericNamespace,
+)
+```
+
+```python
+# Try running a simple similarity search
+
+# Below code should return 5 results
+vector_store.similarity_search("shirt", k=5)
+```
+
+```python
+# Try running a similarity search with text filter
+filters = [Namespace(name="season", allow_tokens=["spring"])]
+
+# Below code should return 4 results now
+vector_store.similarity_search("shirt", k=5, filter=filters)
+```
+
+```python
+# Try running a similarity search with combination of text and numeric filter
+filters = [Namespace(name="season", allow_tokens=["spring"])]
+numeric_filters = [NumericNamespace(name="price", value_float=40.0, op="LESS")]
+
+# Below code should return 2 results now
+vector_store.similarity_search(
+    "shirt", k=5, filter=filters, numeric_filter=numeric_filters
+)
+```
+
+### 将向量存储用作检索器
+
+```python
+# Initialize the vectore_store as retriever
+retriever = vector_store.as_retriever()
+```
+
+```python
+# perform simple similarity search on retriever
+retriever.invoke("What are my options in breathable fabric?")
+```
+
+```python
+# Try running a similarity search with text filter
+filters = [Namespace(name="season", allow_tokens=["spring"])]
+
+retriever.search_kwargs = {"filter": filters}
+
+# perform similarity search with filters on retriever
+retriever.invoke("What are my options in breathable fabric?")
+```
+
+```python
+# Try running a similarity search with combination of text and numeric filter
+filters = [Namespace(name="season", allow_tokens=["spring"])]
+numeric_filters = [NumericNamespace(name="price", value_float=40.0, op="LESS")]
+
+
+retriever.search_kwargs = {"filter": filters, "numeric_filter": numeric_filters}
+
+retriever.invoke("What are my options in breathable fabric?")
+```
+
+### 在问答链中结合检索器过滤条件
+
+```python
+from langchain_google_vertexai import VertexAI
+
+llm = VertexAI(model_name="gemini-pro")
+```
+
+```python
+from langchain_classic.chains import RetrievalQA
+
+filters = [Namespace(name="season", allow_tokens=["spring"])]
+numeric_filters = [NumericNamespace(name="price", value_float=40.0, op="LESS")]
+
+retriever.search_kwargs = {"k": 2, "filter": filters, "numeric_filter": numeric_filters}
+
+retrieval_qa = RetrievalQA.from_chain_type(
+    llm=llm,
+    chain_type="stuff",
+    retriever=retriever,
+    return_source_documents=True,
+)
+
+question = "What are my options in breathable fabric?"
+response = retrieval_qa({"query": question})
+print(f"{response['result']}")
+print("REFERENCES")
+print(f"{response['source_documents']}")
+```
+
+## 读取、切分、向量化并索引 PDF
+
+```python
+!pip install pypdf
+```
+
+<LangchainCommunityUnmaintained />
+
+```python
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+```
+
+```python
+loader = PyPDFLoader("https://arxiv.org/pdf/1706.03762.pdf")
+pages = loader.load()
+```
+
+```python
+text_splitter = RecursiveCharacterTextSplitter(
+    # Set a really small chunk size, just to show.
+    chunk_size=1000,
+    chunk_overlap=20,
+    length_function=len,
+    is_separator_regex=False,
+)
+doc_splits = text_splitter.split_documents(pages)
+```
+
+```python
+texts = [doc.page_content for doc in doc_splits]
+metadatas = [doc.metadata for doc in doc_splits]
+```
+
+```python
+texts[0]
+```
+
+```python
+# Inspect Metadata of 1st page
+metadatas[0]
+```
+
+```python
+vector_store = VectorSearchVectorStore.from_components(
+    project_id=PROJECT_ID,
+    region=REGION,
+    gcs_bucket_name=BUCKET,
+    index_id=my_index.name,
+    endpoint_id=my_index_endpoint.name,
+    embedding=embedding_model,
+)
+
+vector_store.add_texts(texts=texts, metadatas=metadatas, is_complete_overwrite=True)
+```
+
+```python
+vector_store = VectorSearchVectorStore.from_components(
+    project_id=PROJECT_ID,
+    region=REGION,
+    gcs_bucket_name=BUCKET,
+    index_id=my_index.name,
+    endpoint_id=my_index_endpoint.name,
+    embedding=embedding_model,
+)
+```
+
+## 混合搜索
+
+Vector Search 支持混合搜索。这是信息检索（IR）中的一种常见架构模式，将语义搜索与关键词搜索（也叫基于 token 的搜索）结合起来。借助混合搜索，开发者可以同时利用两种方法的优势，从而获得更高的检索质量。
+更多信息请参阅 [Vertex AI hybrid search documentation](https://cloud.google.com/vertex-ai/docs/vector-search/about-hybrid-search)。
+
+为了使用混合搜索，需要先拟合一个稀疏嵌入向量化器，并在 Vector Search 集成之外处理这些嵌入。
+`sklearn` 的 `TfidfVectorizer` 就是一种稀疏嵌入向量化器示例，当然也可以使用其他技术，例如 BM25。
+
+```python
+# Define some sample data
+texts = [
+    "The cat sat on",
+    "the mat.",
+    "I like to",
+    "eat pizza for",
+    "dinner.",
+    "The sun sets",
+    "in the west.",
+]
+
+# optional IDs
+ids = ["i_" + str(i + 1) for i in range(len(texts))]
+
+# optional metadata
+metadatas = [{"my_metadata": i} for i in range(len(texts))]
+```
+
+```python
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# Fit the TFIDF Vectorizer (This is usually done on a very large corpus of data to make sure that word statistics generalize well on new data)
+vectorizer = TfidfVectorizer()
+vectorizer.fit(texts)
+```
+
+```python
+# Utility function to transform text into a TF-IDF Sparse Vector
+def get_sparse_embedding(tfidf_vectorizer, text):
+    tfidf_vector = tfidf_vectorizer.transform([text])
+    values = []
+    dims = []
+    for i, tfidf_value in enumerate(tfidf_vector.data):
+        values.append(float(tfidf_value))
+        dims.append(int(tfidf_vector.indices[i]))
+    return {"values": values, "dimensions": dims}
+```
+
+```python
+# semantic (dense) embeddings
+embeddings = embedding_model.embed_documents(texts)
+# tfidf (sparse) embeddings
+sparse_embeddings = [get_sparse_embedding(vectorizer, x) for x in texts]
+```
+
+```python
+sparse_embeddings[0]
+```
+
+```python
+# Add the dense and sparse embeddings in Vector Search
+
+vector_store.add_texts_with_embeddings(
+    texts=texts,
+    embeddings=embeddings,
+    sparse_embeddings=sparse_embeddings,
+    ids=ids,
+    metadatas=metadatas,
+)
+```
+
+```python
+# Run hybrid search
+query = "the cat"
+embedding = embedding_model.embed_query(query)
+sparse_embedding = get_sparse_embedding(vectorizer, query)
+
+vector_store.similarity_search_by_vector_with_score(
+    embedding=embedding,
+    sparse_embedding=sparse_embedding,
+    k=5,
+    rrf_ranking_alpha=0.7,  # 0.7 weight to dense and 0.3 weight to sparse
+)
+```

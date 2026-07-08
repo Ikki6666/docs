@@ -1,0 +1,403 @@
+---
+title: Sandbox snapshots
+sidebarTitle: Snapshots
+description: 构建并捕获可复用的 sandbox 文件系统镜像。
+---
+
+**snapshot** 是一个可复用的文件系统 bundle，其底层由 Docker image 支撑。当你希望从自定义文件系统镜像启动 sandboxes 时，就可以构建或捕获 snapshot。
+
+你也可以从一个正在运行的 sandbox 中捕获 snapshot，例如安装 packages、写入数据文件，或配置状态，然后把结果 snapshot 下来，作为新的起始镜像重复使用。
+
+![Sandboxes snapshots page](/images/langsmith/sandboxes/sb-snapshots.png)
+
+## 从 Docker image 构建 snapshot
+
+你可以直接基于任意 Docker image 构建 snapshot。这个调用会阻塞，直到 snapshot 准备完成，默认超时 60 秒；如果镜像较大，请调高。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import SandboxClient
+
+client = SandboxClient()
+
+snapshot = client.create_snapshot(
+    "python",
+    docker_image="python:3.12-slim",
+    fs_capacity_bytes=1 * 1024**3,  # 1 GiB
+)
+
+print(snapshot.id)
+```
+
+```ts TypeScript
+import { SandboxClient } from "langsmith/sandbox";
+
+const client = new SandboxClient();
+
+const snapshot = await client.createSnapshot(
+  "python",
+  "python:3.12-slim",
+  1_073_741_824, // 1 GiB
+);
+
+console.log(snapshot.id);
+```
+
+</CodeGroup>
+
+### 私有 registry
+
+如果要从私有 registry 拉取镜像，请先创建一个带凭据的 registry，然后在构建 snapshot 时通过 id 引用它。Registries 是持久化的，因此可以在多个 snapshots 之间复用。
+
+<CodeGroup>
+
+```python Python
+import os
+
+registry = client.registries.create(
+    name="internal",
+    url="registry.example.com",
+    username="me",
+    password=os.environ["REGISTRY_PASSWORD"],
+)
+
+snapshot = client.create_snapshot(
+    "internal-python",
+    docker_image="registry.example.com/internal/python:3.12",
+    fs_capacity_bytes=2 * 1024**3,
+    registry_id=registry.id,
+    timeout=600,
+)
+```
+
+```ts TypeScript
+const registry = await client.registries.create({
+  name: "internal",
+  url: "registry.example.com",
+  username: "me",
+  password: process.env.REGISTRY_PASSWORD,
+});
+
+const snapshot = await client.createSnapshot(
+  "internal-python",
+  "registry.example.com/internal/python:3.12",
+  2_147_483_648,
+  {
+    registryId: registry.id,
+    timeout: 600,
+  },
+);
+```
+
+</CodeGroup>
+
+你可以通过 `client.registries.list()`、`client.registries.retrieve(name)`、`client.registries.update(name, ...)` 和 `client.registries.delete(name)` 来列出、查看、更新和删除 registries。
+
+## 从 Dockerfile 构建 snapshot
+
+如果你手头有本地 `Dockerfile`，但又不想先把 image 发布到 registry，那么可以直接从 `Dockerfile` 及其构建上下文构建 snapshot。LangSmith 会启动一个临时 builder sandbox，上传 context，在其中用 [BuildKit](https://docs.docker.com/build/buildkit/) 执行构建，并将生成的镜像捕获为 snapshot。构建完成后，builder sandbox 会自动销毁。
+
+这个调用会阻塞直到 snapshot 准备完成，默认超时 60 秒；对于大镜像或慢构建，请调高。`fs_capacity_bytes` 必须足够容纳构建上下文、中间层以及最终 image。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import SandboxClient
+
+client = SandboxClient()
+
+snapshot = client.create_snapshot_from_dockerfile(
+    "my-app",
+    dockerfile="Dockerfile",
+    fs_capacity_bytes=2 * 1024**3,  # 2 GiB
+    context=".",  # build context directory (default: current directory)
+)
+
+print(snapshot.id)
+```
+
+```ts TypeScript
+import { SandboxClient } from "langsmith/sandbox";
+
+const client = new SandboxClient();
+
+const snapshot = await client.createSnapshotFromDockerfile(
+  "my-app",
+  "Dockerfile",
+  2_147_483_648, // 2 GiB
+  { context: "." },
+);
+
+console.log(snapshot.id);
+```
+
+</CodeGroup>
+
+<Note>
+`dockerfile` 默认相对于 `context` 解析，除非你传入绝对路径；并且它必须位于 context 目录内部。`.git` 目录会在上传 context 时自动排除。
+</Note>
+
+### Build args 和 target stage
+
+通过 `build_args` / `buildArgs` 传入 Docker 的 `ARG` 值，通过 `target` 指定多阶段构建中的某个 stage 作为终点。
+
+<CodeGroup>
+
+```python Python
+snapshot = client.create_snapshot_from_dockerfile(
+    "my-app",
+    dockerfile="Dockerfile",
+    fs_capacity_bytes=2 * 1024**3,
+    build_args={"PYTHON_VERSION": "3.12", "ENV": "prod"},
+    target="runtime",
+)
+```
+
+```ts TypeScript
+const snapshot = await client.createSnapshotFromDockerfile(
+  "my-app",
+  "Dockerfile",
+  2_147_483_648,
+  {
+    buildArgs: { PYTHON_VERSION: "3.12", ENV: "prod" },
+    target: "runtime",
+  },
+);
+```
+
+</CodeGroup>
+
+### 流式读取构建日志
+
+向 `on_build_log` / `onBuildLog` 传入回调，可以在构建过程中接收 stdout 和 stderr，这对于展示进度或调试失败构建非常有用。
+
+<CodeGroup>
+
+```python Python
+snapshot = client.create_snapshot_from_dockerfile(
+    "my-app",
+    dockerfile="Dockerfile",
+    fs_capacity_bytes=2 * 1024**3,
+    on_build_log=lambda line: print(line, end=""),
+)
+```
+
+```ts TypeScript
+const snapshot = await client.createSnapshotFromDockerfile(
+  "my-app",
+  "Dockerfile",
+  2_147_483_648,
+  { onBuildLog: (line) => process.stdout.write(line) },
+);
+```
+
+</CodeGroup>
+
+### 加速冷启动构建
+
+`vcpus` / `vCpus` 和 `mem_bytes` / `memBytes` 用于配置临时 builder sandbox 的资源。构建过程中，BuildKit 和 native snapshotter 的 layer 复制都在其中运行，默认情况下会争抢单个 CPU core，因此多给 builder 一个 vCPU，通常能显著缩短冷构建的总耗时。
+
+<CodeGroup>
+
+```python Python
+snapshot = client.create_snapshot_from_dockerfile(
+    "my-app",
+    dockerfile="Dockerfile",
+    fs_capacity_bytes=2 * 1024**3,
+    vcpus=2,
+    mem_bytes=4 * 1024**3,  # 4 GiB
+    timeout=600,
+)
+```
+
+```ts TypeScript
+const snapshot = await client.createSnapshotFromDockerfile(
+  "my-app",
+  "Dockerfile",
+  2_147_483_648,
+  {
+    vCpus: 2,
+    memBytes: 4_294_967_296, // 4 GiB
+    timeout: 600,
+  },
+);
+```
+
+</CodeGroup>
+
+<Tip>
+同步 `SandboxClient` 和 `AsyncSandboxClient` 都暴露了这个方法，参数一致。在异步 client 上使用时，请写成 `await client.create_snapshot_from_dockerfile(...)`。
+</Tip>
+
+## 从运行中的 sandbox 捕获 snapshot
+
+先基于已有 snapshot 启动一个 sandbox，安装 packages 或准备数据，然后把结果捕获为新的 snapshot。返回的 snapshot 会把其 `source_sandbox_id` 设为来源 sandbox 的 ID，之后你可以在任何 `create_sandbox` 调用中，将其作为 `snapshot_id` 使用。
+
+<CodeGroup>
+
+```python Python
+sb = client.create_sandbox(snapshot_id=base_snapshot_id, name="setup-box")
+sb.run("pip install numpy pandas scikit-learn", timeout=180)
+sb.write("/opt/config.yaml", "model: gpt-5\n")
+
+# Capture the current filesystem as a new snapshot
+snapshot = sb.capture_snapshot("ml-ready")
+print(snapshot.id, snapshot.source_sandbox_id)
+
+sb.delete()
+
+# Boot fresh sandboxes pre-loaded with those dependencies
+with client.sandbox(snapshot_id=snapshot.id) as sb:
+    sb.run("python -c 'import numpy; print(numpy.__version__)'")
+    assert sb.read("/opt/config.yaml") == b"model: gpt-5\n"
+```
+
+```ts TypeScript
+const running = await client.createSandbox(baseSnapshotId, { name: "setup-box" });
+await running.run("pip install numpy pandas scikit-learn", { timeout: 180 });
+await running.write("/opt/config.yaml", "model: gpt-5\n");
+
+const snapshot = await running.captureSnapshot("ml-ready");
+console.log(snapshot.id, snapshot.source_sandbox_id);
+
+await running.delete();
+
+const sandbox = await client.createSandbox(snapshot.id);
+try {
+  await sandbox.run("python -c 'import numpy; print(numpy.__version__)'");
+  const cfg = await sandbox.read("/opt/config.yaml");
+  console.log(new TextDecoder().decode(cfg));
+} finally {
+  await sandbox.delete();
+}
+```
+
+</CodeGroup>
+
+<Note>
+捕获时只会保留**持久化文件系统**。安装的 packages，位于 `/usr/local`、`/root`、`/opt`、home 目录等，和你写入这些位置的文件都会被保留。运行中的进程、打开的 sockets、内存中的状态，以及 `/tmp` 下的任何内容，该目录是 tmpfs，**都不会**被保留。新 sandbox 启动后，仍需重新启动你需要的进程。
+</Note>
+
+<Tip>
+你也可以通过 snapshot 的**名称**而不是 ID 来启动 sandbox，这在你记得捕获时使用的人类可读标签时会很方便：
+
+<CodeGroup>
+
+```python Python
+sb = client.create_sandbox(snapshot_name="ml-ready")
+```
+
+```ts TypeScript
+const sb = await client.createSandbox({ snapshotName: "ml-ready" });
+```
+
+</CodeGroup>
+
+`snapshot_id` / `snapshot_name`，或 TypeScript 中的 `snapshotId` / `snapshotName`，两者最多传一个。如果都不传，则会使用默认 runtime。
+</Tip>
+
+### 调整捕获等待时间
+
+`capture_snapshot` 会阻塞，直到新的 snapshot 准备完成。如果你的文件系统很大，或存储后端较慢，请提高 `timeout` 参数，默认值为 60 秒。
+
+<CodeGroup>
+
+```python Python
+snapshot = sb.capture_snapshot("ml-ready-v2", timeout=600)
+```
+
+```ts TypeScript
+const snapshot = await sb.captureSnapshot("ml-ready-v2", { timeout: 600 });
+```
+
+</CodeGroup>
+
+## 列出、获取和删除 snapshots
+
+<CodeGroup>
+
+```python Python
+# List all snapshots in the workspace
+snapshots = client.list_snapshots()
+for s in snapshots:
+    print(s.id, s.name, s.status)
+
+# Fetch a single snapshot by ID
+snapshot = client.get_snapshot("550e8400-e29b-41d4-a716-446655440000")
+
+# Delete a snapshot (fails if any sandbox still references it)
+client.delete_snapshot(snapshot.id)
+```
+
+```ts TypeScript
+const snapshots = await client.listSnapshots();
+for (const s of snapshots) {
+  console.log(s.id, s.name, s.status);
+}
+
+const snapshot = await client.getSnapshot("550e8400-e29b-41d4-a716-446655440000");
+
+await client.deleteSnapshot(snapshot.id);
+```
+
+</CodeGroup>
+
+<Note>
+`list_snapshots` / `listSnapshots` 在服务端分页，默认页大小为 50，最大 500，并接受可选过滤参数：`name_contains` / `nameContains`，对 name 做大小写不敏感的子串匹配，`limit`，1–500，和 `offset`，≥ 0。若需翻页，请递增 `offset`。
+
+<CodeGroup>
+
+```python Python
+page = client.list_snapshots(name_contains="ml", limit=100)
+```
+
+```ts TypeScript
+const page = await client.listSnapshots({ nameContains: "ml", limit: 100 });
+```
+
+</CodeGroup>
+
+</Note>
+
+## 停止和启动 sandboxes
+
+Sandboxes 可以在不丢失文件系统状态的情况下停止并重新启动。你在上一次运行期间写入的文件，在 sandbox 重启后仍然存在。
+
+<CodeGroup>
+
+```python Python
+sb = client.create_sandbox(snapshot_id=snapshot.id, name="my-vm")
+sb.run("echo 'hello' > /tmp/state.txt")
+
+# Stop the sandbox — preserves files on disk
+sb.stop()
+
+# Later: start it again (blocks until ready, default timeout=120s)
+sb.start()
+
+result = sb.run("cat /tmp/state.txt")
+assert result.stdout.strip() == "hello"
+```
+
+```ts TypeScript
+const sb = await client.createSandbox(snapshot.id, { name: "my-vm" });
+await sb.run("echo 'hello' > /tmp/state.txt");
+
+await sb.stop();
+
+await sb.start();
+
+const result = await sb.run("cat /tmp/state.txt");
+console.log(result.stdout.trim()); // "hello"
+```
+
+</CodeGroup>
+
+你也可以直接通过名称在 client 上停止和启动 sandbox，Python 中使用 `client.stop_sandbox(name)` / `client.start_sandbox(name)`，TypeScript 中使用 `client.stopSandbox(name)` / `client.startSandbox(name)`。
+
+## 下一步
+
+- [使用 SDK 从 snapshots 创建 sandboxes](/langsmith/sandbox-sdk)
+- [通过 Service URLs 暴露 HTTP 服务](/langsmith/sandbox-service-urls)
+- [通过 Auth proxy 注入凭据](/langsmith/sandbox-auth-proxy)

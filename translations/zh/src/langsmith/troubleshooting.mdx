@@ -1,0 +1,207 @@
+---
+title: 故障排查
+sidebarTitle: Troubleshooting
+---
+
+本指南将带你了解在运行 self-hosted LangSmith 实例时，可能遇到的一些常见问题。
+
+在运行 LangSmith 的过程中，你可能会遇到意外的 500 错误、性能缓慢或其他异常情况。本指南将帮助你诊断并解决这些问题。
+
+## 获取有用的信息
+
+要诊断并解决问题，首先需要收集一些相关信息。下面几节说明了在 Kubernetes 或 Docker 环境中应如何收集这些信息，以及如何获取有帮助的浏览器信息。
+
+通常来说，你最需要重点分析的服务包括：
+
+- `langsmith-backend`：处理 CRUD API 请求、业务逻辑、前端和 SDK 发来的请求、用于写入的数据准备，以及 hub API。
+- `langsmith-platform-backend`：处理认证、run 写入以及其他高吞吐任务。
+- `langsmith-queue`：处理传入的 traces 和 feedback、异步写入和持久化到 datastore、数据完整性检查，以及数据库错误或连接问题期间的重试。
+
+如需了解这些服务的更多细节，请参阅[self-hosted 概览](/langsmith/self-hosted)。
+
+#### Kubernetes
+
+故障排查的第一步，是收集 LangSmith 部署的重要调试信息。服务日志、kubernetes events 以及容器资源利用率，都有助于找出问题的根因。
+
+你可以运行我们的 [k8s troubleshooting script](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/scripts/get_k8s_debugging_info.sh)，它会提取所有相关的 kubernetes 信息，并输出到一个文件夹中供你调查。该脚本还会将这个文件夹压缩为 zip 文件，便于共享。下面是一个示例，假设你的 LangSmith 部署运行在 `langsmith` namespace 中：
+
+```bash
+bash get_k8s_debugging_info.sh --namespace langsmith
+```
+
+然后你可以检查输出目录中的内容，查看是否有相关错误或有价值的信息。如果你希望 LangSmith 团队协助调试，请把这个 zip 文件分享给团队。
+
+#### Docker
+
+如果你运行在 Docker 上，可以通过以下命令检查部署日志：
+
+```bash
+docker compose logs >> logs.txt
+```
+
+#### 浏览器错误
+
+如果你遇到的问题体现在浏览器报错上，检查 HAR 文件也会很有帮助，因为它可能包含关键信息。要获取 HAR 文件，可参考[这份指南](https://support.langchain.com/articles/9042697994-how-to-generate-a-har-file-for-troubleshooting)，其中介绍了不同浏览器的简短操作流程。
+
+之后，你可以使用 [Google 的 HAR analyzer](https://toolbox.googleapps.com/apps/har_analyzer/) 来分析。你也可以把 HAR 文件发送给 LangSmith 团队，以协助调试。
+
+## 常见问题
+
+### *DB::Exception: Cannot reserve 1.00 MiB, not enough space: While executing WaitForAsyncInsert. (NOT_ENOUGH_SPACE)*
+
+当 ClickHouse 磁盘空间耗尽时，会出现这个错误。你需要增加可分配给 ClickHouse 的磁盘空间。
+
+#### Kubernetes
+
+在 Kubernetes 中，你需要增大 ClickHouse PVC 的容量。可以按以下步骤操作：
+
+1. 获取 PVC 的 storage class：`kubectl get pvc data-langsmith-clickhouse-0 -n <namespace> -o jsonpath='{.spec.storageClassName}'`
+
+2. 确认 storage class 具有 `AllowVolumeExpansion: true`：`kubectl get sc <storage-class-name> -o jsonpath='{.allowVolumeExpansion}'`
+
+   * 如果结果为 false，有些 storage class 可以更新为允许扩容。
+   * 要更新 storage class，可运行 `kubectl patch sc <storage-class-name> -p '{"allowVolumeExpansion": true}'`
+   * 如果更新失败，你可能需要创建一个设置正确的新 storage class。
+
+3. 编辑你的 pvc，指定新的容量：`kubectl edit pvc data-langsmith-clickhouse-0 -n <namespace>`，或 `kubectl patch pvc data-langsmith-clickhouse-0 '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}' -n <namespace>`
+
+4. 将 helm chart 中的 `langsmith_config.yaml` 更新为新的容量，例如 `100 Gi`
+
+5. 删除 clickhouse statefulset：`kubectl delete statefulset langsmith-clickhouse --cascade=orphan -n <namespace>`
+
+6. 使用更新后的容量重新应用 helm chart，可参考[升级指南](/langsmith/self-host-upgrades)
+
+7. 现在你的 pvc 应该已经有了新的容量。可通过 `kubectl get pvc` 和 `kubectl exec langsmith-clickhouse-0 -- bash -c "df"` 进行验证。
+
+#### Docker
+
+在 Docker 中，你需要增加 ClickHouse volume 的大小。可按以下步骤操作：
+
+1. 停止你的 LangSmith 实例：`docker compose down`
+2. 如果你使用的是 bind mount，需要增大挂载点的空间。
+3. 如果你使用的是 docker `volume`，则需要为 volume 或 Docker 分配更多空间。
+
+### *error: Dirty database version 'version'. fix and force version*
+
+当 ClickHouse 数据库与我们的 migrations 处于不一致状态时，会出现这个错误。你需要先回退到更早的数据库版本，然后重新执行升级 / migrations。
+
+#### Kubernetes
+
+1. 强制迁移到更早版本，其中 version = dirty version - 1。
+
+```bash
+kubectl exec -it deployments/langsmith-backend -- bash -c 'migrate -source "file://clickhouse/migrations" -database "clickhouse://$CLICKHOUSE_HOST:$CLICKHOUSE_NATIVE_PORT?username=$CLICKHOUSE_USER&password=$CLICKHOUSE_PASSWORD&database=$CLICKHOUSE_DB&x-multi-statement=true&x-migrations-table-engine=MergeTree&secure=$CLICKHOUSE_TLS" force <version>'
+```
+
+1. 重新执行升级 / migrations。
+
+#### Docker
+
+1. 强制迁移到更早版本，其中 version = dirty version - 1。
+
+```bash
+docker compose exec langchain-backend migrate -source "file://clickhouse/migrations" -database "clickhouse://$CLICKHOUSE_HOST:$CLICKHOUSE_NATIVE_PORT?username=$CLICKHOUSE_USER&password=$CLICKHOUSE_PASSWORD&database=$CLICKHOUSE_DB&x-multi-statement=true&x-migrations-table-engine=MergeTree&secure=$CLICKHOUSE_TLS" force <version>
+```
+
+1. 重新执行升级 / migrations。
+
+### *413 - request entity too large*
+
+当请求体大小超过允许的上限时，会出现这个错误。你需要在 Nginx 配置中增大最大请求体大小。
+
+#### Kubernetes
+
+1. 编辑你的 `langsmith_config.yaml`，并增大 `frontend.maxBodySize` [value](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/values.yaml#L519)。配置可能如下：
+
+```yaml
+frontend:
+  maxBodySize: "100M"
+```
+
+2. 将修改应用到集群中。
+
+### *Details: code: 497, message: default: Not enough privileges. to execute this query, it's necessary to have the grant CREATE ROW POLICY ON default.feedbacks_rmt*
+
+当用户没有在 ClickHouse 中创建 row policies 所需的权限时，会出现这个错误。在部署 Docker 版本时，你还需要从 GitHub 仓库中复制 `users.xml` 文件。该文件会向 `users.xml` 中加入 `<access_management>` 标签，从而让用户能够创建 row policies。下面是我们默认期望使用的 `users.xml` 文件：
+
+```xml
+<clickhouse>
+    <users>
+        <default>
+            <access_management>1</access_management>
+            <named_collection_control>1</named_collection_control>
+            <show_named_collections>1</show_named_collections>
+            <show_named_collections_secrets>1</show_named_collections_secrets>
+            <profile>default</profile>
+        </default>
+    </users>
+    <profiles>
+        <default>
+            <async_insert>1</async_insert>
+            <async_insert_max_data_size>2000000</async_insert_max_data_size>
+            <wait_for_async_insert>0</wait_for_async_insert>
+            <parallel_view_processing>1</parallel_view_processing>
+            <allow_simdjson>0</allow_simdjson>
+            <lightweight_deletes_sync>0</lightweight_deletes_sync>
+        </default>
+    </profiles>
+</clickhouse>
+```
+
+在某些环境中，你的挂载点可能对容器不可写。这种情况下，我们建议构建一个自定义镜像，并将 `users.xml` 内置进去。
+
+示例 `Dockerfile`：
+
+```dockerfile
+FROM clickhouse/clickhouse-server:24.8
+COPY ./users.xml /etc/clickhouse-server/users.d/users.xml
+```
+
+然后按以下步骤操作：
+
+1. 构建你的自定义镜像。
+
+```bash
+docker build -t <image-name> .
+```
+
+2. 更新你的 `docker-compose.yaml`，使用这个自定义镜像，并确保移除 users.xml 的挂载点。
+
+```yaml
+langchain-clickhouse:
+  image: <image-name>
+```
+
+3. 重启你的 LangSmith 实例。
+
+```bash
+docker compose down --volumes
+docker compose up
+```
+
+### *ClickHouse fails to start up when running a cluster with AquaSec*
+
+在某些环境中，AquaSec 可能会阻止 ClickHouse 正常启动。这通常表现为 ClickHouse pod 没有输出任何日志，并且始终无法被标记为 ready。
+一般来说，这是因为 AquaSec 设置了 `LD_PRELOAD`，从而干扰了 ClickHouse。要解决这个问题，可以在 ClickHouse 部署中增加以下环境变量：
+
+#### Kubernetes
+
+编辑你的 `langsmith_config.yaml`，或对应配置文件，并设置 `AQUA_SKIP_LD_PRELOAD` 环境变量：
+
+```yaml
+clickhouse:
+  statefulSet:
+    extraEnv:
+      - name: AQUA_SKIP_LD_PRELOAD
+        value: "true"
+```
+
+#### Docker
+
+编辑你的 `docker-compose.yaml`，并设置 `AQUA_SKIP_LD_PRELOAD` 环境变量：
+
+```yaml
+langchain-clickhouse:
+  environment:
+    - AQUA_SKIP_LD_PRELOAD=true
+```

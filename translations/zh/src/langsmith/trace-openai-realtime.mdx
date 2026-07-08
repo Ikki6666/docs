@@ -1,0 +1,183 @@
+---
+title: 跟踪 OpenAI Realtime 应用
+sidebarTitle: OpenAI Realtime
+tag: Beta
+description: 使用 LangSmith SDK 在 LangSmith 中跟踪 OpenAI Realtime 语音智能体。
+---
+
+<Note>
+此集成目前处于 beta 阶段，因此其 API 可能会发生变化。
+</Note>
+
+OpenAI Realtime 是一个 speech-to-speech 模型，它通过 WebSocket 流式传输带类型的 events。无论你是直接用原始连接来构建，还是使用 OpenAI Agents SDK，这个集成都能把每段对话捕获为一条独立的 LangSmith trace，并为每个有意义的 event，例如 transcripts、模型响应和工具调用，建立一个 span，并按 turn 进行组织。
+
+将你的 [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) 语音智能体跟踪到 LangSmith。关于高层约定，请参阅[语音 tracing 基础](/langsmith/trace-voice-fundamentals)。
+
+## 选择一种方式
+
+使用 OpenAI Realtime API 有两种构建方式，而 LangSmith 为每种方式都提供了 tracing 集成：
+
+- 如果你是直接通过 realtime client 连接，请使用 `wrap_realtime`。
+- 如果你是基于 OpenAI Agents SDK 构建，请改用 `wrap_realtime_session`。
+
+## 安装
+
+`langsmith[openai-realtime]>=0.9.7` extra 同时提供这两个 wrappers：
+
+<CodeGroup>
+
+```bash pip
+pip install "langsmith[openai-realtime]"
+```
+
+```bash uv
+uv add "langsmith[openai-realtime]"
+```
+
+</CodeGroup>
+
+## 设置环境变量
+
+```bash .env
+LANGSMITH_API_KEY=<your-langsmith-api-key>
+LANGSMITH_TRACING=true
+LANGSMITH_PROJECT=<your-desired-langsmith-project>
+OPENAI_API_KEY=<your-openai-api-key>
+```
+
+## 使用 Realtime client
+
+如果你是通过 `client.realtime.connect()` 自己打开 WebSocket 并驱动 event loop，请使用这种方式。
+
+### 设置 tracing
+
+`wrap_realtime` 会返回你连接对象的一个透明代理。你现有的 `async for event in connection` 循环、`session.update` 和工具处理逻辑都可以保持不变：
+
+```python
+from langsmith.integrations.openai_realtime import wrap_realtime
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI()
+
+async with client.realtime.connect(model="gpt-realtime-2") as raw, wrap_realtime(
+    raw,
+    project_name="openai-realtime-voice",
+) as connection:
+    await connection.session.update(session={...})  # your existing config
+
+    async for event in connection:
+        ...  # your existing handling: play audio, run tools, update UI
+```
+
+<Note>
+每段对话都会被捕获为一条独立 trace。如需把它与 LangSmith [thread](/langsmith/threads) 中的相关交互归到一起，例如继续先前会话，或从文本聊天中接续，请传入一个 `thread_id`。在不同 traces 之间复用同一个 ID，就会把它们的 events 关联起来。
+</Note>
+
+你在处理 event 时运行的任何 [`@traceable`](/langsmith/annotate-code) 工具，都会自动嵌套在该 event 之下。
+
+<Note>
+请在 `session.update` 中启用 `input_audio_transcription` 和 agent transcript，这样才能在 trace 中查看 transcript。
+</Note>
+
+### 记录对话音频
+
+当你把麦克风音频和播放音频送给这个代理时，它会把一份单独的立体声录音，左声道是用户，右声道是智能体，附加到 trace 中。若要标记 barge-ins，请使用 `is_agent_speaking`：
+
+```python
+import base64
+
+async with client.realtime.connect(model="gpt-realtime-2") as raw, wrap_realtime(
+    raw,
+    is_agent_speaking=lambda: speaker.buffered_bytes() > 0,
+) as connection:
+    # Record the agent's audio from the speaker, so the recording reflects only
+    # what was played — audio a barge-in discards before playback is never recorded.
+    speaker.set_played_callback(connection.record_agent_audio)
+
+    # Record the user's mic where you send it to the model.
+    async def send_mic(mic_chunk):
+        await connection.input_audio_buffer.append(
+            audio=base64.b64encode(mic_chunk).decode("ascii")
+        )
+        connection.record_user_audio(mic_chunk)          # user mic PCM16 as sent
+
+    async for event in connection:
+        if event.type == "response.output_audio.delta":
+            speaker.play(base64.b64decode(event.delta))
+```
+
+<Note>
+你应当从扬声器侧记录智能体的音频，这样录音才能准确反映实际播放出来的内容。在 barge-in 期间，尚未播放就被丢弃的生成音频不应被记录。这样才能让 trace 与用户真正听到的内容保持一致。
+</Note>
+
+## 使用 OpenAI Agents SDK
+
+如果你是使用 [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/realtime/guide/)，也就是 `RealtimeAgent` / `RealtimeRunner`，来构建智能体，并由它接管 turn 和 tool-call loop，请使用这种方式。
+
+<Note>
+Agents SDK 自带的 realtime tracing 会上传到 OpenAI 自己的 dashboard。请调用 `agents.set_tracing_disabled(True)`，以避免出现第二条独立的上传路径。
+</Note>
+
+### 设置 tracing
+
+`wrap_realtime_session` 会包装 `RealtimeSession`，并帮你进入上下文。你可以像使用原始对象一样对其进行迭代，SDK 会负责运行工具和管理 turns：
+
+```python
+from agents import set_tracing_disabled
+from agents.realtime import RealtimeAgent, RealtimeRunner
+from langsmith.integrations.openai_realtime import wrap_realtime_session
+
+set_tracing_disabled(True)
+
+runner = RealtimeRunner(
+    starting_agent=RealtimeAgent(name="assistant", instructions="...", tools=[...]),
+)
+session = await runner.run()
+
+async with wrap_realtime_session(
+    session,
+    project_name="openai-realtime-voice",
+) as conn:
+    async for event in conn:
+        ...  # your handling: play audio, update UI
+```
+
+对话 transcript 会根据 session 的 `history` snapshots 重建，因此即便 SDK 是按 partials 流式发送消息，你依然能看到完整消息。
+
+<Note>
+每段对话都会被捕获为一条独立 trace。如需把它与 LangSmith [thread](/langsmith/threads) 中的相关交互归到一起，例如继续先前会话，或从文本聊天中接续，请传入一个 `thread_id`。在不同 traces 之间复用同一个 ID，就会把它们的 events 关联起来。
+</Note>
+
+### 记录对话音频
+
+把麦克风音频和播放音频送给这个代理对象：
+
+```python
+# Record the agent's audio from the speaker, so the recording reflects only
+# what was played — audio a barge-in discards before playback is never recorded.
+speaker.set_played_callback(conn.record_agent_audio)
+
+# Record the user's mic where you send it to the session.
+async def send_mic(mic_chunk):
+    await conn.send_audio(mic_chunk)
+    conn.record_user_audio(mic_chunk)               # user mic PCM16 as sent
+
+async for event in conn:
+    if event.type == "audio":
+        speaker.play(event.audio.data)
+```
+
+<Note>
+你应当从扬声器侧记录智能体的音频，这样录音才能准确反映实际播放出来的内容。在 barge-in 期间，尚未播放就被丢弃的生成音频不应被记录。这样才能让 trace 与用户真正听到的内容保持一致。
+</Note>
+
+## 后续步骤
+
+<CardGroup cols={2}>
+  <Card title="Voice fundamentals" icon="waveform" href="/langsmith/trace-voice-fundamentals">
+    语音智能体 tracing 的核心约定。
+  </Card>
+  <Card title="Upload files with traces" icon="paperclip" href="/langsmith/upload-files-with-traces">
+    将对话录音附加到你的 trace。
+  </Card>
+</CardGroup>

@@ -1,0 +1,350 @@
+---
+title: "Microsoft Foundry middleware 集成"
+description: "使用 LangChain Python 与 Azure AI middleware 集成。"
+---
+
+这个 middleware 专为 Microsoft Foundry 和 Azure AI Content Safety 设计。更多信息请参阅 [middleware](/oss/langchain/middleware/overview)。
+
+这些 middleware 类位于 `langchain-azure-ai` 包中，并从 `langchain_azure_ai.agents.middleware` 导出。
+
+<Info>
+    Azure AI Content Safety middleware 当前在上游被标记为 experimental。随着 Azure AI Content Safety 和 LangChain middleware 支持继续成熟，API 表面预计会发生变化。
+</Info>
+
+## 概览
+
+| Middleware | Description |
+|------------|-------------|
+| [Text moderation](#text-moderation) | 检查输入和输出文本中的有害内容以及 blocklist 匹配 |
+| [Image moderation](#image-moderation) | 使用 Azure AI Content Safety 图像分析检查图像输入和输出 |
+| [Prompt shield](#prompt-shield) | 检测直接和间接的 prompt injection 尝试 |
+| [Protected material](#protected-material) | 检测受版权保护或其他受保护的文本或代码 |
+| [Groundedness](#groundedness) | 基于 grounding sources 评估模型输出并标记幻觉 |
+
+### 功能
+
+- 对有害内容和自定义 blocklist 进行文本审核。
+- 对 data URL 和公开 HTTP(S) 图像输入进行图像审核。
+- 使用 Prompt Shield 检测 prompt injection。
+- 检测文本和代码中的受保护材料。
+- 基于检索到的上下文评估生成答案的 groundedness。
+- 使用自定义 `context_extractor` 钩子，适配你的 agent state。
+
+## 设置
+
+要使用 Azure AI Content Safety middleware，请安装集成包，配置 Azure AI Foundry project endpoint 或 Azure Content Safety endpoint，并提供 credential。
+
+### 安装
+
+安装包：
+
+<CodeGroup>
+    ```bash pip
+    pip install -U langchain-azure-ai
+    ```
+    ```bash uv
+    uv add langchain-azure-ai
+    ```
+</CodeGroup>
+
+### 凭据
+
+身份验证时，可以通过 `credential` 参数传入 `DefaultAzureCredential()` 或 API key 字符串。使用 Foundry Project 时，必须使用 Microsoft Entra ID 进行身份验证。
+
+```python Initialize credential icon="shield-lock"
+from azure.identity import DefaultAzureCredential
+
+credential = DefaultAzureCredential()
+```
+
+### 实例化
+
+这个 middleware 支持两种 endpoint 形式：
+
+- 通过 `AZURE_CONTENT_SAFETY_ENDPOINT` 指定 Azure Content Safety resource endpoint
+- 通过 `AZURE_AI_PROJECT_ENDPOINT` 指定 Azure AI Foundry project endpoint
+
+如果两者都可用，优先使用 `project_endpoint`，因为它能为 Azure AI Foundry 工作流提供更好的默认值。在大多数场景下，你只需要设置一次环境变量，实例化时就可以省略 `endpoint` 或 `project_endpoint`。
+
+```python Configure endpoint icon="key"
+import os
+
+os.environ["AZURE_AI_PROJECT_ENDPOINT"] = "https://<resource>.services.ai.azure.com/api/projects/<project>"
+```
+
+从 `langchain_azure_ai.agents.middleware` 导入并配置 middleware。
+
+```python Initialize middleware icon="arrows-shuffle"
+from azure.identity import DefaultAzureCredential
+from langchain_azure_ai.agents.middleware import AzureContentModerationMiddleware
+
+middleware = AzureContentModerationMiddleware(
+    project_endpoint="https://<resource>.services.ai.azure.com/api/projects/<project>",
+    credential=DefaultAzureCredential(),
+    categories=["Hate", "Violence"],
+    exit_behavior="error",
+)
+```
+
+## 与 agent 一起使用
+
+按顺序把 middleware 传给 @[`create_agent`]。你可以把 Azure AI middleware 和 [built-in middleware](/oss/langchain/middleware/built-in) 一起使用。
+
+```python Agent with middleware icon="robot"
+from azure.identity import DefaultAzureCredential
+from langchain.agents import create_agent
+from langchain_azure_ai.agents.middleware import AzureContentModerationMiddleware
+
+agent = create_agent(
+    model="azure_ai:gpt-5.5",
+    middleware=[
+        AzureContentModerationMiddleware(
+            project_endpoint="https://<resource>.services.ai.azure.com/api/projects/<project>",
+            credential=DefaultAzureCredential(),
+            categories=["Hate", "Violence"],
+            exit_behavior="error",
+        )
+    ],
+)
+```
+
+<Tip>
+    如果 `AZURE_AI_PROJECT_ENDPOINT` 已经设置，你通常可以在实例化时省略 `project_endpoint`。
+</Tip>
+
+## Azure AI Content Safety
+
+### 文本审核
+
+使用 `AzureContentModerationMiddleware` 可以在 agent 运行前检查最后一条 `HumanMessage`，并在 agent 运行后检查最后一条 `AIMessage`。这个 middleware 使用 Azure AI Content Safety 的有害内容检测，也可以检查你资源中配置的自定义 blocklist。
+
+文本审核适用于以下场景：
+
+- 在模型调用前拦截有害用户输入
+- 在模型输出到达终端用户前进行检查
+- 在受监管或企业部署中执行自定义 blocklist
+- 组合多个审核流程，并使用不同的类别和方向设置
+
+```python
+from azure.identity import DefaultAzureCredential
+from langchain_azure_ai.agents.middleware import AzureContentModerationMiddleware
+
+middleware = AzureContentModerationMiddleware(
+    project_endpoint="https://<resource>.services.ai.azure.com/api/projects/<project>",
+    credential=DefaultAzureCredential(),
+    categories=["Hate", "SelfHarm", "Sexual", "Violence"],
+    severity_threshold=4,
+    exit_behavior="error",
+    apply_to_input=True,
+    apply_to_output=True,
+)
+```
+
+<Accordion title="配置选项">
+
+<ParamField body="categories" type="list[str] | None">
+    要分析的有害内容类别。有效值为 `'Hate'`、`'SelfHarm'`、`'Sexual'` 和 `'Violence'`。默认会使用这四个类别。
+</ParamField>
+
+<ParamField body="severity_threshold" type="int" default="4">
+    触发所配置行为的最小严重级别，范围从 `0` 到 `6`。
+</ParamField>
+
+<ParamField body="exit_behavior" type="string" default="error">
+    可选值为 `'error'`、`'continue'` 或 `'replace'`。
+</ParamField>
+
+<ParamField body="apply_to_input" type="bool" default="True">
+    是否在 agent 运行前检查最后一条 `HumanMessage`。
+</ParamField>
+
+<ParamField body="apply_to_output" type="bool" default="True">
+    是否在 agent 运行后检查最后一条 `AIMessage`。
+</ParamField>
+
+<ParamField body="blocklist_names" type="list[str] | None">
+    Azure Content Safety resource 中配置的自定义 blocklist 名称。
+</ParamField>
+
+<ParamField body="context_extractor" type="Callable | None">
+    可选 callable，用于从 agent state 和 runtime 中提取要检查的文本。
+</ParamField>
+
+</Accordion>
+
+### 图像审核
+
+当 agent 处理视觉内容时，请使用 `AzureContentModerationForImagesMiddleware`。它会从最新的输入或输出消息中提取图像，并使用 Azure AI Content Safety 图像分析 API 进行审核。
+
+这个 middleware 支持：
+
+- Base64 data URL，例如 `data:image/png;base64,...`
+- 公开的 HTTP(S) 图像 URL
+
+```python
+from azure.identity import DefaultAzureCredential
+from langchain_azure_ai.agents.middleware import (
+    AzureContentModerationForImagesMiddleware,
+)
+
+middleware = AzureContentModerationForImagesMiddleware(
+    endpoint="https://<resource>.cognitiveservices.azure.com/",
+    credential=DefaultAzureCredential(),
+    categories=["Hate", "SelfHarm", "Sexual", "Violence"],
+    severity_threshold=4,
+    exit_behavior="error",
+    apply_to_input=True,
+    apply_to_output=False,
+)
+```
+
+<Accordion title="配置选项">
+
+<ParamField body="categories" type="list[str] | None">
+    要分析的图像有害内容类别。默认使用全部四个支持的类别。
+</ParamField>
+
+<ParamField body="severity_threshold" type="int" default="4">
+    触发所配置行为的最小严重级别，范围从 `0` 到 `6`。
+</ParamField>
+
+<ParamField body="exit_behavior" type="string" default="error">
+    可选值为 `'error'` 或 `'continue'`。
+</ParamField>
+
+<ParamField body="apply_to_input" type="bool" default="True">
+    是否检查最近一条 `HumanMessage` 中的图像。
+</ParamField>
+
+<ParamField body="apply_to_output" type="bool" default="False">
+    是否检查最近一条 `AIMessage` 中的图像。
+</ParamField>
+
+<ParamField body="context_extractor" type="Callable | None">
+    可选 callable，用于从 agent state 和 runtime 中提取图像。
+</ParamField>
+
+</Accordion>
+
+### Prompt shield
+
+使用 `AzurePromptShieldMiddleware` 可以检测用户提示词和可选支持文档中的 prompt injection。默认只检查输入，因为 prompt injection 通常是输入侧攻击，但你也可以启用输出检查。
+
+```python
+from azure.identity import DefaultAzureCredential
+from langchain_azure_ai.agents.middleware import AzurePromptShieldMiddleware
+
+middleware = AzurePromptShieldMiddleware(
+    project_endpoint="https://<resource>.services.ai.azure.com/api/projects/<project>",
+    credential=DefaultAzureCredential(),
+    exit_behavior="continue",
+    apply_to_input=True,
+    apply_to_output=False,
+)
+```
+
+<Accordion title="配置选项">
+
+<ParamField body="exit_behavior" type="string" default="error">
+    可选值为 `'error'`、`'continue'` 或 `'replace'`。
+</ParamField>
+
+<ParamField body="apply_to_input" type="bool" default="True">
+    是否在 agent 运行前检查最新的 `HumanMessage`。
+</ParamField>
+
+<ParamField body="apply_to_output" type="bool" default="False">
+    是否在 agent 运行后检查最新的 `AIMessage`。
+</ParamField>
+
+<ParamField body="context_extractor" type="Callable | None">
+    可选 callable，用于从 agent state 和 runtime 中提取用户提示词和 grounding documents。
+</ParamField>
+
+</Accordion>
+
+### Protected material
+
+使用 `AzureProtectedMaterialMiddleware` 可以检测受保护内容，例如受版权保护的文本或代码。这个 middleware 可以同时检查最新的用户输入和最新的模型输出。
+
+```python
+from azure.identity import DefaultAzureCredential
+from langchain_azure_ai.agents.middleware import AzureProtectedMaterialMiddleware
+
+middleware = AzureProtectedMaterialMiddleware(
+    endpoint="https://<resource>.cognitiveservices.azure.com/",
+    credential=DefaultAzureCredential(),
+    type="code",
+    exit_behavior="replace",
+    apply_to_input=False,
+    apply_to_output=True,
+    violation_message="Protected material detected. Please provide a higher-level summary instead.",
+)
+```
+
+<Accordion title="配置选项">
+
+<ParamField body="type" type="string" default="text">
+    要检查的内容类型：`'text'` 或 `'code'`。
+</ParamField>
+
+<ParamField body="exit_behavior" type="string" default="error">
+    可选值为 `'error'`、`'continue'` 或 `'replace'`。
+</ParamField>
+
+<ParamField body="apply_to_input" type="bool" default="True">
+    是否检查最新的 `HumanMessage`。
+</ParamField>
+
+<ParamField body="apply_to_output" type="bool" default="True">
+    是否检查最新的 `AIMessage`。
+</ParamField>
+
+<ParamField body="context_extractor" type="Callable | None">
+    可选 callable，用于从 agent state 和 runtime 中提取文本。
+</ParamField>
+
+</Accordion>
+
+### Groundedness
+
+使用 `AzureGroundednessMiddleware` 可以评估模型响应是否基于 agent 可用的上下文。与本页其他 middleware 类不同，groundedness 会在模型生成后运行，并把生成的答案与支持来源进行比对。
+
+默认情况下，groundedness 会从当前对话中收集 sources，包括 system content、tool outputs，以及附加到模型响应上的相关注释。
+
+```python
+from azure.identity import DefaultAzureCredential
+from langchain_azure_ai.agents.middleware import AzureGroundednessMiddleware
+
+middleware = AzureGroundednessMiddleware(
+    project_endpoint="https://<resource>.services.ai.azure.com/api/projects/<project>",
+    credential=DefaultAzureCredential(),
+    domain="Generic",
+    task="QnA",
+    exit_behavior="continue",
+)
+```
+
+<Accordion title="配置选项">
+
+<ParamField body="domain" type="string" default="Generic">
+    分析域。支持值为 `'Generic'` 和 `'Medical'`。
+</ParamField>
+
+<ParamField body="task" type="string" default="Summarization">
+    分析的任务类型。支持值为 `'Summarization'` 和 `'QnA'`。
+</ParamField>
+
+<ParamField body="exit_behavior" type="string" default="error">
+    可选值为 `'error'` 或 `'continue'`。
+</ParamField>
+
+<ParamField body="context_extractor" type="Callable | None">
+    可选 callable，用于从 agent state 和 runtime 中提取答案、grounding sources 以及可选问题。
+</ParamField>
+
+</Accordion>
+
+## API reference
+
+完整的 public API 请查看 [`langchain_azure_ai.agents.middleware`](https://github.com/langchain-ai/langchain-azure/tree/main/libs/azure-ai/langchain_azure_ai/agents/middleware) 中导出的 middleware，以及底层的 Content Safety middleware 包 [`langchain_azure_ai.agents.middleware.content_safety`](https://github.com/langchain-ai/langchain-azure/tree/main/libs/azure-ai/langchain_azure_ai/agents/middleware/content_safety)。

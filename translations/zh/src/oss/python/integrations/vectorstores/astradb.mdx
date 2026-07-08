@@ -1,0 +1,277 @@
+---
+title: "Astra DB 集成"
+description: "使用 LangChain Python 集成 Astra DB 向量存储。"
+---
+
+本页提供了使用 Astra DB 作为向量存储的快速入门。
+
+> [DataStax Astra DB](https://docs.datastax.com/en/astra-db-serverless/index.html) 是一个无服务器、面向 AI 的数据库，基于 `Apache Cassandra®` 构建，并通过易用的 JSON API 提供服务。
+
+## 设置
+
+### 依赖
+
+使用该集成需要安装 `langchain-astradb` partner package：
+
+```python
+!pip install \
+    "langchain>=0.3.23,<0.4" \
+    "langchain-core>=0.3.52,<0.4" \
+    "langchain-astradb>=0.6,<0.7"
+```
+
+### 凭证
+
+要使用 AstraDB 向量存储，你需要先访问 [AstraDB website](https://astra.datastax.com)，创建账户并新建数据库，初始化可能需要几分钟。
+
+数据库初始化完成后，请获取你的 [connection secrets](https://docs.datastax.com/en/astra-db-serverless/get-started/quickstart.html#create-a-database-and-store-your-credentials)。你稍后会用到以下内容：
+
+- 一个 **`API Endpoint`**，例如 `"https://01234567-89ab-cdef-0123-456789abcdef-us-east1.apps.astra.datastax.com/"`
+- 一个 **`Database Token`**，例如 `"AstraCS:aBcD123......"`
+
+你也可以可选地提供一个 **`keyspace`**，在 LangChain 组件里称为 "namespace"。它可以在数据库控制台的 `Data Explorer` 标签中管理。如果你愿意，可以在下面的提示里留空，然后退回到默认 keyspace。
+
+```python
+import getpass
+
+ASTRA_DB_API_ENDPOINT = input("ASTRA_DB_API_ENDPOINT = ").strip()
+ASTRA_DB_APPLICATION_TOKEN = getpass.getpass("ASTRA_DB_APPLICATION_TOKEN = ").strip()
+
+desired_keyspace = input("(optional) ASTRA_DB_KEYSPACE = ").strip()
+if desired_keyspace:
+    ASTRA_DB_KEYSPACE = desired_keyspace
+else:
+    ASTRA_DB_KEYSPACE = None
+```
+
+如果你希望为模型调用开启更完善的自动 tracing，也可以取消下面代码的注释，设置你的 [LangSmith](/langsmith/observability) API key：
+
+```python
+os.environ["LANGSMITH_API_KEY"] = getpass.getpass("Enter your LangSmith API key: ")
+os.environ["LANGSMITH_TRACING"] = "true"
+```
+
+## 初始化
+
+创建 Astra DB 向量存储有多种方式：
+
+#### 方法 1：显式 embedding
+
+你可以单独实例化一个 `langchain_core.embeddings.Embeddings` 类，并将其传给 `AstraDBVectorStore` 构造函数，这和大多数 LangChain vector store 的用法一致。
+
+#### 方法 2：服务端 embedding（`vectorize`）
+
+你也可以使用 Astra DB 的 [server-side embedding computation](https://docs.datastax.com/en/astra-db-serverless/databases/embedding-generation.html) 功能，也就是 `vectorize`。在创建存储对应的服务端基础设施时，只需指定 embedding model。之后的读写操作中的 embedding 计算都会完全在数据库内部完成。
+
+#### 方法 3：从已有 collection 自动识别
+
+如果你的 Astra DB 中已经存在某个 [collection](https://docs.datastax.com/en/astra-db-serverless/api-reference/collections.html)，并且可能已经通过 Astra UI 或第三方应用写入过数据，而你只想在 LangChain 中查询它，那么推荐在构造函数中启用 `autodetect_collection` 模式，让组件自行识别细节。
+
+#### 关于 hybrid search
+
+Astra DB 向量存储支持在向量搜索中使用元数据过滤；另外，从 0.6 版本开始，它还通过数据库原语 [findAndRerank](https://docs.datastax.com/en/astra-db-serverless/api-reference/document-methods/find-and-rerank.html) 完整支持 _hybrid search_：文档会同时通过向量相似度检索和关键字检索（lexical）被取回，然后由 reranker 模型进行融合。这个完全在服务端执行的搜索策略通常能提升结果准确性，从而改善你的 RAG 应用质量。只要可用，vector store 默认会自动使用 hybrid search。
+
+#### 其他信息
+
+`AstraDBVectorStore` 可以通过很多方式配置；完整内容请参阅 @[API reference][AstraDBVectorStore]，其中包括异步初始化、非 Astra-DB 数据库、自定义索引 allow/deny list、手动 hybrid-search 控制等。
+
+### 显式 embedding 初始化（方法 1）
+
+使用显式 embedding 类来实例化向量存储：
+
+<EmbeddingTabs/>
+
+```python
+# | output: false
+# | echo: false
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+```
+
+```python
+from langchain_astradb import AstraDBVectorStore
+
+vector_store_explicit_embeddings = AstraDBVectorStore(
+    collection_name="astra_vector_langchain",
+    embedding=embeddings,
+    api_endpoint=ASTRA_DB_API_ENDPOINT,
+    token=ASTRA_DB_APPLICATION_TOKEN,
+    namespace=ASTRA_DB_KEYSPACE,
+)
+```
+
+### 服务端 embedding 初始化（`vectorize`，方法 2）
+
+下面的示例假设你已经：
+
+- 在 Astra DB organization 中启用了 OpenAI integration
+- 向该 integration 添加了一个名为 `"OPENAI_API_KEY"` 的 API key，并将其作用域绑定到当前数据库
+
+更多说明以及如何切换 provider/model，请参阅 [documentation](https://docs.datastax.com/en/astra-db-serverless/databases/embedding-generation.html)。
+
+```python
+from astrapy.info import VectorServiceOptions
+
+openai_vectorize_options = VectorServiceOptions(
+    provider="openai",
+    model_name="text-embedding-3-small",
+    authentication={
+        "providerKey": "OPENAI_API_KEY",
+    },
+)
+
+vector_store_integrated_embeddings = AstraDBVectorStore(
+    collection_name="astra_vectorize_langchain",
+    api_endpoint=ASTRA_DB_API_ENDPOINT,
+    token=ASTRA_DB_APPLICATION_TOKEN,
+    namespace=ASTRA_DB_KEYSPACE,
+    collection_vector_service_options=openai_vectorize_options,
+)
+```
+
+### 自动识别初始化（方法 3）
+
+如果 collection 已经存在于数据库中，并且你希望 `AstraDBVectorStore` 直接使用它（无论读还是写），可以使用这种模式。LangChain 组件会自动检查 collection 并推断所需细节。
+
+如果 collection 是通过 LangChain 之外的工具创建和写入的，例如通过 Astra DB Web 界面导入数据，那么推荐使用这种方式。
+
+自动识别模式不能与 _collection_ 级别设置同时使用；另一方面，如果没有启用服务端 embedding，仍然需要向构造函数传入一个 @[`Embeddings`] 对象。
+
+```python
+vector_store_autodetected = AstraDBVectorStore(
+    collection_name="astra_vectorize_langchain",
+    api_endpoint=ASTRA_DB_API_ENDPOINT,
+    token=ASTRA_DB_APPLICATION_TOKEN,
+    namespace=ASTRA_DB_KEYSPACE,
+    autodetect_collection=True,
+)
+```
+
+## 管理向量存储
+
+创建好向量存储之后，你可以通过添加和删除条目与其交互。
+
+所有与向量存储的交互方式都与初始化方法无关。你可以按需 **修改下面的单元格**，选择一个你已经创建并想测试的向量存储。
+
+```python
+# vector_store = vector_store_explicit_embeddings
+vector_store = vector_store_integrated_embeddings
+# vector_store = vector_store_autodetected
+```
+
+### 添加条目到向量存储
+
+使用 `add_documents` 方法把文档加入向量存储。
+
+```python
+from langchain_core.documents import Document
+
+documents_to_insert = [
+    Document(
+        page_content="ZYX, just another tool in the world, is actually my agent-based superhero",
+        metadata={"source": "tweet"},
+        id="entry_00",
+    ),
+    ...
+]
+
+vector_store.add_documents(documents=documents_to_insert)
+```
+
+### 从向量存储中删除条目
+
+按 ID 删除：
+
+```python
+vector_store.delete(ids=["entry_10", "entry_02"])
+```
+
+## 查询向量存储
+
+向量存储创建并写入完成后，你就可以对它进行查询，例如将其接入 chain 或 agent。
+
+### 直接查询
+
+#### 相似度搜索
+
+```python
+results = vector_store.similarity_search(
+    "LangChain provides abstractions to make working with LLMs easy",
+    k=3,
+    filter={"source": "tweet"},
+)
+for res in results:
+    print(f'* "{res.page_content}", metadata={res.metadata}')
+```
+
+#### 带分数的相似度搜索
+
+```python
+results = vector_store.similarity_search_with_score(
+    "LangChain provides abstractions to make working with LLMs easy",
+    k=3,
+    filter={"source": "tweet"},
+)
+for res, score in results:
+    print(f'* [SIM={score:.2f}] "{res.page_content}", metadata={res.metadata}')
+```
+
+#### 指定不同的关键字查询（需要 hybrid search）
+
+如果 collection 支持 [find-and-rerank](https://docs.datastax.com/en/astra-db-serverless/api-reference/document-methods/find-and-rerank.html)，且 vector store 已识别出该能力，那么默认搜索时会使用 hybrid search。
+
+在这种情况下，默认会把同一段查询文本同时用于向量相似度和 lexical 检索步骤，_除非你显式地为后者提供不同的 query_：
+
+```python
+results = vector_store_autodetected.similarity_search(
+    "LangChain provides abstractions to make working with LLMs easy",
+    k=3,
+    filter={"source": "tweet"},
+    lexical_query="agent",
+)
+for res in results:
+    print(f'* "{res.page_content}", metadata={res.metadata}')
+```
+
+#### 其他搜索方法
+
+还有一些搜索方式本页没有覆盖，例如 MMR 搜索和按向量搜索。
+
+完整的搜索模式请参阅 @[API reference][AstraDBVectorStore]。
+
+### 通过转成 retriever 查询
+
+你也可以把 vector store 变成 retriever，以便更方便地接入 chain。
+
+```python
+retriever = vector_store.as_retriever(
+    search_type="similarity_score_threshold",
+    search_kwargs={"k": 1, "score_threshold": 0.5},
+)
+retriever.invoke("Stealing from the bank is a crime", filter={"source": "news"})
+```
+
+## 用于检索增强生成
+
+如果你想在检索增强生成（RAG）中使用这个向量存储，请参阅以下内容：
+
+- [Retrieval docs](/oss/langchain/retrieval)
+- [Build a RAG app with LangChain](/oss/langchain/rag)
+- [Agentic RAG](/oss/langgraph/agentic-rag)
+
+更多内容可参考 [complete RAG template using Astra DB](https://github.com/langchain-ai/langchain/tree/master/templates/rag-astradb)。
+
+## 清理向量存储
+
+如果你想从 Astra DB 实例中彻底删除这个 collection，可以运行：
+
+```python
+vector_store.delete_collection()
+```
+
+---
+
+## API reference
+
+有关 `AstraDBVectorStore` 全部功能与配置的详细文档，请参阅 @[API reference][AstraDBVectorStore]。

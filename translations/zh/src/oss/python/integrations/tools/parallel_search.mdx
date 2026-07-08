@@ -1,0 +1,228 @@
+---
+title: "Parallel search 集成"
+description: "使用 LangChain Python 集成 ParallelSearchTool 工具。"
+---
+
+>[Parallel](https://platform.parallel.ai/) 是一个为 LLM 和 AI 应用构建的实时网页搜索与内容提取平台。
+
+`ParallelSearchTool` 调用 Parallel 的 [Search API](https://docs.parallel.ai/search/search-quickstart)，将传统的 search → scrape → extract 流程压缩为一次调用，并返回为 LLM 优化的结构化摘录。
+
+<Note>
+    `ParallelSearchTool` 是标准类名。早期的 `ParallelWebSearchTool` 仍然可作为同一类的别名继续使用。需要一个可直接放进 RAG chain 的 `BaseRetriever` 吗？请参阅 [ParallelSearchRetriever](/oss/integrations/retrievers/parallel)。
+</Note>
+
+## 概览
+
+### 集成详情
+
+| Class | Package | Serializable | JS support | Package latest |
+| :--- | :--- | :---: | :---: | :---: |
+| @[`ParallelSearchTool`] | @[`langchain-parallel`] | ❌ | ❌ | <a href="https://pypi.org/project/langchain-parallel/" target="_blank"><img src="https://img.shields.io/pypi/v/langchain-parallel?style=flat-square&label=%20&color=orange" alt="PyPI - Latest version" noZoom height="100" class="rounded" /></a> |
+
+## 设置
+
+该集成位于 `langchain-parallel` 包中。
+
+<CodeGroup>
+    ```bash pip
+    pip install -U langchain-parallel
+    ```
+    ```bash uv
+    uv add langchain-parallel
+    ```
+</CodeGroup>
+
+### 凭证
+
+前往 [Parallel](https://platform.parallel.ai) 注册并生成 API key。然后在环境中设置 `PARALLEL_API_KEY`：
+
+```python
+import getpass
+import os
+
+if not os.environ.get("PARALLEL_API_KEY"):
+    os.environ["PARALLEL_API_KEY"] = getpass.getpass("Parallel API key:\n")
+```
+
+## 实例化
+
+```python
+from langchain_parallel import ParallelSearchTool
+
+tool = ParallelSearchTool()
+
+# Or pass an explicit key / override the base URL:
+# tool = ParallelSearchTool(
+#     api_key="your-api-key",
+#     base_url="https://api.parallel.ai",  # default
+# )
+```
+
+## 调用
+
+### 使用 args 直接调用
+
+该工具要求传入 `search_queries`（一个或多个关键词字符串）。你可以搭配 `objective` 来获得更好的相关性排序，也可以按需添加域名过滤、抓取策略及其他设置。
+
+```python
+result = tool.invoke(
+    {
+        "search_queries": [
+            "AI breakthroughs 2026",
+            "machine learning advances",
+            "generative AI news",
+        ],
+        "objective": "What are the latest developments in AI?",
+        "max_results": 8,
+        "excerpts": {"max_chars_per_result": 2000},
+        "mode": "advanced",
+        "source_policy": {
+            "include_domains": ["arxiv.org", "nature.com"],
+            "exclude_domains": ["reddit.com", "twitter.com"],
+        },
+        "fetch_policy": {
+            "max_age_seconds": 86400,
+            "timeout_seconds": 60,
+        },
+        "include_metadata": True,
+    }
+)
+
+print(f"Found {len(result['results'])} results")
+for r in result["results"][:3]:
+    print(r["title"], "—", r["url"])
+```
+
+```text
+Found 8 results
+Latest AI Developments 2026 — https://arxiv.org/abs/...
+...
+```
+
+`mode="basic"` 是更低延迟的设置，`mode="advanced"` 则会执行质量更高的搜索。
+
+### 使用 ToolCall 调用
+
+使用模型生成的 `ToolCall` 调用时，会返回一个 `ToolMessage`：
+
+```python
+model_generated_tool_call = {
+    "args": {
+        "search_queries": [
+            "climate change initiatives",
+            "global climate policy 2026",
+        ],
+        "objective": "Find recent news about climate change initiatives",
+        "max_results": 3,
+        "source_policy": {
+            "include_domains": ["ipcc.ch", "unfccc.int", "nature.com"],
+        },
+        "include_metadata": True,
+    },
+    "id": "call_123",
+    "name": tool.name,  # "parallel_web_search"
+    "type": "tool_call",
+}
+
+result = tool.invoke(model_generated_tool_call)
+```
+
+### 异步用法
+
+```python
+async def search_async():
+    return await tool.ainvoke(
+        {
+            "search_queries": ["quantum computing breakthroughs"],
+            "objective": "Latest quantum computing breakthroughs",
+            "max_results": 5,
+        }
+    )
+
+result = await search_async()
+```
+
+### 参数
+
+#### 必填
+
+- `search_queries`: 关键词字符串列表（每个关键词 3-6 个词时通常效果最好）。
+
+#### 可选
+
+- `objective`: 对检索目标的自然语言描述。
+- `max_results`: 返回结果数（默认 10）。
+- `excerpts`: 每条结果的摘录设置，例如 `{"max_chars_per_result": 1500}`。
+- `mode`: `"basic"`（低延迟）或 `"advanced"`（高质量）。
+- `source_policy`: 域名过滤。可接受 `SourcePolicy` pydantic model，也可接受带有 `include_domains` / `exclude_domains` / `after_date` 的原始 dict。
+- `fetch_policy`: 缓存控制，例如 `{"max_age_seconds": 86400, "timeout_seconds": 60}`。
+- `max_chars_total`: 所有结果摘录合并长度的上限。
+- `client_model` / `session_id` / `location`: 会透传给 Parallel，用于下游归因和个性化。
+- `include_metadata`: 是否在响应中包含客户端侧耗时信息（默认 `True`）。
+- `timeout`: 单次请求的超时秒数。
+
+### SourcePolicy pydantic model
+
+@[`SourcePolicy`] 与 API 的 `include_domains` / `exclude_domains` / `after_date` 对应。你可以用它获得类型安全，也可以直接传入原始 dict。
+
+```python
+from langchain_parallel import SourcePolicy
+
+result = tool.invoke({
+    "search_queries": ["renewable energy policy Europe"],
+    "source_policy": SourcePolicy(
+        include_domains=["europa.eu", "iea.org", "irena.org"],
+        exclude_domains=["wikipedia.org", "reddit.com"],
+    ),
+    "max_results": 15,
+})
+```
+
+## 链式调用
+
+把工具绑定到任意支持工具调用的聊天模型，再使用 [`create_agent`](/oss/langchain/agents) 驱动 agent：
+
+```python
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
+
+llm = init_chat_model(model="claude-opus-4-8")
+agent = create_agent(model=llm, tools=[tool])
+
+agent.invoke({"messages": [("human", "What are the latest breakthroughs in quantum computing?")]})
+```
+
+<Note>
+    `ChatParallel` 本身不支持工具调用。你可以把它作为 chain 中的研究助手使用，或者将 Parallel search/extract 工具与另一个支持工具调用的模型搭配使用。
+</Note>
+
+## 响应格式
+
+```python
+{
+    "search_id": "search_abc123...",
+    "session_id": "sess_...",
+    "results": [
+        {
+            "url": "https://example.com/page",
+            "title": "Page Title",
+            "publish_date": "2026-04-01",
+            "excerpts": [
+                "First relevant excerpt...",
+                "Second relevant excerpt...",
+            ],
+        },
+    ],
+    "warnings": [...],
+    "usage": {...},
+    "search_metadata": {  # added by this tool when include_metadata=True (the default)
+        "search_duration_seconds": 2.451,
+        "search_timestamp": "2026-04-15T10:30:00",
+        "actual_results_returned": 5,
+    },
+}
+```
+
+## API reference
+
+如需详细文档，请参阅 @[`ParallelSearchTool`] API reference 或 [Parallel Search reference](https://docs.parallel.ai/api-reference/search/search)。

@@ -1,0 +1,198 @@
+---
+title: Nimble Search
+---
+
+>[Nimble 的 Search API](https://docs.nimbleway.com/nimble-sdk/search-api) 通过 headless browser 浏览实时网页，而不是查询预建索引，因此能够提供实时 web search。这个 retriever 可以处理 JavaScript 渲染、动态内容和复杂导航流程，因此特别适合需要访问当前网页数据的 RAG 应用，包括分页、筛选器以及客户端渲染后才出现的内容。
+
+我们可以把它作为一个 [retriever](/oss/langchain/retrieval) 使用。下面会展示这个集成的特定功能。看完之后，你也可以进一步查看[相关 use-case 页面](/oss/langchain/rag)，了解如何把它作为更大 chain 的一部分来使用。
+
+### 安装
+
+<CodeGroup>
+```bash pip
+pip install -U langchain-nimble
+```
+```bash uv
+uv add langchain-nimble
+```
+</CodeGroup>
+
+我们还需要设置 Nimble API key。你可以在 [Nimble](https://www.nimbleway.com/) 注册后获取。
+
+```python
+import getpass
+import os
+
+if not os.environ.get("NIMBLE_API_KEY"):
+    os.environ["NIMBLE_API_KEY"] = getpass.getpass("Nimble API key:\n")
+```
+
+## 使用
+
+现在我们可以实例化 retriever 了：
+
+```python
+from langchain_nimble import NimbleSearchRetriever
+
+# 基础 retriever
+retriever = NimbleSearchRetriever(k=5)
+```
+
+## 在 chain 中使用
+
+我们可以很方便地把这个 retriever 组合到一个用于问答的 RAG chain 中：
+
+```python
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_openai import ChatOpenAI
+
+# 创建 RAG prompt
+prompt = ChatPromptTemplate.from_template(
+    """Answer the question based only on the provided context.
+If you cannot answer based on the context, say so.
+
+Context: {context}
+
+Question: {question}
+
+Answer:"""
+)
+
+llm = ChatOpenAI(model="gpt-4o-mini")
+
+# 为更全面的结果配置 retriever
+retriever = NimbleSearchRetriever(
+    k=5,
+    deep_search=True,
+    parsing_type="markdown",
+    include_domains=["wikipedia.org", "britannica.com", ".edu", ".gov"]
+)
+
+
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+
+# 构建 RAG chain
+chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | prompt
+    | llm
+    | StrOutputParser()
+)
+```
+
+```python
+# 提问
+response = chain.invoke("What are the key differences between renewable and non-renewable energy sources?")
+print(response)
+```
+
+```output
+Based on the provided context, here are the key differences between renewable and non-renewable energy sources:
+
+**Renewable Energy Sources:**
+- Naturally replenished on a human timescale (solar, wind, hydro, geothermal, biomass)
+- Sustainable and virtually inexhaustible
+- Generally produce little to no greenhouse gas emissions
+- Lower environmental impact
+- Costs have decreased significantly in recent years
+
+**Non-Renewable Energy Sources:**
+- Finite resources that cannot be replenished quickly (coal, oil, natural gas, nuclear)
+- Will eventually be depleted
+- Combustion releases significant greenhouse gases and pollutants
+- Major contributor to climate change
+- Currently still provide the majority of global energy but declining in competitiveness
+
+The context indicates that renewable energy is increasingly becoming cost-competitive with fossil fuels while offering environmental benefits.
+```
+
+## 高级配置
+
+这个 retriever 支持大量配置项，以适配不同使用场景：
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `k` | int | 10 | 返回结果的最大数量（1-20） |
+| `deep_search` | bool | True | **Deep mode**（默认）会提取完整内容，**Fast mode**（False）只返回 SERP 结果 |
+| `topic` | str | "general" | 针对特定内容类型优化搜索："general"、"news" 或 "location" |
+| `include_answer` | bool | False | 在搜索结果旁边生成 AI 驱动的摘要答案 |
+| `include_domains` | list[str] | None | 指定白名单域名（例如 `["wikipedia.org", ".edu"]`） |
+| `exclude_domains` | list[str] | None | 指定黑名单域名以排除结果 |
+| `start_date` | str | None | 过滤指定日期之后的结果（YYYY-MM-DD 或 YYYY） |
+| `end_date` | str | None | 过滤指定日期之前的结果（YYYY-MM-DD 或 YYYY） |
+| `parsing_type` | str | "markdown" | 输出格式："plain_text"、"markdown" 或 "simplified_html" |
+| `locale` | str | "en" | 搜索地区语言，例如 `"en-US"` |
+| `country` | str | "US" | 用于本地化结果的国家代码，例如 `"US"` |
+| `api_key` | str | env var | Nimble API key（默认读取 `NIMBLE_API_KEY` 环境变量） |
+
+**高级配置示例：**
+
+```python
+from langchain_nimble import NimbleSearchRetriever
+
+# 针对学术研究优化的 retriever
+retriever = NimbleSearchRetriever(
+    k=10,
+    deep_search=True,
+    topic="general",
+    include_domains=["arxiv.org", "nature.com", "science.org"],
+    start_date="2025-01-01",
+    parsing_type="markdown"
+)
+
+docs = retriever.invoke("recent advances in quantum computing")
+```
+
+## 最佳实践
+
+### Fast mode 与 Deep mode
+
+- **Deep mode**（`deep_search=True`，默认）：
+  - 从网页提取完整内容
+  - 适合需要完整内容的 RAG 应用
+  - 最适合详细研究和构建知识库
+  - 可以处理 JavaScript 渲染和动态内容
+
+- **Fast mode**（`deep_search=False`）：
+  - 仅返回快速的 SERP 结果，包括标题和摘要
+  - 针对性能敏感型应用做了优化
+  - 最适合高吞吐查询、对速度要求高的场景
+  - 单次查询成本更低
+
+### 过滤策略
+
+**域名过滤：**
+
+- 使用 `include_domains` 做聚焦研究（学术、政府、可信来源）
+- 使用 `exclude_domains` 过滤论坛、社交媒体或不可靠来源
+- 两者结合使用，可以更精确地控制来源质量
+
+**日期过滤：**
+
+- 对时间敏感查询设置 `start_date` 和 `end_date`
+- 对最新新闻、当前事件或带日期限制的信息特别重要
+- 格式可以是 `"YYYY-MM-DD"`（精确日期）或 `"YYYY"`（仅年份）
+
+**主题路由：**
+
+- 使用 `topic="news"` 针对时事新闻和新闻文章做优化
+- 使用 `topic="location"` 针对本地商业和地理类查询做优化
+- 使用 `topic="general"`，或直接省略，用于标准 web search
+
+### 性能优化
+
+1. **选择合适的模式**：对高吞吐且重视速度的查询，使用 **Fast mode**（`deep_search=False`）；对需要完整内容提取的场景，使用 **Deep mode**（默认）
+2. **调优结果数量**：先从较小的 `k` 值开始，再按需增加
+3. **使用异步**：利用 `ainvoke()` 处理并发查询
+4. **合理做缓存**：考虑缓存高频查询
+5. **谨慎使用过滤**：域名和日期过滤可以减少噪音并提升相关性
+
+---
+
+## API reference
+
+关于 `NimbleSearchRetriever` 所有功能和配置的详细文档，请访问 [Nimble API documentation](https://docs.nimbleway.com/nimble-sdk/search-api)。

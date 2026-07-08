@@ -1,0 +1,154 @@
+---
+title: 如何为你的智能体部署添加语义搜索
+sidebarTitle: 为你的智能体部署添加语义搜索
+---
+
+语义搜索可以让你的智能体按含义，而不是按精确字面表达，召回已存储的记忆和文档。例如，对 “UI preferences” 的查询，可以命中一条写作 “user prefers dark interfaces” 的记忆。本指南介绍如何在部署的跨 thread [store](/oss/langgraph/stores) 上启用语义搜索，从而让智能体在多轮对话之间保留上下文，并基于先前交互来个性化响应。
+
+## 前提条件
+
+- 一个 deployment，参阅[如何设置用于部署的应用](/langsmith/setup-app-requirements-txt)，以及 [hosting options](/langsmith/platform-setup) 的相关信息。
+- 你的 embedding provider 的 API keys，这里以 OpenAI 为例。
+- `langchain >= 0.3.8`，如果你在本指南中使用字符串格式来指定 embedding。
+
+## 步骤
+
+1. 更新你的 [`langgraph.json` 配置文件](/langsmith/application-structure#configuration-file)，加入 store 配置：
+
+    ```json
+    {
+        ...
+        "store": {
+            "index": {
+                "embed": "openai:text-embedding-3-small",
+                "dims": 1536,
+                "fields": ["$"]
+            }
+        }
+    }
+    ```
+
+    这个配置表示：
+
+    - 使用 OpenAI 的 `text-embedding-3-small` 模型生成 embeddings。
+    - 将 embedding 维度设为 1536，与该模型输出匹配。
+    - 对你存储数据中的所有字段建立索引，`["$"]` 表示索引全部字段，也可以只指定某些字段，例如 `["text", "metadata.title"]`。
+
+    <Note>
+    每个 deployment 只支持一个 embedding 模型。LangSmith 不支持配置多个 embedding 模型，因为这会导致 `/store` endpoints 上的歧义，并引发混合索引问题。
+    </Note>
+
+1. 如需使用字符串形式的 embedding 配置，请确保依赖中包含 `langchain >= 0.3.8`：
+
+    ```toml
+    # In pyproject.toml
+    [project]
+    dependencies = [
+        "langchain>=0.3.8"
+    ]
+    ```
+
+    或者，如果你使用 [requirements.txt](/langsmith/setup-app-requirements-txt)：
+
+    ```
+    langchain>=0.3.8
+    ```
+
+## 用法
+
+完成配置后，你就可以在 [nodes](/oss/langgraph/graph-api#nodes) 中使用语义搜索。store 需要一个 namespace tuple 来组织记忆：
+
+```python
+async def search_memory(state: State, *, store: BaseStore):
+    # Search the store using semantic similarity
+    # The namespace tuple helps organize different types of memories
+    # e.g., ("user_facts", "preferences") or ("conversation", "summaries")
+    results = await store.asearch(
+        namespace=("memory", "facts"),  # Organize memories by type
+        query="your search query",
+        limit=3  # number of results to return
+    )
+    return results
+```
+
+每个结果都是一个 `SearchItem`，它在 `Item` 基础上新增了一个 `score` 字段。当配置了语义搜索后，`score` 会包含相似度分数：
+
+```python
+results[0].key       # "07e0caf4-1631-47b7-b15f-65515d4c1843"
+results[0].value     # {"text": "User prefers dark mode"}
+results[0].namespace # ("memory", "facts")
+results[0].score     # 0.92 (similarity score, present when semantic search is configured)
+```
+
+### 更换你的 embedding 模型
+
+<Warning>
+更换 embedding 模型或维度时，需要对已有全部数据重新做 embedding。目前没有自动迁移工具。如果你需要切换模型，请提前规划。
+</Warning>
+
+## 自定义 embeddings
+
+如果你想使用自定义 embeddings，可以传入一个自定义 embedding function 的路径：
+
+```json
+{
+    ...
+    "store": {
+        "index": {
+            "embed": "path/to/embedding_function.py:embed",
+            "dims": 1536,
+            "fields": ["$"]
+        }
+    }
+}
+```
+
+deployment 会在指定路径中查找该函数。这个函数必须是 async 的，并且接受一个字符串列表：
+
+```python
+# path/to/embedding_function.py
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI()
+
+async def aembed_texts(texts: list[str]) -> list[list[float]]:
+    """Custom embedding function that must:
+    1. Be async
+    2. Accept a list of strings
+    3. Return a list of float arrays (embeddings)
+    """
+    response = await client.embeddings.create(
+        model="text-embedding-3-small",
+        input=texts
+    )
+    return [e.embedding for e in response.data]
+```
+
+## 通过 API 查询
+
+你也可以使用 [LangGraph SDK](/langsmith/langgraph-python-sdk) 查询 store。由于 SDK 使用 async 操作：
+
+```python
+from langgraph_sdk import get_client
+
+async def search_store():
+    client = get_client()
+    results = await client.store.search_items(
+        ("memory", "facts"),
+        query="your search query",
+        limit=3  # number of results to return
+    )
+    return results
+
+# Use in an async context
+results = await search_store()
+```
+
+当配置了语义搜索时，每个结果项都会包含 `score` 字段：
+
+```python
+results["items"][0]["key"]       # "07e0caf4-1631-47b7-b15f-65515d4c1843"
+results["items"][0]["value"]     # {"text": "User prefers dark mode"}
+results["items"][0]["namespace"] # ["memory", "facts"]
+results["items"][0]["score"]     # 0.92 (similarity score)
+```

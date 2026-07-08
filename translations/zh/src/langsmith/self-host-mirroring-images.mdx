@@ -1,0 +1,278 @@
+---
+title: 为你的 LangSmith 安装镜像同步 images
+sidebarTitle: 为你的安装镜像同步 images
+---
+
+默认情况下，LangSmith 会从我们的公共 Docker registry 拉取 images。不过，如果你在一个无法访问互联网的环境中运行 LangSmith，或者你希望使用私有 Docker registry，那么你可以先把这些 images 镜像到你自己的 registry，再把 LangSmith 配置为使用这些镜像。
+
+## 前置要求
+
+* Kubernetes 集群或机器可访问的 Docker registry，并且你拥有已认证访问权限。
+* 本地机器，或另一台能够访问该 Docker registry 的机器，已安装 Docker。
+* 一个可运行 LangSmith 的 Kubernetes 集群。
+
+## 镜像同步 images
+
+为了方便起见，我们提供了一个脚本，帮你完成镜像同步。你可以在 [LangSmith Helm Chart 仓库](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/scripts/mirror_langsmith_images.sh)中找到该脚本。
+
+要使用该脚本，你需要执行以下命令，并指定你的 registry 和平台：
+
+```bash
+bash mirror_images.sh <your-registry> [<platform>]
+```
+
+其中，`<your-registry>` 是你的 Docker registry URL，例如 `myregistry.com`，`<platform>` 是你所使用的平台，例如 `linux/amd64`、`linux/arm64` 等。如果不指定平台，默认会使用 `linux/amd64`。
+
+例如，如果你的 registry 是 `myregistry.com`，平台是 `linux/arm64`，并且你希望使用镜像的最新版本，那么可以运行：
+
+```bash
+bash mirror_langsmith_images.sh --registry myregistry --platform linux/arm64 --version 0.10.66
+```
+
+请注意，这个脚本假定你已经安装 Docker，并且已经完成了对目标 registry 的认证。它还会使用与原始镜像相同的 repository/tag，将这些镜像推送到指定 registry。
+
+你也可以手动拉取、镜像并推送这些 images。需要同步的镜像定义在 LangSmith Helm Chart 的 `values.yaml` 文件中，可在这里查看：[LangSmith Helm Chart values.yaml](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/values.yaml#L14)
+
+下面是一个使用 Docker 同步镜像的示例：
+
+```bash
+# Pull the images from the public registry
+docker pull langchain/langsmith-backend:latest
+docker tag langchain/langsmith-backend:latest <your-registry>/langsmith-backend:latest
+docker push <your-registry>/langsmith-backend:latest
+```
+
+你需要对每个想要同步的镜像重复这个过程。
+
+## 配置
+
+完成镜像同步后，你需要把 LangSmith 安装配置为使用这些镜像。可以通过修改 LangSmith Helm Chart 安装中的 `values.yaml` 文件来完成。请把 tag 替换为你想使用的版本，例如 `0.10.66`，这是编写本文时的最新版本。
+
+```yaml
+images:
+  imagePullSecrets: [] # Add your image pull secrets here if needed
+  registry: "" # Set this to your registry URL if you mirrored all images to the same registry using our script. Then you can remove the repository prefix from the images below.
+  aceBackendImage:
+    repository: "(your-registry)/langchain/langsmith-ace-backend"
+    pullPolicy: IfNotPresent
+    tag: "0.10.66"
+  backendImage:
+    repository: "(your-registry)/langchain/langsmith-backend"
+    pullPolicy: IfNotPresent
+    tag: "0.10.66"
+  frontendImage:
+    repository: "(your-registry)/langchain/langsmith-frontend"
+    pullPolicy: IfNotPresent
+    tag: "0.10.66"
+  hostBackendImage:
+    repository: "(your-registry)/langchain/hosted-langserve-backend"
+    pullPolicy: IfNotPresent
+    tag: "0.10.66"
+  operatorImage:
+    repository: "(your-registry)/langchain/langgraph-operator"
+    pullPolicy: IfNotPresent
+    tag: "6cc83a8"
+  platformBackendImage:
+    repository: "(your-registry)/langchain/langsmith-go-backend"
+    pullPolicy: IfNotPresent
+    tag: "0.10.66"
+  playgroundImage:
+    repository: "(your-registry)/langchain/langsmith-playground"
+    pullPolicy: IfNotPresent
+    tag: "0.10.66"
+  postgresImage:
+    repository: "(your-registry)/postgres"
+    pullPolicy: IfNotPresent
+    tag: "14.7"
+  redisImage:
+    repository: "(your-registry)/redis"
+    pullPolicy: IfNotPresent
+    tag: "7"
+  clickhouseImage:
+    repository: "(your-registry)/clickhouse/clickhouse-server"
+    pullPolicy: Always
+    tag: "24.8"
+```
+
+## Fleet 和 Insights 所需的额外 images
+
+如果你正在使用 Fleet 或 Insights，LangGraph operator 会为每个 deployment 动态创建 Redis 和 PostgreSQL，pgvector，pods。这些 pods 使用的是 operator templates 中定义的 images，因此还需要单独配置。
+
+你还必须同步以下额外镜像：
+- `docker.io/redis:7`
+- `docker.io/pgvector/pgvector:pg15`
+
+然后在 `values.yaml` 中覆盖 operator templates，使其改用你镜像后的 images：
+
+```yaml
+operator:
+  templates:
+    redis: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ${service_name}
+        namespace: ${namespace}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: ${service_name}
+        template:
+          metadata:
+            labels:
+              app: ${service_name}
+          spec:
+            enableServiceLinks: false
+            containers:
+            - name: redis
+              image: (your-registry)/redis:7
+              ports:
+              - containerPort: 6379
+                name: redis
+              livenessProbe:
+                exec:
+                  command:
+                  - redis-cli
+                  - ping
+                initialDelaySeconds: 30
+                periodSeconds: 10
+              readinessProbe:
+                tcpSocket:
+                  port: 6379
+                initialDelaySeconds: 10
+                periodSeconds: 5
+    db: |
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: ${service_name}
+      spec:
+        serviceName: ${service_name}
+        selector:
+          matchLabels:
+            app: ${service_name}
+        persistentVolumeClaimRetentionPolicy:
+          whenDeleted: Delete
+          whenScaled: Retain
+        template:
+          metadata:
+            labels:
+              app: ${service_name}
+          spec:
+            containers:
+            - name: postgres
+              image: (your-registry)/pgvector/pgvector:pg15
+              ports:
+              - containerPort: 5432
+              command: ["docker-entrypoint.sh"]
+              args:
+                - postgres
+                - -c
+                - max_connections=${max_connections}
+              env:
+              - name: PGDATA
+                value: /var/lib/postgresql/data/pgdata
+              volumeMounts:
+              - name: postgres-data
+                mountPath: /var/lib/postgresql/data
+            enableServiceLinks: false
+        volumeClaimTemplates:
+        - metadata:
+            name: postgres-data
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: "${storage_gi}Gi"
+```
+
+请将 `(your-registry)` 替换为你的 registry URL。模板变量，`${service_name}`、`${namespace}`、`${max_connections}`、`${storage_gi}`，会在运行时由 operator 进行替换，因此必须保持原样。
+
+完成配置后，你需要更新 LangSmith 安装。可以参考我们的升级指南：[升级 LangSmith](/langsmith/self-host-upgrades)。如果升级成功，你的 LangSmith 实例现在应该已经开始使用来自你 Docker registry 的镜像。
+
+## 验证 image signatures
+
+<Note>
+Image signatures 从 **v15 开始** 才提供，也就是 LangSmith 应用版本 `0.15.x` 及之后。更早的 `v14-stable` 及更老通道版本没有签名，因此无法用下述步骤验证。
+</Note>
+
+稳定通道上的 LangSmith images，位于 `docker.io/langchain/*`，会在发布时通过稳定分支的发布工作流使用无密钥的 [Sigstore/Cosign](https://docs.sigstore.dev/cosign/overview/) 进行签名。签名身份会绑定到特定的 GitHub Actions workflow、run 和 commit，因此该签名不仅证明镜像是真实的，也证明它由 `langchain-ai/langchainplus` 中稳定分支的发布流水线构建。你可以在拉取或镜像镜像前先验证签名，也可以在镜像完成后再次验证，以确认你镜像出去的 digest 与我们签名的 digest 一致。
+
+先安装 `cosign`，[安装指南](https://docs.sigstore.dev/cosign/system_config/installation/)，然后验证任意 tag：
+
+```bash
+cosign verify \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp 'https://github\.com/langchain-ai/langchainplus/\.github/workflows/release_self_hosted_on_version_bump\.yaml@refs/heads/v[0-9]+-stable' \
+  docker.io/langchain/langsmith-backend:<tag>
+```
+
+成功验证意味着：
+
+- 签名上的 cosign claims 是有效的。
+- 证书链锚定到 Sigstore root，并且已记录到 [Rekor](https://docs.sigstore.dev/rekor/overview/) transparency log 中。
+- 签名证书是通过 GitHub Actions OIDC，签发给稳定分支的发布 workflow。
+
+同样的命令也适用于其他已发布镜像，只需替换 repository 名称即可，例如 `langsmith-frontend`、`langsmith-go-backend`、`agent-builder-deep-agent`、`langsmith-clio`、`langsmith-polly`、`agent-builder-tool-server`、`agent-builder-trigger-server`、`hosted-langserve-backend`、`langsmith-playground`、`langsmith-ace-backend`，以及它们的 `*-fips` 变体。
+
+### 固定到特定版本发布
+
+如果你想做更严格的验证，例如锁定到某个稳定分支或某个特定 commit，可以不使用 regex，而改为提供精确的 certificate identity。每个签名的证书中还会通过 Subject Alternative Name 扩展携带 workflow run ID 和 commit SHA，因此你可以将校验约束到某一次具体发布：
+
+```bash
+cosign verify \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity 'https://github.com/langchain-ai/langchainplus/.github/workflows/release_self_hosted_on_version_bump.yaml@refs/heads/v15-stable' \
+  docker.io/langchain/langsmith-backend:0.15.9
+```
+
+若要查看证书中的 claims，workflow run、commit、runner，可以先下载 attestation，再解码其中嵌入的证书：
+
+```bash
+cosign download attestation docker.io/langchain/langsmith-backend:<tag>
+```
+
+### 验证 SBOM attestations
+
+发布镜像还会附带签名过的 SPDX software bill of materials，SBOM，attestations，镜像索引中的每个架构各有一份。
+
+这些按架构拆分的 SBOM 也会挂在多架构索引 digest 上，因此你可以直接对裸 tag 进行验证：
+
+```bash
+cosign verify-attestation \
+  --type spdxjson \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp 'https://github\.com/langchain-ai/langchainplus/\.github/workflows/release_self_hosted_on_version_bump\.yaml@refs/heads/v[0-9]+-stable' \
+  docker.io/langchain/langsmith-backend:<tag>
+```
+
+该命令会为每个架构返回一条已验证 statement。成功验证提供的保证与 image signature 相同：该 attestation 由稳定分支发布 workflow 生成，并且其 claims 已记录到 [Rekor](https://docs.sigstore.dev/rekor/overview/) transparency log 中。
+
+### 获取 SBOM
+
+如果你想将 SBOM 交给漏洞扫描器或 SBOM 管理工具使用，可以把验证后的 SPDX 文档提取到文件中。由于索引中每个架构都带有一条 statement，建议先解析出某个具体架构的子 digest，这样得到的是一份单独的 SPDX 文档，而不是每个架构各一份。
+
+列出某个 tag 下各架构的 digests：
+
+```bash
+docker buildx imagetools inspect --raw docker.io/langchain/langsmith-backend:<tag> \
+  | jq -r '.manifests[] | select(.platform.os == "linux") | .digest + "  " + .platform.architecture'
+```
+
+然后验证该 digest，并把解码后的 predicate，也就是一份标准 SPDX 2.3 文档，里面列出了镜像中的所有 package，保存到文件中：
+
+```bash
+cosign verify-attestation \
+  --type spdxjson \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp 'https://github\.com/langchain-ai/langchainplus/\.github/workflows/release_self_hosted_on_version_bump\.yaml@refs/heads/v[0-9]+-stable' \
+  docker.io/langchain/langsmith-backend@<digest> \
+  | jq -r '.payload' | base64 -d | jq '.predicate' > langsmith-backend.spdx.json
+```
+
+你可以将生成的 `langsmith-backend.spdx.json` 直接交给扫描工具使用，例如 [Grype](https://github.com/anchore/grype)，`grype sbom:langsmith-backend.spdx.json`，或 [Trivy](https://trivy.dev/)，`trivy sbom langsmith-backend.spdx.json`。
+
+<Note>
+通过 `cosign verify-attestation` 而不是 `cosign download attestation` 来提取 SBOM，可以确保你消费的 SBOM 一定已经完成签名和签名身份验证。
+</Note>

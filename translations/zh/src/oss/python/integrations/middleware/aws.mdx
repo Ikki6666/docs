@@ -1,0 +1,160 @@
+---
+title: "AWS middleware 集成"
+description: "使用 LangChain Python 与 AWS middleware 集成。"
+---
+
+这个 middleware 专为托管在 AWS Bedrock 上的模型设计。更多信息请参阅 [middleware](/oss/langchain/middleware/overview)。
+
+| Middleware | Description |
+|------------|-------------|
+| [Prompt caching](#prompt-caching) | 通过缓存重复的 prompt 前缀来降低成本 |
+
+## Prompt caching
+
+通过在 Amazon Bedrock 上缓存频繁复用的 prompt 前缀，可以降低推理延迟和输入 token 成本。`BedrockPromptCachingMiddleware` 通过 `model_settings` 启用缓存。`ChatBedrock` 和 `ChatBedrockConverse` 会在请求时把它转换为正确的 AWS wire format。缓存检查点会放在 system prompt、tool definitions，以及支持的情况下最新一条消息之后，这样模型在后续请求中就可以跳过对已见内容的重新计算。不同 API 和模型家族的缓存位置会有所不同：例如，Nova 会跳过某些 tool definition 和 tool-result 场景。
+
+Prompt caching 适用于以下场景：
+
+- 多轮对话，且 system prompt 很长并保持稳定
+- 工具定义很多、且在多次调用间保持不变的 agent
+- 基于文档的问答，用户会围绕同一份上传内容提出多个问题
+- 处理批量任务时需要重复使用静态内容
+
+支持的模型：
+
+- **Anthropic Claude**
+- **Amazon Nova**
+
+<Info>
+    了解更多关于 [AWS Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html) 的策略和限制。要让缓存检查点生效，缓存内容必须超过 1,024 个 token，有时还会因模型而更高。请参阅[支持的模型、区域和限制](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html#prompt-caching-models)。
+</Info>
+
+**API reference:** @[`BedrockPromptCachingMiddleware`]
+
+```python ChatBedrockConverse
+from langchain_aws import ChatBedrockConverse
+from langchain_aws.middleware.prompt_caching import BedrockPromptCachingMiddleware
+from langchain.agents import create_agent
+
+agent = create_agent(
+    model=ChatBedrockConverse(model="us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+    system_prompt="<Your long system prompt here>",
+    middleware=[BedrockPromptCachingMiddleware(ttl="1h")], # [!code highlight]
+)
+```
+
+```python ChatBedrock
+from langchain_aws import ChatBedrock
+from langchain_aws.middleware.prompt_caching import BedrockPromptCachingMiddleware
+from langchain.agents import create_agent
+
+agent = create_agent(
+    model=ChatBedrock(model="us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+    system_prompt="<Your long system prompt here>",
+    middleware=[BedrockPromptCachingMiddleware(ttl="5m")], # [!code highlight]
+)
+```
+
+<Accordion title="配置选项">
+
+<ParamField body="type" type="string" default="ephemeral">
+    缓存类型。对于 `ChatBedrock`，当前只支持 `'ephemeral'`。对于 `ChatBedrockConverse`，这个值会被忽略，因为 Converse API 始终使用 `"default"` 缓存类型。
+</ParamField>
+
+<ParamField body="ttl" type="string" default="5m">
+    缓存内容的存活时间。可选值为 `'5m'` 或 `'1h'`。注意 Amazon Nova 模型只支持 `'5m'`。
+</ParamField>
+
+<ParamField body="min_messages_to_cache" type="number" default="0">
+    开始缓存前所需的最小消息数量。
+</ParamField>
+
+<ParamField body="unsupported_model_behavior" type="string" default="warn">
+    当使用不支持的模型时的行为。可选值：`'ignore'`、`'warn'` 或 `'raise'`。
+</ParamField>
+
+</Accordion>
+
+<Accordion title="完整示例">
+
+这个 middleware 会缓存每次请求中到最新消息为止的内容。在 TTL 窗口内的后续请求里（5 分钟或 1 小时），之前见过的内容会从缓存中读取，而不是重新处理，从而降低成本和延迟。
+
+**工作方式：**
+1. 第一次请求：system prompt、tools 和用户消息会发送到 API 并被缓存
+2. 第二次请求：缓存内容会被重新使用。只需要处理新的消息
+3. 之后的每一轮都会重复这个模式，每次请求都复用已缓存的对话历史
+
+<Note>
+    Prompt caching 可以通过缓存 token 降低 API 成本，但**不会**提供对话记忆。要在多次调用之间保留对话历史，请使用像 `MemorySaver` 这样的 [checkpointer](https://langchain-ai.github.io/langgraph/concepts/persistence/#checkpointer-libraries)。
+</Note>
+
+```python
+from langchain_aws import ChatBedrockConverse
+from langchain_aws.middleware.prompt_caching import BedrockPromptCachingMiddleware
+from langchain.agents import create_agent
+from langchain_core.runnables import RunnableConfig
+from langchain.messages import HumanMessage
+from langchain.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+
+
+@tool
+def get_weather(city: str) -> str:
+    """获取某个城市的当前天气。"""
+    return f"The weather in {city} is sunny and 72F."
+
+
+# System prompt 必须超过 1,024 个 token，缓存才会生效
+LONG_PROMPT = (
+    "You are a helpful weather assistant with deep expertise in meteorology, "
+    "climate science, and atmospheric phenomena. When answering questions about "
+    "weather, provide accurate and up-to-date information. "
+    + "You should always strive to give the most helpful response possible. " * 85
+)
+
+agent = create_agent(
+    model=ChatBedrockConverse(model="us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+    system_prompt=LONG_PROMPT,
+    tools=[get_weather],
+    middleware=[BedrockPromptCachingMiddleware(ttl="5m")], # [!code highlight]
+    checkpointer=MemorySaver(),  # 保留对话历史
+)
+
+# 使用 thread_id 来维护对话状态
+config: RunnableConfig = {"configurable": {"thread_id": "user-123"}}
+
+# 第一次调用：用 system prompt、tools 和用户消息创建缓存
+response = agent.invoke(
+    {"messages": [HumanMessage("What is the weather in Miami?")]}, config=config
+)
+
+last_msg = response["messages"][-1]
+print(last_msg.content)
+
+# 检查缓存 token 用量
+um = last_msg.usage_metadata
+if um:
+    details = um.get("input_token_details", {})
+    cache_read = details.get("cache_read", 0) or 0
+    cache_write = details.get("cache_creation", 0) or 0
+    print(f"Cache read: {cache_read}, Cache write: {cache_write}")
+
+# 第二次调用：复用已缓存的 system prompt、tools 和之前的消息
+response = agent.invoke(
+    {"messages": [HumanMessage("How about Seattle?")]}, config=config
+)
+print(response["messages"][-1].content)
+```
+
+</Accordion>
+
+### 特定模型行为
+
+这个 middleware 会自动处理不同 API 和模型家族之间的差异：
+
+| Feature | ChatBedrockConverse (Anthropic) | ChatBedrockConverse (Nova) | ChatBedrock (Anthropic) |
+|---------|:-------------------------------:|:--------------------------:|:-----------------------:|
+| System prompt caching | ✅ | ✅ | ✅ |
+| Tool definition caching | ✅ | ❌ | ✅ |
+| Message caching | ✅ | ✅ (excludes tool result messages) | ✅ |
+| Extended TTL (`1h`) | ✅ | ❌ | ✅ |

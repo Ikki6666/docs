@@ -1,0 +1,151 @@
+---
+title: 语音 tracing 基础
+sidebarTitle: Voice fundamentals
+description: LangSmith 中语音与音频智能体 tracing 的最佳实践，包括对话音频、单 trace 对话，以及音频模态标记。
+---
+
+对语音智能体进行 [Tracing](/langsmith/observability-concepts#traces)，与对文本智能体 tracing 并不相同。一次对话是连续的、双向的、可被打断的，用户会打断智能体、中途换话题，并期待亚秒级响应。要调试和评估这类系统，你的 traces 需要把整个对话捕获为一个单一、具备音频感知能力的单位，而不是一系列彼此断开的文本交换。
+
+本页介绍在 LangSmith 中对语音应用进行 tracing 的核心约定。无论你使用哪种框架或模型提供方，例如 [OpenAI Realtime](/langsmith/trace-openai-realtime)、[Gemini Live](/langsmith/trace-gemini-live)、[LiveKit](/langsmith/trace-with-livekit)、[Pipecat](/langsmith/trace-with-pipecat)，还是你自己的实现，都建议遵循这些模式。
+
+<Note>
+这些约定假定你是通过受支持的 [tracing setups](/langsmith/observability) 将 traces 导出到 LangSmith。如需了解 UI 中的音频渲染与播放，请参阅[记录多模态 traces](/langsmith/log-multimodal-traces)和[通过 traces 上传文件](/langsmith/upload-files-with-traces)。
+</Note>
+
+## 两种架构，对应两种 trace 形状
+
+语音智能体的构建方式会决定 trace 的形态。常见有两种架构，而它们产生的 traces 在本质上是不同的。
+
+### Cascade
+
+Cascade 会把多个独立的单一职责模型串联起来：speech-to-text, STT, 负责将用户音频转写为文本，language model, LLM, 负责基于文本做推理并决定下一步动作，text-to-speech, TTS, 负责合成回复语音。中间还会穿插 middleware、tool calls 和 retrieval 步骤。
+
+因为每个阶段都是具有清晰输入和输出的独立模型调用，所以 cascade 的 trace 方式与普通智能体 pipeline 相同。trace 会表现为 `STT`、`LLM`、`TTS`、tool 和 middleware runs 所构成的一棵树：各阶段可以并行运行，并且对话中的每一轮都会重复一次新的 STT → LLM → TTS 循环。这些 runs 都有明确的输入和输出对，例如音频输入到 transcript 输出、提示词输入到 completion 输出。
+
+构建 cascade 语音智能体最常见的两个框架是 [LiveKit](/langsmith/trace-with-livekit) 和 [Pipecat](/langsmith/trace-with-pipecat)。
+
+### Speech-to-speech, S2S
+
+Speech-to-speech 模型，例如 [OpenAI Realtime API](/langsmith/trace-openai-realtime) 或 [Gemini Live](/langsmith/trace-gemini-live)，会原生处理音频，并通过一个持久连接，通常是 WebSocket，以音频形式回复。这里没有 STT / LLM / TTS 的拆分可供 tracing。
+
+相反，模型服务器和你的 client 会通过底层连接交换一连串 **events**，例如音频 chunk、转录片段、工具调用请求、回合边界、中断和错误。最自然的 tracing 单位是 **event payload**，而不是请求 / 响应对。你记录的每个 event 都会成为一个 span，其内容就是穿过连接的 payload。
+
+本页其余部分介绍同时适用于这两种架构的约定。具体的事件流细节，请参阅针对 [OpenAI Realtime](/langsmith/trace-openai-realtime) 和 [Gemini Live](/langsmith/trace-gemini-live) 的 provider 指南。
+
+## 核心约定
+
+以下是我们建议采用的语音 traces 最佳实践。你可以根据自己的基础设施和实现方式来决定具体 tracing 方法，但如果遵循我们建议的结构，你的 traces 会更一致，也更易于调试和评估。
+
+我们建议遵循以下三个高层约定：
+
+1. [**将每段对话作为一条单独 trace**](#trace-each-conversation-as-a-single-trace)，而不是拆成多条 traces。
+2. [**记录一个合并后的音频文件**](#record-a-single-combined-audio-file)，并把它附加到 root run。
+3. [**将 trace 标记为音频**](#mark-the-trace-as-audio)，通过 `ls_modality` 让它在渲染和筛选上都作为语音 trace 处理。
+
+### 将每段对话作为一条单独 trace
+
+一段对话本身就是一次完整交互，因此我们建议把它保留在一条单独的 trace 中，并在其下方嵌套各个独立的模型调用或 events，由一个代表整段对话的 root run 作为根节点。
+
+不要把一段对话拆分成多条 traces。如果你为每次交换都新开一条 trace，就会丢失那些存在于**交换之间**的信息：
+
+- **Interruptions**：用户打断智能体说话，智能体停止发声，即 barge-in。
+- **Timing and latency**：说话人之间的空隙，以及智能体响应所用的时间。
+- **Context**：回指对话更早部分的上下文。
+- **Conversation-level outcomes**：用户目标最终是否得到了满足。
+
+root run 之下挂什么，取决于你的[架构](#two-architectures-two-trace-shapes)。对于 [cascade](#cascade)，子节点是模型调用和 middleware：
+
+```text
+conversation                      ← root run (whole conversation; combined audio; ls_modality="audio")
+│
+├─ stt                            ← a transcription call
+├─ llm                            ← a model call (may include middleware and tool runs)
+├─ tts                            ← a synthesis call
+└─ ...                            ← the pattern repeats as the conversation continues
+```
+
+对于 [speech-to-speech](#speech-to-speech-s2s) 智能体，子节点则是穿过 socket 的 **events**：
+
+```text
+conversation                      ← root run (whole conversation; combined audio; ls_modality="audio")
+│
+├─ input_transcription            ← a fragment of the user's speech transcript
+├─ output_transcription           ← a fragment of the agent's speech transcript
+├─ function_call: get_weather     ← the model requested a tool
+├─ function_response: get_weather ← the tool result heading back to the model
+├─ turn_complete                  ← a turn boundary reported by the server
+└─ interrupted                    ← the server detected user barge-in
+```
+
+<Note>
+语音智能体并没有一个可靠的 “turn” 概念。说话人会重叠、打断和停顿。不要把 runs 人为分组为虚构的 turns。应跟踪真实的单位，也就是 cascade 中的模型调用，或 speech-to-speech 流中的 event payloads。
+</Note>
+
+如需了解如何对相关 runs 做分组，请参阅 [Nest traces](/langsmith/nest-traces)。如需把同一用户的多个独立 session 分组，可使用 [Threads](/langsmith/threads)。
+
+### 记录一个合并后的音频文件
+
+将**一个**同时包含**用户和智能体**的音频文件附加到 root run。这个录音应当记录的是**实际播放到 client 的声音**，而不是模型生成出的原始音频。
+
+请在 client 侧录制。常见方式是生成一个双声道 WAV，用户麦克风位于一个声道，智能体在扬声器实际播放出的语音位于另一个声道。这样做很重要，因为生成出来的音频与用户真正听到的音频并不总是相同：网络延迟、丢包、乱序，以及 barge-in，都会改变用户实际经历到的内容。一个在中途被 barge-in 打断的智能体句子，在录音中就应该表现为被截断，因为这才是真实发生的情况。记录“实际播放过的音频”，而不是“生成了但可能从未真正被听到的音频”，才能保证 trace 忠实反映真实交互。
+
+使用 [attachments API](/langsmith/upload-files-with-traces) 附加这个文件：
+
+```python Python
+from langsmith import traceable
+from langsmith.schemas import Attachment
+
+@traceable(name="conversation", metadata={"ls_modality": "audio"})
+def run_conversation(session_id: str, conversation_audio: bytes):
+    # conversation_audio: a single recording of what was played to the client
+    # (e.g. stereo WAV: user mic on L, agent speech at the speaker on R)
+    ...
+    return {"conversation": Attachment(mime_type="audio/wav", data=conversation_audio)}
+```
+
+<Tip>
+音频文件可能很大。对于高吞吐的生产工作负载，可以考虑降采样、使用压缩格式，例如 MP3 或 Opus，或者只对部分对话进行完整录音采样。
+</Tip>
+
+### 将 trace 标记为音频
+
+在 root run 上将 `ls_modality` metadata 字段设置为 `"audio"`。这会把该 trace 标记为语音 trace，以便 LangSmith 进行合适渲染，并让你能够在项目中[筛选](/langsmith/filter-traces-in-application)语音 traces。
+
+```python Python
+from langsmith import traceable
+
+@traceable(
+    name="conversation",
+    metadata={"ls_modality": "audio"},
+)
+def run_conversation(session_id: str):
+    ...
+```
+
+<Note>
+有关其他 `ls_` metadata 字段，请参阅[Metadata parameters reference](/langsmith/ls-metadata-parameters)。
+</Note>
+
+
+## 后续步骤
+
+<CardGroup cols={2}>
+  <Card title="Trace OpenAI Realtime" icon="microphone" href="/langsmith/trace-openai-realtime">
+    跟踪基于 OpenAI Realtime API 构建的语音智能体。
+  </Card>
+  <Card title="Trace Gemini Live" icon="microphone" href="/langsmith/trace-gemini-live">
+    跟踪基于 Gemini Live API 构建的语音智能体。
+  </Card>
+  <Card title="Trace LiveKit" icon="microphone" href="/langsmith/trace-with-livekit">
+    跟踪使用 LiveKit Agents 构建的语音智能体。
+  </Card>
+  <Card title="Trace Pipecat" icon="microphone" href="/langsmith/trace-with-pipecat">
+    跟踪使用 Pipecat 构建的语音智能体。
+  </Card>
+  <Card title="Upload files with traces" icon="paperclip" href="/langsmith/upload-files-with-traces">
+    将对话录音附加到你的 trace。
+  </Card>
+  <Card title="Log multimodal traces" icon="photo" href="/langsmith/log-multimodal-traces">
+    在 LangSmith UI 中渲染音频和其他媒体。
+  </Card>
+</CardGroup>

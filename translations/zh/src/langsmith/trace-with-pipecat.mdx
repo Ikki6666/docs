@@ -1,0 +1,136 @@
+---
+title: 跟踪 Pipecat 应用
+sidebarTitle: Pipecat
+tag: Beta
+---
+
+<Note>
+此集成目前处于 beta 阶段，因此其 API 可能会发生变化。
+</Note>
+
+使用 LangSmith Pipecat 集成，将你的 [Pipecat](https://pipecat.ai/) 语音智能体跟踪到 LangSmith。有关高层约定，请参阅[语音跟踪基础](/langsmith/trace-voice-fundamentals)。
+
+<Note>
+Pipecat 集成要求 `langsmith[pipecat]>=0.9.7`。
+</Note>
+
+该集成会接入 Pipecat 已经发出的 spans，并将其映射到 LangSmith 的 tracing 格式，因此每段对话都会成为一条独立的 LangSmith trace，并为每个 pipeline stage，STT、LLM、TTS，记录一个 span。
+
+## 安装
+
+连同你的 pipeline 所需的 Pipecat service extras 一起安装此集成：
+
+<CodeGroup>
+
+```bash pip
+pip install "langsmith[pipecat]" "pipecat-ai[openai,local,tracing]"
+```
+
+```bash uv
+uv add "langsmith[pipecat]" "pipecat-ai[openai,local,tracing]"
+```
+
+</CodeGroup>
+
+## 设置环境变量
+
+该集成会从环境中读取你的 LangSmith 凭证，并通过 OpenTelemetry 自动导出到 LangSmith：
+
+```bash .env
+LANGSMITH_API_KEY=<your-langsmith-api-key>
+LANGSMITH_TRACING=true
+LANGSMITH_PROJECT=pipecat-voice
+OPENAI_API_KEY=<your-openai-api-key>
+```
+
+## 设置 tracing
+
+导入 `configure_pipecat`，并在构建 pipeline 之前调用一次。然后在 `PipelineTask` 上启用 tracing：
+
+```python
+from langsmith.integrations.pipecat import configure_pipecat
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+
+# Install the tracer and the LangSmith span processor.
+configure_pipecat()
+
+task = PipelineTask(
+    pipeline,
+    params=PipelineParams(enable_metrics=True),
+    enable_tracing=True,
+    enable_turn_tracking=True,
+    conversation_id=conversation_id,
+)
+```
+
+<Note>
+请设置 `enable_tracing=True`、`enable_turn_tracking=True` 和 `enable_metrics=True`。Turn tracking 是 tracing 所必需的，而 metrics 会驱动每个 span 上的延迟和 token 数据。
+</Note>
+
+### 使用 LangGraph 或 LangChain 智能体作为 LLM
+
+如果你的 LLM stage 是进程内的 [LangGraph 或 LangChain](/oss/langgraph/overview) 智能体，那么它的模型和工具 runs 应嵌套在 Pipecat 的 `llm` span 内，而不是形成一条单独的 trace。要做到这一点：
+
+- 传入 `configure_pipecat(llm_span_kind="chain")`。这样可以避免出现实际上并不代表推理请求的嵌套 `llm` spans。
+- 在环境中设置 `LANGSMITH_TRACING_MODE=otel`。如果不设置，这些 runs 会直接发到 LangSmith，从而形成独立 trace，而不是嵌套进去。
+
+### 使用你自己的 tracer provider
+
+`configure_pipecat()` 会构建一个 `TracerProvider`，注册 LangSmith span processor，并把它接入 Pipecat。如果你已经维护了自己的 `TracerProvider`，例如还会导出到另一个 OpenTelemetry 后端，那么可以跳过 `configure_pipecat`，改为直接把 processor 加到你的 provider 上：
+
+```python
+from langsmith.integrations.pipecat import PipecatLangSmithSpanProcessor
+
+provider.add_span_processor(PipecatLangSmithSpanProcessor())
+```
+
+## 将对话归入一个 thread
+
+如需将某段对话的 runs 归入 LangSmith [thread](/langsmith/threads)，以便启用 thread 级视图以及 token 和 cost 聚合，请在该对话的 spans 发出之前，对每段对话调用一次 `set_thread_id`：
+
+```python
+from langsmith.integrations.pipecat import configure_pipecat, set_thread_id
+
+configure_pipecat()
+set_thread_id(conversation_id)
+```
+
+## 记录对话音频
+
+使用 Pipecat 的 [`AudioBufferProcessor`](https://docs.pipecat.ai/server/utilities/audio/audio-recording) 将对话音频附加到 trace 中。把它放在 `transport.output()` 之后，这样它记录的就是实际播放出来的内容，包括被 barge-in 截断后的结果；再把它交给集成，并在会话运行后启动录制：
+
+```python
+from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
+
+span_processor = configure_pipecat()
+
+# Stereo: user on the left channel, agent on the right.
+audiobuffer = AudioBufferProcessor(num_channels=2, buffer_size=32_000)
+span_processor.attach_audio_buffer(audiobuffer, conversation_id=conversation_id)
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    transport.output(),
+    audiobuffer,                     # after output(): records what was heard
+    context_aggregator.assistant(),
+])
+
+await audiobuffer.start_recording()
+```
+
+该集成会在对话结束时将录音附加到对话根节点。有关底层附件 API，请参阅[通过 traces 上传文件](/langsmith/upload-files-with-traces)。
+
+## 后续步骤
+
+<CardGroup cols={2}>
+  <Card title="Voice fundamentals" icon="waveform" href="/langsmith/trace-voice-fundamentals">
+    语音智能体跟踪的核心约定。
+  </Card>
+  <Card title="Upload files with traces" icon="paperclip" href="/langsmith/upload-files-with-traces">
+    将对话录音附加到你的 trace。
+  </Card>
+</CardGroup>

@@ -1,0 +1,816 @@
+---
+title: 使用 OpenTelemetry 追踪
+description: 在 LangSmith 中配置 OpenTelemetry 追踪，包括 LANGSMITH_OTEL_ENABLED 以及通过 OpenTelemetry Collector 进行 OTEL 扇出。
+sidebarTitle: OpenTelemetry
+---
+
+LangSmith 支持基于 OpenTelemetry 的追踪，因此你可以从任何兼容 OpenTelemetry 的应用发送追踪数据。本文既介绍 LangChain 应用的自动埋点，也介绍其他框架的手动埋点方式。
+
+了解如何在 LangSmith 中使用 OpenTelemetry 追踪你的 LLM 应用。
+
+<Note>
+如果是自托管安装或区域化 SaaS，请在下面的请求中相应更新 LangSmith URL：GCP EU 使用 `eu.api.smith.langchain.com`；GCP APAC 使用 `apac.api.smith.langchain.com`；AWS US 使用 `aws.api.smith.langchain.com`。
+</Note>
+
+## 追踪 LangChain 应用
+
+如果你正在使用 LangChain 或 LangGraph，请使用内置集成来追踪应用：
+
+1. 安装带有 OpenTelemetry 支持的 LangSmith 包：
+
+   <CodeGroup>
+
+   ```bash pip
+   pip install "langsmith[otel]"
+   pip install langchain
+   ```
+
+   </CodeGroup>
+
+   <Info>
+   需要 Python SDK 版本 `langsmith>=0.3.18`。建议使用 `langsmith>=0.4.25`，以获得重要的 OpenTelemetry 修复。
+   </Info>
+
+2. 在 LangChain/LangGraph 应用中，通过设置 `LANGSMITH_OTEL_ENABLED` 环境变量启用 OpenTelemetry 集成：
+
+   <CodeGroup>
+
+   ```bash Shell
+   LANGSMITH_OTEL_ENABLED=true
+   LANGSMITH_TRACING=true
+   LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+   LANGSMITH_API_KEY=<your_langsmith_api_key>
+   # 如果 LangSmith API key 绑定了多个工作区，请设置 LANGSMITH_WORKSPACE_ID 环境变量来指定要使用的工作区。
+   ```
+
+   </CodeGroup>
+
+3. 创建一个带追踪的 LangChain 应用。例如：
+
+   ```python
+   import os
+   from langchain_openai import ChatOpenAI
+   from langchain_core.prompts import ChatPromptTemplate
+
+   # 创建一条链
+   prompt = ChatPromptTemplate.from_template("Tell me a joke about {topic}")
+   model = ChatOpenAI()
+   chain = prompt | model
+
+   # 运行链
+   result = chain.invoke({"topic": "programming"})
+   print(result.content)
+   ```
+
+4. 应用运行后，在 LangSmith 控制台中查看追踪（[示例](https://smith.langchain.com/public/a762af6c-b67d-4f22-90a0-728df16baeba/r)）。
+
+## 追踪非 LangChain 应用
+
+对于非 LangChain 应用或自定义埋点，你可以使用标准 OpenTelemetry 客户端在 LangSmith 中追踪应用。（建议使用 **langsmith ≥ 0.4.25**。）
+
+1. 安装 OpenTelemetry SDK、OpenTelemetry exporter 包，以及 OpenAI 包：
+
+   <CodeGroup>
+
+   ```bash pip
+   pip install openai
+   pip install opentelemetry-sdk
+   pip install opentelemetry-exporter-otlp
+   ```
+
+   </CodeGroup>
+
+2. 为 endpoint 设置环境变量，并替换为你的具体值：
+
+   <CodeGroup>
+
+   ```bash Shell
+   OTEL_EXPORTER_OTLP_ENDPOINT=https://api.smith.langchain.com/otel
+   OTEL_EXPORTER_OTLP_HEADERS="x-api-key=<your langsmith api key>"
+   ```
+
+   </CodeGroup>
+
+   <Note>
+   具体是否需要这样做，取决于你的 otel exporter 配置方式。如果你只发送 trace，可能需要在 endpoint 后追加 `/v1/traces`。
+   </Note>
+
+   <Note>
+   如果你在自托管 LangSmith，请把基础 endpoint 替换成你的 LangSmith API endpoint，并追加 `/api/v1`。例如：`OTEL_EXPORTER_OTLP_ENDPOINT=https://ai-company.com/api/v1/otel`
+   </Note>
+
+   可选：指定一个不是 `"default"` 的自定义项目名：
+
+   <CodeGroup>
+
+   ```bash Shell
+   OTEL_EXPORTER_OTLP_ENDPOINT=https://api.smith.langchain.com/otel
+   OTEL_EXPORTER_OTLP_HEADERS="x-api-key=<your langsmith api key>,Langsmith-Project=<project name>"
+   ```
+
+   </CodeGroup>
+
+3. 记录一条 trace。
+
+   下面的代码会设置一个 OTEL tracer 和 exporter，并将 trace 发送到 LangSmith。随后它会调用 OpenAI，并发送所需的 OpenTelemetry attributes。
+
+   ```python
+   from openai import OpenAI
+   from opentelemetry import trace
+   from opentelemetry.sdk.trace import TracerProvider
+   from opentelemetry.sdk.trace.export import (
+       BatchSpanProcessor,
+   )
+   from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+   client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+   otlp_exporter = OTLPSpanExporter(
+       timeout=10,
+   )
+
+   trace.set_tracer_provider(TracerProvider())
+   trace.get_tracer_provider().add_span_processor(
+       BatchSpanProcessor(otlp_exporter)
+   )
+
+   tracer = trace.get_tracer(__name__)
+
+   def call_openai():
+       model = "gpt-5.4-mini"
+       with tracer.start_as_current_span("call_open_ai") as span:
+           span.set_attribute("langsmith.span.kind", "LLM")
+           span.set_attribute("langsmith.metadata.user_id", "user_123")
+           span.set_attribute("gen_ai.system", "OpenAI")
+           span.set_attribute("gen_ai.request.model", model)
+           span.set_attribute("llm.request.type", "chat")
+
+           messages = [
+               {"role": "system", "content": "You are a helpful assistant."},
+               {
+                   "role": "user",
+                   "content": "Write a haiku about recursion in programming."
+               }
+           ]
+
+           for i, message in enumerate(messages):
+               span.set_attribute(f"gen_ai.prompt.{i}.content", str(message["content"]))
+               span.set_attribute(f"gen_ai.prompt.{i}.role", str(message["role"]))
+
+           completion = client.chat.completions.create(
+               model=model,
+               messages=messages
+           )
+
+           span.set_attribute("gen_ai.response.model", completion.model)
+           span.set_attribute("gen_ai.completion.0.content", str(completion.choices[0].message.content))
+           span.set_attribute("gen_ai.completion.0.role", "assistant")
+           span.set_attribute("gen_ai.usage.prompt_tokens", completion.usage.prompt_tokens)
+           span.set_attribute("gen_ai.usage.completion_tokens", completion.usage.completion_tokens)
+           span.set_attribute("gen_ai.usage.total_tokens", completion.usage.total_tokens)
+
+           return completion.choices[0].message
+
+   if __name__ == "__main__":
+       call_openai()
+   ```
+
+4. 在 LangSmith 控制台中查看这条追踪（[示例](https://smith.langchain.com/public/4f2890b1-f105-44aa-a6cf-c777dcc27a37/r)）。
+
+<Note>
+如果你的 span 引用了来自其他服务或进程的父级 span，请参见[分布式追踪中的上下文传播](#context-propagation-in-distributed-tracing)，了解父子关系如何链接，以及 span 何时可能被丢弃。
+</Note>
+
+## 将 trace 发送到其他 provider
+
+虽然 LangSmith 是 OpenTelemetry trace 的默认目标，但你也可以将 OpenTelemetry 配置为把 trace 发送到其他可观测性平台。
+
+<Info>
+适用于 LangSmith Python SDK **≥ 0.4.1**。建议使用 **≥ 0.4.25**，以获得改进 OTEL 导出和混合扇出稳定性的修复。
+</Info>
+
+### 使用环境变量进行全局配置
+
+默认情况下，LangSmith OpenTelemetry exporter 会将数据发送到 LangSmith API 的 OTEL endpoint，但你也可以通过设置标准 OTEL 环境变量来进行自定义：
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT: 覆盖 endpoint URL
+OTEL_EXPORTER_OTLP_HEADERS: 添加自定义请求头（LangSmith API key 和 Project 会自动附加）
+OTEL_SERVICE_NAME: 设置自定义服务名（默认为 "langsmith"）
+```
+
+LangSmith 默认使用 HTTP trace exporter。如果你想使用自己的 tracing provider，可以采用以下任一方式：
+
+1. 按上面所示设置 OTEL 环境变量，或
+2. 在初始化 LangChain 组件之前先设置全局 trace provider，这样 LangSmith 会检测到它并直接使用，而不是自行创建 provider。
+
+### 配置其他 OTLP endpoint
+
+如果你想把 trace 发送到其他 provider，请用该 provider 的 endpoint 配置 OTLP exporter：
+
+```python
+import os
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+# 为 LangChain 设置环境变量
+os.environ["LANGSMITH_OTEL_ENABLED"] = "true"
+os.environ["LANGSMITH_TRACING"] = "true"
+
+# 为你的自定义 endpoint 配置 OTLP exporter
+provider = TracerProvider()
+otlp_exporter = OTLPSpanExporter(
+    # 改成你的 provider endpoint
+    endpoint="https://otel.your-provider.com/v1/traces",
+    # 添加认证所需的请求头
+    headers={"api-key": "your-api-key"},
+)
+processor = BatchSpanProcessor(otlp_exporter)
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+
+# 创建并运行一个 LangChain 应用
+prompt = ChatPromptTemplate.from_template("Tell me a joke about {topic}")
+model = ChatOpenAI()
+chain = prompt | model
+result = chain.invoke({"topic": "programming"})
+print(result.content)
+```
+
+<Info>
+混合追踪适用于版本 **≥ 0.4.1**。如果你只想把 trace 发送到自己的 OTEL endpoint，请设置：
+
+`LANGSMITH_OTEL_ONLY="true"`
+（建议使用 **langsmith ≥ 0.4.25**。）
+</Info>
+
+## 支持的 OpenTelemetry attribute 和 event 映射
+
+当你通过 OpenTelemetry 向 LangSmith 发送 trace 时，下列 attributes 会被映射到 LangSmith 字段：
+
+### LangSmith 核心 attributes
+
+| OpenTelemetry attribute        | LangSmith field  | Notes                                                                        |
+| ------------------------------ | ---------------- | ---------------------------------------------------------------------------- |
+| `langsmith.trace.name`         | Run name         | 覆盖该 run 的 span 名称                                                       |
+| `langsmith.span.kind`          | [Run type](/langsmith/run-data-format#run-types) | 取值：`llm`、`chain`、`tool`、`retriever`、`embedding`、`prompt`、`parser` |
+| `langsmith.trace.id`           | Trace ID         | 该 span 所属的 trace（root run）；设置后可附着到已有 trace                    |
+| `langsmith.span.id`            | Run ID           | 当前 span 的 run ID（UUID）；会覆盖从 OTLP span ID 推导出的 ID                |
+| `langsmith.span.parent_id`     | Parent run ID    | 通过 run ID 将该 span 嵌套到已有 run 下                                       |
+| `langsmith.span.dotted_order`  | Dotted order     | 在 trace 树中的位置：`<parent.dotted_order>.<timestamp><span.id>`。参见 [`dotted_order`](https://docs.langchain.com/langsmith/run-data-format#what-is-dotted_order)。 |
+| `langsmith.trace.session_id`   | Session ID       | 相关 trace 的会话标识                                                         |
+| `langsmith.trace.session_name` | Session name     | 会话名称                                                                      |
+| `langsmith.span.tags`          | Tags             | 附加到 span 上的自定义标签（逗号分隔）                                         |
+| `langsmith.metadata.{key}`     | `metadata.{key}` | 带有 langsmith 前缀的自定义 metadata                                          |
+
+### GenAI 标准 attributes
+
+| OpenTelemetry attribute                 | LangSmith field               | Notes                                                         |
+| --------------------------------------- | ----------------------------- | ------------------------------------------------------------- |
+| `gen_ai.system`                         | `metadata.ls_provider`        | GenAI 系统（例如 `"openai"`、`"anthropic"`）                   |
+| `gen_ai.operation.name`                 | Run type                      | 将 `"chat"`/`"completion"` 映射为 `"llm"`，将 `"embedding"` 映射为 `"embedding"` |
+| `gen_ai.prompt`                         | `inputs`                      | 发送给模型的输入提示词                                         |
+| `gen_ai.completion`                     | `outputs`                     | 模型生成的输出                                                 |
+| `gen_ai.prompt.{n}.role`                | `inputs.messages[n].role`     | 第 n 条输入消息的角色                                          |
+| `gen_ai.prompt.{n}.content`             | `inputs.messages[n].content`  | 第 n 条输入消息的内容                                          |
+| `gen_ai.prompt.{n}.message.role`        | `inputs.messages[n].role`     | 角色的另一种格式                                               |
+| `gen_ai.prompt.{n}.message.content`     | `inputs.messages[n].content`  | 内容的另一种格式                                               |
+| `gen_ai.completion.{n}.role`            | `outputs.messages[n].role`    | 第 n 条输出消息的角色                                          |
+| `gen_ai.completion.{n}.content`         | `outputs.messages[n].content` | 第 n 条输出消息的内容                                          |
+| `gen_ai.completion.{n}.message.role`    | `outputs.messages[n].role`    | 角色的另一种格式                                               |
+| `gen_ai.completion.{n}.message.content` | `outputs.messages[n].content` | 内容的另一种格式                                               |
+| `gen_ai.input.messages`                 | `inputs.messages`             | 输入消息数组                                                   |
+| `gen_ai.output.messages`                | `outputs.messages`            | 输出消息数组                                                   |
+| `gen_ai.tool.name`                      | `invocation_params.tool_name` | 工具名称，同时会把 run type 设为 `"tool"`                     |
+
+### GenAI 请求参数
+
+| OpenTelemetry attribute            | LangSmith field                       | Notes                                   |
+| ---------------------------------- | ------------------------------------- | --------------------------------------- |
+| `gen_ai.request.model`             | `invocation_params.model`             | 请求使用的模型名                         |
+| `gen_ai.response.model`            | `invocation_params.model`             | 响应返回的模型名                         |
+| `gen_ai.request.temperature`       | `invocation_params.temperature`       | Temperature 设置                         |
+| `gen_ai.request.top_p`             | `invocation_params.top_p`             | Top-p 采样设置                           |
+| `gen_ai.request.max_tokens`        | `invocation_params.max_tokens`        | 最大 token 数设置                        |
+| `gen_ai.request.frequency_penalty` | `invocation_params.frequency_penalty` | Frequency penalty 设置                   |
+| `gen_ai.request.presence_penalty`  | `invocation_params.presence_penalty`  | Presence penalty 设置                    |
+| `gen_ai.request.seed`              | `invocation_params.seed`              | 生成时使用的随机种子                     |
+| `gen_ai.request.stop_sequences`    | `invocation_params.stop`              | 终止生成的序列                           |
+| `gen_ai.request.top_k`             | `invocation_params.top_k`             | Top-k 采样参数                           |
+| `gen_ai.request.encoding_formats`  | `invocation_params.encoding_formats`  | 输出编码格式                             |
+
+### GenAI 使用量指标
+
+| OpenTelemetry attribute          | LangSmith field                | Notes                                     |
+| -------------------------------- | ------------------------------ | ----------------------------------------- |
+| `gen_ai.usage.input_tokens`      | `usage_metadata.input_tokens`  | 使用的输入 token 数                        |
+| `gen_ai.usage.output_tokens`     | `usage_metadata.output_tokens` | 使用的输出 token 数                        |
+| `gen_ai.usage.total_tokens`      | `usage_metadata.total_tokens`  | 使用的总 token 数                          |
+| `gen_ai.usage.prompt_tokens`     | `usage_metadata.input_tokens`  | 使用的输入 token 数（已弃用）              |
+| `gen_ai.usage.completion_tokens` | `usage_metadata.output_tokens` | 使用的输出 token 数（已弃用）              |
+| `gen_ai.usage.details.reasoning_tokens` | `usage_metadata.reasoning_tokens` | 使用的 reasoning token 数                 |
+
+### TraceLoop attributes
+
+| OpenTelemetry attribute                  | LangSmith field  | Notes                                            |
+| ---------------------------------------- | ---------------- | ------------------------------------------------ |
+| `traceloop.entity.input`                 | `inputs`         | TraceLoop 的完整输入值                            |
+| `traceloop.entity.output`                | `outputs`        | TraceLoop 的完整输出值                            |
+| `traceloop.entity.name`                  | Run name         | TraceLoop 中的实体名称                            |
+| `traceloop.span.kind`                    | Run type         | 映射到 LangSmith run type                         |
+| `traceloop.llm.request.type`             | Run type         | `"embedding"` 映射为 `"embedding"`，其余映射为 `"llm"` |
+| `traceloop.association.properties.{key}` | `metadata.{key}` | 带 traceloop 前缀的自定义 metadata                |
+
+### OpenInference attributes
+
+| OpenTelemetry attribute   | LangSmith field          | Notes                                     |
+| ------------------------- | ------------------------ | ----------------------------------------- |
+| `input.value`             | `inputs`                 | 完整输入值，可以是字符串或 JSON            |
+| `output.value`            | `outputs`                | 完整输出值，可以是字符串或 JSON            |
+| `openinference.span.kind` | Run type                 | 将不同 kind 映射到 LangSmith run type      |
+| `llm.system`              | `metadata.ls_provider`   | LLM 系统 provider                         |
+| `llm.model_name`          | `metadata.ls_model_name` | 来自 OpenInference 的模型名                |
+| `tool.name`               | Run name                 | 当 span kind 为 `"TOOL"` 时的工具名        |
+| `metadata`                | `metadata.*`             | 需要被合并的 metadata JSON 字符串          |
+
+### LLM attributes
+
+| OpenTelemetry attribute      | LangSmith field                       | Notes                                |
+| ---------------------------- | ------------------------------------- | ------------------------------------ |
+| `llm.input_messages`         | `inputs.messages`                     | 输入消息                              |
+| `llm.output_messages`        | `outputs.messages`                    | 输出消息                              |
+| `llm.token_count.prompt`     | `usage_metadata.input_tokens`         | 提示词 token 数                       |
+| `llm.token_count.completion` | `usage_metadata.output_tokens`        | completion token 数                   |
+| `llm.token_count.total`      | `usage_metadata.total_tokens`         | 总 token 数                           |
+| `llm.usage.total_tokens`     | `usage_metadata.total_tokens`         | 另一种总 token 数格式                 |
+| `llm.invocation_parameters`  | `invocation_params.*`                 | 调用参数 JSON 字符串                  |
+| `llm.presence_penalty`       | `invocation_params.presence_penalty`  | Presence penalty                      |
+| `llm.frequency_penalty`      | `invocation_params.frequency_penalty` | Frequency penalty                     |
+| `llm.request.functions`      | `invocation_params.functions`         | 函数定义                              |
+
+### Prompt 模板 attributes
+
+| OpenTelemetry attribute         | LangSmith field | Notes                                            |
+| ------------------------------- | --------------- | ------------------------------------------------ |
+| `llm.prompt_template.variables` | Run type        | 将 run type 设为 `"prompt"`，与 `input.value` 一起使用 |
+
+### Retriever attributes
+
+| OpenTelemetry attribute                     | LangSmith field                     | Notes                                         |
+| ------------------------------------------- | ----------------------------------- | --------------------------------------------- |
+| `retrieval.documents.{n}.document.content`  | `outputs.documents[n].page_content` | 第 n 个检索文档的内容                         |
+| `retrieval.documents.{n}.document.metadata` | `outputs.documents[n].metadata`     | 第 n 个检索文档的 metadata（JSON）            |
+
+### Tool attributes
+
+| OpenTelemetry attribute | LangSmith field                    | Notes                                     |
+| ----------------------- | ---------------------------------- | ----------------------------------------- |
+| `tools`                 | `invocation_params.tools`          | 工具定义数组                               |
+| `tool_arguments`        | `invocation_params.tool_arguments` | JSON 或键值对形式的工具参数                |
+
+### Logfire attributes
+
+| OpenTelemetry attribute | LangSmith field    | Notes                                            |
+| ----------------------- | ------------------ | ------------------------------------------------ |
+| `prompt`                | `inputs`           | Logfire 的 prompt 输入                            |
+| `all_messages_events`   | `outputs`          | Logfire 的消息事件输出                            |
+| `events`                | `inputs`/`outputs` | Logfire 的事件数组，会拆分成 input/choice 事件    |
+
+### OpenTelemetry event 映射
+
+| Event name                  | LangSmith field      | Notes                                                            |
+| --------------------------- | -------------------- | ---------------------------------------------------------------- |
+| `gen_ai.content.prompt`     | `inputs`             | 从 event attributes 中提取 prompt 内容                           |
+| `gen_ai.content.completion` | `outputs`            | 从 event attributes 中提取 completion 内容                       |
+| `gen_ai.system.message`     | `inputs.messages[]`  | 对话中的 system message                                          |
+| `gen_ai.user.message`       | `inputs.messages[]`  | 对话中的 user message                                            |
+| `gen_ai.assistant.message`  | `outputs.messages[]` | 对话中的 assistant message                                       |
+| `gen_ai.tool.message`       | `outputs.messages[]` | 工具响应消息                                                     |
+| `gen_ai.choice`             | `outputs`            | 带结束原因的模型 choice/response                                 |
+| `exception`                 | `status`, `error`    | 将状态设为 `"error"`，并提取异常消息/堆栈                        |
+
+#### Event attribute 提取
+
+对于消息事件，会提取以下 attributes：
+
+* `content` → 消息内容
+* `role` → 消息角色
+* `id` → `tool_call_id`（用于工具消息）
+* `gen_ai.event.content` → 完整消息 JSON
+
+对于 choice 事件：
+
+* `finish_reason` → choice 的结束原因
+* `message.content` → choice 的消息内容
+* `message.role` → choice 的消息角色
+* `tool_calls.{n}.id` → 工具调用 ID
+* `tool_calls.{n}.function.name` → 工具函数名
+* `tool_calls.{n}.function.arguments` → 工具函数参数
+* `tool_calls.{n}.type` → 工具调用类型
+
+对于 exception 事件：
+
+* `exception.message` → 错误消息
+* `exception.stacktrace` → 错误堆栈（会附加到消息后）
+
+## 实现示例
+
+### 使用 LangSmith SDK 进行追踪
+
+使用 LangSmith SDK 的 OpenTelemetry helper 配置导出。下面的示例会[追踪一个 Google ADK agent](/langsmith/trace-with-google-adk)：
+
+```python
+import asyncio
+from langsmith.integrations.otel import configure
+from google.adk import Runner
+from google.adk.agents import LlmAgent
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+
+# 配置 LangSmith OpenTelemetry 导出（不需要 OTEL 环境变量或 headers）
+configure(project_name="adk-otel-demo")
+
+
+async def main():
+    agent = LlmAgent(
+        name="travel_assistant",
+        model="gemini-2.5-flash-lite",
+        instruction="You are a helpful travel assistant.",
+    )
+
+    session_service = InMemorySessionService()
+    runner = Runner(app_name="travel_app", agent=agent, session_service=session_service)
+
+    user_id = "user_123"
+    session_id = "session_abc"
+    await session_service.create_session(app_name="travel_app", user_id=user_id, session_id=session_id)
+
+    new_message = types.Content(parts=[types.Part(text="Hi! Recommend a weekend trip to Paris.")], role="user")
+
+    for event in runner.run(user_id=user_id, session_id=session_id, new_message=new_message):
+        print(event)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+<Note>
+你不需要手动设置 OTEL 环境变量或 exporter。`configure()` 会自动为 LangSmith 完成这些连接，instrumentor（如 `GoogleADKInstrumentor`）负责创建 spans。
+</Note>
+
+下面是生成后的 trace 在 LangSmith 中的[示例](https://smith.langchain.com/public/d6d47eeb-511e-4fda-ad17-2caa7bd7150b/r)。
+
+### 将 OpenTelemetry span 链接到 LangSmith SDK trace
+
+原生 OTLP `parentSpanId` 不能引用已有 LangSmith run：OTLP span ID 为 8 字节，而 LangSmith run ID 是完整 UUID。若要把 OpenTelemetry span 挂到其他地方创建的 run 上（例如 LangChain SDK run），请设置带完整父级 UUID 的 `langsmith.*` attributes。它们会覆盖从原生 OTLP span 推导出的 ID，从而让该 span 在同一 trace 中嵌套到现有 run 下。
+
+```python
+import uuid
+from datetime import datetime, timezone
+
+from langsmith import get_current_run_tree, traceable
+from opentelemetry import trace
+
+tracer = trace.get_tracer("my-harness")
+
+
+def emit_otel_child(parent):
+    """Emit an OTel span that nests under an existing LangSmith run."""
+    child_id = uuid.uuid4()
+    start = datetime.now(timezone.utc)
+    # dotted_order = parent's dotted_order, a dot, then this span's timestamp + id
+    dotted = f"{parent.dotted_order}.{start.strftime('%Y%m%dT%H%M%S%fZ')}{child_id}"
+
+    with tracer.start_as_current_span("otel-child") as span:
+        span.set_attribute("langsmith.trace.id", str(parent.trace_id))           # same trace
+        span.set_attribute("langsmith.span.parent_id", str(parent.id))           # nest under parent
+        span.set_attribute("langsmith.span.id", str(child_id))                   # this span's run id
+        span.set_attribute("langsmith.span.dotted_order", dotted)                # position in the tree
+        span.set_attribute("langsmith.trace.session_name", parent.session_name)  # same project
+        # ... your instrumented work here ...
+
+
+@traceable
+def my_agent():
+    parent = get_current_run_tree()  # the LangSmith run to nest under
+    emit_otel_child(parent)
+```
+
+<Note>
+`langsmith.span.dotted_order` 编码了 span 在 trace 树中的位置。请用父级的 [`dotted_order`](https://docs.langchain.com/langsmith/run-data-format#what-is-dotted_order)、一个点号，以及当前 span 的时间戳加上它的 `langsmith.span.id` 来构造。
+</Note>
+
+### 为 trace 添加附件
+
+LangSmith 支持[为 trace 附加文件](/langsmith/upload-files-with-traces)。这对于构建带有多模态输入或输出的 agent 很有帮助。使用 OpenTelemetry 追踪时也支持附件。
+
+下面的示例会[追踪一个 Google ADK agent](/langsmith/trace-with-google-adk)，并向 trace 添加一个附件。它结合使用 LangSmith 的 `OtelSpanProcessor` 和一个自定义 `AttachmentSpanProcessor`，利用 [`on_end()`](https://opentelemetry-python.readthedocs.io/en/latest/sdk/trace.export.html#opentelemetry.sdk.trace.export.SimpleSpanProcessor.on_end) 在父级 span 上附加一张图片。
+
+```python
+import asyncio
+import base64
+import json
+from pathlib import Path
+from dotenv import load_dotenv
+from google.adk import Runner
+from google.adk.agents import LlmAgent
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider, SpanProcessor
+from langsmith.integrations.otel import OtelSpanProcessor
+
+
+class AttachmentSpanProcessor(SpanProcessor):
+    """Custom SpanProcessor to add attachments to invocation spans."""
+
+    def __init__(self):
+        self.attachment_data = None
+
+    def set_attachment(self, attachment_data):
+        self.attachment_data = attachment_data
+
+    def on_end(self, span):
+        if span.name == "invocation" and self.attachment_data:
+            attachments_json = json.dumps([self.attachment_data])
+            span._attributes["langsmith.attachments"] = attachments_json
+
+load_dotenv()
+
+# Manually set up TracerProvider
+provider = TracerProvider()
+trace.set_tracer_provider(provider)
+
+# Add attachment processor FIRST (runs before LangSmith processor)
+attachment_processor = AttachmentSpanProcessor()
+provider.add_span_processor(attachment_processor)
+
+# Add LangSmith processor SECOND (receives already-modified spans)
+langsmith_processor = OtelSpanProcessor(project="travel-assistant")
+provider.add_span_processor(langsmith_processor)
+
+def get_flight_info(destination: str, departure_date: str) -> dict:
+    """Get flight information for a destination."""
+    return {
+        "destination": destination,
+        "departure_date": departure_date,
+        "price": "$450",
+        "duration": "5h 30m",
+        "airline": "Example Airways"
+    }
+
+def get_hotel_recommendations(city: str, check_in: str) -> dict:
+    """Get hotel recommendations for a city."""
+    return {
+        "city": city,
+        "check_in": check_in,
+        "hotels": [
+            {"name": "Grand Plaza Hotel", "rating": 4.5, "price": "$120/night"},
+            {"name": "City Center Inn", "rating": 4.2, "price": "$95/night"}
+        ]
+    }
+
+async def main():
+    # Prepare the attachment
+    receipt_path = Path("receipt-template-example.png")
+    with open(receipt_path, "rb") as img_file:
+        image_bytes = img_file.read()
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+
+    attachment_data = {
+        "name": "receipt-template-example",
+        "content": image_base64,
+        "mime_type": "image/jpeg",
+    }
+
+    attachment_processor.set_attachment(attachment_data)
+
+    # Create ADK agent
+    agent = LlmAgent(
+        name="travel_assistant",
+        tools=[get_flight_info, get_hotel_recommendations],
+        model="gemini-2.0-flash-exp",
+        instruction="You are a helpful travel assistant that can help with flights and hotels.",
+    )
+
+    # Set up session and runner
+    session_service = InMemorySessionService()
+    runner = Runner(
+        app_name="travel_app",
+        agent=agent,
+        session_service=session_service
+    )
+
+    await session_service.create_session(
+        app_name="travel_app",
+        user_id="traveler_456",
+        session_id="session_789"
+    )
+
+    # Send a message to the agent
+    new_message = types.Content(
+        parts=[types.Part(text="I need to book a flight to Paris for March 15th and find a good hotel.")],
+        role="user",
+    )
+
+    # Run the agent and process events
+    events = runner.run(
+        user_id="traveler_456",
+        session_id="session_789",
+        new_message=new_message,
+    )
+
+    for event in events:
+        print(event)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+下面是生成后的 trace 在 LangSmith 中的[示例](https://smith.langchain.com/public/9574f70a-b893-49fe-8c62-691bd114bf14/r)。
+
+## 高级配置
+
+### 使用 OpenTelemetry collector 进行扇出
+
+当你需要 OTEL 扇出时，请使用 `LANGSMITH_OTEL_ENABLED=true`。把应用配置为只发出一次 OTEL spans，然后通过 OpenTelemetry Collector 将其路由到 LangSmith 以及其他可观测性后端。
+
+当你在追踪应用并希望把数据发送到多个目标时，请使用这种方式。如果你操作的是 LangSmith 平台基础设施遥测数据（例如自托管 LangSmith 服务在 Kubernetes 上的日志、指标和 trace），请改用[为 LangSmith 遥测数据配置 collector](/langsmith/langsmith-collector)指南。
+
+对于更高级的场景，你可以使用 OpenTelemetry Collector 将遥测数据扇出到多个目标。这比在应用代码中配置多个 exporter 更易扩展。
+
+1. 根据你的环境[安装 OpenTelemetry Collector](https://opentelemetry.io/docs/collector/getting-started/)。
+
+2. 创建一个配置文件（例如 `otel-collector-config.yaml`），导出到多个目标：
+
+   ```yaml
+   receivers:
+     otlp:
+       protocols:
+         grpc:
+           endpoint: 0.0.0.0:4317
+         http:
+           endpoint: 0.0.0.0:4318
+
+   processors:
+     batch:
+
+   exporters:
+     otlphttp/langsmith:
+       endpoint: https://api.smith.langchain.com/otel/v1/traces
+       headers:
+         x-api-key: ${env:LANGSMITH_API_KEY}
+         Langsmith-Project: my_project
+     otlphttp/other_provider:
+       endpoint: https://otel.your-provider.com/v1/traces
+       headers:
+         api-key: ${env:OTHER_PROVIDER_API_KEY}
+
+   service:
+     pipelines:
+       traces:
+         receivers: [otlp]
+         processors: [batch]
+         exporters: [otlphttp/langsmith, otlphttp/other_provider]
+   ```
+
+3. 将应用配置为把数据发送到 collector：
+
+   ```python
+   import os
+   from opentelemetry import trace
+   from opentelemetry.sdk.trace import TracerProvider
+   from opentelemetry.sdk.trace.export import BatchSpanProcessor
+   from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+   from langchain_openai import ChatOpenAI
+   from langchain_core.prompts import ChatPromptTemplate
+
+   # 指向本地 OpenTelemetry Collector
+   otlp_exporter = OTLPSpanExporter(
+       endpoint="http://localhost:4318/v1/traces"
+   )
+   provider = TracerProvider()
+   processor = BatchSpanProcessor(otlp_exporter)
+   provider.add_span_processor(processor)
+   trace.set_tracer_provider(provider)
+
+   # 为 LangChain 设置环境变量
+   os.environ["LANGSMITH_OTEL_ENABLED"] = "true"
+   os.environ["LANGSMITH_TRACING"] = "true"
+
+   # 创建并运行一个 LangChain 应用
+   prompt = ChatPromptTemplate.from_template("Tell me a joke about {topic}")
+   model = ChatOpenAI()
+   chain = prompt | model
+   result = chain.invoke({"topic": "programming"})
+   print(result.content)
+   ```
+
+这种方式有几个优点：
+
+* 统一配置所有遥测目标
+* 减少应用代码中的额外开销
+* 更好的可扩展性和弹性
+* 无需修改应用代码即可增减目标
+
+### 将 LangChain 与 OpenTelemetry 用于分布式追踪
+
+当你的 LLM 应用跨越多个服务或进程时，分布式追踪非常重要。OpenTelemetry 的上下文传播能力可以确保 trace 在跨服务边界时仍保持连通。
+
+#### 分布式追踪中的上下文传播
+
+在分布式系统中，上下文传播会在服务之间传递 trace metadata，让相关 spans 能连接到同一条 trace：
+
+* **Trace ID**：整个 trace 的唯一标识
+* **Span ID**：当前 span 的唯一标识
+* **Sampling Decision**：指示是否应对该 trace 进行采样
+
+<Warning>
+**如果某个 span 的父级从未被发送到 LangSmith，这个 span 会被丢弃。**
+
+OTel endpoint 是异步的：它接收一个批次，返回 `200`，然后在后台把它物化成 runs。当某个 span 的 `parentSpanId` 引用了 LangSmith 还未收到的父级时，子级会被缓冲，待父级到达后再完成链接。这与到达顺序无关，子级可以先于父级到达，甚至可以来自不同请求，仍然可以正确链接。
+
+但是，如果父级 span **从未**导出到 LangSmith，这个被缓冲的子级最终会过期，并且不会作为 run 出现。LangSmith 不会返回错误，因为 `200` 是在处理前就已经发送了。常见原因是分布式 trace 只有一部分进入了 LangSmith：父级由导出到其他后端的服务发出，或者被采样决策丢弃了。
+
+为了避免静默丢失，请确保你希望在 LangSmith 中看到的每个 span，其祖先 spans 也都会在缓冲窗口内导出到 LangSmith。在自托管部署中，这个窗口由 `REDIS_RUNS_EXPIRY_SECONDS` 控制（默认 12 小时）。
+</Warning>
+
+#### 使用 LangChain 设置分布式追踪
+
+要在多个服务之间启用分布式追踪：
+
+```python
+import os
+from opentelemetry import trace
+from opentelemetry.propagate import inject, extract
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+import requests
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+# Set up OpenTelemetry trace provider
+provider = TracerProvider()
+otlp_exporter = OTLPSpanExporter(
+    endpoint="https://api.smith.langchain.com/otel/v1/traces",
+    headers={"x-api-key": os.getenv("LANGSMITH_API_KEY"), "Langsmith-Project": "my_project"}
+)
+processor = BatchSpanProcessor(otlp_exporter)
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer(__name__)
+
+# Service A: Create a span and propagate context to Service B
+def service_a():
+    with tracer.start_as_current_span("service_a_operation") as span:
+        # Create a chain
+        prompt = ChatPromptTemplate.from_template("Summarize: {text}")
+        model = ChatOpenAI()
+        chain = prompt | model
+
+        # Run the chain
+        result = chain.invoke({"text": "OpenTelemetry is an observability framework"})
+
+        # Propagate context to Service B
+        headers = {}
+        inject(headers)  # Inject trace context into headers
+
+        # Call Service B with the trace context
+        response = requests.post(
+            "http://service-b.example.com/process",
+            headers=headers,
+            json={"summary": result.content}
+        )
+        return response.json()
+
+# Service B: Extract the context and continue the trace
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+@app.route("/process", methods=["POST"])
+def service_b_endpoint():
+    # Extract the trace context from the request headers
+    context = extract(request.headers)
+    with tracer.start_as_current_span("service_b_operation", context=context) as span:
+        data = request.json
+        summary = data.get("summary", "")
+
+        # Process the summary with another LLM chain
+        prompt = ChatPromptTemplate.from_template("Analyze the sentiment of: {text}")
+        model = ChatOpenAI()
+        chain = prompt | model
+        result = chain.invoke({"text": summary})
+
+        return jsonify({"analysis": result.content})
+
+if __name__ == "__main__":
+    app.run(port=5000)
+```

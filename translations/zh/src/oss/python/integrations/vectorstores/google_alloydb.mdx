@@ -1,0 +1,268 @@
+---
+title: "Google AlloyDB for PostgreSQL 集成"
+description: "使用 LangChain Python 集成 Google AlloyDB for PostgreSQL 向量存储。"
+---
+
+>[AlloyDB](https://cloud.google.com/alloydb) 是一项完全托管的关系型数据库服务，具备高性能、无缝集成和出色的可扩展性。AlloyDB 与 PostgreSQL 100% 兼容。借助 AlloyDB 的 LangChain 集成，你可以在现有数据库应用之上构建 AI 驱动的体验。
+
+本笔记本介绍如何使用 `AlloyDB for PostgreSQL` 和 `AlloyDBVectorStore` 类来存储向量 embedding。
+
+你可以在 [GitHub](https://github.com/googleapis/langchain-google-alloydb-pg-python/) 上了解该集成包的更多信息。
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/googleapis/langchain-google-alloydb-pg-python/blob/main/docs/vector_store.ipynb)
+
+## 开始之前
+
+运行本笔记本前，你需要完成以下准备：
+
+* [创建 Google Cloud 项目](https://developers.google.com/workspace/guides/create-project)
+* [启用 AlloyDB API](https://console.cloud.google.com/flows/enableapi?apiid=alloydb.googleapis.com)
+* [创建 AlloyDB 集群和实例](https://cloud.google.com/alloydb/docs/cluster-create)
+* [创建 AlloyDB 数据库](https://cloud.google.com/alloydb/docs/quickstart/create-and-connect)
+* [向数据库添加用户](https://cloud.google.com/alloydb/docs/database-users/about)
+
+### 🦜🔗 安装库
+
+安装集成库 `langchain-google-alloydb-pg`，以及 embedding 服务所需的 `langchain-google-vertexai`。
+
+```python
+pip install -qU  langchain-google-alloydb-pg langchain-google-vertexai
+```
+
+**仅限 Colab：** 取消下面单元格的注释以重启内核，或者直接使用按钮重启内核。对于 Vertex AI Workbench，可以使用顶部按钮重启终端。
+
+```python
+# # Automatically restart kernel after installs so that your environment can access the new packages
+# import IPython
+
+# app = IPython.Application.instance()
+# app.kernel.do_shutdown(True)
+```
+
+### 🔐 认证
+
+将当前笔记本中登录的 IAM 用户认证到 Google Cloud，以访问你的 Google Cloud 项目。
+
+* 如果你使用 Colab 运行本笔记本，请使用下面的单元格继续。
+* 如果你使用 Vertex AI Workbench，请参阅 [Vertex AI Workbench setup instructions](https://github.com/GoogleCloudPlatform/generative-ai/tree/main/setup-env)。
+
+```python
+from google.colab import auth
+
+auth.authenticate_user()
+```
+
+### ☁ 设置 Google Cloud 项目
+
+设置你的 Google Cloud 项目，以便在笔记本中使用 Google Cloud 资源。
+
+如果你不知道项目 ID，可以尝试以下方式：
+
+* 运行 `gcloud config list`。
+* 运行 `gcloud projects list`。
+* 查看帮助页面：[Locate the project ID](https://support.google.com/googleapi/answer/7014113)。
+
+```python
+# @markdown Please fill in the value below with your Google Cloud project ID and then run the cell.
+
+PROJECT_ID = "my-project-id"  # @param {type:"string"}
+
+# Set the project id
+!gcloud config set project {PROJECT_ID}
+```
+
+## 基础用法
+
+### 设置 AlloyDB 数据库参数
+
+在 [AlloyDB Instances page](https://console.cloud.google.com/alloydb/clusters) 中查找你的数据库参数。
+
+```python
+# @title Set Your Values Here { display-mode: "form" }
+REGION = "us-central1"  # @param {type: "string"}
+CLUSTER = "my-cluster"  # @param {type: "string"}
+INSTANCE = "my-primary"  # @param {type: "string"}
+DATABASE = "my-database"  # @param {type: "string"}
+TABLE_NAME = "vector_store"  # @param {type: "string"}
+```
+
+### AlloyDBEngine 连接池
+
+将 AlloyDB 用作向量存储时，前置条件之一是提供一个 `AlloyDBEngine` 对象。`AlloyDBEngine` 会为你的 AlloyDB 数据库配置连接池，帮助应用建立稳定连接，并遵循行业最佳实践。
+
+如果你使用 `AlloyDBEngine.from_instance()` 创建 `AlloyDBEngine`，只需要提供以下 5 项内容：
+
+1. `project_id`：AlloyDB 实例所在 Google Cloud 项目的项目 ID。
+1. `region`：AlloyDB 实例所在区域。
+1. `cluster`：AlloyDB 集群名称。
+1. `instance`：AlloyDB 实例名称。
+1. `database`：要连接到的 AlloyDB 数据库名称。
+
+默认情况下，会使用 [IAM database authentication](https://cloud.google.com/alloydb/docs/connect-iam) 进行数据库认证。该库会使用环境中 [Application Default Credentials (ADC)](https://cloud.google.com/docs/authentication/application-default-credentials) 对应的 IAM principal。
+
+你也可以可选地使用 [built-in database authentication](https://cloud.google.com/alloydb/docs/database-users/about)，通过用户名和密码访问 AlloyDB 数据库。只需向 `AlloyDBEngine.from_instance()` 额外提供以下参数：
+
+* `user`：用于内置数据库认证和登录的数据库用户
+* `password`：用于内置数据库认证和登录的数据库密码
+
+**Note：** 本教程演示异步接口。所有异步方法都有对应的同步版本。
+
+```python
+from langchain_google_alloydb_pg import AlloyDBEngine
+
+engine = await AlloyDBEngine.afrom_instance(
+    project_id=PROJECT_ID,
+    region=REGION,
+    cluster=CLUSTER,
+    instance=INSTANCE,
+    database=DATABASE,
+)
+```
+
+### 初始化数据表
+
+`AlloyDBVectorStore` 类需要一个数据库表。`AlloyDBEngine` 提供了辅助方法 `init_vectorstore_table()`，可以帮你创建具备正确 schema 的表。
+
+```python
+await engine.ainit_vectorstore_table(
+    table_name=TABLE_NAME,
+    vector_size=768,  # Vector size for VertexAI model(textembedding-gecko@latest)
+)
+```
+
+### 创建 embedding 类实例
+
+你可以使用任意 [LangChain embeddings model](/oss/integrations/embeddings/)。
+如果要使用 `VertexAIEmbeddings`，可能还需要启用 Vertex AI API。生产环境中建议固定 embedding 模型版本，详情可参阅 [Text embeddings models](https://cloud.google.com/vertex-ai/docs/generative-ai/model-reference/text-embeddings)。
+
+```python
+# enable Vertex AI API
+!gcloud services enable aiplatform.googleapis.com
+```
+
+```python
+from langchain_google_vertexai import VertexAIEmbeddings
+
+embedding = VertexAIEmbeddings(
+    model_name="textembedding-gecko@latest", project=PROJECT_ID
+)
+```
+
+### 初始化默认的 AlloyDBVectorStore
+
+```python
+from langchain_google_alloydb_pg import AlloyDBVectorStore
+
+store = await AlloyDBVectorStore.create(
+    engine=engine,
+    table_name=TABLE_NAME,
+    embedding_service=embedding,
+)
+```
+
+### 添加文本
+
+```python
+import uuid
+
+all_texts = ["Apples and oranges", "Cars and airplanes", "Pineapple", "Train", "Banana"]
+metadatas = [{"len": len(t)} for t in all_texts]
+ids = [str(uuid.uuid4()) for _ in all_texts]
+
+await store.aadd_texts(all_texts, metadatas=metadatas, ids=ids)
+```
+
+### 删除文本
+
+```python
+await store.adelete([ids[1]])
+```
+
+### 搜索文档
+
+```python
+query = "I'd like a fruit."
+docs = await store.asimilarity_search(query)
+print(docs)
+```
+
+### 按向量搜索文档
+
+```python
+query_vector = embedding.embed_query(query)
+docs = await store.asimilarity_search_by_vector(query_vector, k=2)
+print(docs)
+```
+
+## 添加索引
+
+通过应用向量索引来加速向量搜索查询。更多信息请参阅 [vector indexes](https://cloud.google.com/blog/products/databases/faster-similarity-search-performance-with-pgvector-indexes)。
+
+```python
+from langchain_google_alloydb_pg.indexes import IVFFlatIndex
+
+index = IVFFlatIndex()
+await store.aapply_vector_index(index)
+```
+
+### 重新建立索引
+
+```python
+await store.areindex()  # Re-index using default index name
+```
+
+### 删除索引
+
+```python
+await store.adrop_vector_index()  # Delete index using default name
+```
+
+## 创建自定义向量存储
+
+向量存储可以利用关系型数据来过滤相似度搜索。
+
+先创建一个包含自定义 metadata 列的表。
+
+```python
+from langchain_google_alloydb_pg import Column
+
+# Set table name
+TABLE_NAME = "vectorstore_custom"
+
+await engine.ainit_vectorstore_table(
+    table_name=TABLE_NAME,
+    vector_size=768,  # VertexAI model: textembedding-gecko@latest
+    metadata_columns=[Column("len", "INTEGER")],
+)
+
+
+# Initialize AlloyDBVectorStore
+custom_store = await AlloyDBVectorStore.create(
+    engine=engine,
+    table_name=TABLE_NAME,
+    embedding_service=embedding,
+    metadata_columns=["len"],
+    # Connect to a existing VectorStore by customizing the table schema:
+    # id_column="uuid",
+    # content_column="documents",
+    # embedding_column="vectors",
+)
+```
+
+### 使用 metadata 过滤搜索文档
+
+```python
+import uuid
+
+# Add texts to the Vector Store
+all_texts = ["Apples and oranges", "Cars and airplanes", "Pineapple", "Train", "Banana"]
+metadatas = [{"len": len(t)} for t in all_texts]
+ids = [str(uuid.uuid4()) for _ in all_texts]
+
+await store.aadd_texts(all_texts, metadatas=metadatas, ids=ids)
+
+# Use filter on search
+docs = await custom_store.asimilarity_search_by_vector(query_vector, filter="len >= 6")
+
+print(docs)
+```

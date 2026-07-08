@@ -1,0 +1,335 @@
+---
+title: 跟踪 Deep Agents 应用
+sidebarTitle: Deep Agents
+---
+
+[`deepagents`](/oss/deepagents/overview) 是一个基于 LangGraph 构建的开源 agent framework，专为复杂、多步骤任务设计，这类任务通常需要规划、工具使用以及 sub-agent 委派。Deep Agents 原生支持 LangSmith tracing。
+
+本指南介绍如何为 Deep Agents 启用 LangSmith tracing、如何在 LangSmith UI 中查看 traces，以及如何，按需，自定义 trace 配置来满足更高级的使用场景。
+
+## 安装
+
+在你的 Python 环境中安装 `deepagents`：
+
+<CodeGroup>
+
+```bash pip
+pip install deepagents
+```
+
+```bash uv
+uv add deepagents
+```
+
+</CodeGroup>
+
+`deepagents` 需要：
+
+- Python 3.11+。
+- 一个支持 tool calling 的 LLM，例如 OpenAI 或 Anthropic 模型。
+- 若要做 tracing，还需要一个 [LangSmith account 和 API key](/langsmith/create-account-api-key)，可免费注册。
+
+<Note>
+    你不需要为了跟踪 Deep Agents 而额外安装 `langsmith` Python 包。`deepagents` 构建在 LangGraph 之上，而 LangGraph 已经原生支持 LangSmith tracing。只要设置好 LangSmith 环境变量，traces 就会自动发送。
+
+    只有当你希望[以编程方式控制 tracing](#自定义-langsmith-tracing)时，才需要 `langsmith` 包，例如使用 `tracing_context`、添加自定义 metadata，或通过 Python 查询 runs。
+</Note>
+
+## 设置
+
+你可以在 [LangSmith UI](https://smith.langchain.com) 的 **Settings** 中找到 LangSmith API key 和 project name：
+
+```bash
+export LANGSMITH_API_KEY=<your-langsmith-api-key>
+export LANGSMITH_TRACING=true
+export LANGSMITH_PROJECT=<your-project-name>
+```
+
+## 创建 trace
+
+一旦通过环境变量启用了 tracing，Deep Agents 就会自动向 LangSmith 发出 traces。例如：
+
+```python
+from typing import Dict, Any, List
+
+from deepagents import create_deep_agent
+
+
+def compute_compound_interest(
+    principal: float,
+    annual_rate: float,
+    years: int,
+    compounds_per_year: int,
+) -> Dict[str, Any]:
+    """Compute compound interest and return ending balance and interest earned."""
+    r = annual_rate
+    n = compounds_per_year
+    t = years
+    amount = principal * (1 + r / n) ** (n * t)
+    interest = amount - principal
+    return {
+        "principal": principal,
+        "annual_rate": annual_rate,
+        "years": years,
+        "compounds_per_year": n,
+        "ending_balance": round(amount, 2),
+        "interest_earned": round(interest, 2),
+    }
+
+
+def yearly_balance_schedule(
+    principal: float,
+    annual_rate: float,
+    years: int,
+    compounds_per_year: int,
+) -> List[Dict[str, Any]]:
+    """Return a year-by-year balance schedule for the investment."""
+    r = annual_rate
+    n = compounds_per_year
+    schedule: List[Dict[str, Any]] = []
+
+    for year in range(1, years + 1):
+        amount = principal * (1 + r / n) ** (n * year)
+        schedule.append(
+            {
+                "year": year,
+                "ending_balance": round(amount, 2),
+                "interest_earned": round(amount - principal, 2),
+            }
+        )
+
+    return schedule
+
+
+agent = create_deep_agent(
+    model="google_genai:gemini-3.5-flash",
+    tools=[compute_compound_interest, yearly_balance_schedule],
+    system_prompt=(
+        "You are a careful assistant. "
+        "Use tools for calculations and structured outputs. "
+        "Return a concise final answer."
+    ),
+)
+
+result = agent.invoke(
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "I have $2,500 invested at 6% annual interest compounded monthly for 5 years.\n"
+                    "1) Compute the ending balance and total interest earned.\n"
+                    "2) Generate a year-by-year ending balance schedule.\n"
+                    "Then summarize the key takeaways in 3 bullets.\n\n"
+                    "Use compounds_per_year=12."
+                ),
+            }
+        ]
+    }
+)
+
+print(result)
+```
+
+## 查看 traces
+
+### Details 视图
+
+点击 trace 后，在右上角切换到 **Details** 视图。你在 [LangSmith UI](https://smith.langchain.com) 中看到的 trace tree 会类似于[这个示例](https://smith.langchain.com/public/ec82be64-b158-425e-a959-924be16b8588/r)，结构如下：
+
+- 顶层的 agent run，表示整个 Deep Agents 调用。
+- 一次 LLM 调用，agent 在这里分析用户请求，并决定要用哪些 tools。
+- 工具 run：`compute_compound_interest`：
+    - 展示工具输入，例如 principal、annual_rate、years 和 compounds_per_year。
+    - 展示结构化输出，包括 ending balance 和 total interest earned。
+- 又一次 LLM 调用，它解释计算结果并决定下一步。
+- 工具 run：`yearly_balance_schedule`：
+    - 展示生成 schedule 时所使用的输入。
+    - 返回按年份拆分的 ending balances 和 interest earned。
+- 最终的 LLM 响应，用于向用户总结结果。
+
+生成的 trace 包含多个嵌套 spans，因此你可以在 LangSmith UI 中跟踪 agent 的规划过程、计算步骤以及解释流程。
+
+### Messages 视图
+
+LangSmith UI 中的 **Messages** 视图会展示用户与 agent 之间的简化对话历史。这个视图从顶层 trace 中提取消息，包括用户最初的请求、工具调用以及 agent 的最终响应，并以类似聊天记录的形式呈现。
+
+### 按 subagent 过滤
+
+Deep Agents 会自动将 subagent 的 `name` 写入它所产生的每个 run 的 `lc_agent_name` metadata key 中。你可以利用这一点，在 LangSmith 中筛出某个特定 subagent 的所有 runs，这对于调试、监控或比较 subagent 行为非常有用。
+
+**在 LangSmith UI 中过滤：**
+
+1. 打开 [LangSmith](https://smith.langchain.com) 中的 tracing project。
+2. 将视图切换到 **Runs**，以查看单个 spans。
+3. 点击 **Add filter**，选择 **Metadata**。
+4. 将 **Key** 设为 `lc_agent_name`，将 **Value** 设为 subagent 名称，例如 `research-agent`。
+
+你可以把这个过滤器保存成命名视图，方便快速复用。完整的过滤器选项说明请参阅[过滤 traces](/langsmith/filter-traces-in-application)。
+
+**通过 SDK 以编程方式过滤：**
+
+```python
+from langsmith import Client
+
+client = Client()
+
+# Fetch all runs produced by a specific subagent
+runs = client.list_runs(
+    project_name="<your-project>",
+    filter='has(metadata, \'{"lc_agent_name": "research-agent"}\')',
+)
+
+for run in runs:
+    print(run.name, run.start_time, run.status)
+```
+
+完整的过滤查询语言说明请参阅[Trace query syntax](/langsmith/trace-query-syntax)。
+
+## 自定义 LangSmith tracing
+
+默认情况下，只要通过环境变量启用了 LangSmith tracing，Deep Agents traces 就会自动发出。你也可以直接使用 @[LangSmith SDK][langsmith-python] 自定义 tracing，例如只为代码的一部分启用 tracing、附加 tags 或 metadata，或覆盖 project name。
+
+如果你想：
+
+- 只跟踪某些特定的 agent 调用。
+- 添加自定义 tags 或 metadata，方便在 UI 中过滤。
+- 在运行时覆盖 project name。
+
+那么请安装并使用 `langsmith`：
+
+<CodeGroup>
+
+```bash pip
+pip install langsmith
+```
+
+```bash uv
+uv add langsmith
+```
+
+</CodeGroup>
+
+下面的示例会调用同一个 deep agent 两次：
+
+- 第一次调用不被跟踪，因为它运行在 `tracing_context` 之外。
+- 第二次调用会被跟踪，因为它运行在 `tracing_context(enabled=True, ...)` 内部。
+
+这样你就可以只对工作流中的某一部分启用 tracing，而不必通过 `LANGSMITH_TRACING=true` 为整个进程开启全局 tracing：
+
+```python
+from typing import Dict, Any, List
+
+import langsmith as ls
+from deepagents import create_deep_agent
+
+
+def compute_compound_interest(
+    principal: float,
+    annual_rate: float,
+    years: int,
+    compounds_per_year: int,
+) -> Dict[str, Any]:
+    """Compute compound interest and return ending balance and interest earned."""
+    r = annual_rate
+    n = compounds_per_year
+    t = years
+    amount = principal * (1 + r / n) ** (n * t)
+    interest = amount - principal
+    return {
+        "principal": principal,
+        "annual_rate": annual_rate,
+        "years": years,
+        "compounds_per_year": n,
+        "ending_balance": round(amount, 2),
+        "interest_earned": round(interest, 2),
+    }
+
+
+def yearly_balance_schedule(
+    principal: float,
+    annual_rate: float,
+    years: int,
+    compounds_per_year: int,
+) -> List[Dict[str, Any]]:
+    """Return a year-by-year balance schedule for the investment."""
+    r = annual_rate
+    n = compounds_per_year
+    schedule: List[Dict[str, Any]] = []
+
+    for year in range(1, years + 1):
+        amount = principal * (1 + r / n) ** (n * year)
+        schedule.append(
+            {
+                "year": year,
+                "ending_balance": round(amount, 2),
+                "interest_earned": round(amount - principal, 2),
+            }
+        )
+
+    return schedule
+
+
+agent = create_deep_agent(
+    model="google_genai:gemini-3.5-flash",
+    tools=[compute_compound_interest, yearly_balance_schedule],
+    system_prompt=(
+        "You are a careful assistant. "
+        "Use tools for calculations and structured outputs. "
+        "Return a concise final answer."
+    ),
+)
+
+# ----------------------------
+# Untraced invocation
+# ----------------------------
+agent.invoke(
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "I have $2,500 invested at 6% annual interest compounded monthly for 5 years. "
+                    "Compute the ending balance and total interest earned. "
+                    "Use compounds_per_year=12."
+                ),
+            }
+        ]
+    }
+)
+
+# ----------------------------
+# Traced invocation
+# ----------------------------
+with ls.tracing_context(
+    enabled=True,
+    project_name="deepagents-demo",
+    tags=["deepagents", "scoped-tracing"],
+    metadata={"example": "partial-workflow"},
+):
+    agent.invoke(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "I have $2,500 invested at 6% annual interest compounded monthly for 5 years.\n"
+                        "1) Compute the ending balance and total interest earned.\n"
+                        "2) Generate a year-by-year ending balance schedule.\n"
+                        "Then summarize the key takeaways in 3 bullets.\n\n"
+                        "Use compounds_per_year=12."
+                    ),
+                }
+            ]
+        }
+    )
+```
+
+`tracing_context` 代码块不仅会启用 tracing，还会配置 trace 在 LangSmith 中的记录和组织方式：
+
+- `enabled=True` 会在该代码块期间显式启用 tracing，即使 `LANGSMITH_TRACING` 未设置，或被设为 `false`，也一样。
+- `project_name="deepagents-demo"` 会将该代码块中的 traces 路由到指定的 [LangSmith project](/langsmith/log-traces-to-project)。这会覆盖当前上下文中由 `LANGSMITH_PROJECT` 指定的项目。
+- `tags=[...]` 会把 tags 附加到 traced runs 上。[Tags](/langsmith/add-metadata-tags) 会显示在 [LangSmith UI](https://smith.langchain.com) 中，你可以用它们过滤和分组 traces。
+- `metadata={...}` 会附加任意结构化 metadata，例如环境、实验名或 feature flag。
+
+在这个示例中，agent 被调用了两次，但只有 `tracing_context` 内部的那次调用会被记录。这展示了你如何只为 Deep Agents workflow 的某些特定部分开启 tracing，而不必为整个进程开启全局 tracing。

@@ -1,0 +1,246 @@
+---
+title: 跟踪 LiteLLM 应用
+sidebarTitle: LiteLLM
+---
+
+[LiteLLM](https://www.litellm.ai/) 提供统一接口，能够通过一致的 OpenAI 兼容 API 调用不同的 LLM 提供商。它既可以作为直接嵌入应用中的 [Python SDK](https://docs.litellm.ai/docs/#litellm-python-sdk) 使用，也可以作为一个 [proxy server](https://docs.litellm.ai/docs/simple_proxy) 运行，对客户端应用暴露 OpenAI 兼容端点。
+
+本指南介绍如何使用以下几种方式，在 LangSmith 中跟踪 LiteLLM 调用：
+
+- 使用 [LangSmith SDK](#使用-langsmith_tracing-和-traceable) (`@traceable`) 进行应用层跟踪。
+- 使用 [LiteLLM 内置的 langsmith callback](#使用-langsmith-callback-记录-litellm-调用) 进行模型层日志记录。
+- 使用 [LiteLLM Proxy](#使用-litellm-proxy) 进行网关层跟踪。
+
+## 安装
+
+无论你使用 LiteLLM Python SDK 还是 LiteLLM Proxy，都请安装以下依赖：
+
+<CodeGroup>
+
+```bash Python SDK
+pip install litellm langsmith openai
+```
+
+```bash Proxy usage
+npm install openai langsmith
+```
+
+</CodeGroup>
+
+本指南中的示例使用 OpenAI 模型，不过你也可以按自己的场景安装对应 provider 所需的依赖。
+
+## 使用 LiteLLM Python SDK
+
+LiteLLM 支持两种将 traces 发送到 LangSmith 的方式，它们工作在不同层级：
+
+- 使用 `LANGSMITH_TRACING=true` 的 [LangSmith SDK tracing](#使用-langsmith_tracing-和-traceable) 配合 `@traceable`，可通过 LangSmith SDK 启用应用层跟踪。当你希望跟踪更宽泛的业务逻辑、多步骤流水线，或由 `@traceable` 创建的 spans 时，这种方式很适合。
+- 使用 LiteLLM 内置的 [`langsmith` callback](#使用-langsmith-callback-记录-litellm-调用)，可直接从 LiteLLM 记录模型调用。当你希望专门跟踪 LiteLLM 请求，或运行异步应用时，推荐使用这种方式。
+
+<Note>
+不要对同一批 LiteLLM 调用同时开启 LiteLLM 的 `langsmith` callback 和 LangSmith tracing，否则可能产生重复 traces。
+</Note>
+
+### 使用 `LANGSMITH_TRACING` 和 `traceable`
+
+你可以将 `LANGSMITH_TRACING=true` 与 `@traceable` 一起使用，以便在 LangSmith 中获得更可预测的 traces。这样可以确保 **Input** 和 **Output** 列准确反映你的函数参数和返回值，从而保留完整的消息结构，包括 `role` 和 `content`。这种方式在简单的同步脚本中也能稳定工作，不需要 asyncio 事件循环或额外的 callback 配置。
+
+1. 设置以下环境变量，为 LiteLLM Python SDK 的使用启用 LangSmith tracing：
+
+    ```bash
+    export LANGSMITH_API_KEY="your_api_key"
+    export LANGSMITH_PROJECT="litellm-integration"
+    export LANGSMITH_TRACING="true"
+    ```
+    在 [LangSmith UI](https://smith.langchain.com) 中创建 LangSmith [API key](/langsmith/create-account-api-key)。
+
+    根据你使用的 provider，还需要设置相应的 API key：
+
+    ```bash
+    export OPENAI_API_KEY="your_openai_key"
+    ```
+
+1. 将以下代码添加到你的脚本文件中：
+
+    ```python
+    from langsmith import traceable
+    from litellm import completion
+
+    @traceable(name="LiteLLM Chat Completion")
+    def run(messages):
+        response = completion(
+            model="gpt-4o",
+            messages=messages,
+        )
+        # Return the assistant message so the LangSmith UI shows role + content
+        return response["choices"][0]["message"]
+
+    messages = [
+        {"role": "user", "content": "Explain observability in LLM systems."}
+    ]
+
+    result = run(messages)
+    print(result["content"])
+    ```
+
+    `@traceable` 会把你的函数作为一个 LangSmith run 进行埋点。当设置了 `LANGSMITH_TRACING=true`` 后，LangSmith 会自动：
+
+    - 在函数调用时创建一个 run。
+    - 将函数参数记录为 run 输入。
+    - 执行函数体，包括 LiteLLM 调用。
+    - 将函数返回值记录为 run 输出。
+    - 捕获耗时、错误以及嵌套 spans（如果有）。
+
+    在此示例中，`messages` 参数会成为 trace 输入，返回的 assistant message 对象会成为 trace 输出。LiteLLM 调用本身按正常方式运行，`@traceable` 做的是为其包裹可观测性，而不是修改其行为。这种方式跟踪的是你的应用逻辑，而不仅仅是模型调用。
+
+    <Tip>
+    如需查看更多使用 `@traceable` 的通用示例，请参阅[自定义埋点](/langsmith/annotate-code#use-@traceable-/-traceable)页面。
+    </Tip>
+
+### 使用 `langsmith` callback 记录 LiteLLM 调用
+
+LiteLLM 可以通过其内置的 [callback system](https://docs.litellm.ai/docs/observability/callbacks) 直接将 traces 发送到 LangSmith。这在你将 LiteLLM 运行在异步 Python 服务中，并希望由 LiteLLM 本身发出模型层日志时非常有用。
+
+LiteLLM callbacks 运行在异步环境中。当你使用 `litellm.acompletion()` 发起异步调用时，可以启用 `langsmith` callback 来记录成功的模型调用。
+
+<Tip>
+这种方式最适合异步应用。对于简单的同步脚本，请使用[上一节](#使用-langsmith_tracing-和-traceable)中展示的 `@traceable` 方法。
+</Tip>
+
+1. 设置以下环境变量：
+
+    ```bash
+    export LANGSMITH_API_KEY="your_api_key"
+    export LANGSMITH_PROJECT="litellm-integration"
+    ```
+    在 [LangSmith UI](https://smith.langchain.com) 中创建 LangSmith [API key](/langsmith/create-account-api-key)。
+
+    根据你使用的 provider，还需要设置相应的 API key：
+
+    ```bash
+    export OPENAI_API_KEY="your_openai_key"
+    ```
+
+1. 在一个最小脚本中运行：
+
+    - 使用 `acompletion()`，也就是异步 API。
+    - 使用 `asyncio.run(...)` 创建事件循环。
+    - 设置 `langsmith_batch_size = 1`，以便立即刷新。
+
+    ```python
+    import asyncio
+    import litellm
+    from litellm import acompletion
+
+    # Enable LiteLLM → LangSmith callback
+    litellm.success_callback = ["langsmith"]
+
+    # For short-lived scripts, send immediately instead of waiting for batch flush
+    litellm.langsmith_batch_size = 1
+
+    async def main():
+        response = await acompletion(
+            model="gpt-4o",
+            messages=[
+                {"role": "user", "content": "Explain observability in LLM systems."}
+            ],
+        )
+
+        # Print the assistant message content for local verification
+        print(response["choices"][0]["message"]["content"])
+
+        # Allow time for background logger to flush before process exit
+        await asyncio.sleep(1)
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+    ```
+
+    callback 会将 LiteLLM 的模型请求和响应数据直接发送到 LangSmith，其中包括 provider 元数据和 token 使用量。由于 payload 由 LiteLLM 控制，因此 **Input** 和 **Output** 列相比 `@traceable` 示例可能会包含额外元数据。
+
+## 使用 LiteLLM Proxy
+
+LiteLLM proxy 作为独立服务器运行，并暴露 OpenAI 兼容 API。
+
+1. 若要让 proxy 直接将请求记录到 LangSmith，请在 `config.yaml` 中配置 callback：
+
+    ```yaml
+    model_list:
+      - model_name: gpt-4o
+        litellm_params:
+          model: openai/gpt-4o
+
+    litellm_settings:
+      callbacks: ["langsmith"]
+    ```
+
+1. 在 proxy 的运行环境中设置环境变量：
+
+    ```bash
+    export LANGSMITH_API_KEY="your_api_key"
+    export LANGSMITH_PROJECT="litellm-proxy"
+    export OPENAI_API_KEY="your_openai_key"
+    ```
+
+    <Note>
+    LiteLLM proxy 作为独立服务运行。如果你在 proxy 层开启 LangSmith tracing，必须在 proxy 的运行环境中配置 `LANGSMITH_API_KEY` 及相关环境变量。这些设置不会与应用进程共享。
+    </Note>
+
+1. 启动 proxy：
+
+    ```bash
+    litellm --config config.yaml
+    ```
+
+    默认情况下，proxy 运行在 `http://localhost:4000/v1`。你的应用可以使用任意 OpenAI 兼容客户端来调用它，包括 Python、JavaScript、curl 等。
+
+    开启 `callbacks: ["langsmith"]` 后，proxy 会直接将模型请求和响应数据发送到 LangSmith。客户端应用无需额外配置 tracing。
+
+1. 在另一个终端窗口中调用 proxy：
+
+    <CodeGroup>
+
+    ```python Python
+    from openai import OpenAI
+
+    client = OpenAI(
+        base_url="http://localhost:4000/v1",
+        api_key="anything"  # proxy may require a key but doesn't validate it by default
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "user", "content": "What is LiteLLM?"}
+        ],
+    )
+
+    print(response.choices[0].message.content)
+    ```
+
+    ```javascript JavaScript
+    import OpenAI from "openai";
+
+    const client = new OpenAI({
+    apiKey: "anything",
+    baseURL: "http://localhost:4000/v1",
+    });
+
+    const response = await client.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+        { role: "user", content: "Explain LiteLLM tracing." }
+    ],
+    });
+
+    console.log(response.choices[0].message.content);
+    ```
+
+    </CodeGroup>
+
+    客户端发送的是普通的 chat completion 请求，provider 路由和响应格式化由 proxy 负责处理。
+
+## 后续步骤
+
+- [在 LangSmith 中查看 traces](/langsmith/filter-traces-in-application)
+- [添加自定义元数据](/langsmith/ls-metadata-parameters)
+- [过滤并采样 traces](/langsmith/sample-traces)

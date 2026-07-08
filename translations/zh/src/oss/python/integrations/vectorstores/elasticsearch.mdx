@@ -1,0 +1,715 @@
+---
+title: "Elasticsearch 集成"
+description: "使用 LangChain Python 集成 Elasticsearch 向量存储。"
+---
+
+>[Elasticsearch](https://www.elastic.co/elasticsearch/) 是一个分布式、RESTful 的搜索与分析引擎，既可以执行向量搜索，也可以执行词法搜索。它构建在 Apache Lucene 库之上。
+
+本笔记本展示了如何使用与 `Elasticsearch` 向量存储相关的功能。
+
+## 设置
+
+要使用 `Elasticsearch` 向量搜索，你必须安装 `langchain-elasticsearch` 包。
+
+```python
+pip install -qU langchain-elasticsearch
+```
+
+### 凭证
+
+可用于 Elasticsearch 的部署方式主要有两种：
+
+1. Elastic Cloud：Elastic Cloud 是托管式 Elasticsearch 服务。你可以注册 [free trial](https://cloud.elastic.co/registration?utm_source=langchain&utm_content=documentation)。
+
+如果你要连接的 Elasticsearch 实例不需要登录凭证（通过启用安全功能启动 docker 实例），只需把 Elasticsearch URL、index name 和 embedding 对象一起传给构造函数。
+
+2. 本地安装 Elasticsearch：你也可以在本地运行 Elasticsearch。最简单的方法是使用官方 Elasticsearch Docker 镜像。更多信息请参阅 [Elasticsearch Docker documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/docker.html)。
+
+### 在本地运行 Elasticsearch
+
+在本地用于开发和测试时，最简单的方式是使用 [start-local](https://github.com/elastic/start-local) 脚本。该脚本会通过 Docker 用一条命令完成 Elasticsearch（以及可选的 Kibana）配置。
+
+```bash
+curl -fsSL https://elastic.co/start-local | sh
+```
+
+这会创建一个 `elastic-start-local` 文件夹，其中包含配置文件和启动脚本。要启动 Elasticsearch：
+
+```bash
+cd elastic-start-local
+./start.sh
+```
+
+Elasticsearch 将在 `http://localhost:9200` 提供服务。`elastic` 用户的密码和 API key 会自动生成，并保存在 `elastic-start-local` 文件夹中的 `.env` 文件里。
+
+如果你只需要 Elasticsearch，不需要 Kibana，可以使用 `--esonly` 选项：
+
+```bash
+curl -fsSL https://elastic.co/start-local | sh -s -- --esonly
+```
+
+<Note>
+start-local 仅用于本地测试，不应在生产环境中使用。对于生产安装，请参阅官方 [Elasticsearch documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/install-elasticsearch.html)。
+</Note>
+
+### 使用认证运行
+
+在生产环境中，我们建议启用安全功能。要使用登录凭证连接，你可以使用 `es_api_key` 或 `es_user` 和 `es_password` 参数。
+
+<EmbeddingTabs/>
+
+```python
+# | output: false
+# | echo: false
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+```
+
+```python
+from langchain_elasticsearch import ElasticsearchStore
+
+elastic_vector_search = ElasticsearchStore(
+    es_url="http://localhost:9200",
+    index_name="langchain_index",
+    embedding=embeddings,
+    es_user="elastic",
+    es_password="changeme",
+)
+```
+
+#### 如何获取默认 `"elastic"` 用户的密码？
+
+要获取 Elastic Cloud 中默认 `"elastic"` 用户的密码：
+
+1. 登录 Elastic Cloud 控制台 [cloud.elastic.co](https://cloud.elastic.co)
+2. 进入 `"Security" > "Users"`
+3. 找到 `"elastic"` 用户并点击 `"Edit"`
+4. 点击 `"Reset password"`
+5. 按提示完成密码重置
+
+#### 如何获取 API key？
+
+要获取 API key：
+
+1. 登录 Elastic Cloud 控制台 [cloud.elastic.co](https://cloud.elastic.co)
+2. 打开 Kibana，进入 Stack Management > API Keys
+3. 点击 `"Create API key"`
+4. 为 API key 输入名称并点击 `"Create"`
+5. 复制 API key，并将其填入 `api_key` 参数
+
+### Elastic Cloud
+
+要连接到 Elastic Cloud 上的 Elasticsearch 实例，你可以使用 `es_cloud_id` 或 `es_url` 参数。
+
+```python
+elastic_vector_search = ElasticsearchStore(
+    es_cloud_id="<cloud_id>",
+    index_name="test_index",
+    embedding=embeddings,
+    es_user="elastic",
+    es_password="changeme",
+)
+```
+
+如果你想获得更完善的模型调用自动 tracing，也可以取消下面代码的注释，设置你的 [LangSmith](/langsmith/observability) API key：
+
+```python
+os.environ["LANGSMITH_API_KEY"] = getpass.getpass("Enter your LangSmith API key: ")
+os.environ["LANGSMITH_TRACING"] = "true"
+```
+
+## 初始化
+
+Elasticsearch 正通过 [docker](#running-elasticsearch-locally) 在本地 `localhost:9200` 运行。关于如何从 Elastic Cloud 连接到 Elasticsearch 的更多细节，请参阅上面的 [connecting with authentication](#running-with-authentication)。
+
+```python
+from langchain_elasticsearch import ElasticsearchStore
+
+vector_store = ElasticsearchStore(
+    "langchain-demo", embedding=embeddings, es_url="http://localhost:9201"
+)
+```
+
+## 管理向量存储
+
+### 向向量存储添加条目
+
+```python
+from uuid import uuid4
+
+from langchain_core.documents import Document
+
+document_1 = Document(
+    page_content="I had chocolate chip pancakes and scrambled eggs for breakfast this morning.",
+    metadata={"source": "tweet"},
+)
+
+document_2 = Document(
+    page_content="The weather forecast for tomorrow is cloudy and overcast, with a high of 62 degrees.",
+    metadata={"source": "news"},
+)
+
+document_3 = Document(
+    page_content="Building an exciting new project with LangChain - come check it out!",
+    metadata={"source": "tweet"},
+)
+
+document_4 = Document(
+    page_content="Robbers broke into the city bank and stole $1 million in cash.",
+    metadata={"source": "news"},
+)
+
+document_5 = Document(
+    page_content="Wow! That was an amazing movie. I can't wait to see it again.",
+    metadata={"source": "tweet"},
+)
+
+document_6 = Document(
+    page_content="Is the new iPhone worth the price? Read this review to find out.",
+    metadata={"source": "website"},
+)
+
+document_7 = Document(
+    page_content="The top 10 soccer players in the world right now.",
+    metadata={"source": "website"},
+)
+
+document_8 = Document(
+    page_content="LangGraph is the best framework for building stateful, agentic applications!",
+    metadata={"source": "tweet"},
+)
+
+document_9 = Document(
+    page_content="The stock market is down 500 points today due to fears of a recession.",
+    metadata={"source": "news"},
+)
+
+document_10 = Document(
+    page_content="I have a bad feeling I am going to get deleted :(",
+    metadata={"source": "tweet"},
+)
+
+documents = [
+    document_1,
+    document_2,
+    document_3,
+    document_4,
+    document_5,
+    document_6,
+    document_7,
+    document_8,
+    document_9,
+    document_10,
+]
+uuids = [str(uuid4()) for _ in range(len(documents))]
+
+vector_store.add_documents(documents=documents, ids=uuids)
+```
+
+```python
+['21cca03c-9089-42d2-b41c-3d156be2b519',
+ 'a6ceb967-b552-4802-bb06-c0e95fce386e',
+ '3a35fac4-e5f0-493b-bee0-9143b41aedae',
+ '176da099-66b1-4d6a-811b-dfdfe0808d30',
+ 'ecfa1a30-3c97-408b-80c0-5c43d68bf5ff',
+ 'c0f08baa-e70b-4f83-b387-c6e0a0f36f73',
+ '489b2c9c-1925-43e1-bcf0-0fa94cf1cbc4',
+ '408c6503-9ba4-49fd-b1cc-95584cd914c5',
+ '5248c899-16d5-4377-a9e9-736ca443ad4f',
+ 'ca182769-c4fc-4e25-8f0a-8dd0a525955c']
+```
+
+### 从向量存储删除条目
+
+```python
+vector_store.delete(ids=[uuids[-1]])
+```
+
+```text
+True
+```
+
+## 查询向量存储
+
+当向量存储已创建并写入相关文档后，你通常会希望在 chain 或 agent 运行过程中查询它。下面的示例同时展示了搜索时如何使用过滤器。
+
+### 直接查询
+
+#### 相似度搜索
+
+可以像下面这样执行简单的相似度搜索，并基于元数据进行过滤：
+
+```python
+results = vector_store.similarity_search(
+    query="LangChain provides abstractions to make working with LLMs easy",
+    k=2,
+    filter=[{"term": {"metadata.source.keyword": "tweet"}}],
+)
+for res in results:
+    print(f"* {res.page_content} [{res.metadata}]")
+```
+
+```text
+* Building an exciting new project with LangChain - come check it out! [{'source': 'tweet'}]
+* LangGraph is the best framework for building stateful, agentic applications! [{'source': 'tweet'}]
+```
+
+#### 带分数的相似度搜索
+
+如果你想执行相似度搜索并获得对应分数，可以运行：
+
+```python
+results = vector_store.similarity_search_with_score(
+    query="Will it be hot tomorrow",
+    k=1,
+    filter=[{"term": {"metadata.source.keyword": "news"}}],
+)
+for doc, score in results:
+    print(f"* [SIM={score:3f}] {doc.page_content} [{doc.metadata}]")
+```
+
+```text
+* [SIM=0.765887] The weather forecast for tomorrow is cloudy and overcast, with a high of 62 degrees. [{'source': 'news'}]
+```
+
+### 转换为 retriever 后查询
+
+你也可以将向量存储转换为 retriever，以便更方便地在 chain 中使用。
+
+```python
+retriever = vector_store.as_retriever(
+    search_type="similarity_score_threshold", search_kwargs={"score_threshold": 0.2}
+)
+retriever.invoke("Stealing from the bank is a crime")
+```
+
+```text
+[Document(metadata={'source': 'news'}, page_content='Robbers broke into the city bank and stole $1 million in cash.'),
+ Document(metadata={'source': 'news'}, page_content='The stock market is down 500 points today due to fears of a recession.'),
+ Document(metadata={'source': 'website'}, page_content='Is the new iPhone worth the price? Read this review to find out.'),
+ Document(metadata={'source': 'tweet'}, page_content='Building an exciting new project with LangChain - come check it out!')]
+```
+
+## 距离相似度算法
+
+Elasticsearch 支持以下向量距离相似度算法：
+
+- cosine
+- euclidean
+- dot_product
+
+默认算法是 cosine similarity。
+
+你可以通过 `similarity` 参数指定所需的相似度算法。
+
+**注意：** 根据检索策略不同，距离相似度算法有时不能在查询时动态修改。它需要在为字段创建 index mapping 时设定。如果你需要更改算法，需要删除索引并使用正确的 `distance_strategy` 重新创建。
+
+```python
+db = ElasticsearchStore.from_documents(
+    docs,
+    embeddings,
+    es_url="http://localhost:9200",
+    index_name="test",
+    distance_strategy="COSINE",
+    # distance_strategy="EUCLIDEAN_DISTANCE"
+    # distance_strategy="DOT_PRODUCT"
+)
+```
+
+## 检索策略
+
+与只支持向量的数据库相比，Elasticsearch 的一个巨大优势是它支持多种检索策略。在本笔记本中，我们会配置 `ElasticsearchStore` 来支持一些最常见的检索方式。
+
+默认情况下，`ElasticsearchStore` 使用 `DenseVectorStrategy`（在 0.2.0 之前叫 `ApproxRetrievalStrategy`）。
+
+### DenseVectorStrategy
+
+该策略会返回与查询向量最相似的前 k 个向量。`k` 参数在初始化 `ElasticsearchStore` 时设定，默认值为 10。
+
+```python
+from langchain_elasticsearch import DenseVectorStrategy
+
+db = ElasticsearchStore.from_documents(
+    docs,
+    embeddings,
+    es_url="http://localhost:9200",
+    index_name="test",
+    strategy=DenseVectorStrategy(),
+)
+
+docs = db.similarity_search(
+    query="What did the president say about Ketanji Brown Jackson?", k=10
+)
+```
+
+#### 示例：结合 dense vector 与关键词搜索的混合检索
+
+这个示例展示如何配置 `ElasticsearchStore` 以执行混合检索，即同时结合近似语义搜索和基于关键词的搜索。
+
+我们使用 RRF 来平衡不同检索方法得到的两个分数。
+
+要启用混合检索，需要在 `DenseVectorStrategy` 构造函数中设置 `hybrid=True`。
+
+```python
+db = ElasticsearchStore.from_documents(
+    docs,
+    embeddings,
+    es_url="http://localhost:9200",
+    index_name="test",
+    strategy=DenseVectorStrategy(hybrid=True),
+)
+```
+
+启用 hybrid 后，执行的查询将结合近似语义搜索和基于关键词的搜索。
+
+它会使用 rrf（Reciprocal Rank Fusion）来平衡不同检索方法得到的分数。
+
+**Note**：RRF 要求 Elasticsearch 版本为 8.9.0 或更高。
+
+```python
+{
+    "retriever": {
+        "rrf": {
+            "retrievers": [
+                {
+                    "standard": {
+                        "query": {
+                            "bool": {
+                                "filter": [],
+                                "must": [{"match": {"text": {"query": "foo"}}}],
+                            }
+                        },
+                    },
+                },
+                {
+                    "knn": {
+                        "field": "vector",
+                        "filter": [],
+                        "k": 1,
+                        "num_candidates": 50,
+                        "query_vector": [1.0, ..., 0.0],
+                    },
+                },
+            ]
+        }
+    }
+}
+```
+
+#### 示例：使用 Elasticsearch 中部署的 embedding model 执行 dense vector 搜索
+
+这个示例展示如何配置 `ElasticsearchStore`，以便在 dense vector 检索中使用部署在 Elasticsearch 中的 embedding model。
+
+要使用该方式，需要在 `DenseVectorStrategy` 构造函数中通过 `query_model_id` 参数指定 model_id。
+
+**注意：** 这要求该模型已部署并在 Elasticsearch 的 ML node 上运行。关于如何使用 `eland` 部署模型，请参阅 [notebook example](https://github.com/elastic/elasticsearch-labs/blob/main/notebooks/integrations/hugging-face/loading-model-from-hugging-face.ipynb)。
+
+```python
+DENSE_SELF_DEPLOYED_INDEX_NAME = "test-dense-self-deployed"
+
+# Note: This does not have an embedding function specified
+# Instead, we will use the embedding model deployed in Elasticsearch
+db = ElasticsearchStore(
+    es_cloud_id="<your cloud id>",
+    es_user="elastic",
+    es_password="<your password>",
+    index_name=DENSE_SELF_DEPLOYED_INDEX_NAME,
+    query_field="text_field",
+    vector_query_field="vector_query_field.predicted_value",
+    strategy=DenseVectorStrategy(model_id="sentence-transformers__all-minilm-l6-v2"),
+)
+
+# Setup a Ingest Pipeline to perform the embedding
+# of the text field
+db.client.ingest.put_pipeline(
+    id="test_pipeline",
+    processors=[
+        {
+            "inference": {
+                "model_id": "sentence-transformers__all-minilm-l6-v2",
+                "field_map": {"query_field": "text_field"},
+                "target_field": "vector_query_field",
+            }
+        }
+    ],
+)
+
+# creating a new index with the pipeline,
+# not relying on langchain to create the index
+db.client.indices.create(
+    index=DENSE_SELF_DEPLOYED_INDEX_NAME,
+    mappings={
+        "properties": {
+            "text_field": {"type": "text"},
+            "vector_query_field": {
+                "properties": {
+                    "predicted_value": {
+                        "type": "dense_vector",
+                        "dims": 384,
+                        "index": True,
+                        "similarity": "l2_norm",
+                    }
+                }
+            },
+        }
+    },
+    settings={"index": {"default_pipeline": "test_pipeline"}},
+)
+
+db.from_texts(
+    ["hello world"],
+    es_cloud_id="<cloud id>",
+    es_user="elastic",
+    es_password="<cloud password>",
+    index_name=DENSE_SELF_DEPLOYED_INDEX_NAME,
+    query_field="text_field",
+    vector_query_field="vector_query_field.predicted_value",
+    strategy=DenseVectorStrategy(model_id="sentence-transformers__all-minilm-l6-v2"),
+)
+
+# Perform search
+db.similarity_search("hello world", k=10)
+```
+
+### SparseVectorStrategy（ELSER）
+
+该策略使用 Elasticsearch 的 sparse vector 检索来返回 top-k 结果。目前我们仅支持自家的 `"ELSER"` embedding model。
+
+**注意：** 这要求 ELSER 模型已部署，并在 Elasticsearch 的 ml node 上运行。
+
+要使用它，请在 `ElasticsearchStore` 构造函数中指定 `SparseVectorStrategy`（在 0.2.0 之前叫 `SparseVectorRetrievalStrategy`）。你需要提供一个 model ID。
+
+```python
+from langchain_elasticsearch import SparseVectorStrategy
+
+# Note that this example doesn't have an embedding function. This is because we infer the tokens at index time and at query time within Elasticsearch.
+# This requires the ELSER model to be loaded and running in Elasticsearch.
+db = ElasticsearchStore.from_documents(
+    docs,
+    es_cloud_id="<cloud id>",
+    es_user="elastic",
+    es_password="<cloud password>",
+    index_name="test-elser",
+    strategy=SparseVectorStrategy(model_id=".elser_model_2"),
+)
+
+db.client.indices.refresh(index="test-elser")
+
+results = db.similarity_search(
+    "What did the president say about Ketanji Brown Jackson", k=4
+)
+print(results[0])
+```
+
+### DenseVectorScriptScoreStrategy
+
+该策略使用 Elasticsearch 的 script score query 来执行精确向量检索（也就是暴力搜索），以返回 top-k 结果。（该策略在 0.2.0 之前叫 `ExactRetrievalStrategy`。）
+
+要使用它，请在 `ElasticsearchStore` 构造函数中指定 `DenseVectorScriptScoreStrategy`。
+
+```python
+from langchain_elasticsearch import SparseVectorStrategy
+
+db = ElasticsearchStore.from_documents(
+    docs,
+    embeddings,
+    es_url="http://localhost:9200",
+    index_name="test",
+    strategy=DenseVectorScriptScoreStrategy(),
+)
+```
+
+### BM25Strategy
+
+最后，你也可以使用全文关键词搜索。
+
+要使用它，请在 `ElasticsearchStore` 构造函数中指定 `BM25Strategy`。
+
+```python
+from langchain_elasticsearch import BM25Strategy
+
+db = ElasticsearchStore.from_documents(
+    docs,
+    es_url="http://localhost:9200",
+    index_name="test",
+    strategy=BM25Strategy(),
+)
+```
+
+### BM25RetrievalStrategy
+
+该策略允许用户在完全不使用向量搜索的情况下，执行纯 BM25 搜索。
+
+要使用它，请在 `ElasticsearchStore` 构造函数中指定 `BM25RetrievalStrategy`。
+
+注意，在下面示例中没有指定 embedding 参数，这意味着搜索不会使用 embedding。
+
+```python
+from langchain_elasticsearch import ElasticsearchStore
+
+db = ElasticsearchStore(
+    es_url="http://localhost:9200",
+    index_name="test_index",
+    strategy=ElasticsearchStore.BM25RetrievalStrategy(),
+)
+
+db.add_texts(
+    ["foo", "foo bar", "foo bar baz", "bar", "bar baz", "baz"],
+)
+
+results = db.similarity_search(query="foo", k=10)
+print(results)
+```
+
+## 自定义查询
+
+通过搜索时的 `custom_query` 参数，你可以调整从 Elasticsearch 中检索文档时所使用的查询。这在你想使用更复杂的查询，或支持字段线性加权时非常有用。
+
+```python
+# Example of a custom query that's just doing a BM25 search on the text field.
+def custom_query(query_body: dict, query: str):
+    """Custom query to be used in Elasticsearch.
+    Args:
+        query_body (dict): Elasticsearch query body.
+        query (str): Query string.
+    Returns:
+        dict: Elasticsearch query body.
+    """
+    print("Query Retriever created by the retrieval strategy:")
+    print(query_body)
+    print()
+
+    new_query_body = {"query": {"match": {"text": query}}}
+
+    print("Query that's actually used in Elasticsearch:")
+    print(new_query_body)
+    print()
+
+    return new_query_body
+
+
+results = db.similarity_search(
+    "What did the president say about Ketanji Brown Jackson",
+    k=4,
+    custom_query=custom_query,
+)
+print("Results:")
+print(results[0])
+```
+
+## 自定义文档构造器
+
+通过搜索时的 `doc_builder` 参数，你可以调整如何用 Elasticsearch 返回的数据来构造 `Document`。如果你的索引并不是用 LangChain 创建的，这会特别有用。
+
+```python
+from typing import Dict
+
+from langchain_core.documents import Document
+
+
+def custom_document_builder(hit: Dict) -> Document:
+    src = hit.get("_source", {})
+    return Document(
+        page_content=src.get("content", "Missing content!"),
+        metadata={
+            "page_number": src.get("page_number", -1),
+            "original_filename": src.get("original_filename", "Missing filename!"),
+        },
+    )
+
+
+results = db.similarity_search(
+    "What did the president say about Ketanji Brown Jackson",
+    k=4,
+    doc_builder=custom_document_builder,
+)
+print("Results:")
+print(results[0])
+```
+
+## 用于检索增强生成
+
+关于如何将该向量存储用于检索增强生成（RAG），请参阅以下部分：
+
+- [Retrieval docs](/oss/langchain/retrieval)
+- [Build a RAG app with LangChain](/oss/langchain/rag)
+- [Agentic RAG](/oss/langgraph/agentic-rag)
+
+# FAQ
+
+## 问题：向 Elasticsearch 索引文档时我遇到了 timeout 错误，如何修复？
+
+一种可能的问题是，你的文档索引到 Elasticsearch 所需时间更长。`ElasticsearchStore` 使用 Elasticsearch bulk API，其中有一些默认参数可以调整，以降低超时错误发生的概率。
+
+当你使用 `SparseVectorRetrievalStrategy` 时，这样做同样是个好主意。
+
+默认值如下：
+
+- `chunk_size`: 500
+- `max_chunk_bytes`: 100MB
+
+要调整这些值，你可以在 `ElasticsearchStore` 的 `add_texts` 方法中传入 `chunk_size` 和 `max_chunk_bytes` 参数。
+
+```python
+    vector_store.add_texts(
+        texts,
+        bulk_kwargs={
+            "chunk_size": 50,
+            "max_chunk_bytes": 200000000
+        }
+    )
+```
+
+# 升级到 ElasticsearchStore
+
+如果你已经在 LangChain 项目中使用 Elasticsearch，可能还在使用旧实现：`ElasticVectorSearch` 和 `ElasticKNNSearch`，它们现在已经被弃用。我们引入了一个更灵活、更易用的新实现：`ElasticsearchStore`。本笔记本将指导你如何迁移到新实现。
+
+## 有什么新变化？
+
+新的实现统一为一个 `ElasticsearchStore` 类，它可以通过不同策略支持 approximate dense vector、exact dense vector、sparse vector（ELSER）、BM25 retrieval 以及 hybrid retrieval。
+
+## 我正在使用 ElasticKNNSearch
+
+```python
+from langchain_elasticsearch import ElasticsearchStore, DenseVectorStrategy
+
+db = ElasticsearchStore(
+  es_url="http://localhost:9200",
+  index_name="test_index",
+  embedding=embedding,
+  # if you use the model_id
+  # strategy=DenseVectorStrategy(model_id="test_model")
+  # if you use hybrid search
+  # strategy=DenseVectorStrategy(hybrid=True)
+)
+
+```
+
+## 我正在使用 ElasticVectorSearch
+
+```python
+from langchain_elasticsearch import ElasticsearchStore, DenseVectorScriptScoreStrategy
+
+db = ElasticsearchStore(
+  es_url="http://localhost:9200",
+  index_name="test_index",
+  embedding=embedding,
+  strategy=DenseVectorScriptScoreStrategy()
+)
+
+```
+
+```python
+db.client.indices.delete(
+    index="test-metadata, test-elser, test-basic",
+    ignore_unavailable=True,
+    allow_no_indices=True,
+)
+```
+
+---
+
+## API reference
+
+有关 `ElasticSearchStore` 全部特性与配置的详细文档，请参阅 @[API reference][ElasticSearchStore]。

@@ -1,0 +1,346 @@
+---
+title: SpiceDB 权限工具
+sidebar_label: SpiceDB
+---
+
+`langchain-spicedb` 包提供了 LangChain 工具，使 agent 能在执行操作之前检查 SpiceDB 权限。这些工具尤其适合构建 agentic RAG 系统，因为 agent 需要在检索资源或对资源执行操作之前先验证访问权限。
+
+## 安装
+
+```bash
+pip install langchain-spicedb
+```
+
+## 设置
+
+<Tip>
+    这些工具需要一个正在运行的 SpiceDB 实例。设置说明请参阅 [SpiceDB provider page](/oss/integrations/providers/spicedb)。
+</Tip>
+
+### 环境设置
+
+```python
+import os
+
+# SpiceDB connection details
+os.environ["SPICEDB_ENDPOINT"] = "localhost:50051"
+os.environ["SPICEDB_TOKEN"] = "sometoken"
+```
+
+## 工具
+
+### SpiceDBPermissionTool
+
+检查单个用户是否有权限访问特定资源。
+
+#### 初始化
+
+```python
+from langchain_spicedb import SpiceDBPermissionTool
+
+permission_tool = SpiceDBPermissionTool(
+    spicedb_endpoint="localhost:50051",
+    spicedb_token="sometoken",
+    resource_type="article",
+    subject_type="user",
+    fail_open=False,
+)
+```
+
+#### 参数
+
+- **spicedb_endpoint** (str)：SpiceDB 服务器地址，默认值为 `"localhost:50051"`
+- **spicedb_token** (str)：用于 SpiceDB 认证的预共享密钥
+- **resource_type** (str)：SpiceDB 资源类型，例如 `"document"`、`"article"`
+- **subject_type** (str)：SpiceDB subject 类型，默认值为 `"user"`
+- **fail_open** (bool)：如果为 True，则在出错时允许访问；如果为 False，则在出错时拒绝访问，默认值为 False
+- **use_tls** (bool)：是否为 SpiceDB 连接启用 TLS，默认值为 False
+
+#### 在 agent 中使用
+
+```python
+from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
+from langchain_spicedb import SpiceDBPermissionTool
+
+# Create the permission checking tool
+permission_tool = SpiceDBPermissionTool(
+    spicedb_endpoint="localhost:50051",
+    spicedb_token="sometoken",
+    resource_type="article",
+)
+
+# Create agent with the tool
+llm = ChatOpenAI(model="gpt-4", temperature=0)
+
+agent = create_agent(
+    llm,
+    tools=[permission_tool],
+    system_prompt="""You are a security-aware assistant.
+Before accessing any document, ALWAYS check if the user has permission
+using the check_spicedb_permission tool."""
+)
+
+# Agent checks permissions before proceeding
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Can user alice view document doc1?"}]
+})
+
+print(result["messages"][-1].content)
+# Output: "Yes, user alice can view document doc1" or "No, user alice cannot view document doc1"
+```
+
+#### 直接使用工具
+
+```python
+# Check if alice can view doc1
+result = await permission_tool._arun(
+    subject_id="alice",
+    resource_id="doc1",
+    permission="view"
+)
+
+print(result)  # "true" or "false"
+
+# Check edit permission
+result = await permission_tool._arun(
+    subject_id="alice",
+    resource_id="doc1",
+    permission="edit"
+)
+```
+
+### SpiceDBBulkPermissionTool
+
+一次检查多个资源的权限，适合 agent 在继续执行前需要验证多个文档的访问权限时使用。
+
+#### 初始化
+
+```python
+from langchain_spicedb import SpiceDBBulkPermissionTool
+
+bulk_tool = SpiceDBBulkPermissionTool(
+    spicedb_endpoint="localhost:50051",
+    spicedb_token="sometoken",
+    resource_type="article",
+    subject_type="user",
+)
+```
+
+#### 参数
+
+与 `SpiceDBPermissionTool` 相同，见上文。
+
+#### 在 agent 中使用
+
+```python
+from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
+from langchain_spicedb import SpiceDBBulkPermissionTool
+
+# Create the bulk permission checking tool
+bulk_tool = SpiceDBBulkPermissionTool(
+    spicedb_endpoint="localhost:50051",
+    spicedb_token="sometoken",
+    resource_type="article",
+)
+
+llm = ChatOpenAI(model="gpt-4", temperature=0)
+
+agent = create_agent(
+    llm,
+    tools=[bulk_tool],
+    system_prompt="You are a helpful assistant. Check permissions before accessing documents."
+)
+
+# Agent checks multiple documents at once
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Which of these documents can alice access: doc1, doc2, doc3?"}]
+})
+
+print(result["messages"][-1].content)
+# Output: "alice can access: doc1, doc3"
+```
+
+#### 直接使用工具
+
+```python
+# Check multiple resources at once
+result = await bulk_tool._arun(
+    subject_id="alice",
+    resource_ids="doc1,doc2,doc3",  # Comma-separated IDs
+    permission="view"
+)
+
+print(result)
+# Output: "alice can access: doc1, doc3" or "alice cannot access any of the requested resources"
+```
+
+## agent 如何决定调用这些工具
+
+agent 会使用工具的 **name** 和 **description** 来决定何时调用它们：
+
+### 工具名称
+
+- `check_spicedb_permission` - 单个权限检查
+- `check_spicedb_bulk_permissions` - 批量权限检查
+
+### 工具描述
+
+这两个工具都有详细描述，用于指导 agent：
+
+- **何时使用**："Use this tool before retrieving sensitive documents or taking actions that require authorization"
+- **作用是什么**：检查用户是否有权限访问某个资源
+- **返回什么**：`"true"` / `"false"` 或可访问资源列表
+
+### 影响工具使用方式
+
+要让 agent 更倾向于先检查权限：
+
+1. **系统提示词**：加入明确的安全指导
+   ```python
+   prompt = PromptTemplate.from_template(
+       """You are a security-conscious assistant.
+       Before accessing any document, ALWAYS check if the user has permission
+       using the check_spicedb_permission tool."""
+   )
+   ```
+
+2. **更低 temperature**：使用 `temperature=0` 获得更稳定的行为
+   ```python
+   llm = ChatOpenAI(model="gpt-4", temperature=0)
+   ```
+
+3. **清晰的系统提示词**：显式说明工具使用要求
+   ```python
+   agent = create_agent(llm, tools, system_prompt="Always check permissions before accessing documents.")
+   ```
+
+4. **Few-Shot 示例**：在提示词中包含工具使用示例
+
+## 输入 Schema
+
+### SpiceDBPermissionTool
+
+```python
+{
+    "subject_id": "alice",       # User ID to check (required)
+    "resource_id": "doc1",       # Resource ID - ONLY the ID portion, not "article doc1" (required)
+    "permission": "view"         # Permission to check (default: "view")
+}
+```
+
+<Warning>
+  **Important**：`resource_id` 必须只包含 ID 本身，不能带资源类型前缀。
+
+  ✅ Correct: `resource_id="doc1"`
+
+  ❌ Incorrect: `resource_id="article doc1"` or `resource_id="article:doc1"`
+</Warning>
+
+### SpiceDBBulkPermissionTool
+
+```python
+{
+    "subject_id": "alice",           # User ID to check (required)
+    "resource_ids": "doc1,doc2,doc3", # Comma-separated IDs - ONLY ID portions (required)
+    "permission": "view"             # Permission to check (default: "view")
+}
+```
+
+## 错误处理
+
+### Fail closed（默认）
+
+默认情况下，这些工具采用 fail closed 策略，也就是权限检查出错时会拒绝访问：
+
+```python
+tool = SpiceDBPermissionTool(
+    spicedb_endpoint="localhost:50051",
+    spicedb_token="sometoken",
+    resource_type="article",
+    fail_open=False,  # Default
+)
+```
+
+### Fail open
+
+适用于开发环境或某些特定场景：
+
+```python
+tool = SpiceDBPermissionTool(
+    spicedb_endpoint="localhost:50051",
+    spicedb_token="sometoken",
+    resource_type="article",
+    fail_open=True,  # Allow access on errors
+)
+```
+
+## 完整示例：安全文档 agent
+
+```python
+import os
+from dotenv import load_dotenv
+from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
+from langchain_spicedb import SpiceDBPermissionTool, SpiceDBBulkPermissionTool
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Setup
+os.environ["SPICEDB_ENDPOINT"] = "localhost:50051"
+os.environ["SPICEDB_TOKEN"] = "sometoken"
+
+# Create tools
+permission_tool = SpiceDBPermissionTool(
+    spicedb_endpoint=os.environ["SPICEDB_ENDPOINT"],
+    spicedb_token=os.environ["SPICEDB_TOKEN"],
+    resource_type="article",
+)
+
+bulk_permission_tool = SpiceDBBulkPermissionTool(
+    spicedb_endpoint=os.environ["SPICEDB_ENDPOINT"],
+    spicedb_token=os.environ["SPICEDB_TOKEN"],
+    resource_type="article",
+)
+
+# Create agent
+llm = ChatOpenAI(model="gpt-4", temperature=0)
+
+agent = create_agent(
+    llm,
+    tools=[permission_tool, bulk_permission_tool],
+    system_prompt="""You are a security-aware document assistant.
+ALWAYS verify user permissions before accessing documents using the permission tools.
+Respond with whether the user has access and which documents they can view."""
+)
+
+# Run agent
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Can alice view documents doc1, doc2, and doc3?"}]
+})
+
+print(result["messages"][-1].content)
+```
+
+## API reference
+
+### SpiceDBPermissionTool
+
+- **name**: `"check_spicedb_permission"`
+- **description**: 检查用户是否有权限访问某个资源
+- **args_schema**: `SpiceDBPermissionInput`
+- **return_type**: `str`，即 `"true"` 或 `"false"`
+
+### SpiceDBBulkPermissionTool
+
+- **name**: `"check_spicedb_bulk_permissions"`
+- **description**: 检查用户是否有权限访问多个资源
+- **args_schema**: `SpiceDBBulkPermissionInput`
+- **return_type**: `str`，即逗号分隔的可访问资源列表，或拒绝访问信息
+
+## 相关组件
+
+- [SpiceDB Provider Overview](/oss/integrations/providers/spicedb)
+- [SpiceDB Retriever](/oss/integrations/retrievers/spicedb)

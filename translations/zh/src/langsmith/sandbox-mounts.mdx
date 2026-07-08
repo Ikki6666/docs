@@ -1,0 +1,370 @@
+---
+title: Sandbox mounts
+sidebarTitle: Mounts
+description: 将 S3 buckets、GCS buckets 和公开 Git 仓库挂载到 LangSmith sandboxes 中。
+---
+
+Sandbox mounts 会在 sandbox 创建时，把外部数据源挂载到 sandbox 文件系统中。当 sandbox 内的代码需要直接访问对象存储 bucket 或公开 Git 仓库中的文件，而你又不想把这些数据拷贝进 sandbox 镜像时，就可以使用 mounts。
+
+Mounts 在 Python 中通过 `mount_config` 配置，在 TypeScript 中通过 `mountConfig` 配置。SDK 会把 mount 规格发送给 LangSmith，并为 provider 凭据自动组合所需的 [auth proxy](/langsmith/sandbox-auth-proxy) 规则。
+
+<Note>
+Sandbox mounts 要求 Python 使用 `langsmith[sandbox]>=0.8.16`，或 TypeScript 使用 `langsmith>=0.7.10`。
+</Note>
+
+<Warning>
+在创建会挂载 S3 或 GCS 的 sandbox 之前，请先把云凭据存成 LangSmith workspace secrets。不要把真实云凭据作为 sandbox 环境变量、命令参数或文件直接传入。
+</Warning>
+
+## 配置挂载路径
+
+每个 mount 都有一个 `id`、一个 `type`，以及一个 `mount_path` / `mountPath`。挂载路径必须是 `/mnt/mounts` 下的绝对路径。
+
+建议使用能描述挂载来源的稳定路径：
+
+| Source | Example path |
+|--------|--------------|
+| S3 bucket prefix | `/mnt/mounts/customer-data` |
+| GCS bucket prefix | `/mnt/mounts/eval-datasets` |
+| Git repository | `/mnt/mounts/repo` |
+
+Mount ID 可以包含 ASCII 字母、数字、下划线和连字符。在同一个 sandbox 内，不要复用同一个 ID 或 mount path。
+
+## 挂载一个 S3 bucket
+
+S3 mounts 需要 AWS 认证。SDK 会根据 `aws_auth` / `awsAuth` 创建一条 AWS auth proxy 规则，这样 sandbox 就能访问 bucket，而不会直接看到真实 access keys。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import (
+    SandboxClient,
+    aws_auth,
+    mount_config,
+    s3_mount,
+    workspace_secret,
+)
+
+client = SandboxClient()
+
+mount_cfg = mount_config(
+    auth=[
+        aws_auth(
+            access_key_id=workspace_secret("SANDBOX_AWS_ACCESS_KEY_ID"),
+            secret_access_key=workspace_secret("SANDBOX_AWS_SECRET_ACCESS_KEY"),
+        )
+    ],
+    mounts=[
+        s3_mount(
+            id="customer_data",
+            mount_path="/mnt/mounts/customer-data",
+            bucket="example-bucket",
+            prefix="datasets/customer-data",
+            region="us-east-1",
+            path_style=False,
+            read_only=True,
+        )
+    ],
+)
+
+with client.sandbox(name="s3-mount-sandbox", mount_config=mount_cfg) as sb:
+    result = sb.run("ls /mnt/mounts/customer-data")
+    print(result.stdout)
+```
+
+```ts TypeScript
+import {
+  SandboxClient,
+  awsAuth,
+  mountConfig,
+  s3Mount,
+  workspaceSecret,
+} from "langsmith/sandbox";
+
+const client = new SandboxClient();
+
+const mountCfg = mountConfig({
+  auth: [
+    awsAuth({
+      accessKeyId: workspaceSecret("SANDBOX_AWS_ACCESS_KEY_ID"),
+      secretAccessKey: workspaceSecret("SANDBOX_AWS_SECRET_ACCESS_KEY"),
+    }),
+  ],
+  mounts: [
+    s3Mount({
+      id: "customer_data",
+      mountPath: "/mnt/mounts/customer-data",
+      bucket: "example-bucket",
+      prefix: "datasets/customer-data",
+      region: "us-east-1",
+      pathStyle: false,
+      readOnly: true,
+    }),
+  ],
+});
+
+const sandbox = await client.createSandbox({
+  name: "s3-mount-sandbox",
+  mountConfig: mountCfg,
+});
+
+try {
+  const result = await sandbox.run("ls /mnt/mounts/customer-data");
+  console.log(result.stdout);
+} finally {
+  await sandbox.delete();
+}
+```
+
+</CodeGroup>
+
+## 挂载一个 GCS bucket
+
+GCS mounts 需要 GCP 认证。可读写挂载需要 `https://www.googleapis.com/auth/devstorage.read_write` 或 `https://www.googleapis.com/auth/cloud-platform` OAuth scope。只读挂载则可以使用 `https://www.googleapis.com/auth/devstorage.read_only`。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import (
+    SandboxClient,
+    gcp_auth,
+    gcs_mount,
+    mount_config,
+    workspace_secret,
+)
+
+client = SandboxClient()
+
+mount_cfg = mount_config(
+    auth=[
+        gcp_auth(
+            service_account_json=workspace_secret(
+                "SANDBOX_GCP_SERVICE_ACCOUNT_JSON"
+            ),
+            scopes=["https://www.googleapis.com/auth/devstorage.read_write"],
+        )
+    ],
+    mounts=[
+        gcs_mount(
+            id="eval_datasets",
+            mount_path="/mnt/mounts/eval-datasets",
+            bucket="example-bucket",
+            prefix="datasets/evals",
+            read_only=False,
+        )
+    ],
+)
+
+with client.sandbox(name="gcs-mount-sandbox", mount_config=mount_cfg) as sb:
+    result = sb.run("ls /mnt/mounts/eval-datasets")
+    print(result.stdout)
+```
+
+```ts TypeScript
+import {
+  SandboxClient,
+  gcpAuth,
+  gcsMount,
+  mountConfig,
+  workspaceSecret,
+} from "langsmith/sandbox";
+
+const client = new SandboxClient();
+
+const mountCfg = mountConfig({
+  auth: [
+    gcpAuth({
+      serviceAccountJson: workspaceSecret("SANDBOX_GCP_SERVICE_ACCOUNT_JSON"),
+      scopes: ["https://www.googleapis.com/auth/devstorage.read_write"],
+    }),
+  ],
+  mounts: [
+    gcsMount({
+      id: "eval_datasets",
+      mountPath: "/mnt/mounts/eval-datasets",
+      bucket: "example-bucket",
+      prefix: "datasets/evals",
+      readOnly: false,
+    }),
+  ],
+});
+
+const sandbox = await client.createSandbox({
+  name: "gcs-mount-sandbox",
+  mountConfig: mountCfg,
+});
+
+try {
+  const result = await sandbox.run("ls /mnt/mounts/eval-datasets");
+  console.log(result.stdout);
+} finally {
+  await sandbox.delete();
+}
+```
+
+</CodeGroup>
+
+## 挂载一个公开 Git 仓库
+
+公开 Git mounts 不需要 AWS 或 GCP 认证。请使用 HTTPS remote URL，并可按需固定到某个 branch 或 tag。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import SandboxClient, git_mount, mount_config
+
+client = SandboxClient()
+
+mount_cfg = mount_config(
+    mounts=[
+        git_mount(
+            id="repo",
+            mount_path="/mnt/mounts/repo",
+            remote_url="https://github.com/langchain-ai/langsmith-sdk.git",
+            ref={"type": "branch", "name": "main"},
+            refresh_interval_seconds=60,
+        )
+    ],
+)
+
+with client.sandbox(name="git-mount-sandbox", mount_config=mount_cfg) as sb:
+    result = sb.run("ls /mnt/mounts/repo")
+    print(result.stdout)
+```
+
+```ts TypeScript
+import { SandboxClient, gitMount, mountConfig } from "langsmith/sandbox";
+
+const client = new SandboxClient();
+
+const mountCfg = mountConfig({
+  mounts: [
+    gitMount({
+      id: "repo",
+      mountPath: "/mnt/mounts/repo",
+      remoteUrl: "https://github.com/langchain-ai/langsmith-sdk.git",
+      ref: { type: "branch", name: "main" },
+      refreshIntervalSeconds: 60,
+    }),
+  ],
+});
+
+const sandbox = await client.createSandbox({
+  name: "git-mount-sandbox",
+  mountConfig: mountCfg,
+});
+
+try {
+  const result = await sandbox.run("ls /mnt/mounts/repo");
+  console.log(result.stdout);
+} finally {
+  await sandbox.delete();
+}
+```
+
+</CodeGroup>
+
+私有 Git 仓库在 remote 需要通过 proxy 管理认证时，可以使用底层 `proxy_config` / `proxyConfig` 规则。目前还没有高层的私有 Git 认证 helper。
+
+## 组合多个 mounts
+
+一个 sandbox 可以同时挂载多个来源。构造一个包含全部 mount 规格的 `mount_config` / `mountConfig`，并为这些 mount 所用到的每种 bucket provider 一并提供认证配置。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import (
+    aws_auth,
+    git_mount,
+    gcp_auth,
+    gcs_mount,
+    mount_config,
+    s3_mount,
+    workspace_secret,
+)
+
+mount_cfg = mount_config(
+    auth=[
+        aws_auth(
+            access_key_id=workspace_secret("SANDBOX_AWS_ACCESS_KEY_ID"),
+            secret_access_key=workspace_secret("SANDBOX_AWS_SECRET_ACCESS_KEY"),
+        ),
+        gcp_auth(
+            service_account_json=workspace_secret(
+                "SANDBOX_GCP_SERVICE_ACCOUNT_JSON"
+            ),
+            scopes=["https://www.googleapis.com/auth/devstorage.read_write"],
+        ),
+    ],
+    mounts=[
+        s3_mount(
+            id="s3_data",
+            mount_path="/mnt/mounts/s3-data",
+            bucket="example-s3-bucket",
+        ),
+        gcs_mount(
+            id="gcs_data",
+            mount_path="/mnt/mounts/gcs-data",
+            bucket="example-gcs-bucket",
+        ),
+        git_mount(
+            id="repo",
+            mount_path="/mnt/mounts/repo",
+            remote_url="https://github.com/langchain-ai/langsmith-sdk.git",
+        ),
+    ],
+)
+```
+
+```ts TypeScript
+import {
+  awsAuth,
+  gitMount,
+  gcpAuth,
+  gcsMount,
+  mountConfig,
+  s3Mount,
+  workspaceSecret,
+} from "langsmith/sandbox";
+
+const mountCfg = mountConfig({
+  auth: [
+    awsAuth({
+      accessKeyId: workspaceSecret("SANDBOX_AWS_ACCESS_KEY_ID"),
+      secretAccessKey: workspaceSecret("SANDBOX_AWS_SECRET_ACCESS_KEY"),
+    }),
+    gcpAuth({
+      serviceAccountJson: workspaceSecret("SANDBOX_GCP_SERVICE_ACCOUNT_JSON"),
+      scopes: ["https://www.googleapis.com/auth/devstorage.read_write"],
+    }),
+  ],
+  mounts: [
+    s3Mount({
+      id: "s3_data",
+      mountPath: "/mnt/mounts/s3-data",
+      bucket: "example-s3-bucket",
+    }),
+    gcsMount({
+      id: "gcs_data",
+      mountPath: "/mnt/mounts/gcs-data",
+      bucket: "example-gcs-bucket",
+    }),
+    gitMount({
+      id: "repo",
+      mountPath: "/mnt/mounts/repo",
+      remoteUrl: "https://github.com/langchain-ai/langsmith-sdk.git",
+    }),
+  ],
+});
+```
+
+</CodeGroup>
+
+## 故障排查
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| Mount path is empty | The mounted prefix has no objects, or the service cannot list the bucket | Verify the bucket name, prefix, and credentials |
+| `Permission denied` when writing | The mount is read-only or the cloud IAM role lacks write access | Set `read_only=False` / `readOnly: false` and grant the write scope or permission |
+| Sandbox creation fails with auth proxy errors | The workspace secret name is wrong or the provider auth block is missing | Confirm the secret names and include the matching `aws_auth` / `gcp_auth` block |
+| Git mount does not refresh | The repo ref is pinned and the remote has not changed, or the refresh interval has not elapsed | Wait for the interval or recreate the sandbox |

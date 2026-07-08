@@ -1,0 +1,377 @@
+---
+title: 安装 Mission Control
+sidebarTitle: Mission Control
+description: 安装 Mission Control，这是一个运行在集群内的控制台，用于在 Kubernetes 上监控、配置和运维自托管 LangSmith。
+---
+
+Mission Control 是一个运行在集群内的控制台，用于在 Kubernetes 上监控、配置和运维 LangSmith。它运行在你的集群内部，默认通过 `kubectl port-forward` 访问，因此不需要 ingress。
+
+安装有两种路径：
+
+| Path | Best for |
+|------|----------|
+| [Quick install](#快速安装) | 可以运行经过审查的 shell installer，并希望以最短路径完成安装的客户。 |
+| [Manual install](#手动安装) | 不允许使用 installer scripts，或要求逐条审查 Kubernetes 命令的组织。 |
+
+公开的安装资产包括：
+
+- `install-script.sh`：一个安装脚本，内部拆分为 `prereqs`、`namespace`、`secret`、`values`、`install` 和 `forward` 等步骤。
+- `values.yaml`：用于仅通过 port-forward 访问的默认 Helm values。
+
+Mission Control images 发布在两个 Docker Hub 仓库中：`langchain/mission-control-backend` 和 `langchain/mission-control-frontend`。可通过以下命令检查最新镜像：
+
+```bash
+docker pull langchain/mission-control-backend:latest
+docker pull langchain/mission-control-frontend:latest
+```
+
+浏览器查看链接：
+
+- `https://github.com/langchain-ai/helm/tree/main/charts/mission-control/install-script.sh`
+- `https://github.com/langchain-ai/helm/tree/main/charts/mission-control/values.yaml`
+
+下面的命令使用 raw GitHub URLs，这样 `curl` 就可以直接下载文件。如果你从其他 repo 或 branch 发布这些文件，请替换下面的 raw base URL。
+
+```bash
+MC_RAW_BASE=https://raw.githubusercontent.com/langchain-ai/helm/main/charts/mission-control
+```
+
+## 前置条件
+
+| Tool | Minimum version | Install example |
+|------|-----------------|-----------------|
+| `kubectl` | 1.24+ | `brew install kubectl` |
+| `helm` | 3.x | `brew install helm` |
+| `curl` | 任意当前版本 | 通常已预装 |
+
+你必须在已安装或即将安装 LangSmith 的 Kubernetes 集群上运行安装器。继续前请先确认当前上下文：
+
+```bash
+kubectl config current-context
+```
+
+执行安装的身份需要拥有权限，以创建 Mission Control 的 namespace 资源以及集群级 RBAC：
+
+```bash
+kubectl auth can-i create clusterrole
+kubectl auth can-i create clusterrolebinding
+kubectl auth can-i create serviceaccount -n langsmith
+kubectl auth can-i create deployment -n langsmith
+kubectl auth can-i create secret -n langsmith
+```
+
+这 5 条命令都应该返回 `yes`。关于 Mission Control 在运行时获得的权限，请参阅[权限参考](#权限参考)。
+
+## 快速安装
+
+运行以下 3 条命令：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/langchain-ai/helm/main/charts/mission-control/install-script.sh && chmod +x install-script.sh
+curl -fsSL https://raw.githubusercontent.com/langchain-ai/helm/main/charts/mission-control/values.yaml -o values.yaml
+./install-script.sh all -f values.yaml
+```
+
+`all` 步骤会执行：
+
+- 检查所需工具和 RBAC。
+- 创建 `langsmith` namespace。
+- 提示你输入 Mission Control 的用户名和密码。
+- 将这些凭据保存到 `mission-control-auth` Kubernetes Secret 中。
+- 如果当前不存在 `values.yaml`，则写出一个默认文件。
+- 如果你不是在本地 chart checkout 中运行，则从公共 Helm chart repository 安装。
+- 使用 Helm 安装 Mission Control。
+
+RBAC 检查会运行：
+
+```bash
+kubectl auth can-i create clusterrole
+kubectl auth can-i create clusterrolebinding
+kubectl auth can-i create serviceaccount -n langsmith
+kubectl auth can-i create deployment -n langsmith
+kubectl auth can-i create secret -n langsmith
+```
+
+如果你的组织有意禁用了 `kubectl auth can-i`，但 Helm 安装是通过其他控制路径审批的，那么可以运行：
+
+```bash
+./install-script.sh all -f values.yaml --skip-rbac-check
+```
+
+### 访问 UI
+
+安装完成后，启动本地 port-forward：
+
+```bash
+./install-script.sh forward
+```
+
+打开 [http://localhost:3000](http://localhost:3000/) 并使用你刚才输入的用户名和密码登录。
+
+### 先审查脚本
+
+快速安装路径会先下载脚本再执行，因此你可以在运行第三条命令前，先在本地审查 `install-script.sh`。
+
+### 安装前编辑 values
+
+快速安装路径也会先下载 `values.yaml`，因此如果你需要调整 namespace、resources、ingress、feature flags 或 diagnostics 持久化设置，可以在执行第三条命令前先审查或编辑它。
+
+常见修改项：
+
+| Setting | When to change it |
+|---------|-------------------|
+| `namespace` | 想将 Mission Control 安装到 `langsmith` 之外的其他 namespace 时。同时也要给脚本传 `-n <namespace>`。 |
+| `resources` | 你的 namespace 配置了 `ResourceQuota`，或平台要求特定的 requests/limits。 |
+| `ingress.enabled` 和 `ingress.host` | 你希望通过 ingress controller 暴露 Mission Control，而不是使用 port-forward。 |
+| `config.features.*` | 你需要移除某些写权限或外部 egress 能力。 |
+| `diagnostics.persistence.enabled` | 你希望诊断包在 pod 重启或 Helm 升级后仍然保留。 |
+| `backend.podSecurityContext` 和 `frontend.podSecurityContext` | 你的平台要求容器以特定的非 root UID 运行，例如 `1001`。 |
+
+使用自定义 namespace 的示例：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/langchain-ai/helm/main/charts/mission-control/install-script.sh && chmod +x install-script.sh
+curl -fsSL https://raw.githubusercontent.com/langchain-ai/helm/main/charts/mission-control/values.yaml -o values.yaml
+./install-script.sh all -n mission-control -f values.yaml
+```
+
+### 脚本命令参考
+
+```bash
+./install-script.sh prereqs
+./install-script.sh namespace
+./install-script.sh secret
+./install-script.sh values
+./install-script.sh install
+./install-script.sh forward
+./install-script.sh all
+```
+
+常用参数：
+
+```bash
+./install-script.sh all -n langsmith -f values.yaml
+./install-script.sh all -u admin
+printf '%s\n' 'your-password' | ./install-script.sh secret -u admin --password-stdin
+./install-script.sh all -f values.yaml --skip-rbac-check
+./install-script.sh install --chart-ref langchain/mission-control
+./install-script.sh install --chart-path /path/to/mission-control
+./install-script.sh forward --port 3001:3000
+```
+
+## 手动安装
+
+如果不允许使用 installer scripts，请走这条路径。下面的步骤只使用标准 `kubectl`、`helm` 和 `curl` 命令。
+
+<Steps>
+  <Step title="Add the Helm repo and get the values file">
+    添加 LangChain Helm repo：
+
+    ```bash
+    helm repo add langchain https://langchain-ai.github.io/helm
+    helm repo update langchain
+    ```
+
+    下载客户 values 文件：
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/langchain-ai/helm/main/charts/mission-control/values.yaml -o values.yaml
+    ```
+
+    安装前请先审查 `values.yaml`。在生产环境中请保持 `config.auth.enabled: true`。
+
+    如果你的平台要求容器以非 root 身份运行，Mission Control 可以使用 UID `1001`。安装前请将以下配置加入 `values.yaml`：
+
+    ```yaml
+    backend:
+      podSecurityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+      extraEnv:
+        - name: HOME
+          value: /tmp
+        - name: HELM_CACHE_HOME
+          value: /tmp/.cache/helm
+        - name: HELM_CONFIG_HOME
+          value: /tmp/.config/helm
+        - name: HELM_DATA_HOME
+          value: /tmp/.local/share/helm
+
+    frontend:
+      podSecurityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+    ```
+  </Step>
+  <Step title="Create the namespace">
+    ```bash
+    kubectl create namespace langsmith --dry-run=client -o yaml | kubectl apply -f -
+    ```
+  </Step>
+  <Step title="Create the auth credentials Secret">
+    凭据会存储在 Kubernetes Secret 中，不会写入 `values.yaml`。
+
+    ```bash
+    read -r -p "Username: " MC_USER
+    read -r -s -p "Password: " MC_PASS; echo
+
+    kubectl create secret generic mission-control-auth \
+      --namespace=langsmith \
+      --from-literal=username="$MC_USER" \
+      --from-literal=password="$MC_PASS" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    ```
+
+    对于多副本 backend 部署，还需要在同一个 Secret 中加入共享 JWT signing key，并在 `values.yaml` 中设置 `config.auth.jwtSecretKey: jwtSecret`：
+
+    ```bash
+    JWT_SECRET="$(openssl rand -base64 32)"
+
+    kubectl create secret generic mission-control-auth \
+      --namespace=langsmith \
+      --from-literal=username="$MC_USER" \
+      --from-literal=password="$MC_PASS" \
+      --from-literal=jwtSecret="$JWT_SECRET" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    ```
+  </Step>
+  <Step title="Install with Helm">
+    ```bash
+    helm upgrade --install mission-control langchain/mission-control \
+      --namespace langsmith \
+      --create-namespace \
+      --values values.yaml \
+      --rollback-on-failure
+    ```
+
+    等待两个 workload 都就绪，backend 以 StatefulSet 运行，frontend 以 Deployment 运行：
+
+    ```bash
+    kubectl rollout status statefulset/mission-control-backend -n langsmith
+    kubectl rollout status deployment/mission-control-frontend -n langsmith
+    ```
+
+    你也可以直接查看 pods：
+
+    ```bash
+    kubectl get pods -n langsmith
+    ```
+  </Step>
+  <Step title="Access the UI">
+    ```bash
+    kubectl port-forward svc/mission-control-frontend 3000:3000 -n langsmith
+    ```
+
+    打开 [http://localhost:3000](http://localhost:3000/) 并使用第 3 步中的凭据登录。
+  </Step>
+</Steps>
+
+## 升级
+
+下载最新的公开 values 文件，合并你需要保留的本地修改，然后运行：
+
+```bash
+helm repo update langchain
+
+helm upgrade --install mission-control langchain/mission-control \
+  --namespace langsmith \
+  --values values.yaml \
+  --rollback-on-failure
+```
+
+如果你使用的是本地 chart checkout：
+
+```bash
+helm upgrade --install mission-control . \
+  --namespace langsmith \
+  --values values.yaml \
+  --rollback-on-failure
+```
+
+如果你是通过 quick script 安装，并且仍保留了该脚本：
+
+```bash
+./install-script.sh install -f values.yaml
+```
+
+## 卸载
+
+```bash
+helm uninstall mission-control -n langsmith
+```
+
+这会移除 Mission Control release，但不会删除你的 namespace，也不会删除无关的 LangSmith 资源。
+
+可选：清理由 Mission Control 持有的 Secrets：
+
+```bash
+kubectl delete secret -n langsmith \
+  mission-control-auth \
+  mission-control-draft \
+  mission-control-deployed \
+  mission-control-backup \
+  mission-control-history \
+  mission-control-alerts-config \
+  mission-control-alerts-log \
+  mission-control-alerts-key \
+  mission-control-setup-token \
+  --ignore-not-found
+```
+
+## 附加资源
+
+### 故障排查
+
+| Symptom | What to check |
+|---------|---------------|
+| `kubectl auth can-i ...` 返回 `no` | 请集群管理员授予安装所需的 RBAC，或请对方代你执行安装。 |
+| Pods 一直处于 `Pending` | 检查 namespace 的 `ResourceQuota`、节点容量，以及 `kubectl describe pod -n langsmith <pod>` 输出中的 PVC/storage class 事件。 |
+| Image pull 错误 | 确认集群能够拉取 `langchain/mission-control-backend:latest` 和 `langchain/mission-control-frontend:latest`。 |
+| 登录失败 | 确认同一 namespace 中存在 `mission-control-auth`，并且它包含 `username` 和 `password` 两个 key。 |
+| 浏览器无法连接 | 确认 port-forward 命令仍在运行，并且没有其他本地进程占用 `3000` 端口。 |
+
+### 权限参考
+
+Helm chart 会创建一个名为 `mission-control` 的 `ServiceAccount`、`ClusterRole` 和 `ClusterRoleBinding`。绝大多数权限是只读的。写权限范围较窄，并且通过 feature flags 控制。
+
+安装或升级需要具备创建集群级 RBAC，`ClusterRole` 和 `ClusterRoleBinding`，的能力，通常这意味着 `cluster-admin`，或等价的自定义权限。最宽的运行时权限集仅在 `config.features.deploy: true` 时使用；该标志默认启用，如果你希望只读安装，请将其设为 `false`。
+
+#### 始终存在的只读权限
+
+| Resource group | Resources | Verbs |
+|----------------|-----------|-------|
+| Workloads | pods, pods/log, deployments, statefulsets, replicasets, daemonsets, jobs, cronjobs | get, list, watch |
+| Networking | services, endpoints, ingresses, ingressclasses | get, list, watch |
+| Storage | persistentvolumeclaims, storageclasses | get, list, watch |
+| Cluster | nodes, namespaces, events, serviceaccounts, resourcequotas | get, list, watch |
+| Config | configmaps, secrets | get, list |
+| Metrics | metrics.k8s.io pods/nodes | get, list, watch |
+| RBAC | roles, rolebindings, clusterroles, clusterrolebindings | get, list, watch |
+| CRDs and extensions | customresourcedefinitions, leases, scaledobjects, httproutes, virtualservices, lgps | get, list, watch |
+
+#### 受 feature flag 控制的权限
+
+| Feature flag | Resources | Extra verbs |
+|--------------|-----------|-------------|
+| `config.features.configSave` | secrets (`mission-control-draft`) | create, update, delete |
+| `config.features.alerts` | secrets (`mission-control-alerts-*`) | create, update, delete |
+| `config.features.fixIssue` | pods | delete |
+| `config.features.adopt` | secrets, configmaps, serviceaccounts, deployments, statefulsets | patch |
+| `config.auth.enabled` | secrets (`mission-control-auth`, setup-token), backend statefulset | create, update, delete, patch |
+| `config.features.valuesOverride` | secrets (`mission-control-values-overrides`) | create, update, delete |
+| `config.features.deploy` | workloads, networking, RBAC, CRDs, Helm release secrets | create, update, patch, delete |
+
+在 `values.yaml` 中将相关 feature flags 设为 `false`，即可移除对应写权限。如果所有 feature flags 都被关闭，那么除了 `config.auth.enabled: true` 时用于认证初始化的权限外，Mission Control 实际上就是只读的。

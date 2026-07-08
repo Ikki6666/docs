@@ -1,0 +1,158 @@
+---
+title: 启用 TTL 和数据保留
+sidebarTitle: 启用 TTL 和数据保留
+---
+
+LangSmith Self-Hosted 支持为 traces 启用自动 TTL 和 Data Retention。如果你需要满足数据隐私法规，或者希望更高效地利用空间并自动清理 traces，这会很有帮助。系统还会根据某些操作或 run rule 的应用，自动延长 traces 的数据保留时间。
+
+<Note>
+**自托管 [Enterprise](/langsmith/pricing-plans) 客户：** 现在你已经可以通过 UI 在 workspace 级别配置 extended data retention，这样就能在不修改环境变量的情况下进行更细粒度的控制。更多信息请参见 [Customize extended retention policy](/langsmith/data-purging-compliance#customize-extended-retention-policy)。本页介绍的系统级 TTL 配置仍然受支持。
+</Note>
+
+## Requirements
+
+你可以通过 helm 或环境变量来配置保留策略。有几个可配置项：
+
+- *Enabled:* 控制是否启用数据保留。如果启用，你就可以通过 UI 为默认 organization 和 project 配置要应用到 traces 上的 TTL tiers（详见 [data retention guide](/langsmith/usage-and-billing#data-retention)）。
+- *Retention Periods:* 你可以为 shortlived 和 longlived traces 配置系统级保留时长。配置完成后，你还可以在每个 project 级别管理保留级别，并为新 project 设置 organization 级默认值。
+
+<CodeGroup>
+
+```yaml Helm
+config:
+  ttl:
+    enabled: true
+    ttl_period_seconds:
+      # -- 400 day longlived and 14 day shortlived
+      longlived: "34560000"
+      shortlived: "1209600"
+```
+
+```bash Docker
+# In your .env fileFF_TRACE_TIERS_ENABLED=trueTRACE_TIER_TTL_DURATION_SEC_MAP='{"longlived": 34560000, "shortlived": 1209600}'
+```
+
+</CodeGroup>
+
+## ClickHouse TTL cleanup job
+
+从版本 **0.11** 开始，系统会在周末运行一个 cron job，帮助删除那些可能没有被 ClickHouse 内建 TTL 机制清理干净的过期数据。
+
+<Warning>
+这个 job 会使用可能运行很久的 **mutations**（`ALTER TABLE DELETE`），而这是开销较大的操作，可能会影响 ClickHouse 性能。我们建议只在离峰时段（夜间和周末）执行这类操作。在测试中，当并发 active mutation 数为 **1**（默认值）时，我们没有观察到明显的 CPU、内存或延迟上升。
+</Warning>
+
+### 默认调度
+
+默认情况下，这个 cleanup job 会在以下时间运行：
+
+- **Saturday**: UTC 时间 8pm 和 10pm
+- **Sunday**: UTC 时间 12am、2am 和 4am
+
+### 禁用该 job
+
+如果你想完全禁用该 cleanup job：
+
+```yaml
+queue:
+  deployment:
+    extraEnv:
+      - name: "ENABLE_CLICKHOUSE_TTL_CLEANUP_CRON"
+        value: "false"
+```
+
+### 配置调度时间
+
+你可以通过修改 cron 表达式来自定义 cleanup job 的运行时间：
+
+```yaml
+queue:
+  deployment:
+    extraEnv:
+      # UTC: Sunday 12am/2am/4am
+      - name: "CLICKHOUSE_TTL_CLEANUP_CRON_WEEKEND_MORNING"
+        value: "0 0,2,4 * * 0"
+      # UTC: Saturday 8pm/10pm
+      - name: "CLICKHOUSE_TTL_CLEANUP_CRON_WEEKEND_EVENING"
+        value: "0 20,22 * * 6"
+```
+
+<Tip>
+如果你希望 job 只按一个 cron schedule 运行，可以把 `CLICKHOUSE_TTL_CLEANUP_CRON_WEEKEND_EVENING` 和 `CLICKHOUSE_TTL_CLEANUP_CRON_WEEKEND_MORNING` 都设为同一个值。Job locking 会阻止重叠执行。
+</Tip>
+
+### 配置每个 part 最小过期行数
+
+这个 job 会逐表扫描 parts，并删除那些包含至少一定数量过期行的 parts 中的数据。这个阈值需要在效率和彻底性之间取得平衡：
+
+- **太低：** job 会扫描整个 part，却只清除很少的数据，效率较低
+- **太高：** job 会漏掉那些已经积累了不少过期数据的 parts
+
+```yaml
+queue:
+  deployment:
+    extraEnv:
+      - name: "CLICKHOUSE_TTL_CRON_MIN_EXPIRED_ROWS_PER_PART"
+        value: "100000" # 100k expired rows
+```
+
+#### 查看过期行数
+
+你可以使用以下查询来分析表中的过期行数，并据此调整最小值：
+
+```sql
+-- Query for Runs table. For other tables, replace 'ttl_seconds' with 'trace_ttl_seconds'
+SELECT
+    _part,
+    count() AS expired_rows
+FROM runs
+WHERE trace_first_received_at IS NOT NULL
+AND ttl_seconds IS NOT NULL
+AND toDateTime(assumeNotNull(trace_first_received_at) + toIntervalSecond(assumeNotNull(ttl_seconds))) < now()
+GROUP BY _part
+ORDER BY expired_rows DESC
+```
+
+### 配置最大 active mutations 数量
+
+删除操作可能非常耗时（例如 100GB 的 part 大约要 50 分钟）。你可以通过提高并发 mutations 数来加快清理过程：
+
+```yaml
+queue:
+  deployment:
+    extraEnv:
+      - name: "CLICKHOUSE_TTL_CRON_MAX_ACTIVE_MUTATIONS"
+        value: "1"
+```
+
+<Warning>
+提高并发 DELETE 操作数可能会严重影响系统性能。请仔细监控系统，只在你能够容忍插入和读取延迟变慢的前提下，才提高这个值。
+</Warning>
+
+### 紧急情况：停止正在运行的 mutation
+
+如果你遇到延迟飙升，并且需要终止一个正在运行的 mutation：
+
+1. **查找 active mutations**：
+
+   ```sql
+   SELECT * FROM system.mutations WHERE is_done = 0;
+   ```
+
+   找到 `command` 列中包含 `DELETE` 语句的那条记录，并记下其 `mutation_id`。
+
+2. **Kill 这个 mutation**：
+   ```sql
+   KILL MUTATION WHERE mutation_id = '<mutation_id>';
+   ```
+
+### 备份与数据保留
+
+如果这个 job 运行后磁盘空间没有下降，或者仍然持续上升，那么问题可能出在备份。备份会创建文件系统 hard links，而这些 links 会阻止 ClickHouse 清理数据。
+
+为确认这一点，请进入 ClickHouse pod，检查以下目录：
+
+ - `/var/lib/clickhouse/backup`
+ - `/var/lib/clickhouse/shadow`
+
+如果这些目录中存在备份，请把它们复制到外部文件系统或 blob storage（例如 S3），然后清空目录。几分钟后，你应该就能看到磁盘空间被释放出来。

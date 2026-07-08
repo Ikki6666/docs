@@ -1,0 +1,170 @@
+---
+title: 为安装创建 Ingress，Kubernetes
+sidebarTitle: 为安装创建 Ingress，Kubernetes
+---
+
+默认情况下，LangSmith 会为 `langsmith-frontend` 预配一个 LoadBalancer service。根据你的云提供方不同，这可能会导致该 service 被分配一个公网 IP 地址。如果你希望使用自定义域名，或者希望对流量如何路由到你的 LangSmith 安装拥有更多控制，可以配置 Ingress、Gateway API 或 Istio Gateway。
+
+## 要求
+
+* 一个现有的 Kubernetes cluster
+* 在你的 Kubernetes cluster 中安装以下其中之一：
+  * Ingress Controller，用于标准 Ingress
+  * Gateway API CRDs 和一个 Gateway resource，用于 Gateway API
+  * Istio，用于 Istio Gateway
+
+## 参数
+
+你可能需要向 LangSmith 安装提供某些参数，以便配置 Ingress。此外，我们还需要把 `langsmith-frontend` service 转换为 ClusterIP service。
+
+* *Hostname，可选*：你希望用于 LangSmith 安装的 hostname，例如 `"langsmith.example.com"`。如果留空，ingress 会把所有流量都转发到该 LangSmith 安装。
+
+* *BasePath，可选*：如果你希望通过 URL basePath 提供 LangSmith，可以在这里指定。例如，添加 `"langsmith"` 后，应用会在 `"example.hostname.com/langsmith"` 下提供服务。这会同时作用于 UI 路径和 API endpoints。
+
+* *IngressClassName，可选*：你想使用的 Ingress class 名称。如果未设置，则会使用默认 Ingress class。
+
+* *Annotations，可选*：额外添加到 Ingress 上的 annotations。某些提供方，例如 AWS，会使用 annotations 来控制 TLS termination 等行为。
+
+  例如，你可以在使用 AWS ALB Ingress Controller 时，添加如下 annotations，把 ACM 证书绑定到 Ingress：
+
+  ```yaml
+  annotations:
+    alb.ingress.kubernetes.io/certificate-arn: "<your-certificate-arn>"
+  ```
+
+* *Labels，可选*：额外添加到 Ingress 上的 labels。
+
+* *TLS，可选*：如果你希望通过 HTTPS 提供 LangSmith，可以在这里添加 TLS 配置，虽然很多 Ingress controllers 也可能通过其他方式控制 TLS，因此通常并不需要。这里应当是一个 TLS 配置数组。每个 TLS 配置应包含以下字段：
+
+  * hosts：证书应适用的 host 数组，例如 \["langsmith.example.com"]
+
+  * secretName：包含证书和私钥的 Kubernetes secret 名称。该 secret 需要包含以下 keys：
+
+    * tls.crt：证书
+    * tls.key：私钥
+
+  * 更多信息请参阅[创建 TLS secret](https://kubernetes.io/do/langsmith/observability-concepts/services-networking/ingress/#tls)。
+
+## 配置
+
+你可以将 LangSmith 实例配置为使用以下三种路由选项之一：标准 Ingress、Gateway API 或 Istio Gateway。请选择最适合你基础设施的方案。
+
+### 选项 1：标准 ingress
+
+准备好这些参数后，你就可以把 LangSmith 实例配置为使用 Ingress。可通过修改 LangSmith Helm Chart 安装的 `config.yaml` 文件来完成。
+
+```yaml
+config:
+  hostname: "" # Main domain for LangSmith
+  basePath: "" # If you want to serve langsmith under a URL base path (e.g., /langsmith)
+ingress:
+  enabled: true
+  hostname: "" # Deprecated: Use config.hostname instead after v0.12.0
+  subdomain: "" # Deprecated: Use config.hostname instead after v0.12.0
+  ingressClassName: "" # If not set, the default ingress class will be used
+  annotations: {} # Add annotations here if needed
+  labels: {} # Add labels here if needed
+  tls: [] # Add TLS configuration here if needed
+frontend:
+  service:
+    type: ClusterIP
+```
+
+完成配置后，你需要更新 LangSmith 安装。如果一切配置正确，你的 LangSmith 实例现在应当可以通过 Ingress 访问。你可以运行以下命令检查 Ingress 状态：
+
+```bash
+kubectl get ingress
+```
+
+你会在输出中看到类似如下内容：
+
+```
+NAME                         CLASS   HOSTS    ADDRESS          PORTS     AGE
+langsmith-ingress            nginx   <host>   35.227.243.203   80, 443   95d
+```
+
+<Warning>
+如果你没有自动化 DNS 配置，则需要手动把这个 IP 地址添加到你的 DNS 提供方中。
+</Warning>
+
+### 选项 2：Gateway API
+
+<Note>
+Gateway API 支持自 LangSmith v0.12.0 起可用
+</Note>
+
+如果你的 cluster 使用 [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/)，你可以配置 LangSmith 来预配 HTTPRoute resources。这会为 LangSmith 创建一个 HTTPRoute，并为每个 [agent deployment](/langsmith/deployment) 创建一个 HTTPRoute。
+
+#### 参数
+
+* *name，必填*：要引用的 Gateway resource 名称
+* *namespace，必填*：Gateway resource 所在的 namespace
+* *hostname，可选*：你希望用于 LangSmith 安装的 hostname，例如 `"langsmith.example.com"`
+* *basePath，可选*：如果你希望通过 base path 提供 LangSmith，可在这里指定，例如 `"example.com/langsmith"`
+* *sectionName，可选*：要使用的 Gateway 中某个特定 listener section 的名称
+* *annotations，可选*：额外添加到 HTTPRoute resources 上的 annotations
+* *labels，可选*：额外添加到 HTTPRoute resources 上的 labels
+
+#### 配置
+
+```yaml
+config:
+  hostname: "" # Main domain for LangSmith
+  basePath: "" # If you want to serve langsmith under a base path. E.g "example.com/langsmith"
+gateway:
+  enabled: true
+  name: "my-gateway" # Name of your Gateway resource
+  namespace: "gateway-system" # Namespace of your Gateway resource
+  sectionName: "" # Optional: specific listener section name
+  annotations: {} # Add annotations here if needed
+  labels: {} # Add labels here if needed
+frontend:
+  service:
+    type: ClusterIP
+```
+
+完成配置后，你可以检查 HTTPRoutes 的状态：
+
+```bash
+kubectl get httproute
+```
+
+### 选项 3：Istio Gateway
+
+<Note>
+Istio Gateway 支持自 LangSmith v0.12.0 起可用
+</Note>
+
+如果你的 cluster 使用 [Istio](https://istio.io/)，你可以配置 LangSmith 来预配 VirtualService resources。这会为 LangSmith 创建一个 VirtualService，并为每个 [agent deployment](/langsmith/deployment) 创建一个 VirtualService。
+
+#### 参数
+
+* *name，可选*：要引用的 Istio Gateway resource 名称。默认值为 `"istio-gateway"`
+* *namespace，可选*：Istio Gateway resource 所在的 namespace。默认值为 `"istio-system"`
+* *hostname，可选*：你希望用于 LangSmith 安装的 hostname，例如 `"langsmith.example.com"`
+* *basePath，可选*：如果你希望通过 base path 提供 LangSmith，可在这里指定，例如 `"example.com/langsmith"`
+* *annotations，可选*：额外添加到 VirtualService resources 上的 annotations
+* *labels，可选*：额外添加到 VirtualService resources 上的 labels
+
+#### 配置
+
+```yaml
+config:
+  hostname: "" # Main domain for LangSmith
+  basePath: "" # If you want to serve langsmith on a separate basePath. E.g "example.com/langsmith"
+istioGateway:
+  enabled: true
+  name: "istio-gateway" # Name of your Istio Gateway resource
+  namespace: "istio-system" # Namespace of your Istio Gateway resource
+  annotations: {} # Add annotations here if needed
+  labels: {} # Add labels here if needed
+frontend:
+  service:
+    type: ClusterIP
+```
+
+完成配置后，你可以检查 VirtualServices 的状态：
+
+```bash
+kubectl get virtualservice
+```

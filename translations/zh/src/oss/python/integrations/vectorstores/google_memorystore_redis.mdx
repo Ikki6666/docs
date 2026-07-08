@@ -1,0 +1,231 @@
+---
+title: "Google Memorystore for Redis 集成"
+description: "使用 LangChain Python 集成 Google Memorystore for Redis 向量存储。"
+---
+
+import LangchainCommunityUnmaintained from '/snippets/oss/langchain-community-unmaintained.mdx';
+
+> [Google Memorystore for Redis](https://cloud.google.com/memorystore/docs/redis/memorystore-for-redis-overview) 是一项完全托管的服务，基于 Redis 内存数据存储构建应用缓存，可提供亚毫秒级的数据访问。它还能借助 Memorystore for Redis 的 LangChain 集成为数据库应用扩展 AI 驱动的体验。
+
+本笔记介绍如何使用 [Memorystore for Redis](https://cloud.google.com/memorystore/docs/redis/memorystore-for-redis-overview) 与 `MemorystoreVectorStore` 类来存储向量嵌入。
+
+可在 [GitHub](https://github.com/googleapis/langchain-google-memorystore-redis-python/) 上了解该软件包的更多信息。
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/googleapis/langchain-google-memorystore-redis-python/blob/main/docs/vector_store.ipynb)
+
+## 前置要求
+
+## 开始之前
+
+要运行本笔记，需要完成以下步骤：
+
+* [创建 Google Cloud 项目](https://developers.google.com/workspace/guides/create-project)
+* [启用 Memorystore for Redis API](https://console.cloud.google.com/flows/enableapi?apiid=redis.googleapis.com)
+* [创建 Memorystore for Redis 实例](https://cloud.google.com/memorystore/docs/redis/create-instance-console)。请确保版本大于或等于 7.2。
+
+### 🦜🔗 安装库
+
+该集成位于独立的软件包 `langchain-google-memorystore-redis` 中，因此需要先安装。
+
+```python
+pip install -upgrade --quiet langchain-google-memorystore-redis langchain
+```
+
+**仅适用于 Colab：** 取消注释下面的单元以重启内核，或使用按钮重启内核。对于 Vertex AI Workbench，可以使用顶部按钮重启终端。
+
+```python
+# # Automatically restart kernel after installs so that your environment can access the new packages
+# import IPython
+
+# app = IPython.Application.instance()
+# app.kernel.do_shutdown(True)
+```
+
+### ☁ 设置 Google Cloud 项目
+
+设置你的 Google Cloud 项目，以便在本笔记中使用 Google Cloud 资源。
+
+如果不知道项目 ID，可以尝试以下方法：
+
+* 运行 `gcloud config list`。
+* 运行 `gcloud projects list`。
+* 查看支持页面：[查找项目 ID](https://support.google.com/googleapi/answer/7014113)。
+
+```python
+# @markdown Please fill in the value below with your Google Cloud project ID and then run the cell.
+
+PROJECT_ID = "my-project-id"  # @param {type:"string"}
+
+# Set the project id
+!gcloud config set project {PROJECT_ID}
+```
+
+### 🔐 身份验证
+
+以当前登录到此笔记本的 IAM 用户身份对 Google Cloud 进行身份验证，以访问你的 Google Cloud 项目。
+
+* 如果你使用 Colab 运行本笔记，请使用下面的单元并继续。
+* 如果你使用 Vertex AI Workbench，请参阅 [Vertex AI Workbench 设置说明](https://github.com/GoogleCloudPlatform/generative-ai/tree/main/setup-env)。
+
+```python
+from google.colab import auth
+
+auth.authenticate_user()
+```
+
+## 基本用法
+
+### 初始化向量索引
+
+```python
+import redis
+from langchain_google_memorystore_redis import (
+    DistanceStrategy,
+    HNSWConfig,
+    RedisVectorStore,
+)
+
+# Connect to a Memorystore for Redis instance
+redis_client = redis.from_url("redis://127.0.0.1:6379")
+
+# Configure HNSW index with descriptive parameters
+index_config = HNSWConfig(
+    name="my_vector_index", distance_strategy=DistanceStrategy.COSINE, vector_size=128
+)
+
+# Initialize/create the vector store index
+RedisVectorStore.init_index(client=redis_client, index_config=index_config)
+```
+
+### 准备文档
+
+在与向量存储交互之前，需要先对文本进行处理并转换为数值表示。通常包括：
+
+* 加载文本：`TextLoader` 从文件中读取文本数据，例如 `"state_of_the_union.txt"`。
+* 文本切分：`CharacterTextSplitter` 将文本拆分成较小的片段，以便嵌入模型处理。
+
+<LangchainCommunityUnmaintained />
+
+```python
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import CharacterTextSplitter
+
+loader = TextLoader("./state_of_the_union.txt")
+documents = loader.load()
+text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+docs = text_splitter.split_documents(documents)
+```
+
+### 向向量存储添加文档
+
+完成文本准备并生成嵌入后，可以使用以下方法将其写入 Redis 向量存储。
+
+#### 方法 1：使用类方法直接写入
+
+这种方式通过 `from_documents` 类方法将嵌入创建和写入合并为一步：
+
+<LangchainCommunityUnmaintained />
+
+```python
+from langchain_community.embeddings.fake import FakeEmbeddings
+
+embeddings = FakeEmbeddings(size=128)
+redis_client = redis.from_url("redis://127.0.0.1:6379")
+rvs = RedisVectorStore.from_documents(
+    docs, embedding=embeddings, client=redis_client, index_name="my_vector_index"
+)
+```
+
+#### 方法 2：基于实例写入
+
+这种方式在使用新的或已有的 `RedisVectorStore` 时更加灵活：
+
+* [可选] 创建 `RedisVectorStore` 实例：如果你需要自定义配置，可以先实例化一个对象。若已有实例，可直接进入下一步。
+* 添加带元数据的文本：向实例提供原始文本和元数据，嵌入生成和写入会自动完成。
+
+```python
+rvs = RedisVectorStore(
+    client=redis_client, index_name="my_vector_index", embeddings=embeddings
+)
+ids = rvs.add_texts(
+    texts=[d.page_content for d in docs], metadatas=[d.metadata for d in docs]
+)
+```
+
+### 执行相似度搜索（KNN）
+
+填充向量存储后，可以搜索与查询语义相近的文本。下面展示如何使用默认设置进行 KNN（K 近邻）搜索：
+
+* 构造查询：使用自然语言问题表达搜索意图，例如 `"What did the president say about Ketanji Brown Jackson"`。
+* 获取相似结果：`similarity_search` 方法会查找与查询在语义上最接近的项。
+
+```python
+import pprint
+
+query = "What did the president say about Ketanji Brown Jackson"
+knn_results = rvs.similarity_search(query=query)
+pprint.pprint(knn_results)
+```
+
+### 执行基于范围的相似度搜索
+
+范围查询可以通过指定相似度阈值，让搜索控制更精细：
+
+* 构造查询：使用自然语言问题定义搜索意图。
+* 设置相似度阈值：`distance_threshold` 参数决定多接近的结果才被视为相关。
+* 获取结果：`similarity_search_with_score` 方法会返回落在指定相似度范围内的项。
+
+```python
+rq_results = rvs.similarity_search_with_score(query=query, distance_threshold=0.8)
+pprint.pprint(rq_results)
+```
+
+### 执行最大边际相关性（MMR）搜索
+
+MMR 查询会尽量返回既与查询相关、彼此又更具多样性的结果，从而减少冗余。
+
+* 构造查询：使用自然语言问题定义搜索意图。
+* 平衡相关性与多样性：`lambda_mult` 参数用于控制两者之间的权衡。
+* 获取 MMR 结果：`max_marginal_relevance_search` 方法会返回同时优化相关性和多样性的结果。
+
+```python
+mmr_results = rvs.max_marginal_relevance_search(query=query, lambda_mult=0.90)
+pprint.pprint(mmr_results)
+```
+
+## 将向量存储用作检索器
+
+为了与其他 LangChain 组件更顺畅地集成，可以将向量存储转换为检索器。这有几个好处：
+
+* LangChain 兼容性更好：许多 LangChain 工具和方法都可直接与检索器交互。
+* 使用更简洁：`as_retriever()` 方法可将向量存储转换为更便于查询的形式。
+
+```python
+retriever = rvs.as_retriever()
+results = retriever.invoke(query)
+pprint.pprint(results)
+```
+
+## 清理
+
+### 从向量存储中删除文档
+
+有时需要删除文档及其关联向量。`delete` 方法可完成这一操作。
+
+```python
+rvs.delete(ids)
+```
+
+### 删除向量索引
+
+在某些情况下，可能需要删除现有向量索引。常见原因包括：
+
+* 索引配置变更：若需要修改索引参数，通常需要先删除再重新创建。
+* 存储管理：删除未使用的索引有助于释放 Redis 实例中的空间。
+
+注意：删除向量索引是不可逆操作。请确认不再需要已存储的向量及其搜索功能后再继续。
+
+```python
+# Delete the vector index
+RedisVectorStore.drop_index(client=redis_client, index_name="my_vector_index")
+```

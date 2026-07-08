@@ -1,0 +1,388 @@
+---
+title: "Elasticsearch 集成"
+description: "使用 LangChain Python 与 Elasticsearch retriever 集成。"
+---
+
+import LangchainCommunityUnmaintained from '/snippets/oss/langchain-community-unmaintained.mdx';
+
+>[Elasticsearch](https://www.elastic.co/elasticsearch/) 是一个分布式、RESTful 的搜索与分析引擎。它提供支持多租户的分布式全文搜索引擎、HTTP Web 接口以及无 schema 的 JSON 文档。它支持关键词搜索、向量搜索、混合搜索以及复杂过滤。
+
+`ElasticsearchRetriever` 是一个通用封装器，让你能够通过 [Query DSL](https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl.html) 灵活访问 `Elasticsearch` 的全部特性。对于大多数场景，其他类（如 `ElasticsearchStore`、`ElasticsearchEmbeddings` 等）已经足够；但如果不够用，就可以使用 `ElasticsearchRetriever`。
+
+本指南将帮助你开始使用 Elasticsearch [retriever](/oss/langchain/retrieval)。如需查看 `ElasticsearchRetriever` 的全部特性和配置项，请参阅 [API reference](https://reference.langchain.com/python/langchain-elasticsearch/retrievers/ElasticsearchRetriever)。
+
+### 集成详情
+
+<ItemTable category="document_retrievers" item="ElasticsearchRetriever" />
+
+## 设置
+
+搭建 Elasticsearch 实例主要有两种方式：
+
+- Elastic Cloud：[Elastic Cloud](https://cloud.elastic.co/) 是托管式 Elasticsearch 服务。你可以注册一个[免费试用](https://www.elastic.co/cloud/cloud-trial-overview)。  
+要连接一个不需要登录凭据的 Elasticsearch 实例（启动 docker 实例时启用了安全配置），需要在构造函数中传入 Elasticsearch URL、索引名以及 embedding 对象。
+
+- 本地安装 Elasticsearch：通过本地运行来开始使用 Elasticsearch。最简单的方法是使用官方 Elasticsearch Docker 镜像。详情请参阅 [Elasticsearch Docker documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/docker.html)。
+
+如果你想从单次查询中获取自动 tracing，也可以取消下面的注释并设置 [LangSmith](/langsmith/observability) API key：
+
+```python
+os.environ["LANGSMITH_API_KEY"] = getpass.getpass("Enter your LangSmith API key: ")
+os.environ["LANGSMITH_TRACING"] = "true"
+```
+
+### 安装
+
+这个 retriever 位于 `langchain-elasticsearch` 包中。为了演示，我们还会安装 `langchain-community` 来生成文本 [embeddings](/oss/integrations/embeddings)。
+
+<LangchainCommunityUnmaintained />
+
+```python
+pip install -qU langchain-community langchain-elasticsearch
+```
+
+```python
+from typing import Any, Dict, Iterable
+
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import bulk
+from langchain_community.embeddings import DeterministicFakeEmbedding
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_elasticsearch import ElasticsearchRetriever
+```
+
+### 配置
+
+这里定义与 Elasticsearch 的连接。本示例使用本地运行的实例。或者，你也可以在 [Elastic Cloud](https://cloud.elastic.co/) 创建账户并启动一个[免费试用](https://www.elastic.co/cloud/cloud-trial-overview)。
+
+```python
+es_url = "http://localhost:9200"
+es_client = Elasticsearch(hosts=[es_url])
+es_client.info()
+```
+
+在这个示例里，为了演示向量搜索，我们会使用随机 embeddings。实际使用时，请从可用的 LangChain [Embeddings](/oss/integrations/embeddings) 类中选择合适的实现。
+
+```python
+embeddings = DeterministicFakeEmbedding(size=3)
+```
+
+#### 定义示例数据
+
+```python
+index_name = "test-langchain-retriever"
+text_field = "text"
+dense_vector_field = "fake_embedding"
+num_characters_field = "num_characters"
+texts = [
+    "foo",
+    "bar",
+    "world",
+    "hello world",
+    "hello",
+    "foo bar",
+    "bla bla foo",
+]
+```
+
+#### 索引数据
+
+通常，用户使用 `ElasticsearchRetriever` 时，Elasticsearch 索引中已经有现成数据。这里我们会索引一些示例文本。如果你是通过 `ElasticsearchStore.from_documents` 创建索引，也没有问题。
+
+```python
+def create_index(
+    es_client: Elasticsearch,
+    index_name: str,
+    text_field: str,
+    dense_vector_field: str,
+    num_characters_field: str,
+):
+    es_client.indices.create(
+        index=index_name,
+        mappings={
+            "properties": {
+                text_field: {"type": "text"},
+                dense_vector_field: {"type": "dense_vector"},
+                num_characters_field: {"type": "integer"},
+            }
+        },
+    )
+
+
+def index_data(
+    es_client: Elasticsearch,
+    index_name: str,
+    text_field: str,
+    dense_vector_field: str,
+    embeddings: Embeddings,
+    texts: Iterable[str],
+    refresh: bool = True,
+) -> None:
+    create_index(
+        es_client, index_name, text_field, dense_vector_field, num_characters_field
+    )
+
+    vectors = embeddings.embed_documents(list(texts))
+    requests = [
+        {
+            "_op_type": "index",
+            "_index": index_name,
+            "_id": i,
+            text_field: text,
+            dense_vector_field: vector,
+            num_characters_field: len(text),
+        }
+        for i, (text, vector) in enumerate(zip(texts, vectors))
+    ]
+
+    bulk(es_client, requests)
+
+    if refresh:
+        es_client.indices.refresh(index=index_name)
+
+    return len(requests)
+```
+
+```python
+index_data(es_client, index_name, text_field, dense_vector_field, embeddings, texts)
+```
+
+```text
+7
+```
+
+## 实例化
+
+### 向量搜索
+
+本示例使用 fake embeddings 进行稠密向量检索。
+
+```python
+def vector_query(search_query: str) -> Dict:
+    vector = embeddings.embed_query(search_query)  # same embeddings as for indexing
+    return {
+        "knn": {
+            "field": dense_vector_field,
+            "query_vector": vector,
+            "k": 5,
+            "num_candidates": 10,
+        }
+    }
+
+
+vector_retriever = ElasticsearchRetriever.from_es_params(
+    index_name=index_name,
+    body_func=vector_query,
+    content_field=text_field,
+    url=es_url,
+)
+
+vector_retriever.invoke("foo")
+```
+
+```python
+[Document(page_content='foo', metadata={'_index': 'test-langchain-index', '_id': '0', '_score': 1.0, '_source': {'fake_embedding': [-2.336764233933763, 0.27510289545940503, -0.7957597268194339], 'num_characters': 3}}),
+ Document(page_content='world', metadata={'_index': 'test-langchain-index', '_id': '2', '_score': 0.6770179, '_source': {'fake_embedding': [-0.7041151202179595, -1.4652961969276497, -0.25786766898672847], 'num_characters': 5}}),
+ Document(page_content='hello world', metadata={'_index': 'test-langchain-index', '_id': '3', '_score': 0.4816144, '_source': {'fake_embedding': [0.42728413221815387, -1.1889908285425348, -1.445433230084671], 'num_characters': 11}}),
+ Document(page_content='hello', metadata={'_index': 'test-langchain-index', '_id': '4', '_score': 0.46853775, '_source': {'fake_embedding': [-0.28560441330564046, 0.9958894823084921, 1.5489829880195058], 'num_characters': 5}}),
+ Document(page_content='foo bar', metadata={'_index': 'test-langchain-index', '_id': '5', '_score': 0.2086992, '_source': {'fake_embedding': [0.2533670476638539, 0.08100381646160418, 0.7763644080870179], 'num_characters': 7}})]
+```
+
+### BM25
+
+传统关键词匹配。
+
+```python
+def bm25_query(search_query: str) -> Dict:
+    return {
+        "query": {
+            "match": {
+                text_field: search_query,
+            },
+        },
+    }
+
+
+bm25_retriever = ElasticsearchRetriever.from_es_params(
+    index_name=index_name,
+    body_func=bm25_query,
+    content_field=text_field,
+    url=es_url,
+)
+
+bm25_retriever.invoke("foo")
+```
+
+```python
+[Document(page_content='foo', metadata={'_index': 'test-langchain-index', '_id': '0', '_score': 0.9711467, '_source': {'fake_embedding': [-2.336764233933763, 0.27510289545940503, -0.7957597268194339], 'num_characters': 3}}),
+ Document(page_content='foo bar', metadata={'_index': 'test-langchain-index', '_id': '5', '_score': 0.7437035, '_source': {'fake_embedding': [0.2533670476638539, 0.08100381646160418, 0.7763644080870179], 'num_characters': 7}}),
+ Document(page_content='bla bla foo', metadata={'_index': 'test-langchain-index', '_id': '6', '_score': 0.6025789, '_source': {'fake_embedding': [1.7365927060137358, -0.5230400847844948, 0.7978339724186192], 'num_characters': 11}})]
+```
+
+### 混合搜索
+
+使用 [Reciprocal Rank Fusion](https://www.elastic.co/guide/en/elasticsearch/reference/current/rrf.html) (RRF) 组合向量搜索和 BM25 搜索的结果集。
+
+```python
+def hybrid_query(search_query: str) -> Dict:
+    vector = embeddings.embed_query(search_query)  # same embeddings as for indexing
+    return {
+        "retriever": {
+            "rrf": {
+                "retrievers": [
+                    {
+                        "standard": {
+                            "query": {
+                                "match": {
+                                    text_field: search_query,
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "knn": {
+                            "field": dense_vector_field,
+                            "query_vector": vector,
+                            "k": 5,
+                            "num_candidates": 10,
+                        }
+                    },
+                ]
+            }
+        }
+    }
+
+
+hybrid_retriever = ElasticsearchRetriever.from_es_params(
+    index_name=index_name,
+    body_func=hybrid_query,
+    content_field=text_field,
+    url=es_url,
+)
+
+hybrid_retriever.invoke("foo")
+```
+
+```python
+[Document(page_content='foo', metadata={'_index': 'test-langchain-index', '_id': '0', '_score': 0.9711467, '_source': {'fake_embedding': [-2.336764233933763, 0.27510289545940503, -0.7957597268194339], 'num_characters': 3}}),
+ Document(page_content='foo bar', metadata={'_index': 'test-langchain-index', '_id': '5', '_score': 0.7437035, '_source': {'fake_embedding': [0.2533670476638539, 0.08100381646160418, 0.7763644080870179], 'num_characters': 7}}),
+ Document(page_content='bla bla foo', metadata={'_index': 'test-langchain-index', '_id': '6', '_score': 0.6025789, '_source': {'fake_embedding': [1.7365927060137358, -0.5230400847844948, 0.7978339724186192], 'num_characters': 11}})]
+```
+
+### 模糊匹配
+
+带拼写容错的关键词匹配。
+
+```python
+def fuzzy_query(search_query: str) -> Dict:
+    return {
+        "query": {
+            "match": {
+                text_field: {
+                    "query": search_query,
+                    "fuzziness": "AUTO",
+                }
+            },
+        },
+    }
+
+
+fuzzy_retriever = ElasticsearchRetriever.from_es_params(
+    index_name=index_name,
+    body_func=fuzzy_query,
+    content_field=text_field,
+    url=es_url,
+)
+
+fuzzy_retriever.invoke("fox")  # note the character tolernace
+```
+
+```python
+[Document(page_content='foo', metadata={'_index': 'test-langchain-index', '_id': '0', '_score': 0.6474311, '_source': {'fake_embedding': [-2.336764233933763, 0.27510289545940503, -0.7957597268194339], 'num_characters': 3}}),
+ Document(page_content='foo bar', metadata={'_index': 'test-langchain-index', '_id': '5', '_score': 0.49580228, '_source': {'fake_embedding': [0.2533670476638539, 0.08100381646160418, 0.7763644080870179], 'num_characters': 7}}),
+ Document(page_content='bla bla foo', metadata={'_index': 'test-langchain-index', '_id': '6', '_score': 0.40171927, '_source': {'fake_embedding': [1.7365927060137358, -0.5230400847844948, 0.7978339724186192], 'num_characters': 11}})]
+```
+
+### 复杂过滤
+
+在不同字段上组合多个过滤条件。
+
+```python
+def filter_query_func(search_query: str) -> Dict:
+    return {
+        "query": {
+            "bool": {
+                "must": [
+                    {"range": {num_characters_field: {"gte": 5}}},
+                ],
+                "must_not": [
+                    {"prefix": {text_field: "bla"}},
+                ],
+                "should": [
+                    {"match": {text_field: search_query}},
+                ],
+            }
+        }
+    }
+
+
+filtering_retriever = ElasticsearchRetriever.from_es_params(
+    index_name=index_name,
+    body_func=filter_query_func,
+    content_field=text_field,
+    url=es_url,
+)
+
+filtering_retriever.invoke("foo")
+```
+
+```python
+[Document(page_content='foo bar', metadata={'_index': 'test-langchain-index', '_id': '5', '_score': 1.7437035, '_source': {'fake_embedding': [0.2533670476638539, 0.08100381646160418, 0.7763644080870179], 'num_characters': 7}}),
+ Document(page_content='world', metadata={'_index': 'test-langchain-index', '_id': '2', '_score': 1.0, '_source': {'fake_embedding': [-0.7041151202179595, -1.4652961969276497, -0.25786766898672847], 'num_characters': 5}}),
+ Document(page_content='hello world', metadata={'_index': 'test-langchain-index', '_id': '3', '_score': 1.0, '_source': {'fake_embedding': [0.42728413221815387, -1.1889908285425348, -1.445433230084671], 'num_characters': 11}}),
+ Document(page_content='hello', metadata={'_index': 'test-langchain-index', '_id': '4', '_score': 1.0, '_source': {'fake_embedding': [-0.28560441330564046, 0.9958894823084921, 1.5489829880195058], 'num_characters': 5}})]
+```
+
+注意，这里查询匹配结果会排在最前面。其他通过过滤条件的文档也会出现在结果集中，但它们的分数都相同。
+
+### 自定义 document mapper
+
+你可以自定义一个函数，将 Elasticsearch 返回结果（hit）映射为 LangChain document。
+
+```python
+def num_characters_mapper(hit: Dict[str, Any]) -> Document:
+    num_chars = hit["_source"][num_characters_field]
+    content = hit["_source"][text_field]
+    return Document(
+        page_content=f"This document has {num_chars} characters",
+        metadata={"text_content": content},
+    )
+
+
+custom_mapped_retriever = ElasticsearchRetriever.from_es_params(
+    index_name=index_name,
+    body_func=filter_query_func,
+    document_mapper=num_characters_mapper,
+    url=es_url,
+)
+
+custom_mapped_retriever.invoke("foo")
+```
+
+```python
+[Document(page_content='This document has 7 characters', metadata={'text_content': 'foo bar'}),
+ Document(page_content='This document has 5 characters', metadata={'text_content': 'world'}),
+ Document(page_content='This document has 11 characters', metadata={'text_content': 'hello world'}),
+ Document(page_content='This document has 5 characters', metadata={'text_content': 'hello'})]
+```
+
+## 用法
+
+按照上面的示例，可以使用 `invoke` 发起单次查询。
+
+---
+
+## API reference
+
+如需查看 `ElasticsearchRetriever` 的全部特性和配置项，请参阅 [API reference](https://reference.langchain.com/python/langchain-elasticsearch/retrievers/ElasticsearchRetriever)。

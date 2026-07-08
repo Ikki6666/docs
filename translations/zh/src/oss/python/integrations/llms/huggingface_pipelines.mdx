@@ -1,0 +1,201 @@
+---
+title: "Hugging Face 本地 pipelines 集成"
+description: "使用 LangChain Python 与 Hugging Face 本地 pipelines LLM 集成。"
+---
+
+Hugging Face 模型可以通过 `HuggingFacePipeline` 类在本地运行。
+
+[Hugging Face Model Hub](https://huggingface.co/models) 托管了超过 12 万个模型、2 万个数据集和 5 万个 demo app（Spaces），全部开源且可公开访问，是一个方便人们在线协作并共同构建 ML 的平台。
+
+你可以通过这个本地 pipeline wrapper 从 LangChain 调用这些模型，也可以通过 HuggingFaceHub class 调用它们托管的 inference endpoints。
+
+要使用它，你应该先安装 `transformers` python [package](https://pypi.org/project/transformers/) 和 [pytorch](https://pytorch.org/get-started/locally/)。你也可以安装 `xformer` 来使用更省内存的 attention 实现。
+
+```python
+pip install -qU transformers
+```
+
+### 模型加载
+
+可以通过 `from_model_id` 方法指定模型参数来加载模型。
+
+```python
+from langchain_huggingface.llms import HuggingFacePipeline
+
+hf = HuggingFacePipeline.from_model_id(
+    model_id="gpt2",
+    task="text-generation",
+    pipeline_kwargs={"max_new_tokens": 10},
+)
+```
+
+你也可以直接传入现有的 `transformers` pipeline 来加载。
+
+```python
+from langchain_huggingface.llms import HuggingFacePipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+
+model_id = "gpt2"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id)
+pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=10)
+hf = HuggingFacePipeline(pipeline=pipe)
+```
+
+### 创建 chain
+
+模型加载到内存后，你可以把它与 prompt 组合成一个 chain。
+
+```python
+from langchain_core.prompts import PromptTemplate
+
+template = """Question: {question}
+
+Answer: Let's think step by step."""
+prompt = PromptTemplate.from_template(template)
+
+chain = prompt | hf
+
+question = "What is electroencephalography?"
+
+print(chain.invoke({"question": question}))
+```
+
+如果你不想使用 prompt，可以把 `skip_prompt=True` 绑定到 LLM 上。
+
+```python
+chain = prompt | hf.bind(skip_prompt=True)
+
+question = "What is electroencephalography?"
+
+print(chain.invoke({"question": question}))
+```
+
+流式输出。
+
+```python
+for chunk in chain.stream(question):
+    print(chunk, end="", flush=True)
+```
+
+### GPU 推理
+
+在 GPU 机器上运行时，你可以指定 `device=n` 参数把模型放到指定设备上。
+默认值为 `-1`，表示 CPU 推理。
+
+如果你有多 GPU，或者模型太大无法放进单个 GPU，可以指定 `device_map="auto"`。这需要并使用 [Accelerate](https://huggingface.co/docs/accelerate/index) 库来自动决定如何加载模型权重。
+
+*注意*：`device` 和 `device_map` 不应同时指定，否则可能导致意外行为。
+
+```python
+gpu_llm = HuggingFacePipeline.from_model_id(
+    model_id="gpt2",
+    task="text-generation",
+    device=0,  # 如需使用 accelerate 库，可替换为 device_map="auto"
+    pipeline_kwargs={"max_new_tokens": 10},
+)
+
+gpu_chain = prompt | gpu_llm
+
+question = "What is electroencephalography?"
+
+print(gpu_chain.invoke({"question": question}))
+```
+
+### 批量 GPU 推理
+
+如果在带 GPU 的设备上运行，你也可以用 batch 模式在 GPU 上推理。
+
+```python
+gpu_llm = HuggingFacePipeline.from_model_id(
+    model_id="bigscience/bloom-1b7",
+    task="text-generation",
+    device=0,  # CPU 时为 -1
+    batch_size=2,  # 根据 GPU 映射和模型大小按需调整
+    model_kwargs={"temperature": 0, "max_length": 64},
+)
+
+gpu_chain = prompt | gpu_llm.bind(stop=["\n\n"])
+
+questions = []
+for i in range(4):
+    questions.append({"question": f"What is the number {i} in french?"})
+
+answers = gpu_chain.batch(questions)
+for answer in answers:
+    print(answer)
+```
+
+### 使用 OpenVINO 后端推理
+
+要部署 OpenVINO 模型，你可以指定 `backend="openvino"` 参数，把 OpenVINO 作为后端推理框架。
+
+如果你有 Intel GPU，可以指定 `model_kwargs={"device": "GPU"}` 在其上运行推理。
+
+```python
+pip install -U-strategy eager "optimum[openvino,nncf]" --quiet
+```
+
+```python
+ov_config = {"PERFORMANCE_HINT": "LATENCY", "NUM_STREAMS": "1", "CACHE_DIR": ""}
+
+ov_llm = HuggingFacePipeline.from_model_id(
+    model_id="gpt2",
+    task="text-generation",
+    backend="openvino",
+    model_kwargs={"device": "CPU", "ov_config": ov_config},
+    pipeline_kwargs={"max_new_tokens": 10},
+)
+
+ov_chain = prompt | ov_llm
+
+question = "What is electroencephalography?"
+
+print(ov_chain.invoke({"question": question}))
+```
+
+### 使用本地 OpenVINO 模型推理
+
+你可以使用 CLI 将模型 [export your model](https://github.com/huggingface/optimum-intel?tab=readme-ov-file#export) 为 OpenVINO IR 格式，并从本地文件夹加载模型。
+
+```python
+!optimum-cli export openvino --model gpt2 ov_model_dir
+```
+
+建议使用 `--weight-format` 进行 8 位或 4 位权重量化，以降低推理延迟并减小模型体积：
+
+```python
+!optimum-cli export openvino --model gpt2  --weight-format int8 ov_model_dir # 8 位量化
+
+!optimum-cli export openvino --model gpt2  --weight-format int4 ov_model_dir # 4 位量化
+```
+
+```python
+ov_llm = HuggingFacePipeline.from_model_id(
+    model_id="ov_model_dir",
+    task="text-generation",
+    backend="openvino",
+    model_kwargs={"device": "CPU", "ov_config": ov_config},
+    pipeline_kwargs={"max_new_tokens": 10},
+)
+
+ov_chain = prompt | ov_llm
+
+question = "What is electroencephalography?"
+
+print(ov_chain.invoke({"question": question}))
+```
+
+你还可以通过对 activations 和 KV-cache 进行 Dynamic Quantization 来获得额外的推理速度提升。可以通过如下 `ov_config` 启用这些选项：
+
+```python
+ov_config = {
+    "KV_CACHE_PRECISION": "u8",
+    "DYNAMIC_QUANTIZATION_GROUP_SIZE": "32",
+    "PERFORMANCE_HINT": "LATENCY",
+    "NUM_STREAMS": "1",
+    "CACHE_DIR": "",
+}
+```
+
+关于更多信息，请参见 [OpenVINO LLM guide](https://docs.openvino.ai/2024/learn-openvino/llm_inference_guide.html) 和 [OpenVINO Local Pipelines notebook](/oss/integrations/llms/openvino/)。

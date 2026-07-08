@@ -1,0 +1,135 @@
+---
+title: Agent Server 指标
+sidebarTitle: Agent Server 指标
+icon: "chart-line"
+description: self-hosted 部署中 Agent Server OpenTelemetry 指标参考，包括 Deployment UI 指标、内部指标和 Datadog 导出。
+---
+
+[Agent Server](/langsmith/agent-server) 通过 OpenTelemetry, OTel, client 发出指标。指标默认使用 `lg_api_` 名称前缀，也可通过 `METRIC_PREFIX` 覆盖。
+
+在 self-hosted 部署中，可使用本页选择 scrape 或 push 后端、启用你需要的指标集，并在构建仪表盘或告警时查找对应的 Prometheus 名称。
+
+## 指标后端
+
+Agent Server 将指标分成两组：
+
+- **Deployment UI metrics**：显示在 LangSmith Deployment UI 中，并默认暴露在 Agent Server 的 Prometheus scrape endpoint 上，即 `GET /metrics`，`format=prometheus`。
+- **Internal metrics**：供 LangChain 运维人员使用的运行和调试指标。配置后会发送到 Datadog。在 Prometheus 中，只有显式启用后才会出现内部指标。
+
+| Backend | Metric set | Enable |
+|---------|------------|--------|
+| **Prometheus**，scrape `GET /metrics` | 默认包含 Deployment UI metrics。设置 `EXPOSE_INTERNAL_METRICS_PROMETHEUS=true` 后，也会在同一 endpoint 上暴露内部指标。 | 当安装了 OTel Prometheus exporter 时可用 |
+| **Datadog**，OTLP push | 仅内部指标 | 设置 `LSD_DD_API_KEY`，或 `CUSTOM_LSD_DD_API_KEY`。指标会推送到 `https://{LSD_DD_ENDPOINT}/v1/metrics`，默认 endpoint 为 `otlp.us5.datadoghq.com`。 |
+
+Prometheus 和 Datadog 可以同时启用。Datadog 只接收内部指标补集，因此 UI 指标不会在两个后端中重复。
+
+## 指标分层
+
+每个指标都会分配一个 tier，用于控制内部指标是否会被记录：
+
+| Tier | Value | Purpose |
+|------|-------|---------|
+| **CRITICAL** | `1` | 核心健康和失败信号。当内部指标启用时总会记录，包括 `dev` / `dev_free` 部署。 |
+| **INFO** | `2` | 用于生产监控的运维细节。在生产环境中默认上限为 `METRIC_MAX_EMITTING_TIER=2`。 |
+| **DEBUG** | `3` | 更深入的故障排查信息。除非提高 `METRIC_MAX_EMITTING_TIER`，否则不会记录。 |
+| **DEEP_DEBUG** | `4` | 更详细的诊断信息。除非提高 `METRIC_MAX_EMITTING_TIER`，否则不会记录。 |
+
+将 `METRIC_MAX_EMITTING_TIER` 设置为你希望记录的最高 tier，以控制内部指标的采集范围。Deployment UI metrics 不受此设置影响，总是会发出。
+
+## 配置导出
+
+### Prometheus
+
+如需抓取 Deployment UI metrics：
+
+1. 将你的 Prometheus collector 指向 Agent Server 的 `/metrics` endpoint，例如 `https://<agent-server-host>/metrics`。
+2. 使用默认的 `format=prometheus` 查询参数，或直接省略它。
+
+如需在同一 endpoint 上同时暴露内部指标，请设置：
+
+```bash
+EXPOSE_INTERNAL_METRICS_PROMETHEUS=true
+```
+
+### Datadog
+
+如需将内部指标推送到 Datadog，而不是只使用 Prometheus，或与其并行使用：
+
+1. 将 `LSD_DD_API_KEY` 设置为你的 Datadog API key。只要该 key 存在，`DATADOG_METRICS_ENABLED` 就会自动开启。
+2. 可选设置 `LSD_DD_ENDPOINT`，默认值为 `otlp.us5.datadoghq.com`，或者使用旧别名 `CUSTOM_LSD_DD_API_KEY` / `CUSTOM_LSD_DD_ENDPOINT`。
+
+Datadog 只接收内部指标。Deployment UI metrics 仍应通过 Prometheus 或 Grafana 抓取 `/metrics`。
+
+## Deployment UI 指标
+
+这些指标带有 `lsd_web_metric=true`。它们默认会出现在 Prometheus `/metrics` scrape 中，并驱动 LangSmith Deployment UI。表中列出的 tier 仅供参考，这些指标无论 `METRIC_MAX_EMITTING_TIER` 如何设置都会发出。
+
+| Name | Type | Tier | Description |
+|------|------|------|-------------|
+| `lg_api_http_requests_total` | Counter | INFO | Agent Server 的 HTTP 请求总数。 |
+| `lg_api_http_requests_latency` | Histogram，毫秒 | INFO | HTTP 请求延迟。 |
+| `lg_api_run_queue_wait_time_1st_attempt` | Histogram，毫秒 | INFO | 作业在首次处理前在队列中的等待时间。 |
+| `lg_api_num_pending_runs` | Gauge | INFO | 当前处于 pending 状态的 runs 数量。在 Postgres 后端中由 Go core 作为数据来源，在 in-memory 后端中由 Python collector 发出该 gauge。 |
+| `lg_api_num_running_runs` | Gauge | INFO | 当前正在运行的 runs 数量。运行时拆分逻辑与 `lg_api_num_pending_runs` 相同。 |
+| `lg_api_workers_max` | Gauge | CRITICAL | 最大 worker 容量。在 in-memory runtime 中由 Python collector 发出，在 Postgres 中由 Go core 发出。 |
+| `lg_api_workers_active` | Gauge | CRITICAL | 当前正在执行 runs 的 workers 数量。 |
+| `lg_api_workers_available` | Gauge | CRITICAL | 当前可接受新 runs 的 workers 数量。 |
+| `lg_api_pg_pool_max` | Gauge | CRITICAL | Postgres 连接池最大容量。 |
+| `lg_api_pg_pool_size` | Gauge | CRITICAL | 当前由 Postgres 连接池管理的连接数，包括空闲、使用中和准备中的连接。 |
+| `lg_api_pg_pool_available` | Gauge | INFO | Postgres 连接池中的空闲连接数。 |
+| `lg_api_pg_pool_requests_queued_total` | Counter | CRITICAL | 因连接无法立即获取而进入排队的 Postgres 连接请求数。OTel Prometheus exporter 会在 counter 名称后追加 `_total`。 |
+| `lg_api_pg_pool_requests_errors_total` | Counter | CRITICAL | Postgres 连接请求错误数，例如超时、队列已满等失败。 |
+| `lg_api_redis_pool_max` | Gauge | INFO | Redis 连接池最大容量。 |
+| `lg_api_redis_pool_size` | Gauge | INFO | 当前正在使用的 Redis 连接数。 |
+| `lg_api_redis_pool_available` | Gauge | INFO | Redis 连接池中的空闲连接数。 |
+
+## 内部指标
+
+这些指标带有 `lsd_web_metric=false`。默认情况下，当设置了 `LSD_DD_API_KEY` 时，它们会导出到 Datadog。设置 `EXPOSE_INTERNAL_METRICS_PROMETHEUS=true` 后，也会包含在 Prometheus `/metrics` scrape 中。只有 tier 不高于 `METRIC_MAX_EMITTING_TIER` 的内部指标才会记录，更高 tier 的指标会被省略。
+
+### Run 生命周期
+
+| Name | Type | Tier | Description |
+|------|------|------|-------------|
+| `lg_api_run_attempt_started_counter` | Counter | CRITICAL | 已开始的 run 执行尝试次数。 |
+| `lg_api_run_success_counter` | Counter | CRITICAL | 成功完成的 runs 数量。 |
+| `lg_api_run_canceled_by_request_counter` | Counter | CRITICAL | 因显式取消请求而被取消的 runs 数量。 |
+| `lg_api_run_failed_retriable_counter` | Counter | CRITICAL | 因可重试错误而失败的 runs 数量。 |
+| `lg_api_run_failed_after_retry_counter` | Counter | CRITICAL | 重试耗尽后仍失败的 runs 数量。 |
+| `lg_api_run_exceed_max_attempts_at_start_counter` | Counter | CRITICAL | 因在启动时就已超过最大尝试次数而被拒绝的 runs 数量。 |
+| `lg_api_run_abandoned_by_shutdown_counter` | Counter | CRITICAL | 在服务器关闭期间被放弃的 runs 数量。 |
+| `lg_api_run_set_status_error_counter` | Counter | CRITICAL | 更新 run 状态时发生的错误数。 |
+| `lg_api_failed_to_fetch_runs_counter` | Counter | CRITICAL | 从队列获取 runs 失败的次数。 |
+| `lg_api_run_execution_latency` | Histogram，毫秒 | INFO | 端到端 run 执行延迟。 |
+| `lg_api_run_queue_wait_time_retry_attempt` | Histogram，毫秒 | INFO | 重试尝试中的队列等待时间，不含首次尝试。 |
+
+### Streaming 和 protocol v2
+
+| Name | Type | Tier | Description |
+|------|------|------|-------------|
+| `lg_api_streaming_data_loss_counter` | Counter | CRITICAL | Streaming 数据丢失事件数。 |
+| `lg_api_stream_publish_latency` | Histogram，毫秒 | INFO | 发布 stream chunk 的延迟。 |
+| `lg_api_stream_data_size_bytes` | Histogram | DEBUG | 已发布 stream payload 的字节大小。 |
+| `lg_api_protocol_v2_buffer_evicted_counter` | Counter | INFO | Event Streaming v2 replay buffer 淘汰次数。 |
+| `lg_api_protocol_v2_event_emitted_counter` | Counter | DEBUG | 已发出的 Event Streaming v2 事件数。 |
+| `lg_api_protocol_v2_resume_gap_counter` | Counter | INFO | 在 replay 过程中检测到的 Event Streaming v2 resume gap 数。 |
+| `lg_api_protocol_v2_transport_send_failure_counter` | Counter | INFO | Event Streaming v2 transport 发送失败次数。 |
+| `lg_api_protocol_v2_buffer_size` | Gauge | DEBUG | 每个 run 当前 Event Streaming v2 replay buffer 的占用量。当该值接近上限时，调整 `LSD_PROTOCOL_V2_BUFFER_SIZE`。 |
+| `lg_api_protocol_v2_replayed_events` | Histogram | DEBUG | Event Streaming v2 重连时被重放的事件数量。 |
+
+### 服务器和基础设施
+
+| Name | Type | Tier | Description |
+|------|------|------|-------------|
+| `lg_api_server_started_counter` | Counter | INFO | 服务器启动事件数。 |
+| `lg_api_server_requested_to_stop_counter` | Counter | INFO | 收到的优雅关闭请求数。 |
+| `lg_api_server_stopped_counter` | Counter | INFO | 服务器停止事件数。 |
+| `lg_api_graph_recursion_limit_error_counter` | Counter | INFO | 图递归上限错误数。 |
+| `lg_api_publish_queue_availability` | Gauge | CRITICAL | Redis 发布队列可用性信号。 |
+
+## 另请参阅
+
+- [Self-hosted overview](/langsmith/deploy-to-self-hosted-overview)
+- [Configure Agent Server for scale](/langsmith/agent-server-scale)
+- [Troubleshooting for self-hosted deployments](/langsmith/diagnostics-self-hosted)
+- [Agent Server changelog](/langsmith/agent-server-changelog)

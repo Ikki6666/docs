@@ -1,0 +1,265 @@
+---
+title: "Activeloop Deep Lake 集成"
+description: "使用 LangChain Python 集成 Activeloop Deep Lake 向量存储。"
+---
+
+import LangchainCommunityUnmaintained from '/snippets/oss/langchain-community-unmaintained.mdx';
+
+>[Activeloop Deep Lake](https://docs.deeplake.ai/) 是一个多模态向量存储，可存储 embedding 及其元数据，包括文本、json、图片、音频、视频等。它可以将数据保存在本地、你的云环境中，或 Activeloop 存储上，并支持结合 embedding 与属性的混合搜索。
+
+本 notebook 展示了 `Activeloop Deep Lake` 的基础功能。虽然 `Deep Lake` 可以存储 embedding，但它实际上能够存储任意类型的数据。它是一个带版本控制、查询引擎以及面向深度学习框架的流式 dataloader 的无服务器 data lake。
+
+更多信息请参阅 Deep Lake [documentation](https://docs.deeplake.ai/)。
+
+## 设置
+
+```python
+pip install -qU  langchain-openai langchain-deeplake tiktoken
+```
+
+## Activeloop 提供的示例
+
+[Integration with LangChain](https://docs.activeloop.ai/tutorials/vector-store/deep-lake-vector-store-in-langchain)
+
+## 本地使用 Deep Lake
+
+```python
+from langchain_deeplake.vectorstores import DeeplakeVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import CharacterTextSplitter
+```
+
+```python
+import getpass
+import os
+
+if "OPENAI_API_KEY" not in os.environ:
+    os.environ["OPENAI_API_KEY"] = getpass.getpass("OpenAI API Key:")
+
+if "ACTIVELOOP_TOKEN" not in os.environ:
+    os.environ["ACTIVELOOP_TOKEN"] = getpass.getpass("activeloop token:")
+```
+
+<LangchainCommunityUnmaintained />
+
+```python
+from langchain_community.document_loaders import TextLoader
+
+loader = TextLoader("../../how_to/state_of_the_union.txt")
+documents = loader.load()
+text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+docs = text_splitter.split_documents(documents)
+
+embeddings = OpenAIEmbeddings()
+```
+
+### 创建本地数据集
+
+在 `./my_deeplake/` 创建一个本地数据集，然后运行相似度搜索。Deeplake 和 LangChain 的集成底层使用的是 Deep Lake dataset，因此这里 `dataset` 和 `vector store` 可以视为同义词。若要在你自己的云环境或 Deep Lake 存储中创建数据集，请按需 [adjust the path accordingly](https://docs.deeplake.ai/latest/getting-started/storage-and-creds/storage-options/)。
+
+```python
+db = DeeplakeVectorStore(
+    dataset_path="./my_deeplake/", embedding_function=embeddings, overwrite=True
+)
+db.add_documents(docs)
+```
+
+### 查询数据集
+
+```python
+query = "What did the president say about Ketanji Brown Jackson"
+docs = db.similarity_search(query)
+```
+
+```python
+print(docs[0].page_content)
+```
+
+之后，你可以在不重新计算 embedding 的前提下重新加载该数据集：
+
+```python
+db = DeeplakeVectorStore(
+    dataset_path="./my_deeplake/", embedding_function=embeddings, read_only=True
+)
+docs = db.similarity_search(query)
+```
+
+设置 `read_only=True` 可以避免在无需更新时误修改向量存储。这能确保数据保持不变，除非你明确打算更新它。通常建议显式设置这个参数，以避免意外写入。
+
+### Retrieval Question/Answering
+
+```python
+from langchain_classic.chains import RetrievalQA
+from langchain_openai import ChatOpenAI
+
+qa = RetrievalQA.from_chain_type(
+    llm=ChatOpenAI(model="gpt-3.5-turbo"),
+    chain_type="stuff",
+    retriever=db.as_retriever(),
+)
+```
+
+```python
+query = "What did the president say about Ketanji Brown Jackson"
+qa.run(query)
+```
+
+### 基于元数据属性过滤
+
+让我们创建另一个带元数据的向量存储，其中记录文档创建年份。
+
+```python
+import random
+
+for d in docs:
+    d.metadata["year"] = random.randint(2012, 2014)
+
+db = DeeplakeVectorStore.from_documents(
+    docs, embeddings, dataset_path="./my_deeplake/", overwrite=True
+)
+```
+
+```python
+db.similarity_search(
+    "What did the president say about Ketanji Brown Jackson",
+    filter={"metadata": {"year": 2013}},
+)
+```
+
+### 选择距离函数
+
+距离函数 `L2` 表示欧氏距离，`cos` 表示余弦相似度。
+
+```python
+db.similarity_search(
+    "What did the president say about Ketanji Brown Jackson?", distance_metric="l2"
+)
+```
+
+### 最大边际相关性
+
+使用最大边际相关性：
+
+```python
+db.max_marginal_relevance_search(
+    "What did the president say about Ketanji Brown Jackson?"
+)
+```
+
+### 删除数据集
+
+```python
+db.delete_dataset()
+```
+
+## 将 Deep Lake 数据集保存在云端（Activeloop、AWS、GCS 等）或内存中
+
+默认情况下，Deep Lake 数据集保存在本地。若要保存在内存、Deep Lake Managed DB 或任意对象存储中，可以在创建向量存储时提供 [corresponding path and credentials](https://docs.deeplake.ai/latest/getting-started/storage-and-creds/storage-options/)。某些路径需要先注册 Activeloop 并创建 API token，可在 [retrieved here](https://app.activeloop.ai/) 获取。
+
+```python
+os.environ["ACTIVELOOP_TOKEN"] = activeloop_token
+```
+
+```python
+username = "<USERNAME_OR_ORG>"
+dataset_path = f"hub://{username}/langchain_testing_python"
+
+docs = text_splitter.split_documents(documents)
+
+embedding = OpenAIEmbeddings()
+db = DeeplakeVectorStore(
+    dataset_path=dataset_path, embedding_function=embeddings, overwrite=True
+)
+ids = db.add_documents(docs)
+```
+
+```python
+query = "What did the president say about Ketanji Brown Jackson"
+docs = db.similarity_search(query)
+print(docs[0].page_content)
+```
+
+```python
+username = "<USERNAME_OR_ORG>"
+dataset_path = f"hub://{username}/langchain_testing"
+
+docs = text_splitter.split_documents(documents)
+
+embedding = OpenAIEmbeddings()
+db = DeeplakeVectorStore(
+    dataset_path=dataset_path,
+    embedding_function=embeddings,
+    overwrite=True,
+)
+ids = db.add_documents(docs)
+```
+
+### TQL 搜索
+
+此外，`similarity_search` 方法支持以 Deep Lake 的 Tensor Query Language（TQL）方式指定查询。
+
+```python
+search_id = db.dataset["ids"][0]
+```
+
+```python
+docs = db.similarity_search(
+    query=None,
+    tql=f"SELECT * WHERE ids == '{search_id}'",
+)
+```
+
+```python
+db.dataset.summary()
+```
+
+### 在 AWS S3 上创建向量存储
+
+```python
+dataset_path = "s3://BUCKET/langchain_test"
+
+embedding = OpenAIEmbeddings()
+db = DeeplakeVectorStore.from_documents(
+    docs,
+    dataset_path=dataset_path,
+    embedding=embeddings,
+    overwrite=True,
+    creds={
+        "aws_access_key_id": os.environ["AWS_ACCESS_KEY_ID"],
+        "aws_secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
+        "aws_session_token": os.environ["AWS_SESSION_TOKEN"],
+    },
+)
+```
+
+## Deep Lake API
+
+你可以通过 `db.vectorstore` 访问底层 Deep Lake dataset。
+
+```python
+db.dataset.summary()
+```
+
+```python
+embeds = db.dataset["embeddings"][:]
+```
+
+### 将本地数据集迁移到云端
+
+把已创建的 dataset 复制到云端，也可以反向从云端复制到本地。
+
+```python
+import deeplake
+
+username = "<USERNAME_OR_ORG>"
+source = f"hub://{username}/langchain_testing"
+destination = f"hub://{username}/langchain_test_copy"
+
+
+deeplake.copy(src=source, dst=destination)
+```
+
+```python
+db = DeeplakeVectorStore(dataset_path=destination, embedding_function=embeddings)
+db.add_documents(docs)
+```

@@ -1,0 +1,500 @@
+---
+title: 为 LangGraph 应用添加追踪
+sidebarTitle: LangGraph
+---
+
+import SaasRegionUrls from '/snippets/langsmith/saas-region-urls.mdx';
+
+LangSmith 可以与 LangGraph（Python 和 JS）顺畅集成，帮助你为 agents 添加追踪，无论你使用的是 LangChain 模块还是其他 SDK。
+
+## 配合 LangChain 使用
+
+如果你在 LangGraph 中使用的是 LangChain 模块，只需要设置少量环境变量即可启用追踪。
+
+本指南会演示一个基础示例。关于配置的更详细说明，请参见 [Trace With LangChain](/langsmith/trace-with-langchain) 指南。
+
+### 1. 安装
+
+安装 LangGraph 库，以及 Python 和 JS 的 OpenAI 集成（下面的代码片段使用 OpenAI 集成）。
+
+可用包的完整列表，请参见 [LangChain Python 文档](https://docs.langchain.com/oss/python/integrations/providers/overview) 和 [LangChain JS 文档](https://docs.langchain.com/oss/javascript/integrations/providers/overview)。
+
+<CodeGroup>
+
+```bash pip
+pip install langchain_openai langgraph
+```
+
+```bash yarn
+yarn add @langchain/openai @langchain/langgraph
+```
+
+```bash npm
+npm install @langchain/openai @langchain/langgraph
+```
+
+```bash pnpm
+pnpm add @langchain/openai @langchain/langgraph
+```
+
+</CodeGroup>
+
+### 2. 配置环境
+
+```bash wrap
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=<your-api-key>
+# This example uses OpenAI, but you can use any LLM provider of choice
+export OPENAI_API_KEY=<your-openai-api-key>
+# For LangSmith API keys linked to multiple workspaces, set the LANGSMITH_WORKSPACE_ID environment variable to specify which workspace to use.
+export LANGSMITH_WORKSPACE_ID=<your-workspace-id>
+```
+
+<Note>
+如果你的账户位于美国之外的其他区域，也要把 `LANGSMITH_ENDPOINT` 设置为对应区域的 API URL。否则你的 API key 将无法被识别，请求也会认证失败。
+
+<SaasRegionUrls prefix="api.smith" />
+
+例如，对于 EU 账户：`export LANGSMITH_ENDPOINT="https://eu.api.smith.langchain.com"`。
+</Note>
+
+<Info>
+    如果你在非 serverless 环境中将 LangChain.js 与 LangSmith 一起使用，也建议显式设置下面这个变量来降低延迟：
+
+    `export LANGCHAIN_CALLBACKS_BACKGROUND=true`
+
+    如果你运行在 serverless 环境中，则建议反过来设置，以便在函数结束前完成 tracing：
+
+    `export LANGCHAIN_CALLBACKS_BACKGROUND=false`
+
+    更多信息请参见[这个 LangChain.js 指南](https://js.langchain.com/docs/how_to/callbacks_serverless)。
+</Info>
+
+### 3. 记录 trace
+
+配置好环境之后，就可以像平常一样调用 LangChain runnables。LangSmith 会自动推断正确的 tracing 配置：
+
+<CodeGroup>
+
+```python Python
+from typing import Literal
+from langchain.messages import HumanMessage
+from langchain_openai import ChatOpenAI
+from langchain.tools import tool
+from langgraph.prebuilt import ToolNode
+from langgraph.graph import StateGraph, MessagesState
+
+@tool
+def search(query: str):
+    """Call to surf the web."""
+    if "sf" in query.lower() or "san francisco" in query.lower():
+        return "It's 60 degrees and foggy."
+    return "It's 90 degrees and sunny."
+
+tools = [search]
+tool_node = ToolNode(tools)
+
+model = ChatOpenAI(model="gpt-5.5", temperature=0).bind_tools(tools)
+
+def should_continue(state: MessagesState) -> Literal["tools", "__end__"]:
+    messages = state['messages']
+    last_message = messages[-1]
+    if last_message.tool_calls:
+        return "tools"
+    return "__end__"
+
+def call_model(state: MessagesState):
+    messages = state['messages']
+    # Invoking `model` will automatically infer the correct tracing context
+    response = model.invoke(messages)
+    return {"messages": [response]}
+
+workflow = StateGraph(MessagesState)
+workflow.add_node("agent", call_model)
+workflow.add_node("tools", tool_node)
+workflow.add_edge("__start__", "agent")
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+)
+workflow.add_edge("tools", 'agent')
+
+app = workflow.compile()
+
+final_state = app.invoke(
+    {"messages": [HumanMessage(content="what is the weather in sf")]},
+    config={"configurable": {"thread_id": 42}}
+)
+
+final_state["messages"][-1].content
+```
+
+```typescript TypeScript
+import { HumanMessage, AIMessage } from "@langchain/core/messages";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+import { ChatOpenAI } from "@langchain/openai";
+import { StateGraph, StateGraphArgs } from "@langchain/langgraph";
+import { ToolNode } from "@langchain/langgraph/prebuilt";
+
+interface AgentState {
+  messages: HumanMessage[];
+}
+
+const graphState: StateGraphArgs<AgentState>["channels"] = {
+  messages: {
+    reducer: (x: HumanMessage[], y: HumanMessage[]) => x.concat(y),
+  },
+};
+
+const searchTool = tool(async ({ query }: { query: string }) => {
+  if (query.toLowerCase().includes("sf") || query.toLowerCase().includes("san francisco")) {
+    return "It's 60 degrees and foggy."
+  }
+  return "It's 90 degrees and sunny."
+}, {
+  name: "search",
+  description:
+    "Call to surf the web.",
+  schema: z.object({
+    query: z.string().describe("The query to use in your search."),
+  }),
+});
+
+const tools = [searchTool];
+const toolNode = new ToolNode<AgentState>(tools);
+
+const model = new ChatOpenAI({
+  model: "gpt-5.5",
+  temperature: 0,
+}).bindTools(tools);
+
+function shouldContinue(state: AgentState) {
+  const messages = state.messages;
+  const lastMessage = messages[messages.length - 1] as AIMessage;
+  if (lastMessage.tool_calls?.length) {
+    return "tools";
+  }
+  return "__end__";
+}
+
+async function callModel(state: AgentState) {
+  const messages = state.messages;
+  // Invoking `model` will automatically infer the correct tracing context
+  const response = await model.invoke(messages);
+  return { messages: [response] };
+}
+
+const workflow = new StateGraph<AgentState>({ channels: graphState })
+  .addNode("agent", callModel)
+  .addNode("tools", toolNode)
+  .addEdge("__start__", "agent")
+  .addConditionalEdges("agent", shouldContinue)
+  .addEdge("tools", "agent");
+
+const app = workflow.compile();
+
+const finalState = await app.invoke(
+  { messages: [new HumanMessage("what is the weather in sf")] },
+  { configurable: { thread_id: "42" } }
+);
+
+finalState.messages[finalState.messages.length - 1].content;
+```
+
+</CodeGroup>
+
+### 查看 trace
+
+**Details 视图**
+
+点击 trace，然后切换到右上角的 **Details** 视图。你在 LangSmith 中的 trace 应该[类似这样](https://smith.langchain.com/public/79061a0f-c602-4012-b022-03fd46bce89e/r)。
+
+**Messages 视图**
+
+LangSmith UI 中的 **Messages** 视图展示了用户与 agent 之间简化后的对话历史。这个视图会从顶层 trace 中提取消息（包括用户最初的请求、tool calls 以及 agent 的最终响应），并以类似聊天的形式呈现出来。
+
+## 不配合 LangChain 使用
+
+如果你在 LangGraph 中使用的是其他 SDK 或自定义函数，则需要[对它们进行适当包装或装饰](/langsmith/annotate-code#use-%40traceable-%2F-traceable)（Python 中使用 `@traceable` 装饰器，JS 中使用 `traceable` 函数，或者对于某些 SDK 使用类似 `wrap_openai` 的方式）。这样做之后，LangSmith 会自动把这些被包装方法的 traces 以嵌套方式组织起来。
+
+下面是一个示例。你也可以查看本页以了解更多信息。
+
+### 1. 安装
+
+安装 LangGraph 库，以及 Python 和 JS 的 OpenAI SDK（下面的代码片段使用 OpenAI 集成）。
+
+<CodeGroup>
+
+```bash pip
+pip install openai langsmith langgraph
+```
+
+```bash yarn
+yarn add openai langsmith @langchain/langgraph
+```
+
+```bash npm
+npm install openai langsmith @langchain/langgraph
+```
+
+```bash pnpm
+pnpm add openai langsmith @langchain/langgraph
+```
+
+</CodeGroup>
+
+### 2. 配置环境
+
+```bash wrap
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=<your-api-key>
+# This example uses OpenAI, but you can use any LLM provider of choice
+export OPENAI_API_KEY=<your-openai-api-key>
+```
+
+<Note>
+如果你的账户位于美国之外的其他区域，也要把 `LANGSMITH_ENDPOINT` 设置为对应区域的 API URL。否则你的 API key 将无法被识别，请求也会认证失败。
+
+<SaasRegionUrls prefix="api.smith" />
+
+例如，对于 EU 账户：`export LANGSMITH_ENDPOINT="https://eu.api.smith.langchain.com"`。
+</Note>
+
+<Info>
+    如果你在非 serverless 环境中将 LangChain.js 与 LangSmith 一起使用，也建议显式设置下面这个变量来降低延迟：
+
+    `export LANGCHAIN_CALLBACKS_BACKGROUND=true`
+
+    如果你运行在 serverless 环境中，则建议反过来设置，以便在函数结束前完成 tracing：
+
+    `export LANGCHAIN_CALLBACKS_BACKGROUND=false`
+
+    更多信息请参见[这个 LangChain.js 指南](https://js.langchain.com/docs/how_to/callbacks_serverless)。
+</Info>
+
+### 3. 记录 trace
+
+环境配置完成后，[对你想追踪的自定义函数或 SDK 进行包装或装饰](/langsmith/annotate-code#use-%40traceable-%2F-traceable)。LangSmith 之后就会自动推断正确的 tracing 配置：
+
+<CodeGroup>
+
+```python Python
+import json
+import openai
+import operator
+from langsmith import traceable
+from langsmith.wrappers import wrap_openai
+from typing import Annotated, Literal, TypedDict
+from langgraph.graph import StateGraph
+
+class State(TypedDict):
+    messages: Annotated[list, operator.add]
+
+tool_schema = {
+    "type": "function",
+    "function": {
+        "name": "search",
+        "description": "Call to surf the web.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+}
+
+# Decorating the tool function will automatically trace it with the correct context
+@traceable(run_type="tool", name="Search Tool")
+def search(query: str):
+    """Call to surf the web."""
+    if "sf" in query.lower() or "san francisco" in query.lower():
+        return "It's 60 degrees and foggy."
+    return "It's 90 degrees and sunny."
+
+tools = [search]
+
+def call_tools(state):
+    function_name_to_function = {"search": search}
+    messages = state["messages"]
+    tool_call = messages[-1]["tool_calls"][0]
+    function_name = tool_call["function"]["name"]
+    function_arguments = tool_call["function"]["arguments"]
+    arguments = json.loads(function_arguments)
+    function_response = function_name_to_function[function_name](**arguments)
+    tool_message = {
+        "tool_call_id": tool_call["id"],
+        "role": "tool",
+        "name": function_name,
+        "content": function_response,
+    }
+    return {"messages": [tool_message]}
+
+wrapped_client = wrap_openai(openai.Client())
+
+def should_continue(state: State) -> Literal["tools", "__end__"]:
+    messages = state["messages"]
+    last_message = messages[-1]
+    if last_message["tool_calls"]:
+        return "tools"
+    return "__end__"
+
+def call_model(state: State):
+    messages = state["messages"]
+    # Calling the wrapped client will automatically infer the correct tracing context
+    response = wrapped_client.chat.completions.create(
+        messages=messages, model="gpt-5.4-mini", tools=[tool_schema]
+    )
+    raw_tool_calls = response.choices[0].message.tool_calls
+    tool_calls = [tool_call.to_dict() for tool_call in raw_tool_calls] if raw_tool_calls else []
+    response_message = {
+        "role": "assistant",
+        "content": response.choices[0].message.content,
+        "tool_calls": tool_calls,
+    }
+    return {"messages": [response_message]}
+
+workflow = StateGraph(State)
+workflow.add_node("agent", call_model)
+workflow.add_node("tools", call_tools)
+workflow.add_edge("__start__", "agent")
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+)
+workflow.add_edge("tools", 'agent')
+
+app = workflow.compile()
+
+final_state = app.invoke(
+    {"messages": [{"role": "user", "content": "what is the weather in sf"}]}
+)
+
+final_state["messages"][-1]["content"]
+```
+
+```typescript TypeScript
+**Note:** The below example requires `langsmith>=0.1.39` and `@langchain/langgraph>=0.0.31`
+
+import OpenAI from "openai";
+import { StateGraph } from "@langchain/langgraph";
+import { wrapOpenAI } from "langsmith/wrappers/openai";
+import { traceable } from "langsmith/traceable";
+
+type GraphState = {
+  messages: OpenAI.ChatCompletionMessageParam[];
+};
+
+const wrappedClient = wrapOpenAI(new OpenAI({}));
+
+const toolSchema: OpenAI.ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: "search",
+    description: "Use this tool to query the web.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+        },
+      },
+      required: ["query"],
+    }
+  }
+};
+
+// Wrapping the tool function will automatically trace it with the correct context
+const search = traceable(async ({ query }: { query: string }) => {
+  if (
+    query.toLowerCase().includes("sf") ||
+    query.toLowerCase().includes("san francisco")
+  ) {
+    return "It's 60 degrees and foggy.";
+  }
+  return "It's 90 degrees and sunny.";
+}, { run_type: "tool", name: "Search Tool" });
+
+const callTools = async ({ messages }: GraphState) => {
+  const mostRecentMessage = messages[messages.length - 1];
+  const toolCalls = (mostRecentMessage as OpenAI.ChatCompletionAssistantMessageParam).tool_calls;
+  if (toolCalls === undefined || toolCalls.length === 0) {
+    throw new Error("No tool calls passed to node.");
+  }
+  const toolNameMap = {
+    search,
+  };
+  const functionName = toolCalls[0].function.name;
+  const functionArguments = JSON.parse(toolCalls[0].function.arguments);
+  const response = await toolNameMap[functionName](functionArguments);
+  const toolMessage = {
+    tool_call_id: toolCalls[0].id,
+    role: "tool",
+    name: functionName,
+    content: response,
+  }
+  return { messages: [toolMessage] };
+};
+
+const callModel = async ({ messages }: GraphState) => {
+  // Calling the wrapped client will automatically infer the correct tracing context
+  const response = await wrappedClient.chat.completions.create({
+    messages,
+    model: "gpt-5.4-mini",
+    tools: [toolSchema],
+  });
+  const responseMessage = {
+    role: "assistant",
+    content: response.choices[0].message.content,
+    tool_calls: response.choices[0].message.tool_calls ?? [],
+  };
+  return { messages: [responseMessage] };
+};
+
+const shouldContinue = ({ messages }: GraphState) => {
+  const lastMessage =
+    messages[messages.length - 1] as OpenAI.ChatCompletionAssistantMessageParam;
+  if (
+    lastMessage?.tool_calls !== undefined &&
+    lastMessage?.tool_calls.length > 0
+  ) {
+    return "tools";
+  }
+  return "__end__";
+}
+
+const workflow = new StateGraph<GraphState>({
+  channels: {
+    messages: {
+      reducer: (a: any, b: any) => a.concat(b),
+    }
+  }
+});
+
+const graph = workflow
+  .addNode("model", callModel)
+  .addNode("tools", callTools)
+  .addEdge("__start__", "model")
+  .addConditionalEdges("model", shouldContinue, {
+    tools: "tools",
+    __end__: "__end__",
+  })
+  .addEdge("tools", "model")
+  .compile();
+
+await graph.invoke({
+  messages: [{ role: "user", content: "what is the weather in sf" }]
+});
+```
+
+</CodeGroup>
+
+### 查看 trace
+
+**Details 视图**
+
+点击 trace，然后切换到右上角的 **Details** 视图。你在 LangSmith 中的 trace 应该[类似这样](https://smith.langchain.com/public/c3d128fa-c618-4b0e-b9d0-ccbb619440d8/r)。
+
+**Messages 视图**
+
+LangSmith UI 中的 **Messages** 视图展示了用户与 agent 之间简化后的对话历史。这个视图会从顶层 trace 中提取消息（包括用户最初的请求、tool calls 以及 agent 的最终响应），并以类似聊天的形式呈现出来。

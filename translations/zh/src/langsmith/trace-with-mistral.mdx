@@ -1,0 +1,161 @@
+---
+title: 跟踪 Mistral 应用
+sidebarTitle: Mistral
+---
+
+[Mistral](https://mistral.ai/) 通过简洁的 API 提供对 open-weight 语言模型的托管访问。
+
+本指南介绍如何使用 LangSmith 跟踪 Mistral API 调用，以便记录 prompts、responses 和 metadata，用于调试与可观测性分析。Traces 会通过 @[LangSmith SDK][langsmith] 和标准 span instrumentation 直接发送到 LangSmith。
+
+## 安装
+
+安装 Mistral 官方库和 LangSmith：
+
+<CodeGroup>
+
+```bash Python
+pip install mistralai langsmith
+```
+
+```bash JavaScript
+npm install @mistralai/mistralai langsmith dotenv
+```
+</CodeGroup>
+
+[`mistralai`](https://docs.mistral.ai/getting-started/clients) 提供了一个与 Mistral API 交互的 Mistral client。
+
+## 设置
+
+设置你的 [API keys](/langsmith/create-account-api-key) 和 project 名称：
+
+```bash
+export MISTRAL_API_KEY="<your_mistral_api_key>"
+export LANGSMITH_TRACING="true"
+export LANGSMITH_API_KEY="<your_langsmith_api_key>"
+export LANGSMITH_PROJECT="<your_project_name>"  # optional
+```
+
+- 确保你已从 [Mistral AI account](https://v2.auth.mistral.ai/login) 获取 Mistral API key，并将其设置为 `MISTRAL_API_KEY`。
+- 设置 `LANGSMITH_TRACING=true` 并提供 LangSmith API key，也就是 `LANGSMITH_API_KEY`，即可启用自动 trace 记录。
+- 指定 [`LANGSMITH_PROJECT`](/langsmith/log-traces-to-project) 名称，可按项目组织 traces；如果未设置，traces 会进入默认 project，名称为 "default"。
+- `LANGSMITH_TRACING` 标志必须为 true，才能记录任何 traces。
+
+## 配置 tracing
+
+1. 使用 LangSmith 为 Mistral API 调用添加 instrumentation。在脚本中，创建一个 Mistral client，并把调用包裹在 traced function 中：
+
+    <CodeGroup>
+
+    ```python Python
+    import os
+    from mistralai import Mistral
+    from langsmith import traceable
+
+    # Initialize Mistral API client with your API key
+    client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+
+    @traceable(
+        run_type="llm",
+        metadata={"ls_provider": "mistral", "ls_model_name": "mistral-medium-latest"},
+    )
+    def query_mistral(prompt: str):
+        response = client.chat.complete(
+            model="mistral-medium-latest",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message
+
+    # Example usage
+    result = query_mistral("Hello, how are you?")
+    print("Mistral response:", result.content)
+    ```
+
+    ```typescript TypeScript
+    import { Client } from "langsmith";
+    import { traceable } from "langsmith/traceable";
+    import { Mistral } from "@mistralai/mistralai";
+    import "dotenv/config";
+
+    const mistral = new Mistral({
+      apiKey: process.env.MISTRAL_API_KEY,
+    });
+
+    const langsmith = new Client();
+
+    const tracedChatCompletion = traceable(
+      async (params: {
+        model: string;
+        messages: Array<{ role: string; content: string }>;
+      }) => {
+        const response = await mistral.chat.complete(params);
+        // Return the message content so LangSmith captures it correctly
+        return response.choices[0].message.content;
+      },
+      {
+        name: "Mistral Chat Completion",
+        run_type: "llm",
+        metadata: {
+          ls_provider: "mistral",
+          ls_model_name: "mistral-small-latest",
+        },
+      }
+    );
+
+    async function main() {
+      const response = await tracedChatCompletion({
+        model: "mistral-small-latest",
+        messages: [
+          { role: "user", content: "Say hello in one short sentence." },
+        ],
+      });
+
+      console.log(response);
+    }
+
+    main();
+    ```
+
+    </CodeGroup>
+
+    在这个示例中，你使用 [Mistral SDK](https://docs.mistral.ai/getting-started/clients) 发送一个 chat completion 请求，即用户 prompt，并获取模型回答。
+
+    @[`@traceable`][traceable] 装饰器，来自 @[LangSmith Python SDK][langsmith-python]，会包装 `query_mistral` 函数，因此每次调用都会作为一个 `"llm"` 类型的 trace run 被记录。`metadata={"ls_provider": "mistral", "ls_model_name": "mistral-medium-latest"}` 会为该 trace 打上 provider，Mistral，和模型名称的标签。
+
+    你也可以参考 @[LangSmith JavaScript SDK][langsmith-js]。
+
+1. 执行脚本以生成 trace。例如：
+
+    <CodeGroup>
+
+    ```bash Python
+    python mistral_trace.py
+    ```
+
+    ```bash JavaScript
+    node index.js
+    ```
+
+    </CodeGroup>
+
+    `query_mistral("Hello, how are you?")` 调用会访问 Mistral API，而由于有 `@traceable` / `traceable` 包装，LangSmith 会将这次调用的输入与输出记录为一条新的 trace。你会在控制台中看到模型响应，同时在 [LangSmith](https://smith.langchain.com) 中看到对应的 run。
+
+## 在 LangSmith 中查看 traces
+
+运行示例后，你可以在 [LangSmith UI](https://smith.langchain.com) 中检查已记录的 traces：
+
+1. 打开 LangSmith UI，并登录你的账户。
+1. 选择本次集成所用的 project，例如 `LANGSMITH_PROJECT` 中设置的名称，若未设置则为 default。
+1. 找到与你的 Mistral API 调用对应的 trace。它会以函数名 `query_mistral` 标识，或显示你提供的自定义名称。
+1. 点击该 trace 打开详情。你可以检查模型输入与输出，包括发送的 prompt messages、Mistral 的响应、耗时信息，也就是 latency，以及调用失败时的错误详情。
+
+借助 LangSmith tracing，你可以完整观察 Mistral 调用，从而调试 Mistral 模型的行为、监控性能，例如响应时间与 token 用量，并借助 metadata tags 比较不同参数下的运行结果。
+
+## 成本跟踪
+
+尽管 Mistral 模型是 open-weight 的，但使用托管版 Mistral API 仍可能根据你的套餐产生按用量计费的成本。
+
+LangSmith 可以通过估算 token 用量并应用模型定价，自动把成本关联到已跟踪的 LLM 调用上。跟踪 Mistral API 调用时，LangSmith 会使用已记录的 prompt 与 response messages 来计算 token 数量，并为每个 run 附加成本信息。
+
+如需启用 LLM 调用的自动成本跟踪，请参阅[根据 token 数量自动跟踪成本](/langsmith/cost-tracking#llm-calls:-automatically-track-costs-based-on-token-counts)。
+
+启用后，成本会直接显示在 LangSmith UI 中对应的每条 Mistral traced run 旁边，方便你持续监控用量并比较实验结果。

@@ -1,0 +1,123 @@
+---
+title: 跟踪 Gemini Live 应用
+sidebarTitle: Gemini Live
+tag: Beta
+description: 在 LangSmith 中跟踪使用 Google Agent Development Kit (ADK) 构建的 Gemini Live 语音智能体。
+---
+
+<Note>
+此集成目前处于 beta 阶段，因此其 API 可能会发生变化。
+</Note>
+
+Gemini Live 是一个 speech-to-speech 模型，ADK 会将其作为 `run_live` 事件流式传输到你的应用中。该集成会将每段对话捕获为一条 LangSmith trace，并为每个有意义的事件建立 span，例如转录、工具调用、回合边界和中断。
+
+使用 LangSmith ADK 集成，把基于 [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/streaming/) 构建的 [Gemini Live](https://ai.google.dev/gemini-api/docs/live-api) 语音智能体跟踪到 LangSmith。有关高层约定，请参阅[语音跟踪基础](/langsmith/trace-voice-fundamentals)。
+
+<Note>
+ADK Live 集成要求 `langsmith[google-adk-live]>=0.9.7`，这与 `langsmith[google-adk]` 批处理集成是分开的。
+</Note>
+
+如需跟踪使用 ADK 构建的文本智能体、工具和多智能体工作流，请参阅[跟踪 Google ADK 应用](/langsmith/trace-with-google-adk)。
+
+## 安装
+
+<CodeGroup>
+
+```bash pip
+pip install "langsmith[google-adk-live]" google-genai
+```
+
+```bash uv
+uv add "langsmith[google-adk-live]" google-genai
+```
+
+</CodeGroup>
+
+## 设置环境变量
+
+```bash .env
+LANGSMITH_API_KEY=<your-langsmith-api-key>
+LANGSMITH_TRACING=true
+LANGSMITH_PROJECT=<your-desired-langsmith-project>
+GOOGLE_API_KEY=<your-google-api-key>
+```
+
+## 设置 tracing
+
+导入 `LangSmithGoogleADKLivePlugin` 并将其注册到你的 `Runner` 上。它会与你自己的 `run_live` 循环并行运行，因此你的循环只需要处理音频播放、barge-in 和 UI 更新：
+
+```python
+from google.adk.agents.run_config import RunConfig, StreamingMode
+from google.adk.runners import Runner
+from google.genai import types as genai_types
+from langsmith.integrations.google_adk_live import LangSmithGoogleADKLivePlugin
+
+plugin = LangSmithGoogleADKLivePlugin(project_name="gemini-live-voice")
+
+runner = Runner(
+    app_name="voice-app",
+    agent=root_agent,
+    session_service=session_service,
+    plugins=[plugin],
+)
+
+run_config = RunConfig(
+    response_modalities=["AUDIO"],
+    streaming_mode=StreamingMode.BIDI,
+    input_audio_transcription=genai_types.AudioTranscriptionConfig(),
+    output_audio_transcription=genai_types.AudioTranscriptionConfig(),
+)
+
+async for event in runner.run_live(
+    user_id=user_id,
+    session_id=adk_session.id,
+    live_request_queue=queue,
+    run_config=run_config,
+):
+    ...  # play audio, handle barge-in, update the UI
+```
+
+<Note>
+转录是按需启用的。如果要显示 transcript，请在 `RunConfig` 上同时设置 `input_audio_transcription` 和 `output_audio_transcription`。
+</Note>
+
+<Note>
+在正常结束时，例如 live request queue 关闭，ADK 会发送它的 `after_run` 回调，插件会为你完成 trace 的收尾。
+
+如果运行被取消，例如控制台应用在按下 Ctrl-C 时停止 `run_live`，ADK 可能不会发送该回调，这时请在 teardown 阶段调用 `plugin.finalize(session_id=adk_session.id)`。否则，你会丢失 trace 以及在 finalize 阶段构建的音频附件。该调用是幂等的，因此如果 ADK 的回调已经执行过，它不会重复做事。
+</Note>
+
+## 将对话归入一个 thread
+
+每段对话都会被捕获为各自独立的一条 trace，并拥有自己的 thread ID。如果你想提供自己的 ID，例如把这段对话与 LangSmith [thread](/langsmith/threads) 中的相关交互归到一起，可以向插件传入 `thread_id_provider`：
+
+```python
+plugin = LangSmithGoogleADKLivePlugin(
+    project_name="gemini-live-voice",
+    thread_id_provider=lambda: thread_id,
+)
+```
+
+同一个插件实例会在每次 `run_live` 调用之间共享，并在每段对话开始时解析一次 thread ID。默认行为会让并发对话彼此分离。如果你在处理并发对话的服务端传入 `thread_id_provider`，它应返回当前对话对应的 ID，而不是固定值。例如，可以读取在每次运行开始时设置好的 `ContextVar`。
+
+## 记录对话音频
+
+如果你把麦克风输入音频和播放音频都送给插件，它会将一份单独的立体声录音附加到 trace 中，左声道是用户，右声道是智能体：
+
+```python
+plugin.record_user_audio(mic_chunk)      # user mic PCM16
+plugin.record_agent_audio(played_chunk)  # agent PCM16 as played
+```
+
+为了准确反映实际听到的内容，请在将用户麦克风音频重采样给 ADK 之前进行记录，并从扬声器播放链路中截取智能体音频。两个声道应使用相同的采样率，插件的 `sample_rate` 默认是 24 kHz。有关底层附件 API，请参阅[通过 traces 上传文件](/langsmith/upload-files-with-traces)。
+
+## 后续步骤
+
+<CardGroup cols={2}>
+  <Card title="语音基础" icon="waveform" href="/langsmith/trace-voice-fundamentals">
+    语音智能体跟踪的核心约定。
+  </Card>
+  <Card title="通过 traces 上传文件" icon="paperclip" href="/langsmith/upload-files-with-traces">
+    将对话录音附加到你的 trace。
+  </Card>
+</CardGroup>

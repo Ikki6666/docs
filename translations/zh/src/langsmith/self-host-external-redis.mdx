@@ -1,0 +1,666 @@
+---
+title: 连接到外部 Redis 或 Valkey 数据库
+sidebarTitle: 连接到外部 Redis 或 Valkey 数据库
+---
+
+LangSmith 使用 Redis 作为队列和缓存操作的基础存储。默认情况下，LangSmith Self-Hosted 会使用内部 Redis 实例。不过，你也可以把 LangSmith 配置为使用外部 Redis 实例。这样做之后，你就能更方便地管理 Redis 实例的备份、扩容和其他运维任务。
+
+[Valkey](https://valkey.io/) 也被官方支持，可作为 Redis 的无缝替代品。凡是本页提到 Redis 的地方，你都可以使用兼容的 Valkey 实例。支持的版本请参见 [Requirements](#requirements)。
+
+<Warning>
+每个 LangSmith 安装都必须使用自己专属的 Redis 实例。不同的 LangSmith 安装之间不能共享 Redis（例如迁移过程中旧集群和新集群共用一个 Redis）。跨安装共享 Redis 会导致 deployment tasks 被错误路由到不正确的集群。
+</Warning>
+
+<Tip>
+**如果你使用的是托管 Redis 服务**，我们推荐：
+- [Amazon ElastiCache](https://aws.amazon.com/elasticache/redis/) (AWS)
+- [Google Cloud Memorystore](https://cloud.google.com/memorystore) (GCP)
+- [Azure Cache for Redis](https://azure.microsoft.com/en-us/services/cache/) (Azure)
+
+如果你需要云厂商专属的 IAM/Workload Identity 认证，请参见 [IAM authentication section](#iam-authentication)。
+</Tip>
+
+## Requirements
+
+* 一个已经部署好的 Redis 或 [Valkey](https://valkey.io/) 实例，并且你的 LangSmith 实例对其具备网络访问能力。我们推荐使用托管服务，例如：
+
+  * [Amazon ElastiCache](https://aws.amazon.com/elasticache/redis/)（Redis 或 Valkey）
+  * [Google Cloud Memorystore](https://cloud.google.com/memorystore)（Redis 或 Valkey）
+  * [Azure Cache for Redis](https://azure.microsoft.com/en-us/services/cache/)
+
+* **支持版本：** Redis >= 5，或者 Valkey 8。本指南中 Valkey 被视为 Redis 的无缝替代。
+* 我们同时支持 Standalone 和 Redis Cluster（包括 Valkey Cluster）。请参考对应小节进行部署配置。
+* 我们支持无认证、密码认证，以及 [IAM/Workload Identity](#iam-authentication) 认证。
+* 默认情况下，我们建议实例至少具备 2 vCPUs 和 8GB 内存。不过，实际需求仍取决于你的 tracing 工作负载。建议持续监控 Redis 实例并按需扩容。
+
+## Standalone Redis
+
+### Connection string
+
+你需要先为 Redis 实例拼出 connection string。这个 connection string 应包含以下信息：
+
+* Host
+* Database
+* Port
+* URL params
+
+整体格式如下：
+
+```
+"redis://host:port/db?<url_params>"
+```
+
+一个示例 connection string 可能如下：
+
+```
+"redis://langsmith-redis:6379/0"
+```
+
+注意：如果你的 Standalone Redis 启用了认证或 TLS，请把这些信息直接包含在 connection URL 中：
+
+- 如果 Redis 服务端启用了 TLS，请使用 `rediss://`
+- 如果需要密码，请把 password 写进 connection string
+
+例如：
+
+```text
+rediss://langsmith-redis:6380/0?password=foo
+```
+
+若使用 IAM 认证，请用 identity 作为用户名（不带 password）：
+
+```text
+rediss://<iam-identity>@host:6380
+```
+
+### Configuration
+
+拿到 connection string 后，就可以把 LangSmith 配置为使用外部 Redis 实例。你可以修改 LangSmith Helm Chart 安装中的 `values` 文件，或者 Docker 安装中的 `.env` 文件。
+
+<CodeGroup>
+
+```yaml Helm
+redis:
+  external:
+    enabled: true
+    connectionUrl: "Your connection url"
+```
+
+```bash Docker
+# In your .env file
+REDIS_DATABASE_URI="Your connection url"
+```
+
+
+</CodeGroup>
+
+你也可以把 connection URL 存进现有的 Kubernetes Secret，然后在 Helm values 中引用它。
+
+<CodeGroup>
+
+```yaml Helm (using an existing Secret)
+redis:
+  external:
+    enabled: true
+    # Name of an existing Secret that contains the connection URL
+    existingSecretName: "my-redis-secret"
+    # Key in the Secret that stores the connection URL (default shown)
+    connectionUrlSecretKey: "connection_url"
+```
+
+```yaml Kubernetes Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-redis-secret
+type: Opaque
+stringData:
+  # Full connection URL, e.g., using TLS with password
+  connection_url: "rediss://langsmith-redis:6380/0?password=foo"
+```
+
+</CodeGroup>
+
+配置完成后，你应该就可以重新安装 LangSmith 实例了。如果一切设置正确，LangSmith 就会开始使用你的外部 Redis 实例。
+
+## Redis cluster
+
+从 LangSmith helm version **0.12.25** 开始，我们正式支持 **Redis Cluster**。
+
+### Host names
+
+使用 Redis Cluster 时，请提供 node hostnames 和 ports 的列表。每个 node URI 都必须使用以下格式：
+
+```text
+redis://hostname:port
+```
+
+例如：
+
+```text
+redis://redis-node-0:6379
+redis://redis-node-1:6379
+redis://redis-node-2:6379
+```
+
+不要在这些 URI 中包含 password，也不要在这里使用 `rediss`。对于 Redis Cluster：
+
+- 请通过 `redis.external.cluster.password` 单独提供 password，或者用 Secret 中的 `passwordSecretKey`
+- Redis Cluster 默认启用 TLS（`redis.external.cluster.tlsEnabled: true`）。如果你的 cluster 未使用 TLS，请显式设为 `tlsEnabled: false`
+
+### Configuration
+
+连接外部 Redis Cluster 时，请在 `redis.external.cluster` 下配置 Helm values。你有两种方式：
+
+* 直接在 `values.yaml` 中提供 node URIs 和（可选的）password
+* 或者引用一个现有的 Kubernetes `Secret`，让它提供 node URIs 和 password
+
+<CodeGroup>
+
+```yaml Helm (inline values)
+redis:
+  external:
+    enabled: true
+    cluster:
+      enabled: true
+      # List of cluster node URIs. Format: redis://host:port
+      nodeUris:
+        - "redis://redis-node-0:6379"
+        - "redis://redis-node-1:6379"
+        - "redis://redis-node-2:6379"
+      # Optional. If your cluster requires auth, set a password or use a Secret (recommended).
+      password: "your_redis_password"
+      # TLS is enabled by default. Set to false if your cluster does not use TLS.
+      tlsEnabled: true
+```
+
+```yaml Helm (using an existing Secret)
+redis:
+  external:
+    enabled: true
+    # Name of an existing Secret that contains cluster connection details
+    existingSecretName: "my-redis-cluster-secret"
+    cluster:
+      enabled: true
+      # Keys in the Secret. Defaults shown here; override if your Secret uses different keys.
+      nodeUrisSecretKey: "redis_cluster_node_uris"
+      passwordSecretKey: "redis_cluster_password"
+      tlsEnabled: true
+```
+
+</CodeGroup>
+
+如果使用现有 Secret，它应包含：
+
+<CodeGroup>
+
+```yaml Kubernetes Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-redis-cluster-secret
+type: Opaque
+stringData:
+  # JSON array of node URIs (as a string)
+  redis_cluster_node_uris: '["redis://redis-node-0:6379","redis://redis-node-1:6379","redis://redis-node-2:6379"]'
+  # Optional if your cluster requires a password
+  redis_cluster_password: "your_redis_password"
+```
+
+</CodeGroup>
+
+## Azure managed Redis
+
+[Azure Managed Redis](https://azure.microsoft.com/en-us/products/managed-redis) 支持两种 clustering policy，这会影响 LangSmith 的连接方式。请根据你实例所使用的 clustering policy 选择对应配置。
+
+### OSS Cluster
+
+LangSmith 会以 Redis Cluster 模式连接 OSS clustering policy 实例。
+
+从 LangSmith helm chart **0.13.33** 开始，支持把 `ssl_check_hostname=false` 作为 node URI 参数。在我们的测试中，OSS clustering policy 需要关闭 SSL hostname verification。因为 Azure 的代理会把连接解析到证书 SAN 中不存在的内部 node IP，导致 hostname verification 失败。
+
+```yaml
+redis:
+  external:
+    enabled: true
+    cluster:
+      enabled: true
+      nodeUris:
+        - "redis://<node_url>:10000?ssl_check_hostname=false"
+      tlsEnabled: true
+```
+
+### EnterpriseCluster
+
+从 LangSmith helm chart **0.13.33** 开始，LangSmith 支持使用 EnterpriseCluster policy 的 Azure Managed Redis。该 policy 提供一个统一 endpoint，在内部处理分片。LangSmith 必须把它当作 standalone（单实例）client 连接，但又不能使用诸如 MULTI/EXEC 这类 cluster unsafe operations。因此请设置 `redis.external.clusterSafeMode: true` 来关闭这些不安全的 cluster 操作。
+
+```yaml
+redis:
+  external:
+    enabled: true
+    connectionUrl: "rediss://<azure-redis-host>:6380"
+    # Required for EnterpriseCluster: use a single-instance client and disable unsafe cluster operations
+    clusterSafeMode: true
+```
+
+如果 EnterpriseCluster 还需要 Microsoft Entra（IAM）认证，请参见 [Azure tab in IAM authentication](#azure-cache-for-redis)，并在 Helm values 中加入 `clusterSafeMode: true`。
+
+## 使用 Redis 的 TLS
+
+本节介绍如何为 Redis 连接启用 TLS。若你需要挂载内部或公共 CA，让 LangSmith 信任 Redis 服务端证书，请参见 [Configure custom TLS certificates](/langsmith/self-host-custom-tls-certificates#mount-internal-cas-for-tls)。
+
+### 服务端 TLS（单向）
+
+若要校验 Redis 服务端证书：
+
+- 通过 `config.customCa.secretName` 和 `config.customCa.secretKey` 提供 CA bundle。
+- 对 Standalone Redis，请在连接 URL 中使用 `rediss://`。
+- 对 Redis Cluster，`redis.external.cluster.tlsEnabled` 默认值是 `true`。请确保不要把它设为 `false`。
+
+<Warning>
+只有当你的 Redis 服务端使用内部或私有 CA 时，才需要挂载自定义 CA。若使用的是公共受信任 CA，则不需要这项配置。
+</Warning>
+
+<CodeGroup>
+
+```yaml Helm (Standalone - server TLS)
+config:
+  customCa:
+    secretName: "langsmith-custom-ca"  # Secret containing your CA bundle
+    secretKey: "ca.crt"    # Key in the Secret with the CA bundle
+redis:
+  external:
+    enabled: true
+    # Use rediss:// and include password if required by your server
+    connectionUrl: "rediss://host:6380/0?password=<PASSWORD>"
+```
+
+```yaml Helm (Cluster - server TLS)
+config:
+  customCa:
+    secretName: "langsmith-custom-ca"  # Secret containing your CA bundle
+    secretKey: "ca.crt"    # Key in the Secret with the CA bundle
+redis:
+  external:
+    enabled: true
+    cluster:
+      enabled: true
+      tlsEnabled: true
+      nodeUris:
+        - "redis://redis-node-0:6379"
+        - "redis://redis-node-1:6379"
+        - "redis://redis-node-2:6379"
+      password: "<PASSWORD>"
+```
+
+```yaml Kubernetes Secret (CA bundle)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: langsmith-custom-ca
+type: Opaque
+stringData:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    <ROOT_OR_INTERMEDIATE_CA_CERT_CHAIN>
+    -----END CERTIFICATE-----
+```
+
+</CodeGroup>
+
+### 启用客户端证书认证的 Mutual TLS（mTLS）
+
+从 LangSmith helm chart **0.12.29** 开始，我们支持 Redis client 的 mTLS。若要完成 mTLS 中的服务端认证，除了下面的客户端证书配置外，还需要同时完成 [Server TLS steps](#服务端-tls单向) 中的 custom CA 配置。
+
+如果你的 Redis 服务端要求客户端证书认证：
+
+- 准备一个包含客户端证书和私钥的 Secret。
+- 通过 `redis.external.clientCert.secretName` 引用它，并用 `certSecretKey` 和 `keySecretKey` 指定具体 key 名。
+- 对 Standalone Redis，继续在连接 URL 中使用 `rediss://`
+- 对 Redis Cluster，`redis.external.cluster.tlsEnabled` 默认值是 `true`。请确保不要把它设为 `false`
+
+<CodeGroup>
+
+```yaml Helm (client Auth)
+redis:
+  external:
+    enabled: true
+    clientCert:
+      secretName: "redis-mtls-secret"
+      certSecretKey: "tls.crt"
+      keySecretKey: "tls.key"
+    # Standalone example:
+    # connectionUrl: "rediss://host:6380/0?password=<PASSWORD>"
+    # Or, for Cluster:
+    cluster:
+      enabled: true
+      tlsEnabled: true
+      nodeUris:
+        - "redis://redis-node-0:6379"
+        - "redis://redis-node-1:6379"
+        - "redis://redis-node-2:6379"
+      password: "<PASSWORD>"
+```
+
+```yaml Kubernetes Secret (client cert/key)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-mtls-secret
+type: Opaque
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    <CLIENT_CERT>
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN PRIVATE KEY-----
+    <CLIENT_KEY>
+    -----END PRIVATE KEY-----
+```
+
+</CodeGroup>
+
+#### 为证书挂载卷设置 pod security context
+
+用于 mTLS 的证书卷会受到文件访问权限限制。为了确保所有 LangSmith pods 都能读取证书文件，你必须在 pod security context 中设置 `fsGroup: 1000`。
+
+你可以通过以下两种方式之一完成：
+
+**Option 1: 使用 `commonPodSecurityContext`**
+
+在顶层统一设置 `fsGroup`，从而应用到所有 pods：
+
+```yaml
+commonPodSecurityContext:
+  fsGroup: 1000
+```
+
+**Option 2: 分别添加到各个 pod 的 security context**
+
+如果你需要更细粒度的控制，也可以分别为每个 pod 的 security context 添加 `fsGroup`。完整参考请见 [mtls configuration example](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/examples/mtls_config.yaml)。
+
+## IAM authentication
+
+从 LangSmith helm chart **0.12.34** 开始，我们支持 Redis 的 IAM authentication。这样你就可以使用云厂商的 workload identity，而不是静态密码。
+
+<Note>
+IAM authentication 同时支持 standalone Redis 和 Redis Cluster 配置。不过，并不是所有云厂商都为所有 Redis 产品形态提供 IAM authentication。请查阅对应云厂商文档，确认你的具体 Redis 方案是否支持 IAM（例如 GCP 只对 Memorystore Cluster 提供 IAM，而不是 standalone Memorystore）。
+</Note>
+
+<Tabs>
+  <Tab title="AWS">
+
+<a id="amazon-elasticache"></a>
+
+### ElastiCache for Redis IAM authentication
+
+ElastiCache for Redis 支持 [IAM authentication](https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/auth-iam.html)，允许你使用 AWS IAM 凭据，而不是 Redis AUTH 密码进行认证。
+
+#### Prerequisites
+
+1. 在 Kubernetes 集群中通过 [AWS IRSA](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html) 或 [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html) 配置 **workload identity**
+2. 在 ElastiCache 实例上启用 **IAM authentication**，并为 workload identity 授予访问权限
+
+#### Configuration
+
+**Standalone Redis：**
+
+```yaml
+redis:
+  external:
+    enabled: true
+    existingSecretName: "redis-secret"
+    iamAuthProvider: "aws"
+```
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-secret
+type: Opaque
+stringData:
+  # IAM connection URL - identity as username, no password
+  connection_url: "rediss://<iam-identity>@<elasticache-host>:6380"
+```
+
+**Redis Cluster：**
+
+```yaml
+redis:
+  external:
+    enabled: true
+    existingSecretName: "redis-cluster-secret"
+    iamAuthProvider: "aws"
+    cluster:
+      enabled: true
+      nodeUrisSecretKey: "redis_cluster_node_uris"
+      tlsEnabled: true
+```
+
+#### Required annotations
+
+你必须把 AWS IRSA 所要求的 ServiceAccount annotations 应用到所有会连接 Redis 的 LangSmith 组件上：
+
+**Deployments:** `backend`, `queue`, `platformBackend`, `hostBackend`, `ingestQueue`
+
+示例配置如下：
+
+```yaml
+backend:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::<account-id>:role/<role-name>"
+
+queue:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::<account-id>:role/<role-name>"
+
+platformBackend:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::<account-id>:role/<role-name>"
+
+hostBackend:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::<account-id>:role/<role-name>"
+
+ingestQueue:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::<account-id>:role/<role-name>"
+```
+
+完整的可配置服务列表请参见 [Helm values reference](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/values.yaml)。
+
+  </Tab>
+  <Tab title="GCP">
+
+<a id="google-cloud-memorystore"></a>
+
+### Memorystore for Redis IAM authentication
+
+Memorystore for Redis 对 **Cluster 实例**（不是 standalone Memorystore）支持 [IAM authentication](https://docs.cloud.google.com/memorystore/docs/cluster/about-iam-auth)。这样你就可以使用 GCP service accounts 进行认证。
+
+<Note>
+IAM authentication 仅适用于 Memorystore Cluster，不适用于 standalone Memorystore 实例。
+</Note>
+
+#### Prerequisites
+
+1. 在 Kubernetes 集群中通过 [GCP Workload Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) 配置 **workload identity**
+2. 在 Memorystore Cluster 上启用 **IAM authentication**，并为 workload identity 授予访问权限
+
+#### Configuration
+
+**Memorystore Cluster with IAM：**
+
+```yaml
+redis:
+  external:
+    enabled: true
+    existingSecretName: "redis-cluster-secret"
+    iamAuthProvider: "gcp"
+    cluster:
+      enabled: true
+      nodeUrisSecretKey: "redis_cluster_node_uris"
+      tlsEnabled: true
+```
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-cluster-secret
+type: Opaque
+stringData:
+  redis_cluster_node_uris: '["redis://node-0:6379","redis://node-1:6379","redis://node-2:6379"]'
+```
+
+#### Required annotations
+
+你必须把 GCP Workload Identity 所要求的 ServiceAccount annotations 应用到所有会连接 Redis 的 LangSmith 组件上：
+
+**Deployments:** `backend`, `queue`, `platformBackend`, `hostBackend`, `ingestQueue`
+
+示例配置如下：
+
+```yaml
+backend:
+  serviceAccount:
+    annotations:
+      iam.gke.io/gcp-service-account: "<service-account>@<project>.iam.gserviceaccount.com"
+
+queue:
+  serviceAccount:
+    annotations:
+      iam.gke.io/gcp-service-account: "<service-account>@<project>.iam.gserviceaccount.com"
+
+platformBackend:
+  serviceAccount:
+    annotations:
+      iam.gke.io/gcp-service-account: "<service-account>@<project>.iam.gserviceaccount.com"
+
+hostBackend:
+  serviceAccount:
+    annotations:
+      iam.gke.io/gcp-service-account: "<service-account>@<project>.iam.gserviceaccount.com"
+
+ingestQueue:
+  serviceAccount:
+    annotations:
+      iam.gke.io/gcp-service-account: "<service-account>@<project>.iam.gserviceaccount.com"
+```
+
+完整的可配置服务列表请参见 [Helm values reference](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/values.yaml)。
+
+  </Tab>
+  <Tab title="Azure">
+
+<a id="azure-cache-for-redis"></a>
+
+### Azure Cache for Redis with Microsoft Entra authentication
+
+Azure Cache for Redis 支持 [Microsoft Entra authentication](https://learn.microsoft.com/en-us/azure/azure-cache-for-redis/cache-azure-active-directory-for-authentication)，允许你使用 Azure managed identities 进行认证。
+
+#### Prerequisites
+
+1. 在 Kubernetes 集群中通过 [Azure Workload Identity](https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview) 配置 **workload identity**
+2. 在 Azure Cache for Redis 上启用 **Microsoft Entra authentication**，并为 workload identity 授予访问权限
+
+#### Configuration
+
+**Standalone Redis：**
+
+```yaml
+redis:
+  external:
+    enabled: true
+    existingSecretName: "redis-secret"
+    iamAuthProvider: "azure"
+    # Include if using EnterpriseCluster policy. See the Azure managed Redis section for details.
+    # clusterSafeMode: true
+```
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-secret
+type: Opaque
+stringData:
+  # IAM connection URL - managed identity as username, no password
+  connection_url: "rediss://<managed-identity>@<azure-redis-host>:6380"
+```
+
+**Redis Cluster：**
+
+```yaml
+redis:
+  external:
+    enabled: true
+    existingSecretName: "redis-cluster-secret"
+    iamAuthProvider: "azure"
+    cluster:
+      enabled: true
+      nodeUrisSecretKey: "redis_cluster_node_uris"
+      tlsEnabled: true
+```
+
+#### Required annotations
+
+你必须把 Azure Workload Identity 所要求的 ServiceAccount annotations 和 pod labels 应用到所有会连接 Redis 的 LangSmith 组件上：
+
+**Deployments:** `backend`, `queue`, `platformBackend`, `hostBackend`, `ingestQueue`
+
+示例配置如下：
+
+```yaml
+backend:
+  serviceAccount:
+    annotations:
+      azure.workload.identity/client-id: "<managed-identity-client-id>"
+  deployment:
+    labels:
+      azure.workload.identity/use: "true"
+
+queue:
+  serviceAccount:
+    annotations:
+      azure.workload.identity/client-id: "<managed-identity-client-id>"
+  deployment:
+    labels:
+      azure.workload.identity/use: "true"
+
+platformBackend:
+  serviceAccount:
+    annotations:
+      azure.workload.identity/client-id: "<managed-identity-client-id>"
+  deployment:
+    labels:
+      azure.workload.identity/use: "true"
+
+hostBackend:
+  serviceAccount:
+    annotations:
+      azure.workload.identity/client-id: "<managed-identity-client-id>"
+  deployment:
+    labels:
+      azure.workload.identity/use: "true"
+
+ingestQueue:
+  serviceAccount:
+    annotations:
+      azure.workload.identity/client-id: "<managed-identity-client-id>"
+  deployment:
+    labels:
+      azure.workload.identity/use: "true"
+```
+
+完整的可配置服务列表请参见 [Helm values reference](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/values.yaml)。
+
+  </Tab>
+</Tabs>

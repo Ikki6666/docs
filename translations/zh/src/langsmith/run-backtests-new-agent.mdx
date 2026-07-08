@@ -1,0 +1,284 @@
+---
+title: 对 agent 新版本运行回测
+sidebarTitle: 对 agent 新版本运行回测
+---
+
+部署应用只是持续改进过程的开始。在部署到生产环境后，你通常还会继续优化系统，例如改进 prompts、语言模型、tools 和架构。回测，backtesting，是指使用历史数据评估应用的新版本，并将新输出与原始输出进行比较。与使用预生产数据集的评估相比，回测更能清楚地反映应用新版本是否真的优于当前部署。
+
+回测的大致步骤如下：
+
+1. 从生产 tracing project 中选择一批 sample runs 作为测试对象。
+2. 将这些 run 的输入转换为数据集，并把 run 输出记录为该数据集上的初始实验。
+3. 在新数据集上运行你的新系统，并比较两个实验的结果。
+
+这样做会得到一个包含代表性输入的新数据集，你可以对它做版本管理，并将其用于模型回测。
+
+<Info>
+很多时候，你并没有明确的 “ground truth” 答案。在这种情况下，你可以手动标注输出，或者使用不依赖参考答案的 evaluators。如果你的应用可以捕获 ground-truth labels，例如允许用户提交反馈，我们强烈建议这样做。
+</Info>
+
+## 设置
+
+### 配置环境
+
+安装依赖并设置环境变量。本指南要求 `langsmith>=0.2.4`。
+
+<Info>
+为了方便，本教程会使用 LangChain OSS framework，但这里展示的 LangSmith 功能并不依赖特定框架。
+</Info>
+
+<CodeGroup>
+```bash pip
+pip install -U langsmith langchain langchain-anthropic langchainhub emoji
+```
+
+```bash uv
+uv add langsmith langchain langchain-anthropic langchainhub emoji
+```
+</CodeGroup>
+
+```python
+import getpass
+import os
+
+# Set the project name to whichever project you'd like to be testing against
+project_name = "Tweet Writing Task"
+os.environ["LANGSMITH_PROJECT"] = project_name
+os.environ["LANGSMITH_TRACING"] = "true"
+
+if not os.environ.get("LANGSMITH_API_KEY"):
+    os.environ["LANGSMITH_API_KEY"] = getpass.getpass("YOUR API KEY")
+
+# Optional. You can swap OpenAI for any other tool-calling chat model.
+os.environ["OPENAI_API_KEY"] = "YOUR OPENAI API KEY"
+
+# Optional. You can swap Tavily for the free DuckDuckGo search tool if preferred.
+# Get Tavily API key: https://tavily.com
+os.environ["TAVILY_API_KEY"] = "YOUR TAVILY API KEY"
+```
+
+### 定义应用
+
+在这个示例中，我们创建一个简单的 Tweet 编写应用，它可以访问一些互联网搜索工具：
+
+```python
+from langchain.chat_models import init_chat_model
+from langchain.agents import create_agent
+from langchain_community.tools import DuckDuckGoSearchRun, TavilySearchResults
+from langchain_core.rate_limiters import InMemoryRateLimiter
+
+
+# We will use GPT-3.5 Turbo as the baseline and compare against GPT-4o
+gpt_3_5_turbo = init_chat_model(
+    "gpt-3.5-turbo",
+    temperature=1,
+    configurable_fields=("model", "model_provider"),
+)
+
+# The instructions are passed as a system message to the agent
+instructions = """You are a tweet writing assistant. Given a topic, do some research and write a relevant and engaging tweet about it.
+- Use at least 3 emojis in each tweet
+- The tweet should be no longer than 280 characters
+- Always use the search tool to gather recent information on the tweet topic
+- Write the tweet only based on the search content. Do not rely on your internal knowledge
+- When relevant, link to your sources
+- Make your tweet as engaging as possible"""
+
+# Define the tools our agent can use
+# If you have a higher tiered Tavily API plan you can increase this
+rate_limiter = InMemoryRateLimiter(requests_per_second=0.08)
+
+# Use DuckDuckGo if you don't have a Tavily API key:
+# tools = [DuckDuckGoSearchRun(rate_limiter=rate_limiter)]
+tools = [TavilySearchResults(max_results=5, rate_limiter=rate_limiter)]
+
+agent = create_agent(gpt_3_5_turbo, tools=tools, system_prompt=instructions)
+```
+
+### 模拟生产数据
+
+现在我们来模拟一些生产数据：
+
+```python
+fake_production_inputs = [
+    "Alan turing's early childhood",
+    "Economic impacts of the European Union",
+    "Underrated philosophers",
+    "History of the Roxie theater in San Francisco",
+    "ELI5: gravitational waves",
+    "The arguments for and against a parliamentary system",
+    "Pivotal moments in music history",
+    "Big ideas in programming languages",
+    "Big questions in biology",
+    "The relationship between math and reality",
+    "What makes someone funny",
+]
+
+agent.batch(
+    [{"messages": [{"role": "user", "content": content}]} for content in fake_production_inputs],
+)
+```
+
+## 将生产 traces 转换为实验
+
+第一步是基于生产环境中的 *inputs* 生成一个数据集。然后把这些 traces 复制过来，作为基线实验。
+
+### 选择要回测的 runs
+
+你可以使用 `list_runs` 的 `filter` 参数来选择要参与回测的 runs。这个 `filter` 参数使用的是 LangSmith 的 [trace query syntax](/langsmith/trace-query-syntax)。
+
+```python
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+from langsmith import Client
+from langsmith.beta import convert_runs_to_test
+
+# Fetch the runs we want to convert to a dataset/experiment
+client = Client()
+
+# How we are sampling runs to include in our dataset
+end_time = datetime.now(tz=timezone.utc)
+start_time = end_time - timedelta(days=1)
+run_filter = f'and(gt(start_time, "{start_time.isoformat()}"), lt(end_time, "{end_time.isoformat()}"))'
+prod_runs = list(
+    client.list_runs(
+        project_name=project_name,
+        is_root=True,
+        filter=run_filter,
+    )
+)
+```
+
+### 将 runs 转换为实验
+
+`convert_runs_to_test` 是一个函数，接收一组 runs 后会执行以下操作：
+
+1. 将输入，以及可选的输出，保存到数据集，作为 Examples。
+2. 将输入和输出保存为一个实验，就像你运行过 `evaluate` 并得到了这些输出一样。
+
+```python
+# Name of the dataset we want to create
+dataset_name = f'{project_name}-backtesting {start_time.strftime("%Y-%m-%d")}-{end_time.strftime("%Y-%m-%d")}'
+# Name of the experiment we want to create from the historical runs
+baseline_experiment_name = f"prod-baseline-gpt-3.5-turbo-{str(uuid4())[:4]}"
+
+# This converts the runs to a dataset + experiment
+convert_runs_to_test(
+    prod_runs,
+    # Name of the resulting dataset
+    dataset_name=dataset_name,
+    # Whether to include the run outputs as reference/ground truth
+    include_outputs=False,
+    # Whether to include the full traces in the resulting experiment
+    # (default is to just include the root run)
+    load_child_runs=True,
+    # Name of the experiment so we can apply evalautors to it after
+    test_project_name=baseline_experiment_name
+)
+```
+
+完成这一步后，你应该会在 LangSmith project 中看到一个名为 “Tweet Writing Task-backtesting TODAYS DATE” 的新数据集，其中包含一个实验，如下所示：
+
+![Baseline experiment](/langsmith/images/baseline-experiment.png)
+
+## 与新系统进行基准对比
+
+现在我们就可以开始把生产 runs 与新系统进行对比评估了。
+
+### 定义 evaluators
+
+首先，定义我们用来比较两个系统的 evaluators。请注意，这里没有参考输出，因此我们需要设计一些只依赖实际输出的评估指标。
+
+```python
+import emoji
+from pydantic import BaseModel, Field
+from langchain_core.messages import convert_to_openai_messages
+
+class Grade(BaseModel):
+    """Grade whether a response is supported by some context."""
+    grounded: bool = Field(..., description="Is the majority of the response supported by the retrieved context?")
+
+grounded_instructions = f"""You have given somebody some contextual information and asked them to write a statement grounded in that context.
+
+Grade whether their response is fully supported by the context you have provided. \
+If any meaningful part of their statement is not backed up directly by the context you provided, then their response is not grounded. \
+Otherwise it is grounded."""
+grounded_model = init_chat_model(model="gpt-5.5").with_structured_output(Grade)
+
+def lt_280_chars(outputs: dict) -> bool:
+    messages = convert_to_openai_messages(outputs["messages"])
+    return len(messages[-1]['content']) <= 280
+
+def gte_3_emojis(outputs: dict) -> bool:
+    messages = convert_to_openai_messages(outputs["messages"])
+    return len(emoji.emoji_list(messages[-1]['content'])) >= 3
+
+async def is_grounded(outputs: dict) -> bool:
+    context = ""
+    messages = convert_to_openai_messages(outputs["messages"])
+    for message in messages:
+        if message["role"] == "tool":
+            # Tool message outputs are the results returned from the Tavily/DuckDuckGo tool
+            context += "\n\n" + message["content"]
+    tweet = messages[-1]["content"]
+    user = f"""CONTEXT PROVIDED:
+    {context}
+
+    RESPONSE GIVEN:
+    {tweet}"""
+    grade = await grounded_model.ainvoke([
+        {"role": "system", "content": grounded_instructions},
+        {"role": "user", "content": user}
+    ])
+    return grade.grounded
+```
+
+### 评估基线系统
+
+现在我们来对基线实验运行 evaluators。
+
+```python
+baseline_results = await client.aevaluate(
+    baseline_experiment_name,
+    evaluators=[lt_280_chars, gte_3_emojis, is_grounded],
+)
+# If you have pandas installed can easily explore results as df:
+# baseline_results.to_pandas()
+```
+
+### 定义并评估新系统
+
+现在来定义并评估新系统。在这个示例中，新系统与旧系统唯一的区别是使用 GPT-4o 代替 GPT-3.5。由于我们已经把模型做成可配置的，因此只需要更新传给 agent 的默认配置即可：
+
+```python
+candidate_results = await client.aevaluate(
+    agent.with_config(model="gpt-5.5"),
+    data=dataset_name,
+    evaluators=[lt_280_chars, gte_3_emojis, is_grounded],
+    experiment_prefix="candidate-gpt-5.5",
+)
+# If you have pandas installed can easily explore results as df:
+# candidate_results.to_pandas()
+```
+
+## 对比结果
+
+在两个实验都运行完成后，你可以在数据集中查看它们：
+
+![Dataset page](/langsmith/images/dataset-page.png)
+
+结果揭示了这两个模型之间一个很有意思的权衡：
+
+1. GPT-4o 在遵守格式规则方面表现更好，能够更稳定地包含所要求数量的 emojis。
+2. 但 GPT-4o 在严格依据搜索结果作答方面反而没那么可靠。
+
+为了说明 grounding 问题：在[这个示例 run](https://smith.langchain.com/public/be060e19-0bc0-4798-94f5-c3d35719a5f6/r/07d43e7a-8632-479d-ae28-c7eac6e54da4)中，GPT-4o 添加了关于 Abū Bakr Muhammad ibn Zakariyyā al-Rāzī 医学贡献的事实，但这些内容并不在搜索结果中。这说明它调用了自身内部知识，而不是严格依赖提供的信息。
+
+这次回测表明，尽管 GPT-4o 通常被认为能力更强，但仅仅升级到它，并不会让我们的 tweet writer 变得更好。若要有效利用 GPT-4o，我们还需要：
+
+* 进一步改进 prompts，更强地强调只能使用提供的信息。
+* 或者调整系统架构，更严格地约束模型输出。
+
+这个洞察很好地体现了回测的价值，它帮助我们在部署前就发现了潜在问题。
+
+![Tutorial comparison view](/langsmith/images/tutorial-comparison-view.png)

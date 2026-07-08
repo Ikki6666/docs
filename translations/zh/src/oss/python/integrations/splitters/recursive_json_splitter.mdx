@@ -1,0 +1,129 @@
+---
+title: "拆分 JSON 数据 - 文本分割器集成"
+description: "使用 LangChain Python 与 Split JSON data text splitter 集成。"
+---
+
+这个 JSON splitter 可以在控制 chunk 大小的同时，对 JSON 数据进行 [split](/oss/integrations/splitters/)。它会以深度优先方式遍历 JSON 数据，并构造更小的 JSON chunk。它会尽量保持嵌套 JSON 对象完整，但如果需要，也会拆开它们，以便让 chunk 保持在 `min_chunk_size` 和 `max_chunk_size` 之间。
+
+如果某个值不是嵌套 JSON，而是一个非常大的字符串，那么这个字符串不会被继续拆分。如果你需要对 chunk 大小做硬性上限，可以把它和这些 chunk 上的 Recursive Text splitter 组合使用。还有一个可选的预处理步骤可以拆分 list，做法是先把 list 转成 JSON（dict），再按这种形式拆分。
+
+1. 文本是如何被拆分的：按 JSON value。
+2. chunk 大小如何衡量：按字符数。
+
+```python
+pip install -qU langchain-text-splitters
+```
+
+先加载一些 JSON 数据：
+
+```python
+import json
+
+import requests
+
+# This is a large nested json object and will be loaded as a python dict
+json_data = requests.get("https://api.smith.langchain.com/openapi.json").json()
+```
+
+## 基本用法
+
+指定 `max_chunk_size` 来限制 chunk 大小：
+
+```python
+from langchain_text_splitters import RecursiveJsonSplitter
+
+splitter = RecursiveJsonSplitter(max_chunk_size=300)
+```
+
+要获取 JSON chunks，可以使用 `.split_json` 方法：
+
+```python
+# Recursively split json data - If you need to access/manipulate the smaller json chunks
+json_chunks = splitter.split_json(json_data=json_data)
+
+for chunk in json_chunks[:3]:
+    print(chunk)
+```
+```python
+{'openapi': '3.1.0', 'info': {'title': 'LangSmith', 'version': '0.1.0'}, 'servers': [{'url': 'https://api.smith.langchain.com', 'description': 'LangSmith API endpoint.'}]}
+{'paths': {'/api/v1/sessions/{session_id}': {'get': {'tags': ['tracer-sessions'], 'summary': 'Read Tracer Session', 'description': 'Get a specific session.', 'operationId': 'read_tracer_session_api_v1_sessions__session_id__get'}}}}
+{'paths': {'/api/v1/sessions/{session_id}': {'get': {'security': [{'API Key': []}, {'Tenant ID': []}, {'Bearer Auth': []}]}}}}
+```
+
+要获取 LangChain [Document](https://reference.langchain.com/python/langchain-core/documents/base/Document) 对象，可以使用 `.create_documents` 方法：
+
+```python
+# The splitter can also output documents
+docs = splitter.create_documents(texts=[json_data])
+
+for doc in docs[:3]:
+    print(doc)
+```
+```python
+page_content='{"openapi": "3.1.0", "info": {"title": "LangSmith", "version": "0.1.0"}, "servers": [{"url": "https://api.smith.langchain.com", "description": "LangSmith API endpoint."}]}'
+page_content='{"paths": {"/api/v1/sessions/{session_id}": {"get": {"tags": ["tracer-sessions"], "summary": "Read Tracer Session", "description": "Get a specific session.", "operationId": "read_tracer_session_api_v1_sessions__session_id__get"}}}}'
+page_content='{"paths": {"/api/v1/sessions/{session_id}": {"get": {"security": [{"API Key": []}, {"Tenant ID": []}, {"Bearer Auth": []}]}}}}'
+```
+
+或者使用 `.split_text` 直接获取字符串内容：
+
+```python
+texts = splitter.split_text(json_data=json_data)
+
+print(texts[0])
+print(texts[1])
+```
+```json
+{"openapi": "3.1.0", "info": {"title": "LangSmith", "version": "0.1.0"}, "servers": [{"url": "https://api.smith.langchain.com", "description": "LangSmith API endpoint."}]}
+{"paths": {"/api/v1/sessions/{session_id}": {"get": {"tags": ["tracer-sessions"], "summary": "Read Tracer Session", "description": "Get a specific session.", "operationId": "read_tracer_session_api_v1_sessions__session_id__get"}}}}
+```
+
+## 如何处理由 list 内容导致的 chunk 大小问题
+
+注意，这个示例里有一个 chunk 超过了设定的 `max_chunk_size=300`。检查这些较大的 chunk 之一可以看到，其中包含了一个 list 对象：
+
+```python
+print([len(text) for text in texts][:10])
+print()
+print(texts[3])
+```
+```json
+[171, 231, 126, 469, 210, 213, 237, 271, 191, 232]
+
+{"paths": {"/api/v1/sessions/{session_id}": {"get": {"parameters": [{"name": "session_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid", "title": "Session Id"}}, {"name": "include_stats", "in": "query", "required": false, "schema": {"type": "boolean", "default": false, "title": "Include Stats"}}, {"name": "accept", "in": "header", "required": false, "schema": {"anyOf": [{"type": "string"}, {"type": "null"}], "title": "Accept"}}]}}}}
+```
+
+JSON splitter 默认不会拆分 list。
+
+指定 `convert_lists=True` 可以先对 JSON 进行预处理，把 list 内容转换成 dict，其中 `index:item` 会变成 `key:val` 对：
+
+```python
+texts = splitter.split_text(json_data=json_data, convert_lists=True)
+```
+
+再来看看 chunk 大小。现在它们都小于最大值了。
+
+```python
+print([len(text) for text in texts][:10])
+```
+```text
+[176, 236, 141, 203, 212, 221, 210, 213, 242, 291]
+```
+
+list 已经被转换成 dict，但即便它被拆成多个 chunk，也仍然保留了所需的上下文信息：
+
+```python
+print(texts[1])
+```
+```json
+{"paths": {"/api/v1/sessions/{session_id}": {"get": {"tags": {"0": "tracer-sessions"}, "summary": "Read Tracer Session", "description": "Get a specific session.", "operationId": "read_tracer_session_api_v1_sessions__session_id__get"}}}}
+```
+
+```python
+# We can also look at the documents
+docs[1]
+```
+
+```python
+Document(page_content='{"paths": {"/api/v1/sessions/{session_id}": {"get": {"tags": ["tracer-sessions"], "summary": "Read Tracer Session", "description": "Get a specific session.", "operationId": "read_tracer_session_api_v1_sessions__session_id__get"}}}}')
+```

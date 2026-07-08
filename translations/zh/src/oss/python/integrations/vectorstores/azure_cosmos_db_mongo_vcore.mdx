@@ -1,0 +1,187 @@
+---
+title: "Azure Cosmos DB mongo vCore 集成"
+description: "使用 LangChain Python 集成 Azure Cosmos DB mongo vCore 向量存储。"
+---
+
+import LangchainCommunityUnmaintained from '/snippets/oss/langchain-community-unmaintained.mdx';
+
+本 notebook 展示如何利用这个集成的 [vector database](https://learn.microsoft.com/en-us/azure/cosmos-db/vector-database)，将文档存入 collection、创建索引，并通过向量搜索查询，使用 COS（余弦距离）、L2（欧氏距离）和 IP（内积）等近似最近邻算法，找到与查询向量接近的文档。
+
+Azure Cosmos DB 是驱动 OpenAI ChatGPT 服务的数据库。它提供个位数毫秒响应时间、自动且即时的扩展能力，以及任意规模下的速度保障。
+
+[Azure Cosmos DB for MongoDB vCore](https://learn.microsoft.com/en-us/azure/cosmos-db/mongodb/vcore/) 为开发者提供了一个全托管、兼容 MongoDB 的数据库服务，可用于构建现代应用。你可以继续沿用自己的 MongoDB 经验，并通过 MongoDB drivers、SDK 和工具连接到这个 API for MongoDB vCore 账户。
+
+[Sign Up](https://azure.microsoft.com/en-us/free/) 即可开始终身免费使用。
+
+```python
+pip install -qU pymongo langchain-openai langchain-azure-ai
+```
+
+```python
+import os
+
+CONNECTION_STRING = "YOUR_CONNECTION_STRING"
+INDEX_NAME = "langchain-test-index"
+NAMESPACE = "langchain_test_db.langchain_test_collection"
+DB_NAME, COLLECTION_NAME = NAMESPACE.split(".")
+```
+
+我们将使用 `AzureOpenAIEmbeddings`，因此需要配置 Azure OpenAI API Key 以及其他环境变量。
+
+```python
+os.environ["AZURE_OPENAI_API_KEY"] = "YOUR_AZURE_OPENAI_API_KEY"
+os.environ["AZURE_OPENAI_ENDPOINT"] = "YOUR_AZURE_OPENAI_ENDPOINT"
+os.environ["AZURE_OPENAI_API_VERSION"] = "2023-05-15"
+os.environ["OPENAI_EMBEDDINGS_MODEL_NAME"] = "text-embedding-ada-002"
+os.environ["OPENAI_EMBEDDINGS_DEPLOYMENT"] = "text-embedding-ada-002"
+```
+
+接下来，我们需要把文档加载进 collection、创建索引，然后执行查询。
+
+如果你对某些参数有疑问，请参阅 [documentation](https://learn.microsoft.com/en-us/azure/cosmos-db/mongodb/vcore/vector-search)。
+
+<LangchainCommunityUnmaintained />
+
+```python
+from langchain_community.document_loaders import TextLoader
+from langchain_azure_ai.vectorstores.azure_cosmos_db_mongo_vcore import (
+    AzureCosmosDBMongoVCoreVectorSearch,
+    CosmosDBSimilarityType,
+    CosmosDBVectorSearchType,
+)
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_text_splitters import CharacterTextSplitter
+
+SOURCE_FILE_NAME = "../../how_to/state_of_the_union.txt"
+...
+```
+
+```python
+docs[0]
+```
+
+```text
+Document(metadata={'source': '../../how_to/state_of_the_union.txt'}, page_content='Madam Speaker, ...')
+```
+
+```python
+from pymongo import MongoClient
+...
+vectorstore = AzureCosmosDBMongoVCoreVectorSearch.from_documents(
+    docs,
+    openai_embeddings,
+    collection=collection,
+    index_name=INDEX_NAME,
+)
+
+num_lists = 100
+dimensions = 1536
+similarity_algorithm = CosmosDBSimilarityType.COS
+kind = CosmosDBVectorSearchType.VECTOR_IVF
+m = 16
+ef_construction = 64
+ef_search = 40
+score_threshold = 0.1
+
+vectorstore.create_index(
+    num_lists, dimensions, similarity_algorithm, kind, m, ef_construction
+)
+...
+```
+
+```text
+'\n# DiskANN vectorstore...
+```
+
+```python
+query = "What did the president say about Ketanji Brown Jackson"
+docs = vectorstore.similarity_search(query)
+```
+
+```python
+print(docs[0].page_content)
+```
+
+```text
+Tonight. I call on the Senate to: Pass the Freedom to Vote Act...
+```
+
+文档加载并创建索引后，你也可以直接实例化向量存储，并对索引执行查询：
+
+```python
+vectorstore = AzureCosmosDBMongoVCoreVectorSearch.from_connection_string(
+    CONNECTION_STRING, NAMESPACE, openai_embeddings, index_name=INDEX_NAME
+)
+
+query = "What did the president say about Ketanji Brown Jackson"
+docs = vectorstore.similarity_search(query)
+
+print(docs[0].page_content)
+```
+
+```text
+Tonight. I call on the Senate to: Pass the Freedom to Vote Act...
+```
+
+```python
+vectorstore = AzureCosmosDBMongoVCoreVectorSearch(
+    collection, openai_embeddings, index_name=INDEX_NAME
+)
+
+query = "What did the president say about Ketanji Brown Jackson"
+docs = vectorstore.similarity_search(query)
+
+print(docs[0].page_content)
+```
+
+```text
+Tonight. I call on the Senate to: Pass the Freedom to Vote Act...
+```
+
+## 过滤向量搜索（预览）
+
+Azure Cosmos DB for MongoDB 支持使用 `$lt`、`$lte`、`$eq`、`$neq`、`$gte`、`$gt`、`$in`、`$nin` 和 `$regex` 做预过滤。要使用这个功能，请在 Azure Subscription 的 "Preview Features" 标签中启用 `"filtering vector search"`。更多信息请参阅 [filtered vector search preview features](https://learn.microsoft.com/azure/cosmos-db/mongodb/vcore/vector-search#filtered-vector-search-preview)。
+
+```python
+vectorstore.create_filter_index(
+    property_to_filter="metadata.source", index_name="filter_index"
+)
+```
+
+```text
+{'raw': {'defaultShard': {'numIndexesBefore': 3,
+   'numIndexesAfter': 4,
+   'createdCollectionAutomatically': False,
+   'ok': 1}},
+ 'ok': 1}
+```
+
+```python
+query = "What did the president say about Ketanji Brown Jackson"
+docs = vectorstore.similarity_search(
+    query, pre_filter={"metadata.source": {"$ne": "filter content"}}
+)
+```
+
+```python
+len(docs)
+```
+
+```text
+4
+```
+
+```python
+docs = vectorstore.similarity_search(
+    query,
+    pre_filter={"metadata.source": {"$ne": "../../how_to/state_of_the_union.txt"}},
+)
+```
+
+```python
+len(docs)
+```
+
+```text
+0
+```

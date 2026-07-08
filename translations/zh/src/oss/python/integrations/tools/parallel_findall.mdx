@@ -1,0 +1,204 @@
+---
+title: "Parallel FindAll integration"
+description: "使用 LangChain Python 集成 ParallelFindAllTool 工具。"
+---
+
+>[Parallel](https://platform.parallel.ai/) 是一个面向 LLM 和 AI 应用构建的实时 Web 搜索与内容提取平台。
+
+`ParallelFindAllTool` 会调用 Parallel 的 [FindAll API](https://docs.parallel.ai/findall-api/findall-quickstart) 来执行实体发现。给定一个自然语言目标和一组布尔匹配条件后，它会返回满足所有条件的候选实体，并按相关性排序。
+
+## Overview
+
+### Integration details
+
+| Class | Package | Serializable | JS support | Package latest |
+| :--- | :--- | :---: | :---: | :---: |
+| @[`ParallelFindAllTool`] | @[`langchain-parallel`] | ❌ | ❌ | <a href="https://pypi.org/project/langchain-parallel/" target="_blank"><img src="https://img.shields.io/pypi/v/langchain-parallel?style=flat-square&label=%20&color=orange" alt="PyPI - Latest version" noZoom height="100" class="rounded" /></a> |
+
+## Setup
+
+该集成位于 `langchain-parallel` 包中。
+
+<CodeGroup>
+    ```bash pip
+    pip install -U langchain-parallel
+    ```
+    ```bash uv
+    uv add langchain-parallel
+    ```
+</CodeGroup>
+
+### Credentials
+
+前往 [Parallel](https://platform.parallel.ai) 注册并生成 API key。然后在环境变量中设置 `PARALLEL_API_KEY`：
+
+```python
+import getpass
+import os
+
+if not os.environ.get("PARALLEL_API_KEY"):
+    os.environ["PARALLEL_API_KEY"] = getpass.getpass("Parallel API key:\n")
+```
+
+## Instantiation
+
+`generator` 是工具级别的设置。快速迭代时可使用 `"preview"`（免费，但最多 10 个候选），而 `"base"`（默认）、`"core"` 或 `"pro"` 则可获得更高质量的结果。
+
+```python
+from langchain_parallel import ParallelFindAllTool
+
+tool = ParallelFindAllTool(generator="preview")
+```
+
+## Invocation
+
+### Quick discovery（preview generator）
+
+`preview` generator 会在几秒内返回结果，最多返回 10 个候选。`match_limit` 为必填；在 `preview` 模式下，它必须位于 `[5, 10]` 范围内。
+
+```python
+from langchain_parallel import FindAllMatchCondition
+
+result = await tool.ainvoke({
+    "objective": "Pure-play public LLM API providers",
+    "entity_type": "company",
+    "match_conditions": [
+        FindAllMatchCondition(
+            name="public_us",
+            description="Company is publicly traded on a US exchange",
+        ),
+        FindAllMatchCondition(
+            name="llm_api_revenue",
+            description="Primary revenue is selling LLM inference via API",
+        ),
+    ],
+    "match_limit": 5,
+})
+
+for c in result["candidates"]:
+    print(c["name"], "—", c["url"])
+```
+
+```text
+Anthropic — https://www.anthropic.com
+OpenAI — https://www.openai.com
+...
+```
+
+### Higher-quality runs
+
+切换到 `"base"`、`"core"` 或 `"pro"`，可以将 `match_limit` 提高到 1000。这些运行通常需要几分钟；工具会持续轮询，直到运行进入终态（`completed`、`cancelled` 或 `failed`）。
+
+```python
+deep = ParallelFindAllTool(generator="core")
+
+result = await deep.ainvoke({
+    "objective": "Independent solar-installer companies based in the EU",
+    "entity_type": "company",
+    "match_conditions": [
+        FindAllMatchCondition(
+            name="eu_hq",
+            description="Headquartered in an EU country",
+        ),
+        FindAllMatchCondition(
+            name="residential_solar_pv",
+            description="Primarily installs residential solar PV",
+        ),
+    ],
+    "match_limit": 50,
+})
+```
+
+### Excluding seen candidates
+
+传入 `exclude_list=[FindAllExcludeEntry(name=..., url=...)]` 可排除你已经处理过的候选。`name` 和 `url` 都是必填。
+
+```python
+from langchain_parallel import FindAllExcludeEntry
+
+result = await tool.ainvoke({
+    "objective": "Pure-play public LLM API providers",
+    "entity_type": "company",
+    "match_conditions": [
+        FindAllMatchCondition(
+            name="llm_api_revenue",
+            description="Primary revenue is selling LLM inference via API",
+        ),
+    ],
+    "match_limit": 5,
+    "exclude_list": [
+        FindAllExcludeEntry(name="OpenAI", url="https://www.openai.com"),
+        FindAllExcludeEntry(name="Anthropic", url="https://www.anthropic.com"),
+    ],
+})
+```
+
+### Cancellation
+
+`cancel()` 可通过 id 中止一个仍在运行中的任务。该 id 会返回给启动该运行的调用方；如果你是在一个长时间运行的任务中通过 `tool.ainvoke(...)` 启动它，请在等待其完成前先捕获运行中的 `findall_id`。
+
+```python
+# from another task / handler:
+tool.cancel(findall_id)        # sync
+await tool.acancel(findall_id) # async
+```
+
+### Parameters
+
+#### Required
+
+- `objective`：要查找内容的自然语言描述。
+- `entity_type`：候选实体类别的简短名词，例如 `"company"`、`"researcher"`、`"product"` 等。
+- `match_conditions`：`FindAllMatchCondition(name=..., description=...)` 列表。每个条件的两个字段都必填。
+- `match_limit`：位于 `[5, 1000]` 之间的整数。`preview` generator 会进一步将其限制为最多 10。
+
+#### Optional
+
+- `exclude_list`：`FindAllExcludeEntry(name=..., url=...)` 列表，用于跳过某些候选。
+- `webhook`：`FindAllWebhook(url=..., event_types=[...])`，用于接收运行或候选事件。
+- `metadata`：持久化在运行记录上的自由格式元数据。
+- `timeout`：轮询超时时间（秒），默认 600。
+
+## Chaining
+
+将该工具绑定到任意支持工具调用的聊天模型，再用 [`create_agent`](/oss/langchain/agents) 驱动 agent：
+
+```python
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
+
+llm = init_chat_model(model="claude-haiku-4-5", model_provider="anthropic")
+agent = create_agent(model=llm, tools=[tool])
+
+agent.invoke({"messages": [("human", "Find me a few independent EU solar installers.")]})
+```
+
+## Response format
+
+```python
+{
+    "candidates": [
+        {
+            "candidate_id": "cand_abc",
+            "name": "Acme Solar",
+            "url": "https://acmesolar.example",
+            "description": "...",
+            "match_status": "matched",  # or "generated" / "unmatched"
+            "output": {
+                "<condition_name>": {
+                    "type": "match_condition",
+                    "value": True,
+                    "is_matched": True,
+                },
+            },
+            "basis": [...],  # citations + reasoning per output field
+        },
+    ],
+    "run": {...},          # status info
+    "last_event_id": "...",
+}
+```
+
+## API reference
+
+详细文档请参阅 @[`ParallelFindAllTool`] API reference 或 [Parallel FindAll API guides](https://docs.parallel.ai/findall-api/findall-quickstart)。

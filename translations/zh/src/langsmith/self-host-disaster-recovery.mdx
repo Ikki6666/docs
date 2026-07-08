@@ -1,0 +1,280 @@
+---
+title: 自托管 LangSmith 的灾难恢复
+sidebarTitle: 灾难恢复
+---
+
+本页介绍如何为自托管 LangSmith Observability and Evaluation 规划、配置并执行 disaster recovery（DR）。内容包括哪些数据必须受到保护、它们存储在哪里、如何备份，以及在区域或可用区故障后如何恢复整个平台。
+
+<Note>
+**Shared responsibility。** 对于自托管部署，你需要负责每个组件的备份、复制、恢复演练和恢复流程，包括 LangSmith pods 以及所有底层数据存储。LangChain 只对 LangSmith 软件本身负责。若想了解对应 SaaS 场景下的责任划分，请参见 [Shared responsibility model](/langsmith/shared-responsibility-model)。
+</Note>
+
+<Tip>
+关于本页默认假设的架构基础能力，例如无状态服务、队列心跳、exactly-once 语义，请参见 [Scalability and resilience](/langsmith/scalability-and-resilience)。
+</Tip>
+
+## 你要恢复的是什么
+
+自托管 LangSmith 由一组无状态服务和四类状态存储组成。恢复规划几乎都围绕状态存储展开。无状态服务可以随时通过重新应用 Helm chart 来重建。
+
+| Layer | Components | State | Recovery action |
+|-------|------------|--------|-----------------|
+| LangSmith services | `langsmith-frontend`, `langsmith-backend`, `langsmith-platform-backend`, `langsmith-queue`, `langsmith-ingest-queue`, `langsmith-playground`, `langsmith-ace-backend` | 无状态 | 重新安装 Helm chart |
+| PostgreSQL | 业务数据：orgs、workspaces、users、API keys、datasets、prompts、projects、deployments metadata | **持久化** | 从备份或 replica 恢复 |
+| ClickHouse | Traces 和 feedback（高吞吐分析数据） | **持久化** | 从备份或 replica 恢复 |
+| Blob storage (S3/GCS/Azure Blob) | Run inputs、outputs、errors、manifests、extras、events、attachments（启用时） | **持久化** | 从开启版本控制的 bucket 或 replica 恢复 |
+| Redis (or Valkey) | 临时队列状态、pub/sub、缓存、run heartbeats | 临时态 | 重新部署，无需恢复 |
+| Kubernetes objects | Helm values、`Secret`s、TLS material、IRSA / Workload Identity bindings | 配置 | 从源码仓或集群状态备份中重新应用 |
+
+<Warning>
+所有持久化数据存储都必须一起保护。Postgres、ClickHouse 和 blob storage 这三者保存的是持久化数据；Redis 是临时态，不需要备份。只恢复 Postgres 而不恢复 ClickHouse 和 blob storage（反之亦然）会导致安装处于不一致状态。Postgres 中指向 ClickHouse traces 或 blob storage 对象的引用会在分叉点之后失效。请始终执行协调一致的备份，或者让各个存储的 point-in-time recovery（PITR）时间点尽可能接近。
+</Warning>
+
+## 规划你的 RPO 和 RTO
+
+在设计 DR 架构之前，先定义两个目标：
+
+- **Recovery Point Objective (RPO)：** 组织可以容忍的最大数据丢失时间窗口。使用托管 Postgres PITR 时，RPO 通常可低于 5 分钟。若只有夜间快照，RPO 可能高达 24 小时。
+- **Recovery Time Objective (RTO)：** 故障发生后允许的最大恢复时间。跨区域 warm replica 可以把 RTO 压到分钟级；从 snapshot 冷恢复则可能需要数小时，尤其是 ClickHouse 数据量较大时。
+
+下面这些部署模式通常对应三种目标档位：
+
+| Profile | Typical RPO | Typical RTO | Approach |
+|---------|-------------|-------------|----------|
+| Snapshot-only | 6 到 24 小时 | 数小时 | 对每个存储做每日托管备份。成本最低，恢复最慢。 |
+| Multi-AZ HA | 数秒 | 分钟级（可用区故障） | Postgres 和 ClickHouse 在另一个 AZ 有同步 standby，Redis 为 Multi-AZ，blob storage 使用跨区冗余。这是标准生产姿态。 |
+| Cross-region DR | 数分钟到数小时 | 数小时 | 将 Postgres、ClickHouse 和 blob storage 的备份复制到第二个区域，按需恢复。也可额外部署 Postgres 跨区域 replica，以获得更紧的 Postgres RPO。成本最高，恢复速度慢于 Multi-AZ，但可以应对区域级故障。 |
+
+## Postgres
+
+LangSmith 使用 PostgreSQL 作为主要的业务与事务数据存储。**所有与 Postgres 的通信都会对可重试错误做重试**，因此在故障切换期间的短暂中断通常不会直接暴露成用户可见错误。若中断持续时间过长，LangSmith API 将不可用。
+
+### 使用托管服务
+
+我们强烈建议生产环境中的 Postgres 使用托管服务。托管服务通常自带自动备份、PITR 和 HA failover。具体配置请参见 [Connect external Postgres](/langsmith/self-host-external-postgres)。
+
+<Tabs>
+  <Tab title="AWS">
+    使用启用 Multi-AZ 模式的 [Amazon RDS for PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_GettingStarted.CreatingConnecting.PostgreSQL.html) 或 [Aurora PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Overview.html)。
+
+    - **Backups：** 启用 [automated backups](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithAutomatedBackups.html)，并设置符合你合规要求的保留周期（常见是 7 到 35 天）。
+    - **PITR：** 自动备份默认包含保留窗口内的 PITR。
+    - **HA：** Multi-AZ 部署会在第二个 availability zone 中维护一个同步 standby，并支持自动 failover。
+    - **Cross-region DR：** 若是 Aurora，请配置 [Aurora Global Database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database.html)。若是 RDS，请使用 [cross-region read replicas](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.XRgn.html)，或把自动快照复制到次区域。
+    - **Encryption：** 使用客户自管的 [KMS](https://aws.amazon.com/kms/) key 启用存储加密。
+  </Tab>
+  <Tab title="GCP">
+    使用启用 [high availability](https://cloud.google.com/sql/docs/postgres/high-availability) 的 [Cloud SQL for PostgreSQL](https://cloud.google.com/sql/docs/postgres)。
+
+    - **Backups：** 启用带 PITR 的 [automated backups](https://cloud.google.com/sql/docs/postgres/backup-recovery/backups)。
+    - **HA：** 区域级实例会同步复制到另一个 zone 中的 standby。
+    - **Cross-region DR：** 配置 [cross-region read replicas](https://cloud.google.com/sql/docs/postgres/replication/cross-region-replicas)，并在区域故障时提升它们。
+    - **Encryption：** 使用 [Cloud KMS customer-managed encryption keys](https://docs.cloud.google.com/sql/docs/postgres/cmek)。
+  </Tab>
+  <Tab title="Azure">
+    使用启用 zone-redundant HA 的 [Azure Database for PostgreSQL Flexible Server](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/overview)。
+
+    - **Backups：** 启用带 geo-redundant backup storage 的 [automatic backups](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-backup-restore)。
+    - **HA：** Zone-redundant HA 会在另一个 availability zone 中维持同步 standby。
+    - **Cross-region DR：** 在第二个区域使用 [read replicas](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-read-replicas)，并在区域故障时进行提升。
+  </Tab>
+</Tabs>
+
+### 集群内 Postgres
+
+如果你必须在集群内运行 chart 自带的 Postgres，那么底层 PersistentVolume 的备份责任完全在你。请通过 CSI driver 的 snapshot class，定期为 PVC 制作快照，并将这些快照复制到对象存储或其他区域。**这条路径不推荐用于生产环境。**
+
+## ClickHouse
+
+ClickHouse 保存高吞吐量的 trace 和 feedback 数据，通常是 LangSmith 部署中体量最大的存储。它的备份与复制需要围绕成本和恢复时间来做规划。
+
+### 托管 ClickHouse
+
+获得高可用 ClickHouse 的最快方式是使用托管方案。请参见 [Connect external ClickHouse](/langsmith/self-host-external-clickhouse)。
+
+- **[LangSmith Managed ClickHouse](/langsmith/langsmith-managed-clickhouse)：** 由 LangChain 负责 ClickHouse 集群，包括备份和复制。它通过 VPC peering 接入你的 LangSmith 安装。
+- **[ClickHouse Cloud](https://clickhouse.cloud/)：** 提供内建备份、复制和 HA，并可通过 AWS、GCP 和 Azure marketplace 使用。
+
+### 自管复制集群
+
+如果出于合规或 air-gap 原因必须自管 ClickHouse，请使用复制集群。单节点 ClickHouse 无法满足有意义的 RPO 目标。
+
+- 使用 [Keeper or ZooKeeper](https://clickhouse.com/docs/architecture/replication) 配置多节点复制集群。
+- 在 LangSmith chart 中设置 `cluster` 值，这样 migrations 才会从一开始就创建 `Replicated` 表引擎。**Clustered 配置必须从全新 schema 开始**，无法事后把单机实例转换为集群。
+- 将 replicas 分布到多个 availability zones。
+- 按符合你 RPO 的频率，把 [`BACKUP TABLE` or `BACKUP DATABASE`](https://clickhouse.com/docs/operations/backup) 定时备份到对象存储。社区中的 [`clickhouse-backup`](https://github.com/Altinity/clickhouse-backup) 也是常见方案，支持定时增量备份并内建 S3、GCS 和 Azure Blob 支持。
+- 对于跨区域 DR，请把备份 bucket 复制到第二个区域。自管部署通常不支持跨区域 ClickHouse 复制，ClickHouse Cloud 也不提供，因此请按“备份/恢复故障切换”而非“热备 replica”的模式来设计。
+
+复制集群的配置示例可参考 Helm 仓库中的 [replicated ClickHouse example](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/examples/replicated-clickhouse/README.md)。
+
+<Warning>
+在同等数据量下，恢复 ClickHouse 往往比恢复 Postgres 更慢，因为 trace 表通常非常大。设置 RTO 时务必考虑这一点，并在 DR 演练中用有代表性的数据集验证真实恢复时间。
+</Warning>
+
+## Blob storage
+
+如果你启用了 [blob storage](/langsmith/self-host-blob-storage)（生产环境推荐），那么 run inputs、outputs、errors、manifests、extras、events 和 attachments 都会存放在 S3、GCS 或 Azure Blob Storage 中。云对象存储本身已经具备高耐久性，但你仍然需要配置防误删和区域故障保护。
+
+<Tabs>
+  <Tab title="AWS">
+    - 启用 [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html)，防止误删和误覆盖。
+    - 对高安全要求 bucket 启用 [MFA Delete](https://docs.aws.amazon.com/AmazonS3/latest/userguide/MultiFactorAuthenticationDelete.html)。
+    - 对于跨区域 DR，配置到 DR 区域 bucket 的 [Cross-Region Replication (CRR)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication.html)。
+    - 如需 WORM 保留策略，使用 [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)。
+    - 使用 [SSE-KMS](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html) 加密。LangSmith 支持传入指定 KMS key ARN，详见 [KMS encryption header support](/langsmith/self-host-blob-storage#kms-encryption-header-support)。
+  </Tab>
+  <Tab title="GCP">
+    - 在 bucket 上启用 [Object Versioning](https://cloud.google.com/storage/docs/object-versioning)。
+    - 使用 [dual-region or multi-region buckets](https://cloud.google.com/storage/docs/locations) 获得地理冗余。
+    - 对于跨区域 DR，可通过 [Storage Transfer Service](https://cloud.google.com/storage-transfer-service) 或带复制策略的 [Object Lifecycle Management](https://cloud.google.com/storage/docs/lifecycle) 实现。
+    - 使用 [Customer-Managed Encryption Keys (CMEK)](https://cloud.google.com/storage/docs/encryption/customer-managed-keys) 加密。
+  </Tab>
+  <Tab title="Azure">
+    - 选择符合 DR 目标的 [redundancy tier](https://learn.microsoft.com/en-us/azure/storage/common/storage-redundancy)。若需要主区域故障期间的跨区域只读访问，请使用 **RA-GRS** 或 **RA-GZRS**。
+    - 启用 [soft delete and blob versioning](https://learn.microsoft.com/en-us/azure/storage/blobs/soft-delete-blob-overview)。
+    - 使用保存在 [customer-managed key in Key Vault](https://learn.microsoft.com/en-us/azure/storage/common/customer-managed-keys-overview) 中的密钥加密。
+  </Tab>
+</Tabs>
+
+<Warning>
+**在 DR bucket 中保留 TTL lifecycle rules。** 如果你把数据复制到 DR bucket，请同步复制 `ttl_s/`、`ttl_l/` 以及任何自定义 `ttl_XXd/` 前缀对应的 lifecycle rules。若 DR bucket 中缺少这些规则，故障切换后数据会无限期保留。详见 [TTL configuration](/langsmith/self-host-blob-storage#ttl-configuration)。
+</Warning>
+
+## Redis
+
+Redis 保存的是临时元数据、队列状态，以及跨实例的 pub/sub。**Redis 中没有持久化业务数据，因此不需要备份。** LangSmith 与 Redis 的通信会对可重试错误进行重试。恢复设计的重点是：在活动区域内把 Redis 做成高可用，在 DR 区域中从零重新部署。
+
+- 按云平台使用相应的托管服务：[Amazon ElastiCache](https://aws.amazon.com/elasticache/redis/)、[Google Cloud Memorystore](https://cloud.google.com/memorystore) 或 [Azure Cache for Redis](https://azure.microsoft.com/en-us/products/cache)。
+- 启用 Multi-AZ failover。
+- 对于跨区域 DR，在 DR 区域中重新创建全新的 Redis 实例；**不要**在新集群中复用活动区域 Redis 的 URI。
+
+<Warning>
+每个 LangSmith 安装都必须使用自己专用的 Redis 实例。**不要在两个安装之间共享一个 Redis 实例**，包括任何可能同时活跃的 primary 和 DR replica。共享 Redis 会导致 deployment tasks 被错误路由到另一个集群。详见 [Connect external Redis](/langsmith/self-host-external-redis)。
+</Warning>
+
+## Kubernetes 配置和 secrets
+
+Helm chart values、Kubernetes `Secret`s 以及身份绑定和数据备份同样重要。完整恢复必须两者同时具备。
+
+- **Helm values：** 把 `values.yaml` 放进源码仓管理，并单独跟踪各环境的 overrides。
+- **Image versions：** 固定 LangSmith chart 版本和 image tags，确保恢复时安装的是同一软件版本。详见 [Self-host upgrades](/langsmith/self-host-upgrades) 和 [Dependency versions](/langsmith/self-host-dependency-versions)。
+- **Secrets：** LangSmith 会从 Kubernetes `Secret`s 中读取数据库、blob 和许可证相关凭据。请把它们同步到 DR 集群对应的 secret manager 中，例如 [AWS Secrets Manager](https://aws.amazon.com/secrets-manager/)、[GCP Secret Manager](https://cloud.google.com/secret-manager) 或 [Azure Key Vault](https://azure.microsoft.com/en-us/products/key-vault/)。详见 [Use an existing secret](/langsmith/self-host-using-an-existing-secret)。
+- **TLS material：** 如果你在 LangSmith ingress 层终止 TLS，请备份证书和私钥，或在 DR 区域从你的私有 CA 重新签发。详见 [Custom TLS certificates](/langsmith/self-host-custom-tls-certificates)。
+- **IRSA / Workload Identity bindings：** 在 DR 区域重建 IAM roles 和 service-account bindings；service account 的 ARN 和 annotations 都是区域作用域的。
+- **License key：** 把 LangSmith license key 与其他恢复 secrets 一起妥善保管。
+
+## 参考部署模式
+
+### 单区域 Multi-AZ HA（推荐基线）
+
+这是最低生产基线，可应对可用区故障，但无法覆盖区域级故障。
+
+- Kubernetes node pools 分布在至少两个 availability zones。
+- Postgres 运行于 Multi-AZ HA 模式（RDS Multi-AZ、Cloud SQL HA 或 Flexible Server zone-redundant）。
+- ClickHouse 使用托管服务，或使用跨 AZ 分布的 3 节点复制集群。
+- Redis 启用 Multi-AZ failover。
+- Blob storage 启用 versioning，并至少使用 zone-redundant 的冗余级别。
+- 所有数据存储每天至少做一次快照，保留不少于 7 天。
+
+### 跨区域 active/passive DR
+
+这套模式可以应对区域故障。成本明显更高，但对于 tier-1 部署来说是合适的方案。
+
+- 在 DR 区域准备第二个 Kubernetes 集群，并安装 LangSmith Helm chart，但副本数保持较低（warm）或为零（cold）。
+- 配置 Postgres 跨区域 replica（如 RDS 或 Aurora cross-region replica、Cloud SQL cross-region replica、Azure Flexible Server cross-region replica），并在故障切换时将其提升为 primary。
+- 使用 ClickHouse Cloud 或 LangSmith Managed ClickHouse，并制定区域 failover 方案；**或者**把 ClickHouse 备份复制到 DR 区域，并在故障切换时恢复到一个新的自管集群中。跨区域 ClickHouse 复制通常不受支持（ClickHouse Cloud 也不提供），因此请按备份/恢复而不是热备 replica 的方式规划。
+- Blob storage 复制到 DR bucket，并启用 versioning 和相同的 lifecycle rules。
+- 在 DR 区域中临时创建全新的 Redis。
+- 通过 [Route 53](https://aws.amazon.com/route53/)、[Cloud DNS](https://cloud.google.com/dns) 或 [Azure DNS](https://azure.microsoft.com/en-us/products/dns/) 管理 DNS，用 health checks 和 failover 策略指向各区域中的 LangSmith frontend ingress。
+
+<Note>
+LangSmith 是一个单写平台。跨区域部署必须采用 **active/passive**，而不是 active/active。让两个区域同时对同一个逻辑安装写入是不受支持的，也一定会导致数据不一致。
+</Note>
+
+## 恢复流程
+
+### 从可用区故障中恢复
+
+在单区域 Multi-AZ 部署中，可用区故障通常由云厂商自动处理：
+
+1. 托管 Postgres 故障切换到另一个 AZ 的 standby。LangSmith pods 通过 cluster endpoint 重新连接，并在重试后继续工作。
+2. 托管 Redis 类似地执行 failover。LangSmith 会自动重试重连。
+3. Kubernetes 在剩余健康节点上重新调度 LangSmith pods。请确认 node pools 和 Horizontal Pod Autoscaler 限制预留了足够 headroom。
+4. 通过 SDK 提交一条测试 trace，确认它能出现在 UI 中，以验证 ingest 正常。
+
+### 从区域故障中恢复
+
+下面是跨区域 failover 的 runbook，请结合你的实际基础设施调整：
+
+<Steps>
+  <Step title="Declare failover">
+    确认主区域已经不可用。通知相关方正在执行 failover，并说明预期 RTO。
+  </Step>
+  <Step title="Promote data stores">
+    将 DR 区域中的 Postgres 跨区域 replica 提升为 primary。对于 ClickHouse Cloud 或 LangSmith Managed ClickHouse，请启动其文档化的区域 failover 流程。若使用自管 ClickHouse，请把最近的备份恢复到 DR 集群中，这通常是整个流程里耗时最长的一步。
+  </Step>
+  <Step title="Repoint blob storage">
+    更新 LangSmith Helm 中的 `config.blobStorage.bucketName` 和 `apiURL`，使其指向 DR bucket。确认该 bucket 拥有相同的 TTL lifecycle rules。详见 [Blob storage configuration](/langsmith/self-host-blob-storage#configuration)。
+  </Step>
+  <Step title="Provision Redis">
+    在 DR 区域中创建一个全新的托管 Redis 实例，并更新 LangSmith Helm `redis.external` 的配置，使其指向这个实例。**不要从主区域 Redis 导入任何 dump**；请使用空实例。
+  </Step>
+  <Step title="Scale the DR cluster">
+    如果 DR 集群当前处于 warm/cold 状态，请把 LangSmith deployments 扩容到生产副本数，并应用源码仓中所有待生效的 Helm values 更新。
+  </Step>
+  <Step title="Run smoke tests">
+    提交一条测试 trace，验证它能落到 ClickHouse 中，并在启用 blob storage 时确认它也落入 DR bucket。打开 UI，确认 traces、datasets 和 projects 都能加载，并验证认证功能正常。详见 [Diagnostics](/langsmith/diagnostics-self-hosted)。
+  </Step>
+  <Step title="Cut DNS over">
+    更新 DNS，把流量切到 DR ingress，并向相关方通报切换结果。
+  </Step>
+  <Step title="Plan failback">
+    当主区域恢复后，规划一次可控的 failback。通常应在维护窗口中进行，先把主区域重建为新的 DR replica，再执行反向切换。
+  </Step>
+</Steps>
+
+### 从 snapshot 恢复
+
+如果你完全丢失了主数据存储，必须从 snapshot 恢复：
+
+<Steps>
+  <Step title="Stop ingestion">
+    将 `langsmith-queue` 和 `langsmith-ingest-queue` 缩容为零，避免恢复期间写入新的 traces。
+  </Step>
+  <Step title="Restore Postgres">
+    将 Postgres 备份恢复到一个新的实例，或执行 PITR 到事故前的最近时间点。然后更新 LangSmith Helm 中 `postgres.external` 的连接信息，使其指向恢复后的实例。
+  </Step>
+  <Step title="Restore ClickHouse">
+    恢复时间点尽量和 Postgres 对齐的最新 ClickHouse 备份。恢复耗时通常随数据量线性增长。
+  </Step>
+  <Step title="Restore blob storage">
+    如果 blob 数据也丢失了（较少见），请从 S3/GCS/Azure 的版本历史中恢复对象，或从已复制的 DR bucket 中回拷。
+  </Step>
+  <Step title="Resume ingestion">
+    将 `langsmith-queue` 和 `langsmith-ingest-queue` 恢复到生产副本数。提交一条 smoke-test trace 并确认能正常落库。
+  </Step>
+</Steps>
+
+<Warning>
+务必把 Postgres、ClickHouse 和 blob storage 恢复到尽可能接近的协调时间点。若 Postgres 恢复到了比 ClickHouse 更靠后的时间点，UI 中就可能出现悬空项目引用或丢失 trace。
+</Warning>
+
+## 测试你的 DR 方案
+
+备份只有在最近一次恢复成功后才真正有意义。建议定期安排以下演练：
+
+- **每季度：** 在非生产环境中恢复 Postgres 和 ClickHouse 快照，并运行 [diagnostics tooling](/langsmith/diagnostics-self-hosted) 与一条 smoke trace 测试。记录真实恢复时间，并确认它符合 RTO。
+- **每半年：** 针对一个 staging 安装执行完整的跨区域 failover 演练。提升 replica、切换 blob storage、扩容 DR 集群、执行 smoke tests，然后再切回。
+- **每次 chart 升级时：** 验证升级路径不会破坏你的 DR 方案，例如只在 primary 上执行的 schema migrations，必须能够同步到 DR replica。详见 [Self-host upgrades](/langsmith/self-host-upgrades)。
+
+## Related pages
+
+- [Scalability and resilience](/langsmith/scalability-and-resilience)
+- [Shared responsibility model](/langsmith/shared-responsibility-model)
+- [Connect external Postgres](/langsmith/self-host-external-postgres)
+- [Connect external ClickHouse](/langsmith/self-host-external-clickhouse)
+- [Connect external Redis](/langsmith/self-host-external-redis)
+- [Enable blob storage](/langsmith/self-host-blob-storage)
+- [Self-host upgrades](/langsmith/self-host-upgrades)
+- [Use an existing secret](/langsmith/self-host-using-an-existing-secret)
+- [Diagnostics for self-hosted](/langsmith/diagnostics-self-hosted)

@@ -1,0 +1,216 @@
+---
+title: 跟踪 LiveKit 应用
+sidebarTitle: LiveKit
+tag: Beta
+---
+
+<Note>
+此集成目前处于 beta 阶段，因此其 API 可能会发生变化。
+</Note>
+
+使用 LangSmith LiveKit 集成，将你的 [LiveKit Agents](https://docs.livekit.io/agents/) 语音代理跟踪到 LangSmith。有关高层约定，请参阅[语音跟踪基础](/langsmith/trace-voice-fundamentals)。
+
+<Note>
+LiveKit 集成要求 `langsmith[livekit]>=0.9.7`。
+</Note>
+
+该集成会接入 LiveKit 已经发出的 spans，并将其映射到 LangSmith 的跟踪格式中，因此每段对话都会变成一个 LangSmith trace：每个流水线事件对应一个 span，外加 LiveKit 的延迟和 token 指标。
+
+## 安装
+
+将该集成与你的代理所使用的 LiveKit 插件一起安装：
+
+<CodeGroup>
+
+```bash pip
+pip install "langsmith[livekit]" "livekit-agents[openai,silero,turn-detector]"
+```
+
+```bash uv
+uv add "langsmith[livekit]" "livekit-agents[openai,silero,turn-detector]"
+```
+
+</CodeGroup>
+
+## 设置环境变量
+
+该集成会从环境中读取你的 LangSmith 凭据，并通过 OpenTelemetry 自动导出到 LangSmith：
+
+```bash .env
+LANGSMITH_API_KEY=<your-langsmith-api-key>
+LANGSMITH_TRACING=true
+LANGSMITH_PROJECT=<your-desired-langsmith-project>
+LIVEKIT_URL=<your-livekit-url>
+LIVEKIT_API_KEY=<your-livekit-api-key>
+LIVEKIT_API_SECRET=<your-livekit-api-secret>
+OPENAI_API_KEY=<your-openai-api-key>
+```
+
+## 设置跟踪
+
+导入 `configure_livekit`，并在创建 `AgentServer` 之前调用一次。它会构建 tracer provider、注册 LangSmith span processor，并将其接入 LiveKit：
+
+```python
+from langsmith.integrations.livekit import configure_livekit
+from livekit import agents
+from livekit.agents import Agent, AgentServer, AgentSession
+
+# 在创建代理前启用跟踪。
+configure_livekit()
+
+server = AgentServer()
+
+@server.rtc_session()
+async def my_agent(ctx: agents.JobContext):
+    session = AgentSession(
+        stt="openai/gpt-4o-mini-transcribe",
+        llm="openai/gpt-4o-mini",
+        tts="openai/tts-1:alloy",
+    )
+    await session.start(room=ctx.room, agent=Agent(instructions="You are a helpful assistant."))
+```
+
+这同时适用于 STT/LLM/TTS 级联方式和 speech-to-speech 模型：如果你选择使用实时模型来构建 `AgentSession`，例如 `lk_openai.realtime.RealtimeModel(...)`，跟踪设置保持不变。
+
+### 使用你自己的 tracer provider
+
+`configure_livekit()` 会构建一个 `TracerProvider`，注册 LangSmith span processor，并将其接入 LiveKit。若要使用你自己管理的 `TracerProvider`，请自行构造 processor，将其添加到 provider 中，然后通过 LiveKit 的 tracer hook 注册该 provider。LiveKit 只会通过其 tracer 绑定的 provider 发出 spans：
+
+```python
+from livekit.agents import telemetry
+from opentelemetry.sdk.trace import TracerProvider
+
+from langsmith.integrations.livekit import LiveKitLangSmithSpanProcessor
+
+provider = TracerProvider()  # 你自己的 provider
+provider.add_span_processor(LiveKitLangSmithSpanProcessor())
+telemetry.set_tracer_provider(provider)
+```
+
+## 将一段对话归入同一个线程
+
+若要将一段对话的 runs 归入同一个 LangSmith [thread](/langsmith/threads)，以获得线程级视图以及 token 和成本聚合，请在每段对话中调用一次 `set_thread_id`，并在该对话的 `@server.rtc_session()` 处理器里、在 spans 发出之前执行：
+
+```python
+from langsmith.integrations.livekit import configure_livekit, set_thread_id
+
+configure_livekit()
+
+@server.rtc_session()
+async def my_agent(ctx: agents.JobContext):
+    set_thread_id(ctx.job.id)  # 为本次会话设置所需的 thread id
+    ...
+```
+
+## 记录对话音频
+
+该集成会把通话录音附加到对话的根 span 上。捕获录音的方式在本地开发和生产环境中有所不同。
+
+### 开发环境：嵌入本地文件
+
+在控制台和本地开发环境中，启用 LiveKit 的 session recording，并将 `audio_path_provider` 指向 LiveKit 写入 `ctx.session_directory` 下的 `audio.ogg`。该集成会读取该文件，并将其字节内容嵌入 trace 中。
+
+```python
+from pathlib import Path
+
+_audio_path: Path | None = None
+configure_livekit(audio_path_provider=lambda: _audio_path)
+
+@server.rtc_session()
+async def my_agent(ctx: agents.JobContext):
+    global _audio_path
+    _audio_path = ctx.session_directory / "audio.ogg"
+    await session.start(
+        room=ctx.room,
+        agent=Agent(instructions="You are a helpful assistant."),
+        record={"audio": True},
+    )
+```
+
+在控制台模式下，还需要在命令行上传入 `--record`。录音反映的是播放给客户端的内容，因此若发生 barge-in，录音中对应的片段也会被截断。
+
+<Warning>
+不要在生产环境中使用 `audio_path_provider`。在已部署的 worker 中，`ctx.session_directory` 是一个临时目录，LiveKit 会在会话结束后将其删除，因此没有可持久保存并嵌入的文件。
+</Warning>
+
+### 生产环境：使用 Egress 录制并附加文件
+
+在生产环境中，使用 [LiveKit Egress](https://docs.livekit.io/home/egress/overview/) 将房间录制到你自己的对象存储中，然后把录制完成的文件作为真实音频附件附加到 trace。Egress 会在通话结束后才完成上传，因此该集成会保持该对话的根 span 处于打开状态，直到你提供文件字节内容：
+
+1. 启动 egress 时调用 `processor.expect_recording(thread_id)`。
+2. 通话结束后，等待 egress 完成，从你的存储中下载文件，然后调用 `processor.complete_recording(thread_id, audio_bytes)`。该集成会嵌入这些字节并导出 trace。
+
+你必须对 `expect_recording` 和 `complete_recording` 使用相同的 `thread_id`，这样录音才能匹配到正确的对话。
+
+```python
+import os
+
+from livekit import agents, api
+from livekit.agents import Agent, AgentServer, AgentSession
+from langsmith.integrations.livekit import configure_livekit, set_thread_id
+
+RECORDING_BUCKET = os.environ["RECORDING_BUCKET"]
+
+processor = configure_livekit()
+server = AgentServer()
+
+@server.rtc_session()
+async def my_agent(ctx: agents.JobContext):
+    thread_id = ctx.job.id  # 每个会话唯一；在 console 模式下 ctx.room.name 为 "console"
+    set_thread_id(thread_id)  # 将本次对话的 spans 归入同一个 thread
+
+    key = f"recordings/{thread_id}.ogg"
+
+    # 启动一个仅音频的 room-composite egress，将文件写入你的存储。
+    lkapi = api.LiveKitAPI()  # 读取 LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET
+    egress = await lkapi.egress.start_room_composite_egress(
+        api.RoomCompositeEgressRequest(
+            room_name=ctx.room.name,
+            audio_only=True,
+            file_outputs=[
+                api.EncodedFileOutput(
+                    file_type=api.EncodedFileType.OGG,
+                    filepath=key,
+                    s3=api.S3Upload(
+                        bucket=RECORDING_BUCKET,
+                        region=os.environ["AWS_REGION"],
+                        access_key=os.environ["AWS_ACCESS_KEY_ID"],
+                        secret=os.environ["AWS_SECRET_ACCESS_KEY"],
+                    ),
+                )
+            ],
+        )
+    )
+    # 在录音就绪前保持 trace 打开。
+    processor.expect_recording(thread_id)
+
+    async def attach_recording():
+        try:
+            await wait_for_egress(lkapi, egress.egress_id)  # 轮询直到 EGRESS_COMPLETE
+            audio = download_from_storage(RECORDING_BUCKET, key)  # 你的存储客户端
+            processor.complete_recording(thread_id, audio, name="call.ogg")
+        except Exception:
+            processor.complete_recording(thread_id, None)  # 不附音频也要释放
+
+    ctx.add_shutdown_callback(attach_recording)
+
+    session = AgentSession(...)
+    await session.start(room=ctx.room, agent=Agent(instructions="..."))
+```
+
+`wait_for_egress` 会轮询 [`list_egress`](https://docs.livekit.io/home/egress/api/)，直到状态为 `EGRESS_COMPLETE`，你也可以订阅 `egress_ended` webhook；`download_from_storage` 则通过你的云服务提供商客户端读取对象。LiveKit Egress 也支持写入 [Google Cloud Storage 和 Azure](https://docs.livekit.io/home/egress/overview/)：将 `s3=` 换成 `gcp=api.GCPUpload(...)` 或 `azure=api.AzureBlobUpload(...)` 即可。
+
+<Note>
+始终调用 `complete_recording`，因为 trace 的根 span 会一直保持到它执行为止，即便失败并传入 `data=None` 也一样。如果 worker 先停止，该集成会在不附加音频的情况下刷新 trace。
+</Note>
+
+## 后续步骤
+
+<CardGroup cols={2}>
+  <Card title="语音基础" icon="waveform" href="/langsmith/trace-voice-fundamentals">
+    了解跟踪语音代理的核心约定。
+  </Card>
+  <Card title="随 traces 上传文件" icon="paperclip" href="/langsmith/upload-files-with-traces">
+    将对话音频录制作为附件添加到你的 trace 中。
+  </Card>
+</CardGroup>

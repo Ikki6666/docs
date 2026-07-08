@@ -1,0 +1,467 @@
+---
+title: 用于计费与运维遥测的 egress
+sidebarTitle: 配置 egress
+---
+
+<Info>
+本页仅适用于未运行在离线（air-gapped）模式下的客户，并假设你使用的是版本 `0.9.0` 或更高的自托管 LangSmith 实例。
+</Info>
+
+自托管 LangSmith 实例会将所有信息存储在本地，绝不会将敏感信息发送到你的网络之外。不过，只要你不是在离线模式下运行，LangSmith 就需要访问 `https://beacon.langchain.com`，原因如下：
+
+- **Billing telemetry** — 许可证校验，以及订阅 / 使用量上报（必需）
+- **Operational telemetry** — 用于支持诊断的日志、指标和 traces（可选，可禁用）
+- **Usage telemetry** — 用于产品洞察的匿名使用快照（可选，可禁用）
+
+<Warning>
+**必须允许访问 `https://beacon.langchain.com`。** 如需静态 IP 地址，请参见 [allowlisting IP section](/langsmith/cloud#allowlisting-ip-addresses)。
+</Warning>
+
+## Billing telemetry
+
+对于未运行在离线模式下的自托管 LangSmith 实例，billing telemetry 是**必需的**。它包括许可证校验以及订阅 / 使用量上报。
+
+<Info>
+Billing telemetry **不能被禁用**。如果你需要在完全没有任何 egress 的情况下运行，请联系你的客户团队申请离线（air-gapped）许可证。
+</Info>
+
+### 它的作用
+
+- **License verification**：在启动时以及之后的周期性时间点校验你的 LangSmith license key。
+- **Subscription/usage reporting**：按照你的订单权限项，为计费目的上报平台使用指标。
+
+### 我们收集什么
+
+- License key 校验请求
+- 聚合后的使用量统计（trace 数量、分配的 seats、正在使用的 seats）
+- Organization 和 workspace 标识符
+
+### 示例 payloads
+
+#### License verification
+
+**Endpoint:** `POST beacon.langchain.com/v1/beacon/verify`
+
+**Request:**
+
+```json
+{
+  "license": "<YOUR_LICENSE_KEY>"
+}
+```
+
+**Response:**
+
+```json
+{
+  "token": "Valid JWT" //Short-lived JWT token to avoid repeated license checks
+}
+```
+
+#### Subscription/usage reporting
+
+**Endpoint:** `POST beacon.langchain.com/v1/beacon/ingest-traces`
+
+**Request:**
+
+```json
+{
+  "license": "<YOUR_LICENSE_KEY>",
+  "trace_transactions": [
+    {
+      "id": "af28dfea-5358-463d-a2dc-37df1da72498",
+      "tenant_id": "3a1c2b6f-4430-4b92-8a5b-79b8b567bbc1",
+      "session_id": "b26ae531-cdb3-42a5-8bcf-05355199fe27",
+      "trace_count": 5,
+      "start_insertion_time": "2025-01-06T10:00:00Z",
+      "end_insertion_time": "2025-01-06T11:00:00Z",
+      "start_interval_time": "2025-01-06T09:00:00Z",
+      "end_interval_time": "2025-01-06T10:00:00Z",
+      "status": "completed",
+      "num_failed_send_attempts": 0,
+      "transaction_type": "type1",
+      "organization_id": "c5b5f53a-4716-4326-8967-d4f7f7799735"
+    }
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "inserted_count": 1 //Number of transactions successfully ingested
+}
+```
+
+## Operational telemetry
+
+从版本 **0.11** 开始，LangSmith 部署默认会发送 operational telemetry。这些遥测数据有助于 LangChain 团队为自托管实例提供更主动的支持和更快速的故障排查。
+
+<Info>
+Operational telemetry 与 billing telemetry **彼此独立**。你可以禁用 operational telemetry，同时仍然保留 billing telemetry。
+</Info>
+
+### 它的作用
+
+- 支持对自托管实例进行更主动的支持与更快速的故障排查
+- 帮助进行性能调优
+- 基于真实使用模式，帮助确定改进优先级
+
+### 我们收集什么
+
+- **Request metadata**：匿名化的请求数量、大小和时长
+- **Database metrics**：查询耗时、错误率和性能计数器
+- **Operational traces**：高延迟或失败请求的耗时与错误信息（这些**不是**客户 traces，而是关于 LangSmith 实例本身运行状态的 traces）
+- **Log messages**：仅包含 warning 和 error 级别的日志消息
+
+<Info>
+我们不会收集实际 payload 内容、数据库记录，或任何可以识别你的终端用户或客户的数据。所有 telemetry 数据都只与 organization 和 deployment 关联，不会标识到具体用户。我们**不会收集 PII**（个人可识别信息）。
+</Info>
+
+### 如何禁用
+
+你可以在 `langsmith_config.yaml` 文件中设置以下值来禁用 operational telemetry：
+
+```yaml
+config:
+  telemetry:
+    logs: false
+    metrics: false
+    traces: false
+```
+
+你也可以只将其中某些值设为 `false`，从而只禁用特定类型的 telemetry。
+
+<Warning>
+禁用 operational telemetry 会停止导出本节描述的日志、指标和 traces，但**不会**禁用 billing telemetry（license verification 和 subscription/usage reporting）。
+</Warning>
+
+### 示例 payloads
+
+#### Operational metrics
+
+**Endpoint:** `POST beacon.langchain.com/v1/beacon/v1/metrics`
+
+**Request:**
+
+```json
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "resource.name",
+            "value": { "stringValue": "langsmith-metrics" }
+          },
+          {
+            "key": "env",
+            "value": { "stringValue": "ls_self_hosted" }
+          }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": {
+            "name": "langsmith.metrics",
+            "version": "0.1.0"
+          },
+          "metrics": [
+            {
+              "name": "langsmith_http_requests_latency",
+              "unit": "seconds",
+              "description": "Request latency of LangSmith services",
+              "gauge": {
+                "dataPoints": [
+                  {
+                    "asDouble": 12.34,
+                    "startTimeUnixNano": 1678886400000000000,
+                    "timeUnixNano": 1678886400000000000,
+                    "attributes": [
+                      {
+                        "key": "endpoint",
+                        "value": { "stringValue": "/sessions" }
+                      },
+                      { "key": "method", "value": { "stringValue": "GET" } },
+                      {
+                        "key": "service_name",
+                        "value": { "stringValue": "langsmith_backend" }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "langsmith_http_requests_failed",
+              "unit": "1",
+              "description": "Counter of failed requests for LangSmith services",
+              "sum": {
+                "dataPoints": [
+                  {
+                    "asInt": 456,
+                    "startTimeUnixNano": 1678886400000000000,
+                    "timeUnixNano": 1678886400000000000,
+                    "attributes": [
+                      {
+                        "key": "endpoint",
+                        "value": { "stringValue": "/info" }
+                      },
+                      { "key": "method", "value": { "stringValue": "POST" } },
+                      {
+                        "key": "service_name",
+                        "value": { "stringValue": "langsmith_platform_backend" }
+                      }
+                    ],
+                    "aggregationTemporality": 2,
+                    "isMonotonic": true
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### Operational traces
+
+**Endpoint:** `POST beacon.langchain.com/v1/beacon/v1/traces`
+
+**Request:**
+
+```json
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "env",
+            "value": {
+              "stringValue": "ls_self_hosted"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "langsmith_backend"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {},
+          "spans": [
+            {
+              "traceId": "71699b6fe85982c7c8995ea3d9c95df2",
+              "spanId": "3c191d03fa8be0",
+              "parentSpanId": "",
+              "name": "receive_request",
+              "startTimeUnixNano": "1581452772000000321",
+              "endTimeUnixNano": "1581452773000000789",
+              "droppedAttributesCount": 1,
+              "events": [
+                {
+                  "timeUnixNano": "1581452773000000123",
+                  "name": "parse_request",
+                  "attributes": [
+                    {
+                      "key": "request_size",
+                      "value": {
+                        "stringValue": "100"
+                      }
+                    }
+                  ],
+                  "droppedAttributesCount": 2
+                },
+                {
+                  "timeUnixNano": "1581452773000000123",
+                  "name": "event",
+                  "droppedAttributesCount": 2
+                }
+              ],
+              "droppedEventsCount": 1,
+              "status": {
+                "message": "status-cancelled",
+                "code": 2
+              }
+            },
+            {
+              "traceId": "71699b6fe85982c7c8995ea3d9c95df2",
+              "spanId": "0932ksdka12345",
+              "parentSpanId": "3c191d03fa8be0",
+              "name": "process_request",
+              "startTimeUnixNano": "1581452772000000321",
+              "endTimeUnixNano": "1581452773000000789",
+              "links": [],
+              "droppedLinksCount": 3,
+              "status": {}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### Operational log messages
+
+我们只导出自托管 LangSmith 实例中的 error 日志消息。这样一来，LangChain 团队在排查应用错误时，无需与你的团队来回沟通就能获得必要信息。
+
+**Endpoint:** `POST beacon.langchain.com/v1/beacon/v1/logs`
+
+**Request:**
+
+```json
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "langsmith_backend"
+            }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {},
+          "logRecords": [
+            {
+              "timeUnixNano": "1581452773000009875",
+              "severityNumber": 13,
+              "severityText": "Warning",
+              "body": {
+                "stringValue": "Database connection pool approaching capacity"
+              },
+              "attributes": [
+                {
+                  "key": "component",
+                  "value": {
+                    "stringValue": "langsmith_backend"
+                  }
+                },
+                {
+                  "key": "pool_size",
+                  "value": {
+                    "intValue": "95"
+                  }
+                }
+              ],
+              "droppedAttributesCount": 0,
+              "traceId": "08040201000000000000000000000000",
+              "spanId": "0102040800000000"
+            },
+            {
+              "timeUnixNano": "1581452773000000789",
+              "severityNumber": 17,
+              "severityText": "Error",
+              "body": {
+                "stringValue": "Failed to process trace batch"
+              },
+              "attributes": [
+                {
+                  "key": "component",
+                  "value": {
+                    "stringValue": "langsmith_queue_worker"
+                  }
+                },
+                {
+                  "key": "error_type",
+                  "value": {
+                    "stringValue": "timeout"
+                  }
+                }
+              ],
+              "droppedAttributesCount": 0,
+              "traceId": "",
+              "spanId": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+## Usage telemetry
+
+Usage telemetry 会收集你的 LangSmith 实例使用指标的匿名快照。这些数据帮助 LangChain 了解平台采用情况，并为产品开发决策提供依据。
+
+<Info>
+Usage telemetry **默认启用**，也可以被禁用。与 billing telemetry 不同，你可以完全控制是否将这些快照发送给 LangChain。
+</Info>
+
+### 它的作用
+
+- 定期采集聚合后的使用指标
+- 提供关于功能采用情况和平台增长的洞察
+- 基于真实使用情况，帮助 LangChain 确定改进和新功能的优先级
+
+### 我们收集什么
+
+- **Platform metrics**：workspaces、projects、experiments、datasets、evaluators 及其他平台资源的数量
+- **Feature usage**：run rules、annotation queues、prompts 以及与 prompts 相关活动的数量
+- **Users**：注册用户总数，以及过去 30 天内活跃的 PATs（Personal Access Tokens）数量
+- **Timestamps**：快照的时间范围（UTC 的起止时间戳）
+
+<Info>
+所有指标都只是**聚合后的数量**。不会收集任何单个资源的数据、标识符或使用模式。也不会收集任何能识别你的终端用户或客户的信息。
+</Info>
+
+### 示例 payloads
+
+**Endpoint:** `POST /v1/beacon/usage-snapshot`
+
+**Request:**
+
+```json
+{
+  "license_key": "<YOUR_LICENSE_KEY>",
+  "from_timestamp": "2026-03-25T02:00:00+00:00",
+  "to_timestamp": "2026-03-26T02:00:00+00:00",
+  "measures": {
+    "workspaces": 12,
+    "users": 63,
+    "projects": 87,
+    "experiments": 34,
+    "datasets": 15,
+    "evaluators": 8,
+    "run_rules": 5,
+    "annotation_queues": 3,
+    "prompts": 22,
+    "prompt_commits": 156,
+    "prompt_pulls": 1043,
+    "active_pats_30d": 47
+  }
+}
+```
+
+### 如何禁用
+
+你可以在部署配置中设置以下环境变量来禁用 usage telemetry：
+
+```yaml
+PHONE_HOME_USAGE_REPORTING_ENABLED: false
+```
+
+将它加入 Helm 配置的 `commonEnv` 部分，即可永久禁用 usage telemetry 上报。
+
+<Warning>
+禁用 usage telemetry **不会**影响 billing telemetry 或 operational telemetry。License verification 与 subscription/usage reporting 仍会正常工作。
+</Warning>
+
+## 我们的承诺
+
+LangChain 不会在 billing telemetry 或 operational telemetry 中存储任何敏感信息。收集到的任何数据都不会与第三方共享。日志消息会被过滤，只包含 error 严重级别，并且不会采集可能包含敏感应用数据的日志消息。如果你对发送的数据有任何顾虑，请禁用 telemetry，和/或联系你的客户团队。

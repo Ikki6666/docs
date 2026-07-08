@@ -1,0 +1,470 @@
+---
+title: "PGVectorStore 集成"
+description: "使用 LangChain Python 集成 PGVectorStore。"
+---
+
+`PGVectorStore` 是一个以 `postgres` 为后端的 LangChain 向量存储实现。
+
+本笔记本介绍如何使用 `PGVectorStore` API。
+
+相关代码位于集成包：[langchain-postgres](https://github.com/langchain-ai/langchain-postgres/)。
+
+## 设置
+
+该包要求使用带有 `pgvector` 扩展的 PostgreSQL 数据库。
+
+你可以运行下面的命令，启动一个启用了 `pgvector` 的 Postgres 容器：
+
+```shell
+docker run --name pgvector-container -e POSTGRES_USER=langchain -e POSTGRES_PASSWORD=langchain -e POSTGRES_DB=langchain -p 6024:5432 -d pgvector/pgvector:pg16
+```
+
+### 安装
+
+安装集成库 `langchain-postgres`。
+
+```python
+pip install -qU  langchain-postgres
+# This notebook also requires the following dependencies
+pip install -qU  langchain-core langchain-cohere sqlalchemy
+```
+
+### 设置 Postgres 参数
+
+设置你的 Postgres 参数，以便在本笔记本中连接到 Postgres 实例并测试功能。
+
+```python
+# @title Set your values or use the defaults to connect to Docker { display-mode: "form" }
+POSTGRES_USER = "langchain"  # @param {type: "string"}
+POSTGRES_PASSWORD = "langchain"  # @param {type: "string"}
+POSTGRES_HOST = "localhost"  # @param {type: "string"}
+POSTGRES_PORT = "6024"  # @param {type: "string"}
+POSTGRES_DB = "langchain"  # @param {type: "string"}
+TABLE_NAME = "vectorstore"  # @param {type: "string"}
+VECTOR_SIZE = 1024  # @param {type: "int"}
+```
+
+## 初始化
+
+### PGEngine 连接池
+
+将 PostgreSQL 用作向量存储时，前置条件之一是提供一个 `PGEngine` 对象。`PGEngine` 会为你的 Postgres 数据库配置共享连接池。这是管理连接数量、并通过连接缓存降低延迟的业界最佳实践。
+
+`PGVectorStore` 可与 `asyncpg` 和 `psycopg3` 驱动一起使用。
+
+如果你使用 `PGEngine.from_connection_string()` 创建 `PGEngine`，需要提供：
+
+1. `url`：使用 `postgresql+asyncpg` 驱动的连接字符串。
+
+**Note：** 本教程演示异步接口。所有异步方法都有对应的同步版本。
+
+```python
+# See docker command above to launch a Postgres instance with pgvector enabled.
+CONNECTION_STRING = (
+    f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}"
+    f":{POSTGRES_PORT}/{POSTGRES_DB}"
+)
+# To use psycopg3 driver, set your connection string to `postgresql+psycopg://`
+```
+
+```python
+from langchain_postgres import PGEngine
+
+pg_engine = PGEngine.from_connection_string(url=CONNECTION_STRING)
+```
+
+如果你使用 `PGEngine.from_engine()` 创建 `PGEngine`，需要提供：
+
+1. `engine`：一个 `AsyncEngine` 对象
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine
+
+# Create an SQLAlchemy Async Engine
+engine = create_async_engine(
+    CONNECTION_STRING,
+)
+
+pg_engine = PGEngine.from_engine(engine=engine)
+```
+
+### 初始化数据表
+
+`PGVectorStore` 类需要一个数据库表。`PGEngine` 提供了辅助方法 `ainit_vectorstore_table()`，可以帮你创建具备正确 schema 的表。
+
+如需自定义 schema，请参阅 [Create a custom Vector Store](#create-a-custom-vector-store) 或 [Create a Vector Store using existing table](#create-a-vector-store-using-existing-table)。
+
+```python
+await pg_engine.ainit_vectorstore_table(
+    table_name=TABLE_NAME,
+    vector_size=VECTOR_SIZE,
+)
+```
+
+#### 可选提示：💡
+
+你也可以在传入 `table_name` 的地方额外指定 `schema_name`。例如：
+
+```python
+SCHEMA_NAME="my_schema"
+
+await pg_engine.ainit_vectorstore_table(
+    table_name=TABLE_NAME,
+    vector_size=768,
+    schema_name=SCHEMA_NAME,    # Default: "public"
+)
+```
+
+### 创建 embedding 类实例
+
+你可以使用任意 [LangChain embeddings model](https://python.langchain.com/docs/integrations/embeddings/)。
+
+```python
+from langchain_cohere import CohereEmbeddings
+
+embedding = CohereEmbeddings(model="embed-english-v3.0")
+```
+
+### 初始化默认的 PGVectorStore
+
+使用默认表结构连接到向量存储。
+
+如需自定义 schema，请参阅 [Create a custom Vector Store](#create-a-custom-vector-store) 或 [Create a Vector Store using existing table](#create-a-vector-store-using-existing-table)。
+
+```python
+from langchain_postgres import PGVectorStore
+
+store = await PGVectorStore.create(
+    engine=pg_engine,
+    table_name=TABLE_NAME,
+    # schema_name=SCHEMA_NAME,
+    embedding_service=embedding,
+)
+```
+
+## 管理向量存储
+
+### 添加文档
+
+将文档添加到向量存储中。metadata 会被存储在 JSON 列中；如果你希望将 metadata 存储在可用于过滤的字段里，请参阅 “Create a custom Vector Store”。
+
+```python
+import uuid
+
+from langchain_core.documents import Document
+
+docs = [
+    Document(
+        id=str(uuid.uuid4()),
+        page_content="Red Apple",
+        metadata={"description": "red", "content": "1", "category": "fruit"},
+    ),
+    Document(
+        id=str(uuid.uuid4()),
+        page_content="Banana Cavendish",
+        metadata={"description": "yellow", "content": "2", "category": "fruit"},
+    ),
+    Document(
+        id=str(uuid.uuid4()),
+        page_content="Orange Navel",
+        metadata={"description": "orange", "content": "3", "category": "fruit"},
+    ),
+]
+
+await store.aadd_documents(docs)
+```
+
+### 添加文本
+
+如果内容不是 `Document` 结构，也可以直接把文本写入向量存储。
+
+```python
+import uuid
+
+all_texts = ["Apples and oranges", "Cars and airplanes", "Pineapple", "Train", "Banana"]
+metadatas = [{"len": len(t)} for t in all_texts]
+ids = [str(uuid.uuid4()) for _ in all_texts]
+
+await store.aadd_texts(all_texts, metadatas=metadatas, ids=ids)
+```
+
+### 删除文档
+
+可以通过 ids 删除文档。
+
+```python
+await store.adelete([ids[1]])
+```
+
+## 查询向量存储
+
+### 搜索文档
+
+使用自然语言查询搜索相似文档。
+
+```python
+query = "I'd like a fruit."
+docs = await store.asimilarity_search(query)
+print(docs)
+```
+
+### 按向量搜索文档
+
+使用向量 embedding 搜索相似文档。
+
+```python
+query_vector = embedding.embed_query(query)
+docs = await store.asimilarity_search_by_vector(query_vector, k=2)
+print(docs)
+```
+
+## 添加索引
+
+通过应用向量索引来加速向量搜索查询。更多信息请参阅 [vector indexes](https://cloud.google.com/blog/products/databases/faster-similarity-search-performance-with-pgvector-indexes)。
+
+如果未提供名称，索引会使用默认索引名。若要添加多个索引，则需要使用不同的索引名称。
+
+```python
+from langchain_postgres.v2.indexes import HNSWIndex, IVFFlatIndex
+
+index = IVFFlatIndex()
+await store.aapply_vector_index(index)
+
+index = HNSWIndex(name="my-hnsw-index")
+await store.aapply_vector_index(index)
+```
+
+你也可以设置索引参数，以在 recall 和 QPS 之间找到更合适的平衡。
+
+```python
+index = IVFFlatIndex(name="my-ivfflat", lists=120)
+await store.aapply_vector_index(index)
+```
+
+### 重新建立索引
+
+使用索引表中已有数据重建索引，并替换旧索引副本。某些索引类型在新增大量数据后可能需要重新建立索引。
+
+```python
+await store.areindex()  # Re-index using the default index name
+await store.areindex("my-hnsw-index")  # Re-index using the index name
+```
+
+### 删除索引
+
+移除向量索引。
+
+```python
+await store.adrop_vector_index()  # Delete index using the default name
+await store.adrop_vector_index("my-hnsw-index")  # Delete index using the index name
+```
+
+### 创建自定义向量存储
+
+你可以通过特殊列名或自定义 metadata 列来定制向量存储。
+
+`ainit_vectorstore_table`
+
+* 使用 `content_column`、`embedding_column`、`metadata_columns`、`metadata_json_column`、`id_column` 重命名列。
+* 使用 `Column` 类创建自定义 id 或 metadata 列。`Column` 由列名和数据类型定义，可使用任意 Postgres [data type](https://www.postgresql.org/docs/current/datatype.html)。
+* 使用 `store_metadata` 创建一个 JSON 列，用于存储额外 metadata。
+
+#### 可选提示：💡
+
+如果要使用非 uuid 的 ids，你必须自定义 id 列：
+
+```python
+await pg_engine.ainit_vectorstore_table(
+    ...,
+    id_column=Column(name="langchain_id", data_type="INTEGER")
+)
+```
+
+`PGVectorStore`
+
+* 使用 `content_column`、`embedding_column`、`metadata_columns`、`metadata_json_column`、`id_column` 重命名列。
+* 使用 `ignore_metadata_columns` 忽略不应作为 `Document` metadata 使用的列。这在对接现有数据表时很有帮助，因为并非所有列都需要纳入 metadata。
+* 使用不同的 `distance_strategy` 进行向量相似度计算。
+* 使用 `index_query_options` 在向量搜索时调优本地索引参数。
+
+```python
+from langchain_postgres import Column
+
+# Set table name
+TABLE_NAME = "vectorstore_custom"
+# SCHEMA_NAME = "my_schema"
+
+await pg_engine.ainit_vectorstore_table(
+    table_name=TABLE_NAME,
+    # schema_name=SCHEMA_NAME,
+    vector_size=VECTOR_SIZE,
+    metadata_columns=[Column("len", "INTEGER")],
+)
+
+
+# Initialize PGVectorStore
+custom_store = await PGVectorStore.create(
+    engine=pg_engine,
+    table_name=TABLE_NAME,
+    # schema_name=SCHEMA_NAME,
+    embedding_service=embedding,
+    metadata_columns=["len"],
+)
+```
+
+### 使用 metadata 过滤搜索文档
+
+向量存储可以利用关系型数据来过滤相似度搜索。该向量存储支持一组可应用于文档 metadata 字段的过滤器。有关如何迁移到 metadata 列的更多信息，请参阅 [migration guide](https://github.com/langchain-ai/langchain-postgres/blob/main/examples/migrate_pgvector_to_pgvectorstore.ipynb)。
+
+`PGVectorStore` 当前支持以下操作符，以及所有 Postgres 数据类型。
+
+| Operator  | 含义/类别 |
+|-----------|-----------|
+| $eq | 相等（==） |
+| $ne | 不相等（!=） |
+| $lt | 小于 (\<) |
+| $lte | 小于等于 (\<=) |
+| $gt | 大于 (>) |
+| $gte | 大于等于 (>=) |
+| $in | 特殊处理（in） |
+| $nin | 特殊处理（not in） |
+| $between | 特殊处理（between） |
+| $exists | 特殊处理（is null） |
+| $like | 文本（like） |
+| $ilike | 文本（不区分大小写 like） |
+| $and | 逻辑（and） |
+| $or | 逻辑（or） |
+
+```python
+import uuid
+
+docs = [
+    Document(
+        id=str(uuid.uuid4()),
+        page_content="Red Apple",
+        metadata={"description": "red", "content": "1", "category": "fruit"},
+    ),
+    Document(
+        id=str(uuid.uuid4()),
+        page_content="Banana Cavendish",
+        metadata={"description": "yellow", "content": "2", "category": "fruit"},
+    ),
+    Document(
+        id=str(uuid.uuid4()),
+        page_content="Orange Navel",
+        metadata={"description": "orange", "content": "3", "category": "fruit"},
+    ),
+]
+
+await custom_store.aadd_documents(docs)
+
+# Use a dictionary filter on search
+docs = await custom_store.asimilarity_search(query, filter={"content": {"$gte": 1}})
+
+print(docs)
+```
+
+### 使用现有数据表创建向量存储
+
+向量存储也可以直接建立在现有数据表之上。
+
+假设 PG 数据库中已经存在一张表 `products`，用于存储电商产品信息。
+
+<details>
+    <summary>点击查看数据表 schema 细节</summary>
+
+### 建表 SQL
+
+  ```
+    CREATE TABLE products (
+        product_id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        price_usd DECIMAL(10, 2) NOT NULL,
+        category VARCHAR(255),
+        quantity INT DEFAULT 0,
+        sku VARCHAR(255) UNIQUE NOT NULL,
+        image_url VARCHAR(255),
+        metadata JSON,
+        embed vector(768) DEFAULT NULL -- vector dimensions depends on the embedding model
+    );
+  ```
+
+### 插入记录
+
+  ```
+INSERT INTO
+  products (name,
+    description,
+    price_usd,
+    category,
+    quantity,
+    sku,
+    image_url,
+    METADATA,
+    embed)
+VALUES
+  ...
+  ```
+
+</details>
+
+下面是这张表如何映射到 `PGVectorStore`：
+
+* **`id_column="product_id"`**：ID 列唯一标识 `products` 表中的每一行。
+* **`content_column="description"`**：`description` 列包含每个商品的文本描述。`embedding_service` 会基于这些文本生成向量，并存入 `embedding_column`，表示描述的语义含义。
+* **`embedding_column="embed"`**：`embed` 列存储由商品描述生成的向量。这些向量用于查找描述相似的商品。
+* **`metadata_columns=["name", "category", "price_usd", "quantity", "sku", "image_url"]`**：这些列会作为每个商品的 metadata。metadata 提供额外信息，例如名称、分类、价格、库存数量、SKU 和图片 URL。这些信息适合在搜索结果中展示，也适合用于过滤和分类。
+* **`metadata_json_column="metadata"`**：`metadata` 列可以用灵活的 JSON 格式保存额外商品信息，适合存放不便拆到标准列中的复杂数据。
+
+```python
+# Set an existing table name
+TABLE_NAME = "products"
+# SCHEMA_NAME = "my_schema"
+
+# Initialize PGVectorStore
+custom_store = await PGVectorStore.create(
+    engine=pg_engine,
+    table_name=TABLE_NAME,
+    # schema_name=SCHEMA_NAME,
+    embedding_service=embedding,
+    # Connect to existing VectorStore by customizing below column names
+    id_column="product_id",
+    content_column="description",
+    embedding_column="embed",
+    metadata_columns=["name", "category", "price_usd", "quantity", "sku", "image_url"],
+    metadata_json_column="metadata",
+)
+```
+
+注意：
+
+1. 可选：如果 `embed` 列是新创建的，或者其维度与 embedding 模型支持的不一致，则需要一次性为旧记录补写 embeddings，例如：
+
+    `ALTER TABLE products ADD COLUMN embed vector(768) DEFAULT NULL`
+
+1. 对于通过 @[`VectorStore`] 新增的记录，embedding 会自动生成。
+
+## 清理
+
+**⚠️ WARNING: this can not be undone**
+
+删除向量存储数据表。
+
+```python
+await pg_engine.adrop_table(TABLE_NAME)
+```
+
+## 用于检索增强生成
+
+如需了解如何在检索增强生成（RAG）中使用该向量存储，请参阅以下内容：
+
+- [Retrieval docs](/oss/langchain/retrieval)
+- [Build a RAG app with LangChain](/oss/langchain/rag)
+- [Agentic RAG](/oss/langgraph/agentic-rag)
+
+---
+
+## API reference
+
+如需查看 `PGVectorStore` 的完整功能和配置说明，请参阅 @[API reference][PGVectorStore]

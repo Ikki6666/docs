@@ -1,0 +1,191 @@
+---
+title: "Google BigQuery Vector Search 集成"
+description: "使用 LangChain Python 集成 Google BigQuery Vector Search 向量存储。"
+---
+
+> [Google Cloud BigQuery Vector Search](https://cloud.google.com/bigquery/docs/vector-search-intro) 允许你使用 GoogleSQL 执行语义搜索，可通过向量索引获得快速的近似结果，也可以使用暴力搜索得到精确结果。
+
+本教程展示了如何在 LangChain 中使用端到端的数据和 embedding 管理系统，并借助 `BigQueryVectorStore` 类在 BigQuery 中实现可扩展的语义搜索。这个类属于 Google Cloud 中两类统一数据存储与灵活向量搜索方案之一：
+
+- **BigQuery Vector Search**：对应 `BigQueryVectorStore` 类，适合无需基础设施设置的快速原型开发和批量检索。
+- **Feature Store Online Store**：对应 `VertexFSVectorStore` 类，支持手动或定时数据同步，并可实现低延迟检索。非常适合面向用户的生产级 GenAI 应用。
+
+<p>Diagram BQ-VertexFS</p>
+
+## 快速开始
+
+### 安装库
+
+```python
+pip install -qU  langchain langchain-google-vertexai "langchain-google-community[featurestore]"
+```
+
+要在当前 Jupyter 运行时中使用刚安装的包，你必须重启运行时。你可以运行下面的单元来重启当前 kernel。
+
+```python
+import IPython
+
+app = IPython.Application.instance()
+app.kernel.do_shutdown(True)
+```
+
+## 开始之前
+
+#### 设置项目 ID
+
+如果你不知道自己的项目 ID，可以尝试以下方式：
+- 运行 `gcloud config list`。
+- 运行 `gcloud projects list`。
+- 查看支持页面：[Locate the project ID](https://support.google.com/googleapi/answer/7014113)。
+
+```python
+PROJECT_ID = ""  # @param {type:"string"}
+
+# Set the project id
+! gcloud config set project {PROJECT_ID}
+```
+
+#### 设置区域
+
+你也可以修改 BigQuery 所使用的 `REGION` 变量。更多信息请参阅 [BigQuery regions](https://cloud.google.com/bigquery/docs/locations#supported_locations)。
+
+```python
+REGION = "us-central1"  # @param {type: "string"}
+```
+
+#### 设置数据集和表名
+
+它们将作为你的 BigQuery Vector Store。
+
+```python
+DATASET = "my_langchain_dataset"  # @param {type: "string"}
+TABLE = "doc_and_vectors"  # @param {type: "string"}
+```
+
+### 对 notebook 环境进行认证
+
+- 如果你使用 **Colab** 运行本 notebook，请取消下面单元格的注释并继续。
+- 如果你使用 **Vertex AI Workbench**，请参阅 [Vertex AI Workbench setup instructions](https://github.com/GoogleCloudPlatform/generative-ai/tree/main/setup-env)。
+
+```python
+# from google.colab import auth as google_auth
+
+# google_auth.authenticate_user()
+```
+
+## Demo: BigQueryVectorStore
+
+### 创建 embedding 类实例
+
+你可能需要在项目中启用 Vertex AI API，可运行
+`gcloud services enable aiplatform.googleapis.com --project {PROJECT_ID}`
+（请将 `{PROJECT_ID}` 替换为你的项目名）。
+
+你可以使用任意 [LangChain embeddings model](/oss/integrations/embeddings/)。
+
+```python
+from langchain_google_vertexai import VertexAIEmbeddings
+
+embedding = VertexAIEmbeddings(
+    model_name="textembedding-gecko@latest", project=PROJECT_ID
+)
+```
+
+### 初始化 BigQueryVectorStore
+
+如果 BigQuery Dataset 和 Table 不存在，将自动创建。关于所有可选参数，请参阅 [class definition](https://github.com/langchain-ai/langchain-google/blob/main/libs/community/langchain_google_community/bq_storage_vectorstores/bigquery.py#L26)。
+
+```python
+from langchain_google_community import BigQueryVectorStore
+
+store = BigQueryVectorStore(
+    project_id=PROJECT_ID,
+    dataset_name=DATASET,
+    table_name=TABLE,
+    location=REGION,
+    embedding=embedding,
+)
+```
+
+### 添加文本
+
+```python
+all_texts = ["Apples and oranges", "Cars and airplanes", "Pineapple", "Train", "Banana"]
+metadatas = [{"len": len(t)} for t in all_texts]
+
+store.add_texts(all_texts, metadatas=metadatas)
+```
+
+### 搜索文档
+
+```python
+query = "I'd like a fruit."
+docs = store.similarity_search(query)
+print(docs)
+```
+
+### 按向量搜索文档
+
+```python
+query_vector = embedding.embed_query(query)
+docs = store.similarity_search_by_vector(query_vector, k=2)
+print(docs)
+```
+
+### 使用元数据过滤搜索文档
+
+这个 vectorstore 支持两种在搜索文档时对元数据字段应用过滤的方法：
+
+- 基于字典的过滤器
+  - 你可以传入一个字典（`dict`），其键表示元数据字段，值表示过滤条件。该方式会对键和值执行等值过滤。当提供多个键值对时，它们会通过逻辑 AND 组合。
+- 基于 SQL 的过滤器
+  - 你也可以提供一个字符串形式的 SQL WHERE 子句，以定义更复杂的过滤条件。这种方式更灵活，支持比较运算符和逻辑运算符等 SQL 表达式。更多信息请参阅 [BigQuery operators](https://cloud.google.com/bigquery/docs/reference/standard-sql/operators)。
+
+```python
+# Dictionary-based Filters
+# This should only return "Banana" document.
+docs = store.similarity_search_by_vector(query_vector, filter={"len": 6})
+print(docs)
+```
+
+```python
+# SQL-based Filters
+# This should return "Banana", "Apples and oranges" and "Cars and airplanes" documents.
+docs = store.similarity_search_by_vector(query_vector, filter="len = 6 AND len > 17")
+print(docs)
+```
+
+### 批量搜索
+
+BigQueryVectorStore 提供了一个 `batch_search` 方法，用于可扩展的向量相似度搜索。
+
+```python
+results = store.batch_search(
+    embeddings=None,  # can pass embeddings or
+    queries=["search_query", "search_query"],  # can pass queries
+)
+```
+
+### 添加带 embedding 的文本
+
+你也可以通过 `add_texts_with_embeddings` 方法，使用自己提供的 embeddings。
+这对于多模态数据尤其有用，因为这类数据在生成 embedding 之前可能需要自定义预处理。
+
+```python
+items = ["some text"]
+embs = embedding.embed(items)
+
+ids = store.add_texts_with_embeddings(
+    texts=["some text"], embs=embs, metadatas=[{"len": 1}]
+)
+```
+
+### 使用 feature store 实现低延迟服务
+
+你可以直接使用 `.to_vertex_fs_vector_store()` 方法获取一个 `VertexFSVectorStore` 对象，它适用于需要低延迟的在线场景。所有必需参数都会自动从现有的 `BigQueryVectorStore` 实例中继承。关于其他可用参数，请参阅 [class definition](https://github.com/langchain-ai/langchain-google/blob/main/libs/community/langchain_google_community/bq_storage_vectorstores/featurestore.py#L33)。
+
+通过 `.to_bq_vector_store()` 方法，你也可以很方便地再切回 `BigQueryVectorStore`。
+
+```python
+store.to_vertex_fs_vector_store()  # pass optional VertexFSVectorStore parameters as arguments
+```

@@ -1,0 +1,191 @@
+---
+title: 跟踪 DeepSeek 应用
+sidebarTitle: DeepSeek
+---
+
+[DeepSeek](https://deepseek.com/) 提供高性能、OpenAI-compatible 的语言模型，包括 `deepseek-chat`，用于通用对话，和 `deepseek-reasoner`，用于高级推理任务。借助 LangSmith，你可以通过捕获结构化的输入、输出和 metadata traces，来调试、监控和评估你的 LLM 应用。
+
+本指南介绍如何在 Python 和 TypeScript 中将 DeepSeek 与 LangSmith 集成，并使用 LangSmith 的 @[`@traceable`][traceable]，Python，和 @[`traceable(...)`][langsmith-js]，TypeScript，工具自动记录 LLM 调用。
+
+
+## 安装
+
+安装 [OpenAI](https://platform.openai.com/docs/libraries) 和 LangSmith：
+
+<CodeGroup>
+
+```bash pip
+pip install openai langsmith
+```
+
+```bash uv
+uv add openai langsmith
+```
+
+```bash npm
+npm install openai langsmith dotenv
+```
+
+</CodeGroup>
+
+DeepSeek 提供 [OpenAI-compatible API](https://api-docs.deepseek.com/)，这意味着你可以使用 OpenAI SDK 与 DeepSeek 模型交互。唯一的区别是，你需要把 client 指向 DeepSeek 的 base URL，也就是 `https://api.deepseek.com/v1`，而不是 OpenAI 的 endpoint。
+
+## 设置
+
+设置你的 [API keys](/langsmith/create-account-api-key) 和 project 名称：
+
+```bash
+export LANGSMITH_API_KEY="your-langsmith-api-key"
+export LANGSMITH_TRACING="true"
+export LANGSMITH_PROJECT="deepseek-integration"
+export DEEPSEEK_API_KEY="your-deepseek-api-key"
+```
+- 确保你已从 [DeepSeek account](https://platform.deepseek.com/) 获取 DeepSeek API key。
+- 设置 `LANGSMITH_TRACING=true` 并提供 LangSmith API key，也就是 `LANGSMITH_API_KEY`，即可启用自动 trace 记录。
+- 指定 [`LANGSMITH_PROJECT`](/langsmith/log-traces-to-project) 名称，可按项目组织 traces；如果未设置，traces 会进入默认 project，名称为 "default"。
+- `LANGSMITH_TRACING` 标志必须为 true，才能记录任何 traces。
+
+## 配置 tracing
+
+1. 使用 LangSmith 为 DeepSeek API 调用添加 instrumentation。在你的脚本中，创建一个配置为使用 DeepSeek API endpoint 的 OpenAI client，并将调用包裹进 traced function：
+
+    <CodeGroup>
+
+    ```python Python
+    import os
+    from openai import OpenAI
+    from langsmith import traceable
+
+    # Create a client pointing to DeepSeek
+    client = OpenAI(
+        api_key=os.environ["DEEPSEEK_API_KEY"],
+        base_url="https://api.deepseek.com/v1"
+    )
+
+    @traceable(
+        run_type="llm",
+        name="DeepSeek Chat Completion",
+        metadata={"ls_provider": "deepseek", "ls_model_name": "deepseek-chat"},
+    )
+    def call_deepseek(messages: list[dict]):
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages
+        )
+        return response.choices[0].message
+
+    if __name__ == "__main__":
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that translates English to French."},
+            {"role": "user", "content": "I love programming."}
+        ]
+        result = call_deepseek(messages=messages)
+        print("Model reply:", result.content)
+    ```
+
+    ```typescript TypeScript
+    import { config } from "dotenv";
+    import OpenAI from "openai";
+    import { traceable } from "langsmith/traceable";
+
+    config(); // Load env vars from .env
+
+    const openai = new OpenAI({
+    apiKey: process.env.DEEPSEEK_API_KEY,
+    baseURL: "https://api.deepseek.com/v1"
+    });
+
+    type ChatMessage = {
+    role: "system" | "user" | "assistant";
+    content: string;
+    };
+
+    const callDeepSeek = traceable(
+    async (messages: ChatMessage[]) => {
+        const response = await openai.chat.completions.create({
+        model: "deepseek-chat",
+        messages
+        });
+
+        return response.choices[0].message;
+    },
+    {
+        name: "DeepSeek Chat Completion",
+        run_type: "llm",
+        metadata: {
+        ls_provider: "deepseek",
+        ls_model_name: "deepseek-chat"
+        }
+    }
+    );
+
+    (async () => {
+    const messages: ChatMessage[] = [
+        {
+        role: "system",
+        content: "You are a helpful assistant that translates English to French."
+        },
+        {
+        role: "user",
+        content: "I love programming."
+        }
+    ];
+
+    const result = await callDeepSeek(messages);
+    console.log("Model reply:", result.content);
+    })();
+
+    ```
+
+    </CodeGroup>
+
+    在这个示例中，你使用 OpenAI SDK 与 [DeepSeek's API](https://api-docs.deepseek.com/) 交互。OpenAI client 通过设置 `base_url="https://api.deepseek.com/v1"`，将请求路由到 DeepSeek 的 endpoint，同时保持 OpenAI-compatible 语法。
+
+    `@traceable` decorator，Python，或 `traceable` function，TypeScript，会包装你的函数，因此每次调用都会作为一个 `"llm"` 类型的 trace run 被记录。`metadata` 参数会为 trace 打上以下标签：
+
+    - `ls_provider`：标识 provider，DeepSeek，用于筛选 traces。
+    - `ls_model_name`：指定所用模型，用于成本跟踪与分析。
+
+    这个函数会返回完整的 message 对象，也就是 `response.choices[0].message`，其中包含响应内容，以及 role 和其他附加字段等 metadata。LangSmith 会自动捕获：
+
+    - 发送给模型的输入消息
+    - 模型的完整响应，内容、角色等
+    - 模型名称和 token 用量统计
+    - 执行耗时和任何错误
+
+2. 执行脚本以生成 trace：
+
+    <CodeGroup>
+
+    ```bash Python
+    python deepseek_trace.py
+    ```
+
+    ```bash TypeScript
+    node deepseek_trace.js
+    ```
+
+    </CodeGroup>
+
+    函数调用会访问 DeepSeek 的 API，而由于有 `@traceable` / `traceable` 包装，LangSmith 会将这次调用的输入与输出记录为一条新的 trace。你会在控制台中看到模型响应，同时在 [LangSmith UI](https://smith.langchain.com) 中看到对应的 run。
+
+## 在 LangSmith 中查看 traces
+
+运行示例后，你可以在 [LangSmith UI](https://smith.langchain.com) 中检查已记录的 traces：
+
+1. 打开 LangSmith UI，并登录你的账户。
+1. 选择本次集成所使用的 project，例如 `LANGSMITH_PROJECT` 中设置的名称，若未设置则为 "default"。
+1. 找到与你的 DeepSeek API 调用对应的 trace。它会以函数名 `DeepSeek Chat Completion` 标识。
+1. 点击该 trace 打开详情。你可以检查模型输入与输出，包括你发送的 prompt messages、DeepSeek 的响应，以及耗时信息，也就是 latency 和 token 用量。
+
+借助 LangSmith tracing，你可以完整观察 DeepSeek 调用，从而调试 DeepSeek 模型的行为、监控性能，响应时间和 token 用量，并比较不同参数下的运行结果。
+
+## 成本跟踪
+
+尽管 DeepSeek 模型是 open-weight 的，但使用托管版 DeepSeek API 仍可能根据你的套餐产生按用量计费的成本。
+
+LangSmith 可以通过估算 token 用量并应用模型定价，自动把成本关联到已跟踪的 LLM 调用上。跟踪 DeepSeek API 调用时，LangSmith 会使用已记录的 prompt 与 response messages 来计算 token 数量，并为每个 run 附加成本信息。
+
+如需启用 LLM 调用的自动成本跟踪，请参阅[根据 token 数量自动跟踪成本](/langsmith/cost-tracking#llm-calls:-automatically-track-costs-based-on-token-counts)。
+
+启用后，成本会直接显示在 LangSmith UI 中对应的每条 DeepSeek traced run 旁边，方便你持续监控用量并比较实验结果。

@@ -1,0 +1,719 @@
+---
+title: 如何模拟多轮交互
+sidebarTitle: 模拟多轮交互
+---
+
+像聊天机器人这样的对话式 AI 应用，会与用户进行多轮交互，也就是所谓的会话 *turns*。在评估这类应用表现时，像[构建数据集](/langsmith/evaluation-concepts#datasets)、定义[evaluators](/langsmith/evaluation-concepts#evaluators) 以及用于判断应用输出的指标等核心概念依然很有价值。不过，你可能还会发现，先在应用和用户之间运行一次 *simulation*，再对这段动态生成的轨迹进行评估，也同样非常有帮助。
+
+这样做的一些优点包括：
+
+* 相比基于完整现有轨迹数据集的评估，更容易快速开始
+* 能覆盖从最初问题到最终成功或失败解决的端到端过程
+* 能够发现应用在多轮迭代中是否出现重复行为或上下文丢失
+
+缺点在于，当你把评估范围扩展到多轮交互后，一致性会低于只对数据集中静态输入对应的单次输出做评估。
+
+![Multi turn trace](/langsmith/images/multi-turn-trace.png)
+
+本指南会演示如何使用开源 [`openevals`](https://github.com/langchain-ai/openevals) 包来模拟多轮交互并对其进行评估。这个包内置了预构建 evaluators 以及许多便捷资源，可用于评估你的 AI 应用。本指南还会使用 OpenAI 模型，不过你也可以换成其他 provider。
+
+## 设置
+
+首先，确保已经安装所需依赖：
+
+<CodeGroup>
+
+```bash Python
+pip install -U langsmith openevals
+```
+
+```bash TypeScript
+npm install langsmith openevals
+```
+
+</CodeGroup>
+
+<Info>
+如果你使用的是 `yarn`，还需要手动安装 `@langchain/core` 作为 `openevals` 的 peer dependency。LangSmith 的 evals 本身通常不需要额外做这一步。
+</Info>
+
+然后配置环境变量：
+
+```bash
+export LANGSMITH_TRACING="true"
+export LANGSMITH_API_KEY="<Your LangSmith API key>"
+export OPENAI_API_KEY="<Your OpenAI API key>"
+```
+
+## 运行一次 simulation
+
+开始前你主要需要两个组件：
+
+* `app`：你的应用，或对其进行包装的函数。它必须接收一条单独的聊天消息（包含 `"role"` 和 `"content"` 键的字典）作为输入参数，并接收一个 `thread_id` 作为关键字参数。它也应该接受其他 kwargs，因为未来版本可能会增加更多参数。它的返回值应当是一条聊天消息，至少包含 `role` 和 `content`。
+* `user`：模拟用户。本指南会使用一个导入的预构建函数 `create_llm_simulated_user`，它通过 LLM 生成用户回复，不过你也可以[自己创建一个](https://github.com/langchain-ai/openevals?tab=readme-ov-file#custom-simulated-users)。
+
+`openevals` 中的 simulator 会在每一轮把 `user` 的一条聊天消息传给你的 `app`。因此，如果需要保留历史，你应该基于 `thread_id` 在内部自行做有状态跟踪。
+
+下面是一个模拟多轮客服交互的示例。本指南用的是一个简单聊天应用，它只是对 OpenAI chat completions API 的一次调用做了包装，不过你在这里完全可以替换成自己的应用或 agent。在这个示例中，我们的模拟用户扮演的是一个态度相当激烈的客户：
+
+<CodeGroup>
+
+```python Python
+from openevals.simulators import run_multiturn_simulation, create_llm_simulated_user
+from openevals.types import ChatCompletionMessage
+from langsmith.wrappers import wrap_openai
+from openai import OpenAI
+
+# Wrap OpenAI client for tracing
+client = wrap_openai(OpenAI())
+history = {}
+
+# Your application logic
+def app(inputs: ChatCompletionMessage, *, thread_id: str, **kwargs):
+    if thread_id not in history:
+        history[thread_id] = []
+    history[thread_id].append(inputs)
+    # inputs is a message object with role and content
+    res = client.chat.completions.create(
+        model="gpt-5.4-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a patient and understanding customer service agent.",
+            },
+        ] + history[thread_id],
+    )
+    response_message = res.choices[0].message
+    history[thread_id].append(response_message)
+    return response_message
+
+user = create_llm_simulated_user(
+    system="You are an aggressive and hostile customer who wants a refund for their car.",
+    model="openai:gpt-5.4-mini",
+)
+
+# Run the simulation directly with the new function
+simulator_result = run_multiturn_simulation(
+    app=app,
+    user=user,
+    max_turns=5,
+)
+print(simulator_result)
+```
+
+```typescript TypeScript
+import { OpenAI } from "openai";
+import { wrapOpenAI } from "langsmith/wrappers/openai";
+import {
+  createLLMSimulatedUser,
+  runMultiturnSimulation,
+  type ChatCompletionMessage,
+} from "openevals";
+
+// Wrap OpenAI client for tracing
+const client = wrapOpenAI(new OpenAI());
+const history = {};
+
+// Your application logic
+const app = async ({ inputs, threadId }: { inputs: ChatCompletionMessage, threadId: string }) => {
+  if (history[threadId] === undefined) {
+    history[threadId] = [];
+  }
+  history[threadId].push(inputs);
+  const res = await client.chat.completions.create({
+    model: "gpt-5.4-mini",
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a patient and understanding customer service agent.",
+      },
+      inputs,
+    ],
+  });
+  const responseMessage = res.choices[0].message;
+  history[threadId].push(responseMessage);
+  return res.choices[0].message;
+};
+
+const user = createLLMSimulatedUser({
+  system: "You are an aggressive and hostile customer who wants a refund for their car.",
+  model: "openai:gpt-5.4-mini",
+});
+
+const result = await runMultiturnSimulation({
+  app,
+  user,
+  maxTurns: 5,
+});
+console.log(result);
+```
+
+</CodeGroup>
+
+返回结果大致如下：
+
+```json
+{
+  "trajectory": [
+    {
+      "role": "user",
+      "content": "This piece of junk car is a complete disaster! I demand a full refund immediately. How dare you sell me such a worthless vehicle!",
+      "id": "chatcmpl-BUpXa07LaM7wXbyaNnng1Gtn5Dsbh"
+    },
+    {
+      "role": "assistant",
+      "content": "I'm really sorry to hear about your experience and understand how frustrating this must be. I'd like to help resolve this issue as smoothly as possible. Could you please provide some details about the problem with the vehicle? Once I have more information, I'll do my best to assist you with a solution, whether it's a refund or other options. Thank you for your patience.",
+      "refusal": null,
+      "annotations": [],
+      "id": "d7520f6a-7cf8-46f8-abe4-7df04f134482"
+    },
+    "...",
+    {
+      "role": "assistant",
+      "content": "I truly understand your frustration and sincerely apologize for the inconvenience you've experienced.\n\nPlease allow me a moment to review your case, and I will do everything I can to expedite your refund. Your patience is greatly appreciated, and I am committed to resolving this matter to your satisfaction.",
+      "refusal": null,
+      "annotations": [],
+      "id": "a0536d4f-9353-4cfa-84df-51c8d29e076d"
+    }
+  ]
+}
+```
+
+simulation 会先让模拟 `user` 生成第一条问题，然后在 `user` 和你的 `app` 之间来回传递回复消息，直到达到 `max_turns`（或者你也可以传入 `stopping_condition`，它接收当前 trajectory 并返回 `True` 或 `False`，[详见 OpenEvals README](https://github.com/langchain-ai/openevals?tab=readme-ov-file#multiturn-simulation)）。其返回值就是构成整段对话 **trajectory** 的最终聊天消息列表。
+
+<Info>
+模拟用户的配置方式有很多，例如让它在 simulation 的前几轮返回固定回复，或者配置整个 simulation 的行为。完整细节请查看 [OpenEvals README](https://github.com/langchain-ai/openevals?tab=readme-ov-file#multiturn-simulation)。
+</Info>
+
+最终 trace 会[类似这样](https://smith.langchain.com/public/648ca37d-1c4d-4f7b-9b6a-89e35dc5d4f0/r)，其中你的 `app` 和 `user` 的回复会交错出现：
+
+![Multi turn trace](/langsmith/images/multi-turn-trace.png)
+
+恭喜，你刚刚完成了第一次多轮 simulation。接下来我们会介绍如何把它运行在 LangSmith experiment 中。
+
+## 在 LangSmith experiments 中运行
+
+你可以将多轮 simulation 的结果作为 LangSmith experiment 的一部分，以跟踪随时间变化的性能和进展。对于下面这些部分，最好你至少已经熟悉 LangSmith 的 [`pytest`](/langsmith/pytest)（仅 Python）、[`Vitest`/`Jest`](/langsmith/vitest-jest)（仅 JS），或者 [`evaluate`](/langsmith/evaluate-llm-application) 运行器中的一种。
+
+### 使用 `pytest` 或 `Vitest/Jest`
+
+<Check>
+想了解如何借助 LangSmith 与测试框架的集成来配置 evals，可以先看下面这些指南：
+
+* [`pytest`](https://docs.smith.langchain.com/langsmith/pytest)
+* [`Vitest` 或 `Jest`](https://docs.smith.langchain.com/langsmith/vitest-jest)
+
+</Check>
+
+如果你在使用 [LangSmith 的测试框架集成](/langsmith/pytest) 之一，那么在运行 simulation 时，可以通过 `trajectory_evaluators` 参数传入一个 OpenEvals evaluators 数组。这些 evaluators 会在 simulation 结束后运行，并将最终聊天消息列表作为 `outputs` 关键字参数传入。因此，你传入的 `trajectory_evaluator` 必须支持接收这个 kwarg。
+
+![Multi turn vitest](/langsmith/images/multi-turn-vitest.png)
+
+示例如下：
+
+<CodeGroup>
+
+```python Python
+from openevals.simulators import run_multiturn_simulation, create_llm_simulated_user
+from openevals.llm import create_llm_as_judge
+from openevals.types import ChatCompletionMessage
+from langsmith import testing as t
+from langsmith.wrappers import wrap_openai
+from openai import OpenAI
+import pytest
+
+@pytest.mark.langsmith
+def test_multiturn_message_with_openai():
+    inputs = {"role": "user", "content": "I want a refund for my car!"}
+    t.log_inputs(inputs)
+    # Wrap OpenAI client for tracing
+    client = wrap_openai(OpenAI())
+    history = {}
+
+    def app(inputs: ChatCompletionMessage, *, thread_id: str):
+        if thread_id not in history:
+            history[thread_id] = []
+        history[thread_id] = history[thread_id] + [inputs]
+        res = client.chat.completions.create(
+            model="gpt-5.4-nano",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a patient and understanding customer service agent.",
+                }
+            ]
+            + history[thread_id],
+        )
+        response = res.choices[0].message
+        history[thread_id].append(response)
+        return response
+
+    user = create_llm_simulated_user(
+        system="You are a nice customer who wants a refund for their car.",
+        model="openai:gpt-5.4-nano",
+        fixed_responses=[
+            inputs,
+        ],
+    )
+    trajectory_evaluator = create_llm_as_judge(
+        model="openai:o3-mini",
+        prompt="Based on the below conversation, was the user satisfied?\n{outputs}",
+        feedback_key="satisfaction",
+    )
+    res = run_multiturn_simulation(
+        app=app,
+        user=user,
+        trajectory_evaluators=[trajectory_evaluator],
+        max_turns=5,
+    )
+    t.log_outputs(res)
+    # Optionally, assert that the evaluator scored the interaction as satisfactory.
+    # This will cause the overall test case to fail if "score" is False.
+    assert res["evaluator_results"][0]["score"]
+```
+
+```typescript TypeScript
+import { OpenAI } from "openai";
+import { wrapOpenAI } from "langsmith/wrappers/openai";
+import * as ls from "langsmith/vitest";
+import { expect } from "vitest";
+// import * as ls from "langsmith/jest";
+// import { expect } from "@jest/globals";
+import {
+  createLLMSimulatedUser,
+  runMultiturnSimulation,
+  createLLMAsJudge,
+  type ChatCompletionMessage,
+} from "openevals";
+
+const client = wrapOpenAI(new OpenAI());
+
+ls.describe("Multiturn demo", () => {
+  ls.test(
+    "Should have a satisfactory interaction with a nice user",
+    {
+      inputs: {
+        messages: [{ role: "user" as const, content: "I want a refund for my car!" }],
+      },
+    },
+    async ({ inputs }) => {
+      const history = {};
+      // Create a custom app function
+      const app = async (
+        { inputs, threadId }: { inputs: ChatCompletionMessage, threadId: string }
+      ) => {
+        if (history[threadId] === undefined) {
+          history[threadId] = [];
+        }
+        history[threadId].push(inputs);
+        const res = await client.chat.completions.create({
+          model: "gpt-5.4-nano",
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a patient and understanding customer service agent",
+            },
+            inputs,
+          ],
+        });
+        const responseMessage = res.choices[0].message;
+        history[threadId].push(responseMessage);
+        return responseMessage;
+      };
+
+      const user = createLLMSimulatedUser({
+        system:
+          "You are a nice customer who wants a refund for their car.",
+        model: "openai:gpt-5.4-nano",
+        fixedResponses: inputs.messages,
+      });
+
+      const trajectoryEvaluator = createLLMAsJudge({
+        model: "openai:o3-mini",
+        prompt:
+          "Based on the below conversation, was the user satisfied?\n{outputs}",
+        feedbackKey: "satisfaction",
+      });
+
+      const result = await runMultiturnSimulation({
+        app,
+        user,
+        trajectoryEvaluators: [trajectoryEvaluator],
+        maxTurns: 5,
+      });
+
+      ls.logOutputs(result);
+      // Optionally, assert that the evaluator scored the interaction as satisfactory.
+      // This will cause the overall test case to fail if "score" is false.
+      expect(result.evaluatorResults[0].score).toBe(true);
+    }
+  );
+});
+```
+
+</CodeGroup>
+
+LangSmith 会自动识别并记录传入 `trajectory_evaluators` 返回的 feedback，并将其加到 experiment 中。还要注意，这个测试用例通过模拟用户的 `fixed_responses` 参数，用某个特定输入启动对话，你可以把这个输入记录下来，并作为存储数据集的一部分。
+
+你可能还会发现，把模拟用户的 system prompt 也纳入已记录的数据集中会更方便。
+
+### 使用 `evaluate`
+
+你也可以使用 [`evaluate`](/langsmith/evaluate-llm-application) 运行器来评估模拟出来的多轮交互。这和上面的 `pytest` / `Vitest` / `Jest` 示例相比，会有一些不同：
+
+* simulation 应该放进你的 `target` 函数中，而 `target` 函数应返回最终 trajectory。
+  * 这样 trajectory 就会成为 LangSmith 传给 evaluators 的 `outputs`。
+* 不再通过 `trajectory_evaluators` 参数传 evaluators，而是把 evaluators 作为参数直接传给 `evaluate()`。
+* 你需要一个已存在的数据集，其中包含输入以及（可选的）参考 trajectories。
+
+示例如下：
+
+<CodeGroup>
+
+```python Python
+from openevals.simulators import run_multiturn_simulation, create_llm_simulated_user
+from openevals.llm import create_llm_as_judge
+from openevals.types import ChatCompletionMessage
+from langsmith.wrappers import wrap_openai
+from langsmith import Client
+from openai import OpenAI
+
+ls_client = Client()
+examples = [
+    {
+        "inputs": {
+            "messages": [{ "role": "user", "content": "I want a refund for my car!" }]
+        },
+    },
+]
+dataset = ls_client.create_dataset(dataset_name="multiturn-starter")
+ls_client.create_examples(
+    dataset_id=dataset.id,
+    examples=examples,
+)
+trajectory_evaluator = create_llm_as_judge(
+    model="openai:o3-mini",
+    prompt="Based on the below conversation, was the user satisfied?\n{outputs}",
+    feedback_key="satisfaction",
+)
+
+def target(inputs: dict):
+    # Wrap OpenAI client for tracing
+    client = wrap_openai(OpenAI())
+    history = {}
+
+    def app(next_message: ChatCompletionMessage, *, thread_id: str):
+        if thread_id not in history:
+            history[thread_id] = []
+        history[thread_id] = history[thread_id] + [next_message]
+        res = client.chat.completions.create(
+            model="gpt-5.4-nano",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a patient and understanding customer service agent.",
+                }
+            ]
+            + history[thread_id],
+        )
+        response = res.choices[0].message
+        history[thread_id].append(response)
+        return response
+
+    user = create_llm_simulated_user(
+        system="You are a nice customer who wants a refund for their car.",
+        model="openai:gpt-5.4-nano",
+        fixed_responses=inputs["messages"],
+    )
+    res = run_multiturn_simulation(
+        app=app,
+        user=user,
+        max_turns=5,
+    )
+    return res["trajectory"]
+
+results = ls_client.evaluate(
+    target,
+    data=dataset.name,
+    evaluators=[trajectory_evaluator],
+)
+```
+
+```typescript TypeScript
+import { OpenAI } from "openai";
+import { Client } from "langsmith";
+import { wrapOpenAI } from "langsmith/wrappers/openai";
+import { evaluate } from "langsmith/evaluation";
+import {
+  createLLMSimulatedUser,
+  runMultiturnSimulation,
+  createLLMAsJudge,
+  type ChatCompletionMessage,
+} from "openevals";
+
+const lsClient = new Client();
+const inputs = {
+  messages: [
+    {
+      role: "user",
+      content: "I want a refund for my car!",
+    },
+  ],
+};
+const datasetName = "Multiturn";
+const dataset = await lsClient.createDataset(datasetName);
+await lsClient.createExamples([{ inputs, dataset_id: dataset.id }]);
+
+const trajectoryEvaluator = createLLMAsJudge({
+  model: "openai:o3-mini",
+  prompt:
+    "Based on the below conversation, was the user satisfied?\n{outputs}",
+  feedbackKey: "satisfaction",
+});
+
+const client = wrapOpenAI(new OpenAI());
+
+const target = async (inputs: { messages: ChatCompletionMessage[]}) => {
+  const history = {};
+  // Create a custom app function
+  const app = async (
+    { inputs: nextMessage, threadId }: { inputs: ChatCompletionMessage, threadId: string }
+  ) => {
+    if (history[threadId] === undefined) {
+      history[threadId] = [];
+    }
+    history[threadId].push(nextMessage);
+    const res = await client.chat.completions.create({
+      model: "gpt-5.4-nano",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a patient and understanding customer service agent",
+        },
+        nextMessage,
+      ],
+    });
+    const responseMessage = res.choices[0].message;
+    history[threadId].push(responseMessage);
+    return responseMessage;
+  };
+
+  const user = createLLMSimulatedUser({
+    system:
+      "You are a nice customer who wants a refund for their car.",
+    model: "openai:gpt-5.4-nano",
+    fixedResponses: inputs.messages,
+  });
+
+  const result = await runMultiturnSimulation({
+    app,
+    user,
+    maxTurns: 5,
+  });
+  return result.trajectory;
+};
+
+await evaluate(target, {
+  data: datasetName,
+  evaluators: [trajectoryEvaluator],
+});
+```
+
+</CodeGroup>
+
+## 修改模拟用户 persona
+
+上面的示例都对所有输入示例使用了相同的模拟用户 persona，也就是通过 `create_llm_simulated_user` 中的 `system` 参数定义的角色。如果你希望针对数据集中的不同条目使用不同 persona，可以给数据集示例增加一个额外字段，用于存放对应的 `system` prompt，然后在创建模拟用户时像下面这样把它传进去：
+
+<CodeGroup>
+
+```python Python
+from openevals.simulators import run_multiturn_simulation, create_llm_simulated_user
+from openevals.llm import create_llm_as_judge
+from openevals.types import ChatCompletionMessage
+from langsmith.wrappers import wrap_openai
+from langsmith import Client
+from openai import OpenAI
+
+ls_client = Client()
+examples = [
+    {
+        "inputs": {
+            "messages": [{ "role": "user", "content": "I want a refund for my car!" }],
+            "simulated_user_prompt": "You are an angry and belligerent customer who wants a refund for their car."
+        },
+    },
+    {
+        "inputs": {
+            "messages": [{ "role": "user", "content": "Please give me a refund for my car." }],
+            "simulated_user_prompt": "You are a nice customer who wants a refund for their car.",
+        },
+    }
+]
+dataset = ls_client.create_dataset(dataset_name="multiturn-with-personas")
+ls_client.create_examples(
+    dataset_id=dataset.id,
+    examples=examples,
+)
+trajectory_evaluator = create_llm_as_judge(
+    model="openai:o3-mini",
+    prompt="Based on the below conversation, was the user satisfied?\n{outputs}",
+    feedback_key="satisfaction",
+)
+
+def target(inputs: dict):
+    # Wrap OpenAI client for tracing
+    client = wrap_openai(OpenAI())
+    history = {}
+
+    def app(next_message: ChatCompletionMessage, *, thread_id: str):
+        if thread_id not in history:
+            history[thread_id] = []
+        history[thread_id] = history[thread_id] + [next_message]
+        res = client.chat.completions.create(
+            model="gpt-5.4-nano",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a patient and understanding customer service agent.",
+                }
+            ]
+            + history[thread_id],
+        )
+        response = res.choices[0].message
+        history[thread_id].append(response)
+        return response
+
+    user = create_llm_simulated_user(
+        system=inputs["simulated_user_prompt"],
+        model="openai:gpt-5.4-nano",
+        fixed_responses=inputs["messages"],
+    )
+    res = run_multiturn_simulation(
+        app=app,
+        user=user,
+        max_turns=5,
+    )
+    return res["trajectory"]
+
+results = ls_client.evaluate(
+    target,
+    data=dataset.name,
+    evaluators=[trajectory_evaluator],
+)
+```
+
+```typescript TypeScript
+import { OpenAI } from "openai";
+import { Client } from "langsmith";
+import { wrapOpenAI } from "langsmith/wrappers/openai";
+import { evaluate } from "langsmith/evaluation";
+import {
+  createLLMSimulatedUser,
+  runMultiturnSimulation,
+  createLLMAsJudge,
+  type ChatCompletionMessage,
+} from "openevals";
+
+const lsClient = new Client();
+const datasetName = "Multiturn with personas";
+const dataset = await lsClient.createDataset(datasetName);
+const examples = [{
+  inputs: {
+    messages: [
+      {
+        role: "user",
+        content: "I want a refund for my car!",
+      },
+    ],
+    simulated_user_prompt: "You are an angry and belligerent customer who wants a refund for their car.",
+  },
+  dataset_id: dataset.id,
+}, {
+  inputs: {
+    messages: [
+      {
+        role: "user",
+        content: "Please give me a refund for my car."
+      }
+    ],
+    simulated_user_prompt: "You are a nice customer who wants a refund for their car.",
+  },
+  dataset_id: dataset.id,
+}];
+await lsClient.createExamples(examples);
+
+const trajectoryEvaluator = createLLMAsJudge({
+  model: "openai:o3-mini",
+  prompt:
+    "Based on the below conversation, was the user satisfied?\n{outputs}",
+  feedbackKey: "satisfaction",
+});
+
+const client = wrapOpenAI(new OpenAI());
+
+const target = async (inputs: {
+  messages: ChatCompletionMessage[],
+  simulated_user_prompt: string,
+}) => {
+  const history = {};
+  // Create a custom app function
+  const app = async (
+    { inputs: nextMessage, threadId }: { inputs: ChatCompletionMessage, threadId: string }
+  ) => {
+    if (history[threadId] === undefined) {
+      history[threadId] = [];
+    }
+    history[threadId].push(nextMessage);
+    const res = await client.chat.completions.create({
+      model: "gpt-5.4-nano",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a patient and understanding customer service agent",
+        },
+        nextMessage,
+      ],
+    });
+    const responseMessage = res.choices[0].message;
+    history[threadId].push(responseMessage);
+    return responseMessage;
+  };
+
+  const user = createLLMSimulatedUser({
+    system: inputs.simulated_user_prompt,
+    model: "openai:gpt-5.4-nano",
+    fixedResponses: inputs.messages,
+  });
+
+  const result = await runMultiturnSimulation({
+    app,
+    user,
+    maxTurns: 5,
+  });
+  return result.trajectory;
+};
+
+await evaluate(target, {
+  data: datasetName,
+  evaluators: [trajectoryEvaluator],
+});
+```
+
+</CodeGroup>
+
+## 下一步
+
+你已经了解了一些模拟多轮交互，并在 LangSmith evals 中运行它们的技巧。
+
+接下来你可能还想探索这些主题：
+
+* [Trace multiturn conversations across different traces](/langsmith/threads)
+* [Use multiple messages in the playground UI](/langsmith/multiple-messages)
+* [Return multiple metrics in one evaluator](/langsmith/multiple-scores)
+
+你也可以继续查看 [OpenEvals readme](https://github.com/langchain-ai/openevals)，了解更多预构建 evaluators。
