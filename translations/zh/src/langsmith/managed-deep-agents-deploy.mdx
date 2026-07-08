@@ -1,782 +1,212 @@
 ---
-title: 部署一个 Managed Deep Agent
+title: Deploy a Managed Deep Agent
 sidebarTitle: 部署 agent
-description: 使用 CLI、SDK 或 REST API 创建或更新 Managed Deep Agent。
+description: 使用 mda CLI 测试并部署 Managed Deep Agent。
 ---
 
-部署 Managed Deep Agent 会创建或更新托管的 agent 资源，并同步包含 instructions、skills、subagents 和 tool 配置的托管文件树。一次 deploy 并不会创建 [LangSmith Deployment](/langsmith/deployment-quickstart)。关于 deploy 实际会创建哪些内容，请参见 [Created resources](/langsmith/managed-deep-agents-overview#created-resources)。
+import ManagedDeepAgentsPrivateBetaNote from '/snippets/langsmith/managed-deep-agents-private-beta-note.mdx';
+import ManagedDeepAgentsRuntimeOwnership from '/snippets/langsmith/managed-deep-agents-runtime-ownership.mdx';
 
-请选择适合你任务的接口：
-
-- 大多数场景使用 [CLI](/langsmith/managed-deep-agents-cli)
-- Python 或 TypeScript 自动化使用 [SDKs](/langsmith/managed-deep-agents-sdk)
-- 如果你需要直接控制请求 payload，则使用 [REST API](/langsmith/managed-deep-agents-api-overview)
+部署 Managed Deep Agent 会把代码优先项目编译成托管 LangGraph app，将 deploy 负责的 context 同步到 [Context Hub](/langsmith/use-the-context-hub)，上传编译后的源码，并触发 LangSmith hosted deployment build。
 
 <Note>
-Managed Deep Agents 目前处于 **private beta**，仅在美国区域的 [LangSmith Cloud](/langsmith/cloud) 提供。[加入候补名单](https://www.langchain.com/langsmith-managed-deep-agents-waitlist)以申请访问权限。
+<ManagedDeepAgentsPrivateBetaNote />
 </Note>
 
-本页覆盖完整的 deploy 工作流，包括项目文件、MCP tools、subagents、backends、共享 agent 更新，以及 REST API。若想用更快、带引导的方式完成设置，请参见 [quickstart](/langsmith/managed-deep-agents-quickstart)。
+本页介绍 secrets 路由、本地开发行为、sandbox 配置和 deploy 提示。关于命令 flags、deploy 步骤清单和故障排查，请参见 [CLI reference](/langsmith/managed-deep-agents-cli)。
+
+<Tip>
+如果你需要理解编译、deploy 生命周期图、Context Hub、threads 和 sandboxes 的概念流程，请参见 [How Managed Deep Agents work](/langsmith/managed-deep-agents-how-it-works)。
+</Tip>
 
 ## 前置条件
 
-在 deploy 之前，请确保你已经准备好：
+在部署前，请确认你已经具备：
 
-- 拥有 Managed Deep Agents 的 [private beta 访问权限](https://www.langchain.com/langsmith-managed-deep-agents-waitlist)
-- 一个可访问 private beta workspace 的 [LangSmith API key](/langsmith/create-account-api-key)，并导出为 `LANGSMITH_API_KEY`
-- 一个符合你使用方式的客户端：CLI 使用 `deepagents-cli`，SDK 工作流使用 `managed-deepagents`（Python）或 `@langchain/managed-deepagents`（TypeScript），REST API 则可以使用 curl 等 HTTP 客户端。安装命令和版本要求请参见 quickstart 中的 [Install a client](/langsmith/managed-deep-agents-quickstart#install-a-client)
+- 一个拥有 Managed Deep Agents [private beta 访问权限](https://www.langchain.com/langsmith-managed-deep-agents-waitlist) 的 workspace。
+- 该 workspace 的 [LangSmith API key](/langsmith/create-account-api-key)，并把它放在 `.env` 或 shell 环境变量中。
+- 从 `managed-deepagents` 安装好的 `mda` CLI。
+- 已安装项目依赖，TypeScript 项目使用 `npm install`，生成的 Python 项目使用 `uv sync`。
+- 模型 provider 凭据，例如 `OPENAI_API_KEY`，并放在 `.env`、shell 环境变量或 LangSmith workspace secrets 中。
 
-## 使用 CLI 从项目文件部署
+CLI 默认面向美国区域 LangSmith Cloud。
 
-CLI 会创建本地项目、校验文件、检查所引用的 MCP servers，并把项目部署到 Managed Deep Agents。所有命令和项目文件规则请参见 [CLI reference](/langsmith/managed-deep-agents-cli)。
+## 项目文件
 
-### 创建项目
+Managed Deep Agents 项目以 agent 入口文件为起点，可以按需包含若干项目目录。你可以通过 `mda init` 创建项目，也可以在现有 TypeScript 或 Python 项目根目录中加入 `agent.ts`、`agent.tsx` 或 `agent.py` 来适配现有项目。
 
-创建一个 Managed Deep Agents 项目：
+完整文件布局与打包规则请参见 [CLI project file reference](/langsmith/managed-deep-agents-cli#project-file-reference)。如果你需要定义 agent 入口、tools、middleware 和 interrupts，请参见 [quickstart](/langsmith/managed-deep-agents-quickstart#edit-the-agent)。
+
+<ManagedDeepAgentsRuntimeOwnership />
+
+## 配置 instructions、skills 和 memory
+
+请把 system prompt 放在项目根 agent 入口旁边的 `instructions.md` 中：
+
+```markdown instructions.md
+# Assistant
+
+You are a careful assistant. Use available tools when needed and cite sources.
+```
+
+请把 deploy 负责的 skills 放在项目根 agent 入口旁边的 `skills/` 目录下。Deploy 会把 `instructions.md` 和 `skills/**` 同步到与该 deployment 关联的 Context Hub repo。
+
+托管 memory 存储在同一个 Context Hub repo 的 `/memories/AGENTS.md` 中。Deploy 会同步 `instructions.md` 和 `skills/**`，但会保留 memory，不会覆盖 `memories/**`。如果要关闭 MDA 托管 memory，请在 agent 定义中设置 `disableMemory: true` 或 `disable_memory=True`。
+
+## 添加 tools、connectors 和 middleware
+
+请直接在 agent 源码中添加自编写 tools 和 middleware。MDA 会把项目文件复制到编译后的 build 中，因此从 `tools/`、`middleware/` 或其他本地模块导入时，行为与普通 Python 或 TypeScript 项目一致。
+
+- 对于业务逻辑、私有 API、数据库访问以及其他项目自有代码，请使用 [custom tools](/langsmith/managed-deep-agents-tools)。
+- 对于围绕模型调用、工具调用、生命周期 hooks、重试、限制和数据处理的横切逻辑，请使用 [custom middleware](/langsmith/managed-deep-agents-middleware)。
+- 在 `connectors/mcp.ts` 或 `connectors/mcp.py` 中声明远程 MCP servers；MDA 会在运行时加载这些 connector tools，并把它们追加到自编写 tools 之后。示例和指导请参见 [Connect MCP tools](/langsmith/managed-deep-agents-mcp)。
+
+如果你希望在敏感 tool calls 前暂停等待人工批准，请在 agent 定义中设置 `interrupt_on`。请参见 [Human-in-the-loop](/langsmith/managed-deep-agents-middleware#human-in-the-loop)。
+
+## 添加 schedules
+
+如果 agent 需要按固定频率运行，请在 `schedules/` 下添加托管 cron schedules。每个 schedule 文件都要导出一个使用 `defineSchedule` 或 `define_schedule` 创建的命名 `schedule` 声明。
+
+示例与 schedule 限制请参见 [Schedules](/langsmith/managed-deep-agents-schedules)。
+
+## 配置 sandbox
+
+当 agent 需要隔离的代码执行环境或文件系统操作能力时，请使用 sandbox。你可以在 `sandbox/index.ts` 或 `sandbox/__init__.py` 中导出 `sandbox`。
+
+<CodeGroup>
+
+```python sandbox/__init__.py
+from managed_deepagents import define_sandbox
+from deepagents.backends import LangSmithSandbox
+
+sandbox = define_sandbox(
+    LangSmithSandbox,
+    scope="thread",
+    idle_ttl_seconds=600,
+    default_timeout=600,
+)
+```
+
+```ts sandbox/index.ts
+import { defineSandbox } from "managed-deepagents";
+import { LangSmithSandbox } from "deepagents";
+
+export const sandbox = defineSandbox(LangSmithSandbox, {
+  scope: "thread",
+  idleTtlSeconds: 600,
+  defaultTimeout: 600,
+});
+```
+
+</CodeGroup>
+
+Sandboxes 以 thread 为作用域。每个 durable thread 或 conversation 都拥有自己的 sandbox。
+
+如果存在 `sandbox/setup.sh`，MDA 会在新建托管 sandbox 时运行一次。你可以用它来安装包、准备文件或初始化工作区状态。
+
+关于 sandbox 的 scope 和本地开发时的生命周期，请参见 [How Managed Deep Agents work](/langsmith/managed-deep-agents-how-it-works#sandboxes)。
+
+## 本地运行
+
+运行本地 LangGraph dev server：
 
 ```bash
-deepagents init my-agent
-cd my-agent
+mda dev .
 ```
 
-这个命令会生成：
+`mda dev` 会编译到 `.mda/build`，并从该目录启动对应的 LangGraph dev server。你可以传入 `--port`、`--hostname`、`--browser` 或 `--no-reload` 来控制本地 dev server 行为。
 
-| File or directory | Purpose |
-| --- | --- |
-| `agent.json` | 配置托管 agent 的名称、模型、backend，以及可选的目标 `agent_id` |
-| `AGENTS.md` | 定义 agent instructions |
-| `tools.json` | 初始为空。在注册 MCP server 后，把 MCP-backed tools 加进来 |
-| `skills/example-skill/` | 包含一个示例 skill，可自行编辑或删除 |
-| `subagents/researcher/` | 包含一个示例 subagent，可自行编辑或删除 |
-| `.gitignore` | 用于排除本地环境文件 |
+在本地开发时，`mda dev` 会把项目 `.env` 文件暂存到 `.mda/build/.env`，以便 LangGraph 加载 model provider keys 和 connector tokens。
 
-你也可以额外添加：
+对于 Python 项目，`mda dev` 要求 `uv` 位于 `PATH` 中，并会自动解析本地 LangGraph dev server。
 
-| File or directory | Purpose |
-| --- | --- |
-| `skills/<name>/` | 存放 agent 可使用的附加 skills |
-| `subagents/<name>/` | 存放用于委派工作的附加 subagent 定义 |
+如果配置了 sandbox，`mda dev` 会优先尝试配置的 provider；当缺少 provider 凭据时，它会退回到本地临时目录 sandbox。这个本地 fallback 仅适用于开发。
 
-生成的 `agent.json` 使用可读性较高的本地 CLI 格式：
+全部 `mda dev` flags 请参见 [CLI reference](/langsmith/managed-deep-agents-cli#develop-locally)。
 
-```json agent.json
-{
-  "name": "my-agent",
-  "description": "A managed deep agent.",
-  "model": "openai:gpt-5.5",
-  "backend": {
-    "type": "state"
-  }
-}
-```
-
-<Note>
-模型标识符使用 `{provider}:{model_id}` 这种形式。关于可用的 providers 和 models，请参见 [Supported models](/langsmith/managed-deep-agents-overview#supported-models)。
-</Note>
-
-请编辑 `AGENTS.md`，定义 agent 的行为。Deploy 会同步到托管文件树中的完整项目布局如下：
-
-```text
-my-agent/
-  agent.json                       # Agent metadata, model, and backend
-  AGENTS.md                        # Main agent instructions (system prompt)
-  tools.json                       # Optional: MCP-backed tools
-  skills/<name>/SKILL.md           # Optional: reusable procedures
-  subagents/<name>/agent.json      # Optional: delegated worker metadata
-  subagents/<name>/AGENTS.md       # Optional: delegated worker instructions
-  subagents/<name>/tools.json      # Optional: subagent-scoped MCP tools
-```
-
-`deepagents init` 会生成一个空的 `tools.json`、一个示例 [skill](/oss/deepagents/skills) 和一个示例 [subagent](/oss/deepagents/subagents)，这样你在注册 MCP server 之前也能成功完成首次 deploy。你可以根据实际 agent 需求编辑或删除这些示例。Deploy 会读取项目中的每一个文件，并把整棵树同步到 [Context Hub](/langsmith/use-the-context-hub) agent repo。完整字段说明请参见 [CLI reference](/langsmith/managed-deep-agents-cli#project-file-reference)。
-
-### 添加 MCP tools
-
-如果希望 agent 调用 MCP tools，请先为 workspace [注册 MCP server](/langsmith/managed-deep-agents-mcp)，然后把 tool 条目加入项目的 `tools.json`。Tool 条目通过 URL 引用一个已注册的 server。
-
-注册完 server 后，可以列出它暴露的 tools，并打印一个可以直接粘贴的 `tools.json` 片段：
-
-```bash
-deepagents mcp-servers tools <id|name|url>
-```
-
-`deepagents mcp-servers add` 命令在注册完成后，也会尝试列出 tools。如果你想跳过这一步，请传入 `--no-tools`。
-
-```json tools.json
-{
-  "tools": [
-    {
-      "name": "example_tool",
-      "mcp_server_url": "https://example.com/mcp",
-      "mcp_server_name": "my-tools",
-      "display_name": "example_tool"
-    }
-  ],
-  "interrupt_config": {
-    "https://example.com/mcp::example_tool": true
-  }
-}
-```
-
-每个 tool 至少需要 `name` 和 `mcp_server_url`。`mcp_server_name` 和 `display_name` 都是可选字段。你可以使用可选的 `interrupt_config` 对象，要求某个 tool 在运行前必须经过人工批准。请以 `"{mcp_server_url}::{tool_name}"` 作为 key，并将其值设为 `true`。
-
-Deploy 在发请求前，会校验所引用的 MCP server URL。如果某个 server URL 尚未注册，deploy 会失败，并提示你先添加它。关于 server 设置和 OAuth，请参见 [Connect tools](/langsmith/managed-deep-agents-mcp)。
-
-### 添加 subagents
-
-Subagents 是主 agent 可以调用的委派 worker，适合处理聚焦型任务。请先在项目根目录下添加一个 `subagents/` 目录，然后为每个 subagent 创建一个单独目录。每个 subagent 目录都要求包含 `agent.json` 和 `AGENTS.md`，并且可以带上自己的 `tools.json` 和 `skills/`。Subagent 名称来自它的目录名。
-
-```text
-my-agent/
-  agent.json
-  AGENTS.md
-  subagents/
-    researcher/
-      agent.json
-      AGENTS.md
-      tools.json                   # Optional: subagent-scoped MCP tools
-      skills/                      # Optional: subagent-local skills
-```
-
-Subagent 的 `agent.json` 支持可选的 `description` 和 `model`：
-
-```json subagents/researcher/agent.json
-{
-  "description": "Researches a topic and returns concise findings with citations.",
-  "model": "openai:gpt-5.5"
-}
-```
-
-新项目请优先使用 `model`。为了兼容旧格式，本地 subagent 文件中的 legacy `model_id` key 仍然可用，而 REST API 的 subagent schema 也依然使用 `model_id`。
-
-请在 `subagents/researcher/AGENTS.md` 中编写 subagent instructions：
-
-```md subagents/researcher/AGENTS.md
-# Researcher
-
-Search for sources, take notes, and return concise findings with citations.
-```
-
-如果你想让某个 subagent 拥有自己的 MCP tools，可以添加 `subagents/researcher/tools.json`，其结构与项目级的 `tools.json` 相同。Subagent 名称会以不区分大小写的方式检查重复。
-
-### 审查完整项目结构
-
-Tools 和 subagents 都不放在 `agent.json` 里：tools 存在 `tools.json` 中，subagents 放在 `subagents/` 目录中。一个同时使用三者的项目看起来像这样：
-
-```text
-research-assistant/
-  agent.json
-  AGENTS.md
-  tools.json
-  subagents/
-    researcher/
-      agent.json
-      AGENTS.md
-      tools.json
-```
-
-`agent.json` 只负责 agent metadata、model 和 backend：
-
-```json agent.json
-{
-  "name": "research-assistant",
-  "description": "Research assistant that searches the web and delegates deep research.",
-  "model": "openai:gpt-5.5",
-  "backend": {
-    "type": "state"
-  }
-}
-```
-
-`AGENTS.md` 定义主 agent instructions：
-
-```md AGENTS.md
-# Research assistant
-
-You are a research assistant. Use the available tools to search for sources, and
-delegate deep research to the `researcher` subagent. Return concise answers with
-citations.
-```
-
-`tools.json` 引用主 agent 会调用的 workspace MCP server：
-
-```json tools.json
-{
-  "tools": [
-    {
-      "name": "web_search",
-      "mcp_server_url": "https://example.com/mcp",
-      "mcp_server_name": "my-tools"
-    }
-  ]
-}
-```
-
-`subagents/researcher/agent.json` 设置 subagent 的 metadata 和 model：
-
-```json subagents/researcher/agent.json
-{
-  "description": "Researches a topic and returns concise findings with citations.",
-  "model": "openai:gpt-5.5"
-}
-```
-
-`subagents/researcher/AGENTS.md` 定义 subagent instructions：
-
-```md subagents/researcher/AGENTS.md
-# Researcher
-
-Search for sources, take notes, and return concise findings with citations.
-```
-
-`subagents/researcher/tools.json` 为这个 subagent 配置它自己的 MCP tools：
-
-```json subagents/researcher/tools.json
-{
-  "tools": [
-    {
-      "name": "web_search",
-      "mcp_server_url": "https://example.com/mcp",
-      "mcp_server_name": "my-tools"
-    }
-  ]
-}
-```
-
-### 选择 backend
-
-CLI 生成的 Managed Deep Agents 项目默认在 `agent.json` 中使用 `state` backend：
-
-```json agent.json
-{
-  "backend": {
-    "type": "state"
-  }
-}
-```
-
-当 agent 需要隔离环境来执行代码、处理文件系统操作或运行长任务时，请改用 [LangSmith sandbox](/langsmith/sandboxes) backend。LangSmith 会管理底层 sandbox 生命周期，而 agent 本身则继续以 thread 级或 agent 级作用域运行。
-
-| Backend type | Use for |
-| --- | --- |
-| `state` | 不使用任何 sandbox 特定 backend 行为 |
-| `sandbox` with `sandbox_config.scope: "thread"` | 将 LangSmith sandbox 资源限定到每个 thread |
-| `sandbox` with `sandbox_config.scope: "agent"` | 将 LangSmith sandbox 资源限定到整个 agent |
-
-你可以在 `agent.json` 的 `backend` 下添加可选的 sandbox 设置：
-
-```json agent.json
-{
-  "backend": {
-    "type": "sandbox",
-    "sandbox_config": {
-      "scope": "thread",
-      "policy_ids": ["policy-id"],
-      "idle_ttl_seconds": 900,
-      "delete_after_stop_seconds": 300
-    }
-  }
-}
-```
-
-只有当 `backend.type` 是 `sandbox` 时，`backend.sandbox_config` 才有效。关于 snapshots、service URLs、permissions、CLI commands 和 SDK 用法等独立 sandbox 能力，请参见 [LangSmith sandboxes overview](/langsmith/sandboxes)。
-
-### 部署项目
+## 部署到 LangSmith
 
 部署本地项目：
 
 ```bash
-deepagents deploy
+mda deploy .
 ```
 
-如果想在真正 deploy 前预览组装出来的 payload 和托管文件树，可以运行 `deepagents deploy --dry-run`。
-
-第一次 deploy 会通过 `/v1/deepagents/agents` 创建一个 Managed Deep Agent。之后的 deploy 会使用本地 deploy state 去更新同一个远程 agent。
-
-成功后，CLI 会打印 agent 名称、ID、简短 revision、agent URL，以及 deploy 后的 MCP health check：
+<Tip>
+`mda deploy` 会把本地项目输入路由到不同的托管目标：
 
 ```text
-Deployed: my-agent
-  agent_id: e2de7a35-9dda-462b-b982-9e57051993bc
-  revision: 13ac11f1
-  https://smith.langchain.com/o/-/agents/e2de7a35-9dda-462b-b982-9e57051993bc
-  health:   {'agent_id': '...', 'mcp_check': {'ok': True, 'servers': [{'url': 'https://example.com/mcp', 'ok': True}]}, ...}
+instructions.md + skills/**  -> Context Hub 中由 deploy 管理的 context
+memories/**                  -> 忽略；保留已有 Context Hub memory
+.env                         -> deploy 鉴权 + 非保留托管 secrets，不打包归档
+project source files         -> .mda/build 源码归档 -> 托管 deployment
+schedules/**                 -> deployment 可用后同步为 LangSmith cron jobs
 ```
+</Tip>
 
-上面的 `health` 输出是简写版本；它实际包含每个被引用 server 的完整 `mcp_check` 结果。`mcp_check.ok` 为 `True` 表示 agent 能够连接到其 tools 所引用的 MCP servers。即使托管文件本身没有变化，每次 deploy 仍会创建一个新的 agent revision，因为 deploy 总是会发送一次 metadata 更新。只有当托管文件内容发生变化时，托管文件树本身才会改变。
-
-### 更新共享 agent
-
-如果你在共享仓库中工作，或者你就是想有意更新一个已存在的 Managed Deep Agent，请在 `agent.json` 中设置目标 agent 的 `agent_id`：
-
-```json agent.json
-{
-  "name": "my-agent",
-  "agent_id": "agent-uuid",
-  "model": "openai:gpt-5.5",
-  "backend": {
-    "type": "state"
-  }
-}
-```
-
-然后执行 deploy：
+如果目录名不是你希望的 deployment 名称，可以显式设置名称：
 
 ```bash
-deepagents deploy
+mda deploy . --name research-assistant
 ```
 
-<Warning>
-一旦设置了 `agent_id`，deploy 将会原地更新现有的共享 agent。
-</Warning>
-
-第一次这样做时，CLI 会在更新远程 agent 前要求你确认。如果想跳过确认，传入 `--yes`：
+创建生产 deployment 时，请使用 `--deployment-type prod`：
 
 ```bash
-deepagents deploy --yes
+mda deploy . --deployment-type prod
 ```
 
-### 排查 deploy 问题
-
-| Symptom | Cause and fix |
-| --- | --- |
-| Deploy fails with an unregistered MCP server URL | `tools.json` 中的某个 tool 引用了一个尚未为该 workspace 注册的 server。请先[注册该 server](/langsmith/managed-deep-agents-mcp)，然后重新 deploy。 |
-| `mcp_check.ok` is `False` in the deploy output | Agent 无法连接一个或多个被引用的 MCP servers。请在 `servers` 字段中找到失败的 URL，确认 server 正在运行且可访问，然后重新 deploy。 |
-| Deploy prompts to confirm an update you did not expect | `agent.json` 中声明了 `agent_id`，并指向一个现有远程 agent。继续之前请先确认目标；如果你想创建新的 agent，请移除 `agent_id`。 |
-| Deploy fails with `401` or `403` | `LANGSMITH_API_KEY` 缺失、无效，或其所属 workspace 没有 private beta 访问权限。请检查 key，并确认 workspace 已获得权限。 |
-
-## 使用 SDK 或 API 创建或更新 agent
-
-### 将项目文件映射到 SDK 或 API 字段
-
-Create 和 update 的 payload 接受与 CLI 同步相同的项目结构。每个类型化字段都对应到一个托管文件：
-
-| SDK or API field | Managed file |
-|------------------|--------------|
-| `name`<br />`description`<br />`model`(SDK)<br />`runtime.model.model_id`(API)<br />`backend` | `agent.json` |
-| `instructions` | `AGENTS.md` |
-| `tools` | `tools.json` |
-| `subagents[]` | `subagents/<name>/AGENTS.md` 以及可选的 `subagents/<name>/tools.json` |
-| `skills[]` | `skills/<name>/SKILL.md` 及其支持文件 |
-| `files` | 不属于上述类型化字段映射的任意路径 |
-
-如果某个路径同时通过类型化字段和 `files` 进行设置，就会返回 `422`（例如同时使用 `instructions` 和 `files["AGENTS.md"]`）。同一路径只能选一种方式。完整请求 schema 请参见 [update agent reference](/langsmith/managed-deep-agents-api/agents/update-agent)。
-
-在 update 时，省略的字段会保持不变。像 `tools`、`subagents`、`skills` 和 `extras` 这类嵌套结构字段，只要你显式包含它们，就会整体替换。
-
-### 鉴权并配置请求
-
-如果使用 SDK，请先安装并配置 [Managed Deep Agents SDKs](/langsmith/managed-deep-agents-sdk)。如果直接调用 REST API，请先设置请求默认值：
+如果你只想触发 build 而不等待完成，可以使用 `--no-wait`：
 
 ```bash
-export LANGSMITH_API_KEY="<LANGSMITH_API_KEY>"
-export LANGSMITH_API_URL="https://api.smith.langchain.com"
-export DEEPAGENTS_BASE_URL="$LANGSMITH_API_URL/v1/deepagents"
+mda deploy . --no-wait
 ```
 
-API 请求需要 `X-Api-Key` header：
+启用 `--no-wait` 时，CLI 会在 deployment 进入 `DEPLOYED` 之前退出，因此这次调用不会对 schedules 执行 reconcile。
 
-```txt
-X-Api-Key: <LANGSMITH_API_KEY>
+成功后，CLI 会打印 LangSmith deployment dashboard URL。完整 deploy 步骤请参见 [CLI reference](/langsmith/managed-deep-agents-cli#deploy-projects)。
+
+## Secrets 与环境文件
+
+`mda deploy` 会优先读取项目 `.env`，再读取 shell 环境变量。你可以把用于 deploy 鉴权的 LangSmith API key，以及托管 deployment 所需的运行时 secrets 放进 `.env`：
+
+```text .env
+LANGSMITH_API_KEY=<LANGSMITH_API_KEY>
+OPENAI_API_KEY=<OPENAI_API_KEY>
+GITHUB_MCP_TOKEN=<GITHUB_MCP_TOKEN>
+DATABASE_URL=<DATABASE_URL>
 ```
 
-Python SDK 会从环境中读取 `LANGSMITH_API_KEY`。TypeScript SDK 则通过显式的 `apiKey` 参数传入。
+`LANGSMITH_API_KEY`、`LANGGRAPH_HOST_API_KEY`、`LANGCHAIN_API_KEY` 以及其他平台变量属于保留变量。它们可用于 deploy 鉴权，但不会作为用户可管理的 deployment secrets 上传。
 
-### 创建 agent
+诸如模型 provider keys、MCP tokens 和自定义 tool 凭据等非保留 `.env` 项，会在 `mda deploy` 创建或更新 deployment 时转发为托管 deployment secrets。如果所配置的模型依赖某个 provider key，而该 key 在 `.env`、shell 环境变量或 LangSmith workspace secrets 中都找不到，deploy 会在上传前失败。如果 provider key 仅存在于 shell 环境变量中，`mda deploy` 也会在这次部署中将其作为 secret 转发。
 
-你可以使用与 CLI 项目文件相同的 instructions、tools、skills 和 subagents 来创建 agent：
+保留平台变量、空值、`.env` 和 `.env.*` 文件都不会被复制到编译后的 build archive 中。
 
-REST API 会把 model 放在 `runtime.model.model_id` 下；SDK 和 CLI 则使用顶层 `model` 字段。
+关于认证 key 的优先顺序和保留变量清单，请参见 [CLI reference](/langsmith/managed-deep-agents-cli#authentication)。
 
-<Tabs>
-  <Tab title="Python SDK">
+## 排查 deploy 问题
 
-```python
-from managed_deepagents import Client
+Deploy 故障排查请参见 [CLI reference](/langsmith/managed-deep-agents-cli#troubleshooting)。
 
-with Client() as client:
-    agent = client.agents.create(
-        name="research-assistant",
-        description="Research assistant that can search the web and summarize sources.",
-        model="openai:gpt-5.5",
-        backend={"type": "state"},
-        instructions=(
-            "You are a careful research assistant. Search for sources, "
-            "keep notes, and return concise answers with citations."
-        ),
-        tools={
-            "tools": [
-                {
-                    "name": "read_url_content",
-                    "mcp_server_url": "https://example.com/mcp",
-                    "mcp_server_name": "my-tools",
-                }
-            ],
-            "interrupt_config": {
-                "https://example.com/mcp::read_url_content": True,
-            },
-        },
-        skills=[
-            {
-                "name": "summarize",
-                "description": "Summarize long source documents.",
-                "instructions": (
-                    "# Summarize\n\n"
-                    "Extract the main claims, supporting evidence, and open questions."
-                ),
-            }
-        ],
-        subagents=[
-            {
-                "name": "source-checker",
-                "description": "Verify facts and source quality.",
-                "model_id": "openai:gpt-5.5",
-                "instructions": (
-                    "Check whether cited sources support the draft answer. "
-                    "Return a concise risk assessment."
-                ),
-            }
-        ],
-        include_files=True,
-    )
-
-agent_id = agent["id"]
-print(f"Agent ID: {agent_id}")
-```
-
-这个调用会返回创建后的 agent。传入 `include_files=True` 后，返回结果里还会包含托管文件树。
-
-  </Tab>
-  <Tab title="TypeScript SDK">
-
-```ts
-import { Client } from "@langchain/managed-deepagents";
-
-const client = new Client();
-
-const agent = await client.agents.create(
-  {
-    name: "research-assistant",
-    description: "Research assistant that can search the web and summarize sources.",
-    model: "openai:gpt-5.5",
-    backend: { type: "state" },
-    instructions:
-      "You are a careful research assistant. Search for sources, keep notes, and return concise answers with citations.",
-    tools: {
-      tools: [
-        {
-          name: "read_url_content",
-          mcp_server_url: "https://example.com/mcp",
-          mcp_server_name: "my-tools",
-        },
-      ],
-      interrupt_config: {
-        "https://example.com/mcp::read_url_content": true,
-      },
-    },
-    skills: [
-      {
-        name: "summarize",
-        description: "Summarize long source documents.",
-        instructions:
-          "# Summarize\n\nExtract the main claims, supporting evidence, and open questions.",
-      },
-    ],
-    subagents: [
-      {
-        name: "source-checker",
-        description: "Verify facts and source quality.",
-        model_id: "openai:gpt-5.5",
-        instructions:
-          "Check whether cited sources support the draft answer. Return a concise risk assessment.",
-      },
-    ],
-  },
-  { includeFiles: true },
-);
-
-console.log(`Agent ID: ${agent.id}`);
-```
-
-这个调用会返回创建后的 agent。传入 `{ includeFiles: true }` 后，返回结果里还会包含托管文件树。
-
-  </Tab>
-  <Tab title="cURL">
-
-```bash
-curl --request POST \
-  --url "$DEEPAGENTS_BASE_URL/agents" \
-  --header "X-Api-Key: $LANGSMITH_API_KEY" \
-  --header 'Content-Type: application/json' \
-  --data '{
-    "name": "research-assistant",
-    "description": "Research assistant that can search the web and summarize sources.",
-    "runtime": {
-      "model": {
-        "model_id": "openai:gpt-5.5"
-      }
-    },
-    "backend": {
-      "type": "state"
-    },
-    "instructions": "You are a careful research assistant. Search for sources, keep notes, and return concise answers with citations.",
-    "tools": {
-      "tools": [
-        {
-          "name": "read_url_content",
-          "mcp_server_url": "https://example.com/mcp",
-          "mcp_server_name": "my-tools"
-        }
-      ],
-      "interrupt_config": {
-        "https://example.com/mcp::read_url_content": true
-      }
-    },
-    "skills": [
-      {
-        "name": "summarize",
-        "description": "Summarize long source documents.",
-        "instructions": "# Summarize\n\nExtract the main claims, supporting evidence, and open questions."
-      }
-    ],
-    "subagents": [
-      {
-        "name": "source-checker",
-        "description": "Verify facts and source quality.",
-        "model_id": "openai:gpt-5.5",
-        "instructions": "Check whether cited sources support the draft answer. Return a concise risk assessment."
-      }
-    ]
-  }'
-```
-
-  </Tab>
-</Tabs>
-
-### 更新已有 agent
-
-更新 agent 时，只需包含你想修改的字段。请把 `<agent_id>` 替换为创建 agent 时返回的 ID：
-
-<Tabs>
-  <Tab title="Python SDK">
-
-```python
-from managed_deepagents import Client
-
-agent_id = "<agent_id>"
-
-with Client() as client:
-    agent = client.agents.update(
-        agent_id,
-        description="Research assistant with stricter citation rules.",
-        instructions=(
-            "You are a careful research assistant. Search for sources, "
-            "keep notes, and cite every factual claim."
-        ),
-        tools={
-            "tools": [
-                {
-                    "name": "read_url_content",
-                    "mcp_server_url": "https://example.com/mcp",
-                    "mcp_server_name": "my-tools",
-                }
-            ],
-            "interrupt_config": {
-                "https://example.com/mcp::read_url_content": True,
-            },
-        },
-        include_files=True,
-    )
-
-print(agent.get("revision"))
-```
-
-  </Tab>
-  <Tab title="TypeScript SDK">
-
-```ts
-import { Client } from "@langchain/managed-deepagents";
-
-const client = new Client();
-
-const agentId = "<agent_id>";
-
-const agent = await client.agents.update(
-  agentId,
-  {
-    description: "Research assistant with stricter citation rules.",
-    instructions:
-      "You are a careful research assistant. Search for sources, keep notes, and cite every factual claim.",
-    tools: {
-      tools: [
-        {
-          name: "read_url_content",
-          mcp_server_url: "https://example.com/mcp",
-          mcp_server_name: "my-tools",
-        },
-      ],
-      interrupt_config: {
-        "https://example.com/mcp::read_url_content": true,
-      },
-    },
-  },
-  { includeFiles: true },
-);
-
-console.log(agent.revision);
-```
-
-  </Tab>
-  <Tab title="cURL">
-
-```bash
-curl --request PATCH \
-  --url "$DEEPAGENTS_BASE_URL/agents/<agent_id>?include_files=true" \
-  --header "X-Api-Key: $LANGSMITH_API_KEY" \
-  --header 'Content-Type: application/json' \
-  --data '{
-    "description": "Research assistant with stricter citation rules.",
-    "instructions": "You are a careful research assistant. Search for sources, keep notes, and cite every factual claim.",
-    "tools": {
-      "tools": [
-        {
-          "name": "read_url_content",
-          "mcp_server_url": "https://example.com/mcp",
-          "mcp_server_name": "my-tools"
-        }
-      ],
-      "interrupt_config": {
-        "https://example.com/mcp::read_url_content": true
-      }
-    }
-  }'
-```
-
-  </Tab>
-</Tabs>
-
-如果你想在 update 时删除原始托管文件，请发送 `deleted_paths`，它是一个相对路径数组，例如 `["docs/old-notes.md"]`。如果你想删除某个结构化区块，例如所有 skills 或 subagents，则把对应字段传成空列表即可。
-
-### 添加原始托管文件
-
-对于不适合映射到 `instructions`、`tools`、`skills` 或 `subagents` 的内容，请使用顶层 `files`：
-
-<Tabs>
-  <Tab title="Python SDK">
-
-```python
-from managed_deepagents import Client
-
-with Client() as client:
-    agent = client.agents.update(
-        "<agent_id>",
-        files={
-            "docs/research-style.md": "Prefer primary sources and note uncertainty.",
-            "data/glossary.md": {"content": "# Glossary\n\nDefine domain terms here."},
-        },
-        include_files=True,
-    )
-```
-
-  </Tab>
-  <Tab title="TypeScript SDK">
-
-```ts
-import { Client } from "@langchain/managed-deepagents";
-
-const client = new Client();
-
-const agent = await client.agents.update(
-  "<agent_id>",
-  {
-    files: {
-      "docs/research-style.md": "Prefer primary sources and note uncertainty.",
-      "data/glossary.md": { content: "# Glossary\n\nDefine domain terms here." },
-    },
-  },
-  { includeFiles: true },
-);
-```
-
-  </Tab>
-  <Tab title="cURL">
-
-```bash
-curl --request PATCH \
-  --url "$DEEPAGENTS_BASE_URL/agents/<agent_id>?include_files=true" \
-  --header "X-Api-Key: $LANGSMITH_API_KEY" \
-  --header 'Content-Type: application/json' \
-  --data '{
-    "files": {
-      "docs/research-style.md": {
-        "content": "Prefer primary sources and note uncertainty."
-      },
-      "data/glossary.md": {
-        "content": "# Glossary\n\nDefine domain terms here."
-      }
-    }
-  }'
-```
-
-  </Tab>
-</Tabs>
-
-### 检查 agent 健康状态
-
-在 create 或 update 之后，可以通过 SDK 或 API 检查 agent 的 backend 和 tool 健康状态：
-
-<Tabs>
-  <Tab title="Python SDK">
-
-```python
-from managed_deepagents import Client
-
-with Client() as client:
-    health = client.agents.health("<agent_id>")
-
-print(health)
-```
-
-  </Tab>
-  <Tab title="TypeScript SDK">
-
-```ts
-import { Client } from "@langchain/managed-deepagents";
-
-const client = new Client();
-
-const health = await client.agents.health("<agent_id>");
-
-// JSON.stringify (not console.log(health)) so nested objects print in full:
-// console.log uses util.inspect with depth 2, which collapses deeper values to
-// "[Object]" — e.g. the entries inside mcp_check.servers.
-console.log(JSON.stringify(health, null, 2));
-```
-
-  </Tab>
-  <Tab title="cURL">
-
-```bash
-curl --url "$DEEPAGENTS_BASE_URL/agents/<agent_id>/health" \
-  --header "X-Api-Key: $LANGSMITH_API_KEY"
-```
-
-  </Tab>
-</Tabs>
-
-返回结果使用的 `mcp_check` 结构，与上文 [deploy output](#deploy-the-project) 中展示的结构相同。
-
-### 通过 API 管理 agent 生命周期
-
-可以使用这些 agent 管理路由完成生命周期自动化：
-
-| Task | Route |
-| --- | --- |
-| Create an agent | [`POST /v1/deepagents/agents`](/langsmith/managed-deep-agents-api/agents/create-agent) |
-| List agents | [`GET /v1/deepagents/agents`](/langsmith/managed-deep-agents-api/agents/list-agents) |
-| Get an agent | [`GET /v1/deepagents/agents/{agent_id}`](/langsmith/managed-deep-agents-api/agents/get-agent) |
-| Update an agent | [`PATCH /v1/deepagents/agents/{agent_id}`](/langsmith/managed-deep-agents-api/agents/update-agent) |
-| Delete an agent | [`DELETE /v1/deepagents/agents/{agent_id}`](/langsmith/managed-deep-agents-api/agents/delete-agent) |
+如果 deployment 进入 `BUILD_FAILED` 或 `DEPLOY_FAILED`，请在 LangSmith 中打开 CLI 打印出的 deployment URL，查看 revision logs。
 
 ## 下一步
 
-在你创建或部署完 agent 后，可以通过创建 thread 并流式运行一次 run，来[运行它](/langsmith/managed-deep-agents-invoke)。
+<CardGroup cols={2}>
+  <Card title="Connect MCP tools" icon="plug" href="/langsmith/managed-deep-agents-mcp">
+    通过 connectors 声明远程 MCP servers。
+  </Card>
+  <Card title="Schedules" icon="calendar" href="/langsmith/managed-deep-agents-schedules">
+    让 agent 通过托管 cron schedules 运行。
+  </Card>
+  <Card title="Custom tools" icon="tool" href="/langsmith/managed-deep-agents-tools">
+    在 agent 定义中添加自编写 LangChain tools。
+  </Card>
+  <Card title="Custom middleware" icon="code" href="/langsmith/managed-deep-agents-middleware">
+    添加日志、重试、限制和 guardrails middleware。
+  </Card>
+  <Card title="CLI reference" icon="terminal" href="/langsmith/managed-deep-agents-cli">
+    查看全部 `mda` 命令和 flags。
+  </Card>
+</CardGroup>

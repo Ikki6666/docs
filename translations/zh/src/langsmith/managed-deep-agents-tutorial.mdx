@@ -1,0 +1,213 @@
+---
+title: Build a scheduled research agent
+sidebarTitle: 教程
+description: 构建一个带 tool、持久 memory 和每日 schedule 的 Managed Deep Agent，然后将其部署。
+---
+
+import ManagedDeepAgentsPrivateBetaNote from '/snippets/langsmith/managed-deep-agents-private-beta-note.mdx';
+
+本教程会逐步为研究助手添加能力。请先完成 [quickstart](/langsmith/managed-deep-agents-quickstart)，创建项目脚手架、添加 API keys 并在本地运行 `mda dev`。然后你会继续添加搜索 tool、使用持久 memory、配置每日 schedule，并将其部署到 LangSmith。
+
+如果你想查看一个使用了全部原语的完整项目，请参见 [example project](/langsmith/managed-deep-agents-examples)。
+
+<Note>
+<ManagedDeepAgentsPrivateBetaNote />
+</Note>
+
+## 构建 agent
+
+<Steps>
+  <Step title="编写 instructions" id="instructions">
+
+将 `instructions.md` 替换为研究助手的行为说明。Instructions 会引用你下一步添加的 tool，以及运行时提供的持久 memory：
+
+```markdown instructions.md
+# Research assistant
+
+You are a careful research assistant. Find sources, keep notes, and return
+concise answers with citations.
+
+## Behavior
+
+- Use the `web_search` tool to find sources instead of guessing.
+- Cite the sources you used.
+
+## Memory
+
+- Remember the user's topics of interest and preferred answer format.
+- Never store secrets, API keys, or credentials in memory.
+```
+
+  </Step>
+
+  <Step title="添加搜索 tool" id="add-tool">
+
+创建 `tools/` 模块并加入一个搜索 tool，然后在 agent 入口中导入它。这个示例返回占位结果，因此无需外部 API 也能运行。你可以把函数体替换为调用自己的搜索 provider。
+
+<CodeGroup>
+
+```python tools/search.py
+from langchain.tools import tool
+
+
+@tool(parse_docstring=True)
+def web_search(query: str) -> str:
+    """Search the web for a query and return result snippets.
+
+    Args:
+        query: The search query.
+    """
+    # Replace this stub with a call to your search provider.
+    return f"Top results for '{query}': ..."
+```
+
+```ts tools/search.ts
+import { tool } from "langchain";
+import { z } from "zod";
+
+export const webSearch = tool(
+  async ({ query }) => {
+    // Replace this stub with a call to your search provider.
+    return `Top results for '${query}': ...`;
+  },
+  {
+    name: "web_search",
+    description: "Search the web for a query and return result snippets.",
+    schema: z.object({
+      query: z.string().describe("The search query."),
+    }),
+  },
+);
+```
+
+</CodeGroup>
+
+把这个 tool 导入 agent 入口，并传给 agent 定义：
+
+<CodeGroup>
+
+```python agent.py
+from managed_deepagents import define_deep_agent
+
+from tools.search import web_search
+
+agent = define_deep_agent(
+    model="openai:gpt-5.5",
+    tools=[web_search],
+)
+```
+
+```ts agent.ts
+import { defineDeepAgent } from "managed-deepagents";
+
+import { webSearch } from "./tools/search";
+
+export const agent = defineDeepAgent({
+  model: "openai:gpt-5.5",
+  tools: [webSearch],
+});
+```
+
+</CodeGroup>
+
+关于自定义 tools 的更多信息，请参见 [Custom tools](/langsmith/managed-deep-agents-tools)。
+
+  </Step>
+
+  <Step title="本地运行 agent" id="run-local">
+
+安装依赖并启动本地 dev server：
+
+<CodeGroup>
+
+```bash uv
+uv sync
+mda dev .
+```
+
+```bash npm
+npm install
+mda dev .
+```
+
+</CodeGroup>
+
+`mda dev` 会在 LangSmith Studio 中打开这个 agent。发送一个问题，确认 agent 会调用 `web_search`，并基于返回的 snippets 作答。
+
+  </Step>
+
+  <Step title="使用持久 memory" id="memory">
+
+托管 memory 默认开启，因此你无需配置 backend。运行时会把持久 memory 存储在 Context Hub 中，agent 会在运行期间读写它。由于 instructions 告诉 agent 要记住用户感兴趣的话题，你可以在一轮对话中告诉它一个偏好，例如 “I only care about open-source releases”，然后新开一个对话，确认它能回忆起这个偏好。
+
+如果你想关闭托管 memory，请在 agent 定义中设置 `disable_memory=True` 或 `disableMemory: true`。关于 memory 的持久化方式，请参见 [How Managed Deep Agents work](/langsmith/managed-deep-agents-how-it-works#threads-and-memory)。
+
+  </Step>
+
+  <Step title="安排每日摘要" id="schedule">
+
+添加一个 `schedules/` 模块，让 agent 可以在没有用户消息的情况下按 cron 节奏运行。下面这个 schedule 会在太平洋时间每个工作日早上 8 点运行：
+
+<CodeGroup>
+
+```python schedules/daily_digest.py
+from managed_deepagents import define_schedule
+
+schedule = define_schedule(
+    cron="0 8 * * 1-5",
+    timezone="America/Los_Angeles",
+    prompt="Summarize what you learned yesterday and list open questions.",
+)
+```
+
+```ts schedules/daily-digest.ts
+import { defineSchedule } from "managed-deepagents";
+
+export const schedule = defineSchedule({
+  cron: "0 8 * * 1-5",
+  timezone: "America/Los_Angeles",
+  prompt: "Summarize what you learned yesterday and list open questions.",
+});
+```
+
+</CodeGroup>
+
+在 deployment 可用后，`mda deploy` 会把这个 schedule reconcile 成 LangSmith cron job。关于 thread 行为和限制，请参见 [Schedules](/langsmith/managed-deep-agents-schedules)。
+
+  </Step>
+
+  <Step title="部署 agent" id="deploy">
+
+将项目部署到 LangSmith：
+
+```bash
+mda deploy .
+```
+
+成功后，CLI 会打印 deployment dashboard URL。Deploy 会把 instructions 同步到 Context Hub，上传编译后的项目，并对每日 schedule 执行 reconcile。关于 deploy flags 和故障排查，请参见 [Deploy an agent](/langsmith/managed-deep-agents-deploy) 与 [CLI reference](/langsmith/managed-deep-agents-cli#deploy-projects)。
+
+  </Step>
+
+  <Step title="检查运行" id="inspect">
+
+在 LangSmith 中打开打印出的 URL，查看 build 状态和 revisions。打开 traces，检查 agent 的输入、模型调用、`web_search` 调用、memory 读写以及最终响应。
+
+  </Step>
+</Steps>
+
+## 下一步
+
+<CardGroup cols={2}>
+  <Card title="Custom middleware" icon="code" href="/langsmith/managed-deep-agents-middleware">
+    添加围绕模型与工具调用的日志、重试、限制和 guardrails。
+  </Card>
+  <Card title="Connect MCP tools" icon="plug" href="/langsmith/managed-deep-agents-mcp">
+    从远程 MCP servers 加载 tools。
+  </Card>
+  <Card title="Example project" icon="apps" href="/langsmith/managed-deep-agents-examples">
+    查看一个使用全部原语的完整项目。
+  </Card>
+  <Card title="How it works" icon="settings" href="/langsmith/managed-deep-agents-how-it-works">
+    了解编译、deploy 生命周期和 Context Hub 的工作方式。
+  </Card>
+</CardGroup>

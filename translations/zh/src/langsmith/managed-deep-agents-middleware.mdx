@@ -1,0 +1,187 @@
+---
+title: Add custom middleware to Managed Deep Agents
+sidebarTitle: 自定义 middleware
+description: 为 Managed Deep Agents 项目添加内置或自定义 middleware。
+---
+
+import ManagedDeepAgentsPrivateBetaNote from '/snippets/langsmith/managed-deep-agents-private-beta-note.mdx';
+import ManagedDeepAgentsTestAndDeploy from '/snippets/langsmith/managed-deep-agents-test-and-deploy.mdx';
+
+Managed Deep Agents 支持标准 Deep Agents 的 `middleware` 配置面。你可以把 LangChain middleware 传给 `define_deep_agent` 或 `defineDeepAgent`，以监控 tool calls、添加 guardrails、脱敏数据、重试瞬时失败，或自定义模型调用行为。
+
+<Note>
+<ManagedDeepAgentsPrivateBetaNote />
+</Note>
+
+托管运行时仍负责 `backend`、`store`、`checkpointer`、`memory`、`skills` 和 system prompt。Middleware 应聚焦于模型调用、工具调用和生命周期 hooks 周围的 agent 行为。
+
+如果你想深入了解 hooks、state 和 context，请参见 [Custom middleware](/oss/langchain/middleware/custom)。
+
+## 添加 middleware 模块
+
+把 middleware 代码放在项目的 `middleware/` 目录下，并从 agent 入口中导入。完整项目布局请参见 [CLI project file reference](/langsmith/managed-deep-agents-cli#project-file-reference)。
+
+<CodeGroup>
+
+```python middleware/audit.py
+from collections.abc import Callable
+
+from langchain.agents.middleware import wrap_tool_call
+from langchain.messages import ToolMessage
+from langchain.tools.tool_node import ToolCallRequest
+from langgraph.types import Command
+
+
+@wrap_tool_call
+def log_tool_calls(
+    request: ToolCallRequest,
+    handler: Callable[[ToolCallRequest], ToolMessage | Command],
+) -> ToolMessage | Command:
+    print(f"Calling tool: {request.tool_call['name']}")
+    result = handler(request)
+    print(f"Finished tool: {request.tool_call['name']}")
+    return result
+```
+
+```ts middleware/audit.ts
+import { createMiddleware } from "langchain";
+
+export const logToolCalls = createMiddleware({
+  name: "LogToolCalls",
+  wrapToolCall: async (request, handler) => {
+    console.log(`Calling tool: ${request.toolCall.name}`);
+    const result = await handler(request);
+    console.log(`Finished tool: ${request.toolCall.name}`);
+    return result;
+  },
+});
+```
+
+</CodeGroup>
+
+## 将 middleware 挂到 agent 上
+
+把 middleware 导入项目根目录下的 agent 入口文件，并放进 `middleware` 列表中。
+
+<CodeGroup>
+
+```python agent.py
+from managed_deepagents import define_deep_agent
+
+from middleware.audit import log_tool_calls
+
+agent = define_deep_agent(
+    model="openai:gpt-5.5",
+    middleware=[log_tool_calls],
+)
+```
+
+```ts agent.ts
+import { defineDeepAgent } from "managed-deepagents";
+
+import { logToolCalls } from "./middleware/audit";
+
+export const agent = defineDeepAgent({
+  model: "openai:gpt-5.5",
+  middleware: [logToolCalls],
+});
+```
+
+</CodeGroup>
+
+`mda dev` 和 `mda deploy` 会把项目文件复制到编译后的 build 中。你的 middleware imports 行为应与普通本地 Python 或 TypeScript 项目保持一致。
+
+## 使用预构建 middleware
+
+你也可以直接在 agent 定义中传入 LangChain 预构建 middleware。
+
+<CodeGroup>
+
+```python agent.py
+from langchain.agents.middleware import ModelCallLimitMiddleware, PIIMiddleware
+from managed_deepagents import define_deep_agent
+
+agent = define_deep_agent(
+    model="openai:gpt-5.5",
+    middleware=[
+        PIIMiddleware("email", strategy="redact", apply_to_input=True),
+        ModelCallLimitMiddleware(run_limit=50),
+    ],
+)
+```
+
+```ts agent.ts
+import { defineDeepAgent } from "managed-deepagents";
+import { modelCallLimitMiddleware, piiMiddleware } from "langchain";
+
+export const agent = defineDeepAgent({
+  model: "openai:gpt-5.5",
+  middleware: [
+    piiMiddleware("email", { strategy: "redact", applyToInput: true }),
+    modelCallLimitMiddleware({ runLimit: 50 }),
+  ],
+});
+```
+
+</CodeGroup>
+
+对于 PII 处理、速率限制、重试策略、模型回退、动态模型选择和 tool-call 监控这类横切逻辑，middleware 是最合适的位置。
+
+## Human-in-the-loop
+
+在敏感 tool calls 执行前暂停 agent，让人工可以批准、编辑或拒绝。你可以在 agent 定义中设置 `interrupt_on`（Python）或 `interruptOn`（TypeScript），并根据需要结合 `permissions` 限制工具和文件系统访问。
+
+<CodeGroup>
+
+```python agent.py
+from managed_deepagents import define_deep_agent
+
+from tools.customer import lookup_customer
+
+agent = define_deep_agent(
+    model="openai:gpt-5.5",
+    tools=[lookup_customer],
+    interrupt_on={"lookup_customer": True},
+)
+```
+
+```ts agent.ts
+import { defineDeepAgent } from "managed-deepagents";
+
+import { lookupCustomer } from "./tools/customer";
+
+export const agent = defineDeepAgent({
+  model: "openai:gpt-5.5",
+  tools: [lookupCustomer],
+  interruptOn: {
+    lookup_customer: true,
+  },
+});
+```
+
+</CodeGroup>
+
+`interrupt_on` 的行为与 LangChain 的 [human-in-the-loop middleware](/oss/langchain/guardrails#human-in-the-loop) 一致。关于决策类型（approve、edit、reject）、条件中断与 permission 规则，请参见 Deep Agents 的 [Human-in-the-loop](/oss/deepagents/human-in-the-loop) 和 [Permissions](/oss/deepagents/permissions) 指南。
+
+### 响应 interrupt
+
+当 run 命中 interrupt 时，它会暂停，并在继续之前等待人工响应。
+
+- **本地开发时**，`mda dev` 会在 LangSmith Studio 中运行 agent，你可以在那里查看待执行的 tool call 并恢复 run。
+- **部署后的 agent**，你需要通过 LangGraph server API 发送 `Command(resume=...)` payload 来恢复暂停的 run。请参见 [Human-in-the-loop using server API](/langsmith/add-human-in-the-loop)。
+
+<Note>
+在 private beta 期间，Managed Deep Agents 以 CLI 为主，当前尚未文档化编程式调用。如果你需要从自己的应用中以编程方式恢复 run，请联系 LangChain 团队。
+</Note>
+
+Human-in-the-loop 依赖持久化 thread state 才能暂停和恢复。托管运行时负责 checkpointer，因此不需要额外配置。关于 thread 如何持久化，请参见 [How Managed Deep Agents work](/langsmith/managed-deep-agents-how-it-works#threads-and-memory)。
+
+## 使用运行时 context
+
+Middleware 可以通过标准 LangChain 运行时 API 读取每次 run 的 context。你可以用 context 传递 user IDs、tenant IDs、feature flags、request metadata，或那些默认不应进入模型 prompt 的 credentials。
+
+示例请参见 [Custom middleware](/oss/langchain/middleware/custom)。
+
+## 测试并部署
+
+<ManagedDeepAgentsTestAndDeploy />
