@@ -1,0 +1,780 @@
+---
+title: LangChain v1 迁移指南
+sidebarTitle: LangChain v1
+---
+
+本迁移指南概述 LangChain v1 中的主要变化。要了解 v1 的新功能，请参见[介绍文章](/oss/releases/langchain-v1)。
+
+升级方式：
+
+<CodeGroup>
+```bash npm
+npm install langchain@latest @langchain/core@latest
+```
+```bash pnpm
+pnpm install langchain@latest @langchain/core@latest
+```
+```bash yarn
+yarn add langchain@latest @langchain/core@latest
+```
+```bash bun
+bun add langchain@latest @langchain/core@latest
+```
+</CodeGroup>
+
+## `createAgent`
+
+在 v1 中，react agent prebuilt 现在位于 `langchain` 包中。下表概述发生变化的功能：
+
+| Section | 变化 |
+|---------|------|
+| [Import path](#import-path) | 包从 `@langchain/langgraph/prebuilts` 移到 `langchain` |
+| [Prompts](#prompts) | 参数重命名为 `systemPrompt`，动态 prompts 使用 middleware |
+| [Pre-model hook](#pre-model-hook) | 由带 `beforeModel` 方法的 middleware 替代 |
+| [Post-model hook](#post-model-hook) | 由带 `afterModel` 方法的 middleware 替代 |
+| [Custom state](#custom-state) | 在 middleware 中定义，仅支持 zod objects |
+| [Model](#model) | 通过 middleware 动态选择，不支持 pre-bound models |
+| [Tools](#tools) | Tool 错误处理移到带 `wrapToolCall` 的 middleware |
+| [Structured output](#structured-output) | 移除 prompted output，改用 `toolStrategy`/`providerStrategy` |
+| [Streaming node name](#streaming-node-name-rename) | Node 名称从 `"agent"` 改为 `"model"` |
+| [Runtime context](#runtime-context) | 使用 `context` 属性，而不是 `config.configurable` |
+| [Namespace](#simplified-package) | 简化为聚焦 agent 构建块，旧代码移至 `@langchain/classic` |
+
+### Import path
+
+React agent prebuilt 的 import path 已从 `@langchain/langgraph/prebuilts` 改为 `langchain`。函数名也从 `createReactAgent` 改为 `createAgent`：
+
+```typescript
+import { createReactAgent } from "@langchain/langgraph/prebuilts"; // [!code --]
+import { createAgent } from "langchain"; // [!code ++]
+```
+
+### Prompts
+
+#### Static prompt rename
+
+`prompt` 参数已重命名为 `systemPrompt`：
+
+<CodeGroup>
+```typescript v1 (new)
+import { createAgent } from "langchain";
+
+agent = createAgent({
+  model,
+  tools,
+  systemPrompt: "You are a helpful assistant.", // [!code highlight]
+});
+```
+```typescript v0 (old)
+import { createReactAgent } from "@langchain/langgraph/prebuilts";
+
+const agent = createReactAgent({
+  model,
+  tools,
+  prompt: "You are a helpful assistant.", // [!code highlight]
+});
+```
+</CodeGroup>
+
+#### `SystemMessage`
+
+如果在 system prompt 中使用 `SystemMessage` 对象，现在会直接使用其字符串 content：
+
+<CodeGroup>
+```typescript v1 (new)
+import { SystemMessage, createAgent } from "langchain";
+
+const agent = createAgent({
+  model,
+  tools,
+  systemPrompt: "You are a helpful assistant.", // [!code highlight]
+});
+```
+```typescript v0 (old)
+import { createReactAgent } from "@langchain/langgraph/prebuilts";
+
+const agent = createReactAgent({
+  model,
+  tools,
+  prompt: new SystemMessage(content: "You are a helpful assistant."), // [!code highlight]
+});
+```
+</CodeGroup>
+
+#### Dynamic prompts
+
+Dynamic prompts 是核心上下文工程模式，它会根据当前对话 state 调整你告诉模型的内容。要实现这一点，请使用 `dynamicSystemPromptMiddleware`：
+
+<CodeGroup>
+```typescript v1 (new)
+import { createAgent, dynamicSystemPromptMiddleware } from "langchain";
+import * as z from "zod";
+
+const contextSchema = z.object({
+  userRole: z.enum(["expert", "beginner"]).default("beginner"),
+});
+
+const userRolePrompt = dynamicSystemPromptMiddleware<z.infer<typeof contextSchema>>( // [!code highlight]
+    (_state, runtime) => {
+        const userRole = runtime.context.userRole;
+        const basePrompt = "You are a helpful assistant.";
+
+        if (userRole === "expert") {
+            return `${basePrompt} Provide detailed technical responses.`;
+        } else if (userRole === "beginner") {
+            return `${basePrompt} Explain concepts simply and avoid jargon.`;
+        }
+        return basePrompt; // [!code highlight]
+    }
+);
+
+const agent = createAgent({
+  model,
+  tools,
+  middleware: [userRolePrompt],
+  contextSchema,
+});
+
+await agent.invoke(
+  {
+    messages: [new HumanMessage("Explain async programming")],
+  },
+  {
+    context: {
+      userRole: "expert",
+    },
+  }
+);
+```
+
+```typescript v0 (old)
+import { createReactAgent } from "@langchain/langgraph/prebuilts";
+
+const contextSchema = z.object({
+  userRole: z.enum(["expert", "beginner"]),
+});
+
+const agent = createReactAgent({
+  model,
+  tools,
+  prompt: (state) => {
+    const userRole = state.context.userRole;
+    const basePrompt = "You are a helpful assistant.";
+
+    if (userRole === "expert") {
+      return `${basePrompt} Provide detailed technical responses.`;
+    } else if (userRole === "beginner") {
+      return `${basePrompt} Explain concepts simply and avoid jargon.`;
+    }
+    return basePrompt;
+  },
+  contextSchema,
+});
+
+// Use with context via config.configurable
+await agent.invoke(
+  {
+    messages: [new HumanMessage("Explain async programming")],
+  },
+  {
+    config: {
+      configurable: { userRole: "expert" },
+    },
+  }
+);
+```
+</CodeGroup>
+
+
+### Pre-model hook
+
+Pre-model hooks 现在通过带 `beforeModel` 方法的 middleware 实现。这个模式更易扩展，你可以定义多个 middlewares，在调用模型前运行，并在多个 agents 之间复用。
+
+常见用例包括：
+- 总结对话历史
+- 裁剪 messages
+- 输入 guardrails，例如 PII 遮蔽
+
+v1 包含内置 summarization middleware：
+
+<CodeGroup>
+```typescript v1 (new)
+import { createAgent, summarizationMiddleware } from "langchain";
+
+const agent = createAgent({
+  model: "claude-sonnet-4-6",
+  tools,
+  middleware: [
+    summarizationMiddleware({
+      model: "claude-sonnet-4-6",
+      trigger: { tokens: 1000 },
+    }),
+  ],
+});
+```
+```typescript v0 (old)
+import { createReactAgent } from "@langchain/langgraph/prebuilts";
+
+function customSummarization(state) {
+  // Custom logic for message summarization
+}
+
+const agent = createReactAgent({
+  model: "claude-sonnet-4-6",
+  tools,
+  preModelHook: customSummarization,
+});
+```
+</CodeGroup>
+
+### Post-model hook
+
+Post-model hooks 现在通过带 `afterModel` 方法的 middleware 实现。这让你可以在模型响应后组合多个 handlers。
+
+常见用例包括：
+- Human-in-the-loop approval
+- Output guardrails
+
+v1 包含内置 human-in-the-loop middleware：
+
+<CodeGroup>
+```typescript v1 (new)
+import { createAgent, humanInTheLoopMiddleware } from "langchain";
+
+const agent = createAgent({
+  model: "claude-sonnet-4-6",
+  tools: [readEmail, sendEmail],
+  middleware: [
+    humanInTheLoopMiddleware({
+      interruptOn: {
+        sendEmail: { allowedDecisions: ["approve", "edit", "reject"] },
+      },
+    }),
+  ],
+});
+```
+```typescript v0 (old)
+import { createReactAgent } from "@langchain/langgraph/prebuilts";
+
+function customHumanInTheLoopHook(state) {
+  // Custom approval logic
+}
+
+const agent = createReactAgent({
+  model: "claude-sonnet-4-6",
+  tools: [readEmail, sendEmail],
+  postModelHook: customHumanInTheLoopHook,
+});
+```
+</CodeGroup>
+
+### Custom state
+
+Custom state 现在通过 middleware 的 `stateSchema` 属性定义。使用 Zod 声明会在 agent run 中传递的附加 state 字段。
+
+<CodeGroup>
+```typescript v1 (new)
+import * as z from "zod";
+import { createAgent, createMiddleware, tool } from "langchain";
+
+const UserState = z.object({
+  userName: z.string(),
+});
+
+const userState = createMiddleware({
+  name: "UserState",
+  stateSchema: UserState,
+  beforeModel: (state) => {
+    // Access custom state properties
+    const name = state.userName;
+    // Optionally modify messages/system prompt based on state
+    return;
+  },
+});
+
+const greet = tool(
+  async () => {
+    return "Hello!";
+  },
+  {
+    name: "greet",
+    description: "Greet the user",
+    schema: z.object({}),
+  }
+);
+
+const agent = createAgent({
+  model: "claude-sonnet-4-6",
+  tools: [greet],
+  middleware: [userState],
+});
+
+await agent.invoke({
+  messages: [{ role: "user", content: "Hi" }],
+  userName: "Ada",
+});
+```
+```typescript v0 (old)
+import { getCurrentTaskInput } from "@langchain/langgraph";
+import { createReactAgent } from "@langchain/langgraph/prebuilts";
+import * as z from "zod";
+
+const UserState = z.object({
+  userName: z.string(),
+});
+
+const greet = tool(
+  async () => {
+    const state = await getCurrentTaskInput();
+    const userName = state.userName;
+    return `Hello ${userName}!`;
+  },
+);
+
+// Custom state was provided via agent-level state schema or accessed ad hoc in hooks
+const agent = createReactAgent({
+  model: "claude-sonnet-4-6",
+  tools: [greet],
+  stateSchema: UserState,
+});
+```
+</CodeGroup>
+
+### Model
+
+动态模型选择现在通过 middleware 完成。使用 `wrapModelCall` 根据 state 或 runtime context 替换 models（和 tools）。在 `createReactAgent` 中，这通过传给 `model` 参数的函数完成。
+
+此功能在 v1 中已移植到 middleware 接口。
+
+#### 动态模型选择
+
+<CodeGroup>
+```typescript v1 (new)
+import { createAgent, createMiddleware } from "langchain";
+
+const dynamicModel = createMiddleware({
+  name: "DynamicModel",
+  wrapModelCall: (request, handler) => {
+    const messageCount = request.state.messages.length;
+    const model = messageCount > 10 ? "openai:gpt-5.5" : "openai:gpt-5-nano";
+    return handler({ ...request, model });
+  },
+});
+
+const agent = createAgent({
+  model: "gpt-5-nano",
+  tools,
+  middleware: [dynamicModel],
+});
+```
+```typescript v0 (old)
+import { createReactAgent } from "@langchain/langgraph/prebuilts";
+
+function selectModel(state) {
+  return state.messages.length > 10 ? "openai:gpt-5.5" : "openai:gpt-5-nano";
+}
+
+const agent = createReactAgent({
+  model: selectModel,
+  tools,
+});
+```
+</CodeGroup>
+
+#### Pre-bound models
+
+为了更好地支持 structured output，`createAgent` 应该接收普通 model（字符串或实例）和单独的 `tools` 列表。使用 structured output 时，请避免传入已经绑定 tools 的 models。
+
+```typescript
+// No longer supported
+// const modelWithTools = new ChatOpenAI({ model: "gpt-5.4-mini" }).bindTools([someTool]);
+// const agent = createAgent({ model: modelWithTools, tools: [] });
+
+// Use instead
+const agent = createAgent({ model: "gpt-5.4-mini", tools: [someTool] });
+```
+
+### Tools
+
+`createAgent` 的 `tools` 参数接受：
+
+- 使用 `tool` 创建的函数
+- LangChain tool instances
+- 表示 provider 内置工具的 objects
+
+#### 处理 tool errors
+
+现在可以通过实现 `wrapToolCall` 方法的 middleware 配置 tool errors 的处理方式。
+
+<CodeGroup>
+```typescript v1 (new)
+import { createAgent, createMiddleware, ToolMessage } from "langchain";
+
+const handleToolErrors = createMiddleware({
+  name: "HandleToolErrors",
+  wrapToolCall: async (request, handler) => {
+    try {
+      return await handler(request);
+    } catch (error) {
+      // Only handle errors that occur during tool execution due to invalid inputs
+      // that pass schema validation but fail at runtime (e.g., invalid SQL syntax).
+      // Do NOT handle:
+      // - Network failures (use tool retry middleware instead)
+      // - Incorrect tool implementation errors (should bubble up)
+      // - Schema mismatch errors (already auto-handled by the framework)
+      //
+      // Return a custom error message to the model
+      return new ToolMessage({
+        content: `Tool error: Please check your input and try again. (${error})`,
+        tool_call_id: request.toolCall.id!,
+      });
+    }
+  },
+});
+
+const agent = createAgent({
+  model: "claude-sonnet-4-6",
+  tools: [checkWeather, searchWeb],
+  middleware: [handleToolErrors],
+});
+```
+```typescript v0 (old)
+import { createReactAgent, ToolNode } from "@langchain/langgraph/prebuilts";
+
+const agent = createReactAgent({
+  model: "claude-sonnet-4-6",
+  tools: new ToolNode(
+    [checkWeather, searchWeb],
+    { handleToolErrors: true } // [!code highlight]
+  ),
+});
+```
+</CodeGroup>
+
+### Structured output
+
+#### Node changes
+
+Structured output 过去在独立于主 agent 的节点中生成。现在不再如此。Structured output 会在主循环中生成（没有额外 LLM 调用），从而降低成本和延迟。
+
+#### Tool and provider strategies
+
+v1 中有两种策略：
+
+- `toolStrategy` 使用 artificial tool calling 生成 structured output
+- `providerStrategy` 使用 provider-native structured output generation
+
+<CodeGroup>
+```typescript v1 (new)
+import { createAgent, toolStrategy } from "langchain";
+import * as z from "zod";
+
+const OutputSchema = z.object({
+  summary: z.string(),
+  sentiment: z.string(),
+});
+
+const agent = createAgent({
+  model: "gpt-5.4-mini",
+  tools,
+  // explicitly using tool strategy
+  responseFormat: toolStrategy(OutputSchema), // [!code highlight]
+});
+```
+```typescript v0 (old)
+import { createReactAgent } from "@langchain/langgraph/prebuilts";
+import * as z from "zod";
+
+const OutputSchema = z.object({
+  summary: z.string(),
+  sentiment: z.string(),
+});
+
+const agent = createReactAgent({
+  model: "gpt-5.4-mini",
+  tools,
+  // Structured output was driven primarily via tool-calling with fewer options
+  responseFormat: OutputSchema,
+});
+```
+</CodeGroup>
+
+#### 移除 prompted output
+
+通过 `responseFormat` 中自定义指令实现的 prompted output 已移除，请改用上述策略。
+
+### Streaming node name rename
+
+从 agents 流式传输 events 时，node 名称已从 `"agent"` 改为 `"model"`，以更准确地反映该 node 的用途。
+
+### Runtime context
+
+调用 agent 时，通过 `context` config 参数传入静态、只读配置。这取代了使用 `config.configurable` 的模式。
+
+<CodeGroup>
+```typescript v1 (new)
+import { createAgent, HumanMessage } from "langchain";
+import * as z from "zod";
+
+const agent = createAgent({
+  model: "gpt-5.5",
+  tools,
+  contextSchema: z.object({ userId: z.string(), sessionId: z.string() }),
+});
+
+const result = await agent.invoke(
+  { messages: [new HumanMessage("Hello")] },
+  { context: { userId: "123", sessionId: "abc" } }, // [!code highlight]
+);
+```
+```typescript v0 (old)
+import { createReactAgent, HumanMessage } from "@langchain/langgraph/prebuilts";
+
+const agent = createReactAgent({ model, tools });
+
+// Pass context via config.configurable
+const result = await agent.invoke(
+  { messages: [new HumanMessage("Hello")] },
+  {
+    config: { // [!code highlight]
+      configurable: { userId: "123", sessionId: "abc" }, // [!code highlight]
+    }, // [!code highlight]
+  }
+);
+```
+</CodeGroup>
+
+<Note>
+    旧的 `config.configurable` 模式仍然可以向后兼容，但新应用或迁移到 v1 的应用推荐使用新的 `context` 参数。
+</Note>
+
+---
+
+## Standard content
+
+在 v1 中，messages 获得了 provider 无关的标准 content blocks。通过 `message.contentBlocks` 访问它们，以便跨 providers 获得一致且类型化的视图。现有 `message.content` 字段对字符串或 provider-native 结构保持不变。
+
+### 变化
+
+- Messages 上新增 `contentBlocks` 属性，用于规范化 content。
+- `ContentBlock` 下新增 TypeScript 类型，用于强类型。
+- 可通过 `LC_OUTPUT_VERSION=v1` 或 `outputVersion: "v1"` 将标准 blocks 可选序列化到 `content` 中。
+
+### 读取标准化 content
+
+<CodeGroup>
+```typescript v1 (new)
+import { initChatModel } from "langchain";
+
+const model = await initChatModel("gpt-5-nano");
+const response = await model.invoke("Explain AI");
+
+for (const block of response.contentBlocks) {
+  if (block.type === "reasoning") {
+    console.log(block.reasoning);
+  } else if (block.type === "text") {
+    console.log(block.text);
+  }
+}
+```
+```typescript v0 (old)
+// Provider-native formats vary; you needed per-provider handling.
+const response = await model.invoke("Explain AI");
+for (const item of response.content as any[]) {
+  if (item.type === "reasoning") {
+    // OpenAI-style reasoning
+  } else if (item.type === "thinking") {
+    // Anthropic-style thinking
+  } else if (item.type === "text") {
+    // Text
+  }
+}
+```
+</CodeGroup>
+
+### 创建 multimodal messages
+
+<CodeGroup>
+```typescript v1 (new)
+import { HumanMessage } from "langchain";
+
+const message = new HumanMessage({
+  contentBlocks: [
+    { type: "text", text: "Describe this image." },
+    { type: "image", url: "https://example.com/image.jpg" },
+  ],
+});
+const res = await model.invoke([message]);
+```
+```typescript v0 (old)
+import { HumanMessage } from "langchain";
+
+const message = new HumanMessage({
+  // Provider-native structure
+  content: [
+    { type: "text", text: "Describe this image." },
+    { type: "image_url", image_url: { url: "https://example.com/image.jpg" } },
+  ],
+});
+const res = await model.invoke([message]);
+```
+</CodeGroup>
+
+### 示例 block 类型
+
+```typescript
+import { ContentBlock } from "langchain";
+
+const textBlock: ContentBlock.Text = {
+  type: "text",
+  text: "Hello world",
+};
+
+const imageBlock: ContentBlock.Multimodal.Image = {
+  type: "image",
+  url: "https://example.com/image.png",
+  mimeType: "image/png",
+};
+```
+
+更多细节请参见 content blocks [reference](/oss/langchain/messages#content-block-reference)。
+
+### 序列化标准 content
+
+标准 content blocks 默认**不会序列化**到 `content` 属性中。如果你需要在 `content` 属性中访问标准 content blocks（例如把 messages 发送给客户端时），可以选择将它们序列化到 `content` 中。
+
+<CodeGroup>
+```bash
+export LC_OUTPUT_VERSION=v1
+```
+```typescript
+import { initChatModel } from "langchain";
+
+const model = await initChatModel("gpt-5-nano", {
+  outputVersion: "v1",
+});
+```
+</CodeGroup>
+
+<Note>
+    了解更多：[Messages](/oss/langchain/messages#message-content) 和 [Standard content blocks](/oss/langchain/messages#standard-content-blocks)。输入示例请参见 [Multimodal](/oss/langchain/messages#multimodal)。
+</Note>
+
+---
+
+## 简化后的包
+
+`langchain` 包命名空间已简化为聚焦 agent 构建块。旧功能已移至 `@langchain/classic`。新包只暴露最有用、最相关的功能。
+
+### Exports
+
+v1 包包含：
+
+| 模块 | 可用内容 | 说明 |
+|--------|----------|------|
+| Agents | `createAgent`、`AgentState` | 核心 agent 创建功能 |
+| Messages | Message types、content blocks、`trimMessages` | 从 `@langchain/core` 重新导出 |
+| Tools | `tool`、tool classes | 从 `@langchain/core` 重新导出 |
+| Chat models | `initChatModel`、`BaseChatModel` | 统一模型初始化 |
+
+### `@langchain/classic`
+
+如果你使用旧 chains、indexing API，或以前从 `@langchain/community` 重新导出的功能，请安装 `@langchain/classic` 并更新 imports：
+
+<CodeGroup>
+```bash npm
+npm install @langchain/classic
+```
+```bash pnpm
+pnpm install @langchain/classic
+```
+```bash yarn
+yarn add @langchain/classic
+```
+```bash bun
+bun add @langchain/classic
+```
+</CodeGroup>
+
+```typescript
+// v1 (new)
+import { ... } from "@langchain/classic";
+import { ... } from "@langchain/classic/chains";
+
+// v0 (old)
+import { ... } from "langchain";
+import { ... } from "langchain/chains";
+```
+
+---
+
+## 破坏性变更
+
+### 放弃 Node 18 支持
+
+所有 LangChain 包现在都要求 **Node.js 22 或更高版本**。Node.js 18 已在 2025 年 3 月[生命周期结束](https://nodejs.org/en/about/releases/)。
+
+### 新的构建输出
+
+所有 langchain 包的构建现在都改用基于 bundler 的方式，而不是使用原始 TypeScript 输出。如果你曾经从 `dist/` 目录导入文件（不推荐），需要更新 import，改用新的模块系统。
+
+### 旧代码移至 `@langchain/classic`
+
+标准接口和 agents 之外的旧功能已移至 [`@langchain/classic`](https://www.npmjs.com/package/@langchain/classic) 包。有关核心 `langchain` 包中可用内容以及移到 `@langchain/classic` 的内容，请参见[简化后的包](#simplified-package)部分。
+
+### 移除已弃用 API
+
+已弃用并计划在 1.0 中移除的方法、函数和其他对象已被删除。
+
+<Accordion title="查看已移除的弃用 API">
+
+以下已弃用 API 已在 v1 中移除：
+
+#### Core functionality
+- `TraceGroup`：改用 LangSmith tracing
+- `BaseDocumentLoader.loadAndSplit`：使用 `.load()` 后接 text splitter
+- `RemoteRunnable`：不再支持
+
+#### Prompts
+- `BasePromptTemplate.serialize` 和 `.deserialize`：直接使用 JSON serialization
+- `ChatPromptTemplate.fromPromptMessages`：使用 `ChatPromptTemplate.fromMessages`
+
+#### Retrievers
+- `BaseRetrieverInterface.getRelevantDocuments`：改用 `.invoke()`
+
+#### Runnables
+- `Runnable.bind`：改用 `.bindTools()` 或其他特定 binding 方法
+- `Runnable.map`：改用 `.batch()`
+- `RunnableBatchOptions.maxConcurrency`：使用 config object 中的 `maxConcurrency`
+
+#### Chat models
+- `BaseChatModel.predictMessages`：改用 `.invoke()`
+- `BaseChatModel.predict`：改用 `.invoke()`
+- `BaseChatModel.serialize`：直接使用 JSON serialization
+- `BaseChatModel.callPrompt`：改用 `.invoke()`
+- `BaseChatModel.call`：改用 `.invoke()`
+
+#### LLMs
+- `BaseLLMParams.concurrency`：使用 config object 中的 `maxConcurrency`
+- `BaseLLM.call`：改用 `.invoke()`
+- `BaseLLM.predict`：改用 `.invoke()`
+- `BaseLLM.predictMessages`：改用 `.invoke()`
+- `BaseLLM.serialize`：直接使用 JSON serialization
+
+#### Streaming
+- `createChatMessageChunkEncoderStream`：直接使用 `.stream()` 方法
+
+#### Tracing
+- `BaseTracer.runMap`：使用 LangSmith tracing APIs
+- `getTracingCallbackHandler`：使用 LangSmith tracing
+- `getTracingV2CallbackHandler`：使用 LangSmith tracing
+- `LangChainTracerV1`：使用 LangSmith tracing
+
+#### Memory and storage
+- `BaseListChatMessageHistory.addAIChatMessage`：使用带 `AIMessage` 的 `.addMessage()`
+- `BaseStoreInterface`：使用具体 store implementations
+
+#### Utilities
+- `getRuntimeEnvironmentSync`：使用 async `getRuntimeEnvironment()`
+
+</Accordion>
