@@ -1,0 +1,85 @@
+---
+title: "Anthropic 集成"
+description: "使用 LangChain JavaScript 集成 Anthropic middleware。"
+---
+
+这是专为 Anthropic Claude 模型设计的 middleware。有关更多信息，请参阅 [middleware](/oss/langchain/middleware/overview)。
+
+| Middleware | Description |
+|------------|-------------|
+| [Prompt caching](#prompt-caching) | 通过缓存重复的 prompt 前缀来降低成本 |
+
+## Prompt caching
+
+通过在 Anthropic 的服务器上缓存静态或重复的 prompt 内容，例如 system prompts、tool definitions 和 conversation history，来降低成本和延迟。这个 middleware 实现了**会话式缓存策略**，会在 system message、tool definitions 和最新的 user message 上放置明确的缓存断点，从而让整段对话历史都能在后续 API 调用中被缓存和复用。
+
+Prompt caching 适用于以下场景：
+
+- 请求之间不会变化、但很长的静态 system prompt
+- 包含大量且在多次调用中保持不变的 tool definitions 的 agents
+- 早期消息历史会在多个轮次中重复使用的对话
+- 对降低 API 成本和延迟要求很高的高吞吐部署
+
+<Tip>
+    对于更简单的场景，你也可以在 chat model 上通过在调用时传入 `cache_control` 来使用 [prompt caching](/oss/integrations/chat/anthropic#prompt-caching)，无需 middleware。若你需要显式控制 system prompts 和 tool definitions 上的缓存断点，推荐使用 middleware。
+</Tip>
+
+<Info>
+    进一步了解 [Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching#cache-limitations) 的策略和限制。
+</Info>
+
+```typescript
+import { createAgent, anthropicPromptCachingMiddleware } from "langchain";
+
+const agent = createAgent({
+  model: "claude-sonnet-4-6",
+  prompt: "<Your long system prompt here>",
+  middleware: [anthropicPromptCachingMiddleware({ ttl: "5m" })],
+});
+```
+
+<Accordion title="Configuration options">
+
+<ParamField body="ttl" type="string" default="5m">
+    缓存内容的生存时间。有效值：`'5m'` 或 `'1h'`
+</ParamField>
+
+</Accordion>
+
+<Accordion title="Full example">
+
+这个 middleware 会缓存每次请求中直到最新消息为止的全部内容。在 TTL 窗口内，也就是 5 分钟或 1 小时，后续请求会直接从缓存中读取此前出现过的内容，而不是重新处理，从而显著降低成本和延迟。
+
+**工作方式：**
+1. 第一次请求：system prompt、tools 和用户消息 *"Hi, my name is Bob"* 被发送到 API，并写入缓存
+2. 第二次请求：缓存内容，也就是 system prompt、tools 和第一条消息，会从缓存中读取。只需要处理新消息 *"What's my name?"*，以及模型对第一次请求的响应
+3. 后续每一轮都延续这一模式，每次请求都会复用已缓存的对话历史
+
+```typescript
+import { createAgent, HumanMessage, anthropicPromptCachingMiddleware } from "langchain";
+
+const LONG_PROMPT = `
+Please be a helpful assistant.
+
+<Lots more context ...>
+`;
+
+const agent = createAgent({
+  model: "claude-sonnet-4-6",
+  prompt: LONG_PROMPT,
+  middleware: [anthropicPromptCachingMiddleware({ ttl: "5m" })],
+});
+
+// First invocation: Creates cache with system prompt, tools, and "Hi, my name is Bob"
+await agent.invoke({
+  messages: [new HumanMessage("Hi, my name is Bob")]
+});
+
+// Second invocation: Reuses cached system prompt, tools, and previous messages
+// Only processes the new message "What's my name?" and the previous AI response
+const result = await agent.invoke({
+  messages: [new HumanMessage("What's my name?")]
+});
+```
+
+</Accordion>

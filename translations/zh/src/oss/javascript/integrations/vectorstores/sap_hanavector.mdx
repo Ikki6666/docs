@@ -1,0 +1,182 @@
+---
+title: SAP HANA Cloud Vector Engine
+---
+
+>[SAP HANA Cloud Vector Engine](https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-vector-engine-guide/sap-hana-cloud-sap-hana-database-vector-engine-guide) 是完全集成在 `SAP HANA Cloud` 数据库中的 vector store。
+
+## 设置
+
+安装 `@sap/hana-langchain` 外部集成包，以及本页示例用到的其他包。
+
+```bash
+npm install @sap/hana-langchain @langchain/core@latest @langchain/classic@latest langchain@latest
+```
+
+### 凭据
+
+确保 SAP HANA 实例正在运行。通过环境变量加载凭据，并使用你偏好的 HANA client 创建连接。
+
+```typescript
+import * as dotenv from 'dotenv';
+dotenv.config();
+
+import hanaClient from "@sap/hana-client";
+
+const connectionParams = {
+  host: process.env.HANA_DB_ADDRESS,
+  port: process.env.HANA_DB_PORT,
+  user: process.env.HANA_DB_USER,
+  password: process.env.HANA_DB_PASSWORD,
+};
+const client = hanaClient.createConnection(connectionParams);
+
+await new Promise<void>((resolve, reject) => {
+  client.connect((err: Error) => {
+    if (err) reject(err);
+    else resolve();
+  });
+});
+```
+
+更多背景可参阅 [What is SAP HANA?](https://www.sap.com/products/data-cloud/hana/what-is-sap-hana.html)。
+
+## 初始化
+
+要初始化 `HanaDB` vector store，需要数据库连接和 embedding 实例。SAP HANA Cloud Vector Engine 同时支持外部 embeddings 和内部 embeddings。
+
+### 使用外部 embeddings
+
+```typescript
+import { OpenAIEmbeddings } from "@langchain/openai";
+const embeddings = new OpenAIEmbeddings({ model: "text-embedding-3-large" });
+```
+
+### 使用内部 embeddings
+
+你也可以直接在 SAP HANA 中通过 `VECTOR_EMBEDDING()` 函数计算 embeddings。更多信息请参阅 [SAP HANA VECTOR_EMBEDDING Function](https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-vector-engine-guide/vector-embedding-function-vector)。
+
+```typescript
+import { HanaInternalEmbeddings } from "@sap/hana-langchain";
+
+const internalEmbeddings = new HanaInternalEmbeddings({
+  internalEmbeddingModelId:
+    process.env.HANA_DB_EMBEDDING_MODEL_ID || "SAP_NEB.20240715",
+});
+```
+
+然后创建 vector store：
+
+```typescript
+const args: HanaDBArgs = {
+  connection: client,
+  tableName: "MY_TABLE",
+};
+const db = new HanaDB(embeddings, args);
+await db.initialize()
+```
+
+## 管理 vector store
+
+### 添加内容
+
+```typescript
+import { Document } from "@langchain/core/documents";
+
+await db.addDocuments([
+  new Document({ pageContent: "Hello world" }),
+  new Document({ pageContent: "Other docs"})
+]);
+```
+
+添加带 metadata 的文档：
+
+```typescript
+await db.addDocuments([
+  { pageContent: "foo", metadata: { start: 100, end: 150, docName: "foo.txt", quality: "bad" } },
+  { pageContent: "bar", metadata: { start: 200, end: 250, docName: "bar.txt", quality: "good" } },
+]);
+```
+
+### 删除内容
+
+```typescript
+await db.delete({ filter: { quality: "bad" } });
+```
+
+## 查询 vector store
+
+### 相似度搜索
+
+```typescript
+const docs = await db.similaritySearch("foobar", 2, { quality: "bad" });
+```
+
+### MMR 搜索
+
+```typescript
+const docsMMR = await db.maxMarginalRelevanceSearch("foobar", {
+  k: 2,
+  fetchK: 5,
+  filter: { quality: "bad" },
+});
+```
+
+### 转成 retriever 后查询
+
+```typescript
+const retriever = db.asRetriever();
+const docsRetriever = await retriever.invoke("foobar", {filter: { quality: "good" }});
+```
+
+## 距离算法
+
+`HanaDB` 支持：
+- Cosine Similarity，默认
+- Euclidean Distance，L2
+
+```typescript
+const argsDist: HanaDBArgs = {
+  connection: client,
+  tableName: "MY_TABLE",
+  distanceStrategy: "EUCLIDEAN",
+};
+const dbDist = new HanaDB(embeddings, argsDist);
+await dbDist.initialize();
+```
+
+## 创建 HNSW 索引
+
+```typescript
+const argsHnsw: HanaDBArgs = {
+  connection: client,
+  tableName: "MY_TABLE",
+};
+const dbHnsw = new HanaDB(embeddings, argsHnsw);
+await dbHnsw.initialize();
+dbHnsw.createHnswIndex({
+  indexName: "MY_HNSW_INDEX",
+  efSearch: 100,
+  m: 200,
+  efConstruction: 500,
+});
+```
+
+## 高级过滤
+
+支持的过滤操作符包括：
+
+| Operator | Semantic |
+|----------|---------|
+| `$eq` | Equality (==) |
+| `$ne` | Inequality (!=) |
+| `$lt` | Less than (&lt;) |
+| `$lte` | Less than or equal (&lt;=) |
+| `$gt` | Greater than (&gt;) |
+| `$gte` | Greater than or equal (&gt;=) |
+| `$in` | Contained in a set of given values (in) |
+| `$nin` | Not contained in a set of given values (not in) |
+| `$between` | Between the range of two boundary values |
+| `$like` | Text equality based on SQL `LIKE` semantics |
+| `$contains` | Filters documents containing a specific keyword |
+| `$and` | Logical "and" |
+| `$or` | Logical "or" |

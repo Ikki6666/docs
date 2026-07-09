@@ -1,0 +1,280 @@
+---
+title: "Composio 集成"
+description: 通过 Composio 的统一 API 平台，为 AI agents 访问 500+ 工具和集成，支持 OAuth 处理、事件驱动工作流和多用户支持。
+---
+
+[Composio](https://composio.dev) 是一个集成平台，可访问 GitHub、Slack、Notion 等常见应用中的 500+ 工具。它通过统一 API 让 AI agents 与外部服务交互，同时处理认证、权限和事件驱动工作流。
+
+## 概览
+
+### 集成详情
+
+| Class | Package | Serializable | [Python support](/oss/integrations/tools/composio) | Version |
+|:---|:---|:---:|:---:|:---:|
+| Composio | [@composio/langchain](https://www.npmjs.com/package/@composio/langchain) | ❌ | ✅ | ![npm version](https://img.shields.io/npm/v/@composio/langchain?style=flat-square&label=%20) |
+
+### 工具特性
+
+- **500+ Tool Access**: 为 GitHub、Slack、Gmail、Jira、Notion 等提供预构建集成
+- **Authentication Management**: 处理 OAuth 流程、API keys 和认证状态
+- **Event-Driven Workflows**: 基于外部事件触发 agents，例如新的 Slack 消息、GitHub issues 等
+- **Fine-Grained Permissions**: 按用户控制工具访问和数据暴露范围
+- **Custom Tool Support**: 添加专有 API 和内部工具
+
+## 设置
+
+该集成位于 `@composio/langchain` 包中。
+
+```bash
+npm install @composio/langchain @composio/core
+```
+
+或者使用其他包管理器：
+
+```bash
+yarn add @composio/langchain @composio/core
+# or
+pnpm add @composio/langchain @composio/core
+```
+
+### 凭证
+
+你需要一个 Composio API key。前往 [composio.dev](https://composio.dev) 免费注册即可获取。
+
+```typescript Set API key
+import * as dotenv from 'dotenv';
+dotenv.config();
+
+// Set your Composio API key
+process.env.COMPOSIO_API_KEY = 'your_api_key_here';
+```
+
+同时也建议配置 [LangSmith](/langsmith/observability) 以便 tracing：
+
+```typescript Enable tracing
+// process.env.LANGSMITH_API_KEY = 'your_langsmith_key';
+// process.env.LANGSMITH_TRACING = 'true';
+```
+
+## 实例化
+
+使用 LangChain provider 初始化 Composio，并从特定 toolkit 中获取工具。每个 toolkit 代表一个服务，例如 GitHub、Slack，其中包含多个工具，也就是你可以执行的 actions。
+
+```typescript Initialize Composio
+import { Composio } from '@composio/core';
+import { LangchainProvider } from '@composio/langchain';
+
+// Initialize Composio with LangChain provider
+const composio = new Composio({
+    apiKey: process.env.COMPOSIO_API_KEY,
+    provider: new LangchainProvider(),
+});
+
+// Get tools from specific toolkits
+const tools = await composio.tools.get('default', 'GITHUB');
+
+console.log(`Loaded ${tools.length} tools from GitHub toolkit`);
+```
+
+### 可用 toolkits
+
+Composio 为多种服务提供 toolkits：
+
+**Productivity**: GitHub、Slack、Gmail、Jira、Notion、Asana、Trello、ClickUp
+**Communication**: Discord、Telegram、WhatsApp、Microsoft Teams
+**Development**: GitLab、Bitbucket、Linear、Sentry
+**Data & Analytics**: Google Sheets、Airtable、HubSpot、Salesforce
+**And 100+ more...**
+
+## 调用
+
+### 从多个 toolkits 获取工具
+
+你可以从多个服务中一起加载工具：
+
+```typescript
+// Get tools from multiple toolkits
+const tools = await composio.tools.get('default', ['GITHUB', 'SLACK', 'GMAIL']);
+```
+
+### 获取特定工具
+
+你也可以只加载指定工具，而不是整个 toolkit：
+
+```typescript
+// Get specific tools by name
+const tools = await composio.tools.get('default', {
+    tools: ['GITHUB_CREATE_ISSUE', 'SLACK_SEND_MESSAGE']
+});
+```
+
+### 用户专属工具
+
+Composio 支持带用户专属认证的多用户场景：
+
+```typescript
+// Get tools for a specific user
+// This user must have authenticated their accounts first
+const tools = await composio.tools.get('user_123', 'GITHUB');
+```
+
+## 在 agent 中使用
+
+下面是一个完整示例，展示如何把 Composio tools 与 LangGraph agent 结合使用，与 HackerNews 交互：
+
+```typescript
+import { ChatOpenAI } from '@langchain/openai';
+import { HumanMessage, AIMessage } from '@langchain/core/messages';
+import { ToolNode } from '@langchain/langgraph/prebuilt';
+import { StateGraph, MessagesAnnotation } from '@langchain/langgraph';
+import { Composio } from '@composio/core';
+import { LangchainProvider } from '@composio/langchain';
+
+// Initialize Composio
+const composio = new Composio({
+    apiKey: process.env.COMPOSIO_API_KEY,
+    provider: new LangchainProvider(),
+});
+
+// Fetch the tools
+console.log('🔄 Fetching the tools...');
+const tools = await composio.tools.get('default', 'HACKERNEWS_GET_USER');
+
+// Define the tools for the agent to use
+const toolNode = new ToolNode(tools);
+
+// Create a model and give it access to the tools
+const model = new ChatOpenAI({
+    model: 'gpt-5',
+}).bindTools(tools);
+
+// Define the function that determines whether to continue or not
+function shouldContinue({ messages }: typeof MessagesAnnotation.State) {
+    const lastMessage = messages[messages.length - 1] as AIMessage;
+
+    // If the LLM makes a tool call, then we route to the "tools" node
+    if (lastMessage.tool_calls?.length) {
+        return 'tools';
+    }
+
+    // Otherwise, we stop (reply to the user)
+    return '__end__';
+}
+
+// Define the function that calls the model
+async function callModel(state: typeof MessagesAnnotation.State) {
+    console.log('🔄 Calling the model...');
+    const response = await model.invoke(state.messages);
+    return { messages: [response] };
+}
+
+// Define a new graph
+const workflow = new StateGraph(MessagesAnnotation)
+    .addNode('agent', callModel)
+    .addEdge('__start__', 'agent')
+    .addNode('tools', toolNode)
+    .addEdge('tools', 'agent')
+    .addConditionalEdges('agent', shouldContinue);
+
+// Compile the graph
+const app = workflow.compile();
+
+// Use the agent
+const finalState = await app.invoke({
+    messages: [new HumanMessage('Find the details of the user `pg` on HackerNews')]
+});
+
+console.log('✅ Message received from the model');
+console.log(finalState.messages[finalState.messages.length - 1].content);
+
+// Continue the conversation
+const nextState = await app.invoke({
+    messages: [...finalState.messages, new HumanMessage('what about haxzie')]
+});
+
+console.log('✅ Message received from the model');
+console.log(nextState.messages[nextState.messages.length - 1].content);
+```
+
+### 与 GitHub toolkit 一起使用
+
+下面是一个为 GitHub 仓库加星的示例：
+
+```typescript
+import { ChatOpenAI } from '@langchain/openai';
+import { createReactAgent } from '@langchain/langgraph/prebuilt';
+import { Composio } from '@composio/core';
+import { LangchainProvider } from '@composio/langchain';
+
+// Initialize Composio
+const composio = new Composio({
+    apiKey: process.env.COMPOSIO_API_KEY,
+    provider: new LangchainProvider(),
+});
+
+// Get GitHub tools
+const tools = await composio.tools.get('default', 'GITHUB');
+
+// Create model
+const model = new ChatOpenAI({
+    model: 'gpt-5',
+});
+
+// Create agent
+const agent = createReactAgent({
+    llm: model,
+    tools: tools,
+});
+
+// Execute task
+const result = await agent.invoke({
+    messages: [
+        {
+            role: 'user',
+            content: 'Star the repository composiohq/composio on GitHub'
+        }
+    ]
+});
+
+console.log(result.messages[result.messages.length - 1].content);
+```
+
+## 认证设置
+
+在使用需要认证的工具前，用户需要先连接自己的账号：
+
+```typescript
+import { Composio } from '@composio/core';
+
+const composio = new Composio({
+    apiKey: process.env.COMPOSIO_API_KEY
+});
+
+// Get authentication URL for a user
+const authConnection = await composio.integrations.create({
+    userId: 'user_123',
+    integration: 'github'
+});
+
+console.log(`Authenticate at: ${authConnection.redirectUrl}`);
+
+// After authentication, the user's connected account will be available
+// and tools will work with their credentials
+```
+
+## 多用户场景
+
+对于多用户应用：
+
+```typescript
+// Each user authenticates their own accounts
+const toolsUser1 = await composio.tools.get('user_1', 'GITHUB');
+const toolsUser2 = await composio.tools.get('user_2', 'GITHUB');
+
+// Tools will use the respective user's credentials
+// User 1's agent will act on User 1's GitHub account
+const agent1 = createAgent(model, toolsUser1);
+
+// User 2's agent will act on User 2's GitHub account
+const agent2 = createAgent(model, toolsUser2);
+```

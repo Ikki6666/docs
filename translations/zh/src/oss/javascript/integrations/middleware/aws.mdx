@@ -1,0 +1,149 @@
+---
+title: "AWS middleware 集成"
+description: "使用 LangChain JavaScript 集成 AWS middleware。"
+---
+
+这是专为托管在 AWS Bedrock 上的模型设计的 middleware。有关更多信息，请参阅 [middleware](/oss/langchain/middleware/overview)。
+
+| Middleware | Description |
+|------------|-------------|
+| [Prompt caching](#prompt-caching) | 通过缓存重复的 prompt 前缀来降低成本 |
+
+## Prompt caching
+
+通过在 Amazon Bedrock 上缓存频繁复用的 prompt 前缀，来降低推理延迟和输入 token 成本。`bedrockPromptCachingMiddleware` 通过 `modelSettings` 启用缓存，随后 `ChatBedrockConverse` 会在请求时将其转换为正确的 AWS wire format。系统会在支持的位置把缓存检查点放在 system prompt、tool definitions 和最近一条消息之后，从而让模型在后续请求中跳过对已见内容的重复计算。缓存放置位置会因模型家族而异，例如 Nova 会跳过某些 tool definition 和 tool-result 场景。
+
+Prompt caching 适用于以下场景：
+
+- 带有长且稳定 system prompt 的多轮对话
+- 包含大量且在多次调用中保持不变的 tool definitions 的 agents
+- 用户围绕同一份上传上下文连续提问的文档问答场景
+- 包含重复静态内容的批处理工作负载
+
+支持的模型：
+
+- **Anthropic Claude**
+- **Amazon Nova**
+
+<Info>
+    进一步了解 [AWS Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html) 的策略和限制。缓存内容必须超过 1,024 tokens，缓存检查点才会生效，有时不同模型的要求会更高。请参阅[支持的模型、区域和限制](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html#prompt-caching-models)。
+</Info>
+
+**API reference:** @[`BedrockPromptCachingMiddleware`]
+
+```typescript Model string
+import { createAgent, bedrockPromptCachingMiddleware } from "langchain";
+
+const agent = createAgent({
+  model: "bedrock:us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+  systemPrompt: "<Your long system prompt here>",
+  middleware: [bedrockPromptCachingMiddleware({ ttl: "1h" })], // [!code highlight]
+});
+```
+
+```typescript ChatBedrockConverse instance
+import { createAgent, bedrockPromptCachingMiddleware } from "langchain";
+import { ChatBedrockConverse } from "@langchain/aws";
+
+const agent = createAgent({
+  model: new ChatBedrockConverse({ model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0" }),
+  systemPrompt: "<Your long system prompt here>",
+  middleware: [bedrockPromptCachingMiddleware({ ttl: "5m" })], // [!code highlight]
+});
+```
+
+<Accordion title="Configuration options">
+
+<ParamField body="enableCaching" type="boolean" default="true">
+    是否启用 prompt caching。
+</ParamField>
+
+<ParamField body="ttl" type="string" default="5m">
+    缓存内容的生存时间。有效值：`'5m'` 或 `'1h'`。请注意，Amazon Nova 模型只支持 `'5m'`。
+</ParamField>
+
+<ParamField body="minMessagesToCache" type="number" default="1">
+    开始缓存前所需的最小消息数量。system prompt 也算作一条消息。
+</ParamField>
+
+<ParamField body="unsupportedModelBehavior" type="string" default="warn">
+    使用不受支持模型时的行为。可选值：`'ignore'`、`'warn'` 或 `'raise'`。
+</ParamField>
+
+</Accordion>
+
+<Accordion title="Full example">
+
+这个 middleware 会缓存每次请求中直到最新消息为止的全部内容。在 TTL 窗口内，也就是 5 分钟或 1 小时，后续请求会直接从缓存中读取此前出现过的内容，而不是重新处理，从而降低成本和延迟。
+
+**工作方式：**
+1. 第一次请求：system prompt、tools 和用户消息会被发送到 API，并写入缓存
+2. 第二次请求：缓存内容会从缓存中读取，只需要处理新的消息
+3. 后续每一轮都延续这一模式，每次请求都会复用已缓存的对话历史
+
+<Note>
+    Prompt caching 通过缓存 tokens 来降低 API 成本，但**不会**提供对话记忆。若要在多次调用之间持久化对话历史，请使用像 `MemorySaver` 这样的 [checkpointer](/oss/langgraph/persistence#checkpointer-libraries)。
+</Note>
+
+```typescript
+import { createAgent, bedrockPromptCachingMiddleware, AIMessage, HumanMessage, tool } from "langchain";
+import { ChatBedrockConverse } from "@langchain/aws";
+import { z } from "zod";
+
+const getWeather = tool(
+  async ({ city }) => `The weather in ${city} is sunny and 72F.`,
+  {
+    name: "get_weather",
+    description: "Get the current weather for a city.",
+    schema: z.object({ city: z.string() }),
+  }
+);
+
+// System prompt must exceed 1,024 tokens for caching to take effect
+const LONG_PROMPT =
+  "You are a helpful weather assistant with deep expertise in meteorology, " +
+  "climate science, and atmospheric phenomena. When answering questions about " +
+  "weather, provide accurate and up-to-date information. " +
+  "You should always strive to give the most helpful response possible. ".repeat(85);
+
+const agent = createAgent({
+  model: new ChatBedrockConverse({ model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0" }),
+  systemPrompt: LONG_PROMPT,
+  tools: [getWeather],
+  middleware: [bedrockPromptCachingMiddleware({ ttl: "5m" })], // [!code highlight]
+});
+
+// First invocation: writes the cache (system prompt, tool definitions, and message)
+let response = await agent.invoke({
+  messages: [new HumanMessage("What is the weather in Miami?")],
+});
+const last = response.messages.at(-1);
+console.log(last?.content);
+
+// Check cache token usage
+if (AIMessage.isInstance(last)) {
+  const details = last.usage_metadata?.input_token_details;
+  if (details) {
+    console.log(`Cache read: ${details.cache_read ?? 0}, Cache write: ${details.cache_creation ?? 0}`);
+  }
+}
+
+// Second invocation within the TTL: reuses the cached system prompt and tool definitions
+response = await agent.invoke({
+  messages: [new HumanMessage("How about Seattle?")],
+});
+console.log(response.messages.at(-1)?.content);
+```
+
+</Accordion>
+
+### 模型特定行为
+
+这个 middleware 会自动处理不同模型家族之间的差异：
+
+| Feature | ChatBedrockConverse (Anthropic) | ChatBedrockConverse (Nova) |
+|---------|:-------------------------------:|:--------------------------:|
+| System prompt caching | ✅ | ✅ |
+| Tool definition caching | ✅ | ❌ |
+| Message caching | ✅ | ✅ (excludes tool result messages) |
+| Extended TTL (`1h`) | ✅ | ❌ |

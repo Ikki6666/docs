@@ -1,0 +1,205 @@
+---
+title: "MemoryVectorStore 集成"
+description: "使用 LangChain JavaScript 集成 MemoryVectorStore。"
+---
+
+LangChain 提供了一个基于内存、临时性的 vectorstore，它会把 embeddings 存在内存中，并通过精确的线性搜索来查找最相似的 embeddings。默认相似度度量是余弦相似度，但你也可以切换为 [ml-distance](https://mljs.github.io/distance/modules/similarity.html) 支持的任意相似度度量。
+
+由于它主要面向演示场景，目前还不支持 ids 或删除操作。
+
+本指南快速介绍如何开始使用 `MemoryVectorStore` [vector stores](/oss/integrations/vectorstores)。
+
+## 概览
+
+### 集成详情
+
+| Class | Package | PY support |  Version |
+| :--- | :--- | :---: | :---: |
+| `MemoryVectorStore` | [`langchain`](https://www.npmjs.com/package/langchain) | ❌ |  ![NPM - Version](https://img.shields.io/npm/v/langchain?style=flat-square&label=%20&) |
+
+## 设置
+
+要使用基于内存的 vector stores，你需要安装 `langchain` 包：
+
+本指南还会使用 [OpenAI embeddings](/oss/integrations/embeddings/openai)，因此你也需要安装 `@langchain/openai` 集成包。如果你愿意，也可以改用[其他受支持的 embeddings models](/oss/integrations/embeddings)。
+
+<CodeGroup>
+```bash npm
+npm install langchain @langchain/openai @langchain/core
+```
+```bash yarn
+yarn add langchain @langchain/openai @langchain/core
+```
+```bash pnpm
+pnpm add langchain @langchain/openai @langchain/core
+```
+</CodeGroup>
+
+### 凭据
+
+使用基于内存的 vector stores 不需要任何必填凭据。
+
+如果你在本指南中使用 OpenAI embeddings，那么还需要设置 OpenAI key：
+
+```typescript
+process.env.OPENAI_API_KEY = "YOUR_API_KEY";
+```
+
+如果你希望对模型调用启用自动 tracing，也可以取消注释以下代码来设置 [LangSmith](/langsmith/observability) API key：
+
+```typescript
+// process.env.LANGSMITH_TRACING="true"
+// process.env.LANGSMITH_API_KEY="your-api-key"
+```
+
+## 实例化
+
+```typescript
+import { MemoryVectorStore } from "@langchain/classic/vectorstores/memory";
+import { OpenAIEmbeddings } from "@langchain/openai";
+
+const embeddings = new OpenAIEmbeddings({
+  model: "text-embedding-3-small",
+});
+
+const vectorStore = new MemoryVectorStore(embeddings);
+```
+
+## 管理 vector store
+
+### 向 vector store 添加内容
+
+```typescript
+import type { Document } from "@langchain/core/documents";
+
+const document1: Document = {
+  pageContent: "The powerhouse of the cell is the mitochondria",
+  metadata: { source: "https://example.com" }
+};
+
+const document2: Document = {
+  pageContent: "Buildings are made out of brick",
+  metadata: { source: "https://example.com" }
+};
+
+const document3: Document = {
+  pageContent: "Mitochondria are made out of lipids",
+  metadata: { source: "https://example.com" }
+};
+
+const documents = [document1, document2, document3];
+
+await vectorStore.addDocuments(documents);
+```
+
+## 查询 vector store
+
+当 vector store 创建完成并加入了相关文档后，你通常会希望在运行 chain 或 agent 时对它进行查询。
+
+### 直接查询
+
+执行简单的相似度搜索可以这样做：
+
+```typescript
+const filter = (doc) => doc.metadata.source === "https://example.com";
+
+const similaritySearchResults = await vectorStore.similaritySearch("biology", 2, filter)
+
+for (const doc of similaritySearchResults) {
+  console.log(`* ${doc.pageContent} [${JSON.stringify(doc.metadata, null)}]`);
+}
+```
+
+```text
+* The powerhouse of the cell is the mitochondria [{"source":"https://example.com"}]
+* Mitochondria are made out of lipids [{"source":"https://example.com"}]
+```
+
+这个 filter 是可选的，并且必须是一个 predicate function，它接收一个 document 作为输入，并根据该文档是否应被返回而返回 `true` 或 `false`。
+
+如果你希望执行相似度搜索并同时获取对应分数，可以这样写：
+
+```typescript
+const similaritySearchWithScoreResults = await vectorStore.similaritySearchWithScore("biology", 2, filter)
+
+for (const [doc, score] of similaritySearchWithScoreResults) {
+  console.log(`* [SIM=${score.toFixed(3)}] ${doc.pageContent} [${JSON.stringify(doc.metadata)}]`);
+}
+```
+
+```text
+* [SIM=0.165] The powerhouse of the cell is the mitochondria [{"source":"https://example.com"}]
+* [SIM=0.148] Mitochondria are made out of lipids [{"source":"https://example.com"}]
+```
+
+### 转成 retriever 后查询
+
+你也可以把 vector store 转成一个 [retriever](/oss/langchain/retrieval)，以便在 chains 中更方便地使用：
+
+```typescript
+const retriever = vectorStore.asRetriever({
+  // Optional filter
+  filter: filter,
+  k: 2,
+});
+
+await retriever.invoke("biology");
+```
+
+```javascript
+[
+  Document {
+    pageContent: 'The powerhouse of the cell is the mitochondria',
+    metadata: { source: 'https://example.com' },
+    id: undefined
+  },
+  Document {
+    pageContent: 'Mitochondria are made out of lipids',
+    metadata: { source: 'https://example.com' },
+    id: undefined
+  }
+]
+```
+
+### Maximal marginal relevance
+
+这个 vector store 还支持 maximal marginal relevance，MMR，这种技术会先通过经典相似度搜索获取更多结果，数量由 `searchKwargs.fetchK` 指定，然后再按多样性重新排序，并返回前 `k` 个结果。这有助于避免信息重复：
+
+```typescript
+const mmrRetriever = vectorStore.asRetriever({
+  searchType: "mmr",
+  searchKwargs: {
+    fetchK: 10,
+  },
+  // Optional filter
+  filter: filter,
+  k: 2,
+});
+
+await mmrRetriever.invoke("biology");
+```
+
+```javascript
+[
+  Document {
+    pageContent: 'The powerhouse of the cell is the mitochondria',
+    metadata: { source: 'https://example.com' },
+    id: undefined
+  },
+  Document {
+    pageContent: 'Buildings are made out of brick',
+    metadata: { source: 'https://example.com' },
+    id: undefined
+  }
+]
+```
+
+### 用于检索增强生成
+
+关于如何将这个 vector store 用于检索增强生成，RAG，请参阅以下内容：
+
+- [Build a RAG app with LangChain](/oss/langchain/rag)。
+- [Agentic RAG](/oss/langgraph/agentic-rag)
+- [Retrieval docs](/oss/langchain/retrieval)
+
+---

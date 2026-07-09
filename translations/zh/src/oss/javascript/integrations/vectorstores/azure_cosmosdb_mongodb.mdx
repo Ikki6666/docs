@@ -1,0 +1,134 @@
+---
+title: Azure Cosmos DB for MongoDB vCore，已弃用
+description: "使用 LangChain JavaScript 集成 Azure Cosmos DB for MongoDB vcore vector store。"
+---
+
+<Warning>
+**这个集成已更名。** Azure Cosmos DB for MongoDB vCore 已被 Microsoft 重新命名为 Azure DocumentDB。
+
+请改用新的 [Azure DocumentDB](/oss/integrations/vectorstores/azure_documentdb) 集成。旧的类名，`AzureCosmosDBMongoDBVectorStore` 等，仍作为已弃用别名保留，以兼容旧代码，但你应迁移到新的 `AzureDocumentDBVectorStore` 类。
+</Warning>
+
+> [Azure Cosmos DB for MongoDB vCore](https://learn.microsoft.com/azure/cosmos-db/mongodb/vcore/) 让你可以轻松创建一个完全原生支持 MongoDB 的数据库。你可以复用现有的 MongoDB 经验，并继续使用自己熟悉的 MongoDB drivers、SDKs 和 tools，只需把应用指向 API for MongoDB vCore account 的 connection string。通过 Azure Cosmos DB for MongoDB vCore 中的向量搜索能力，你可以把基于 AI 的应用与存储在 Azure Cosmos DB 中的数据无缝集成。
+
+Azure Cosmos DB for MongoDB vCore 为开发者提供了一个完全托管、兼容 MongoDB 的数据库服务，用于以熟悉的架构构建现代应用。
+
+你可以在[这个页面](https://learn.microsoft.com/azure/cosmos-db/mongodb/vcore/vector-search)了解如何使用 Azure Cosmos DB for MongoDB vCore 的向量搜索能力。如果你还没有 Azure 账户，可以[创建一个免费账户](https://azure.microsoft.com/free/)开始使用。
+
+## 设置
+
+首先，你需要安装 [`@langchain/azure-cosmosdb`](https://www.npmjs.com/package/@langchain/azure-cosmosdb) 包：
+
+<Tip>
+请参阅[这一节](/oss/langchain/install)，了解 LangChain 包的通用安装说明。
+</Tip>
+
+```bash npm
+npm install @langchain/azure-cosmosdb @langchain/core
+```
+
+你还需要准备一个正在运行的 Azure Cosmos DB for MongoDB vCore 实例。你可以按照[本指南](https://learn.microsoft.com/azure/cosmos-db/mongodb/vcore/quickstart-portal)在 Azure Portal 上免费部署一个版本。
+
+当实例运行后，请确保你拿到了 connection string 和 admin key。你可以在 Azure Portal 中实例的 `"Connection strings"` 部分找到它们。然后设置以下环境变量：
+
+```bash .env vars
+AZURE_COSMOSDB_MONGODB_CONNECTION_STRING=
+```
+
+## 示例
+
+下面的示例会把文件中的文档索引到 Azure Cosmos DB for MongoDB vCore 中，执行一次向量搜索查询，最后使用 chain 基于检索到的文档用自然语言回答问题。
+
+```typescript
+import {
+  AzureCosmosDBMongoDBVectorStore,
+  AzureCosmosDBMongoDBSimilarityType,
+} from "@langchain/azure-cosmosdb";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { ChatOpenAI, OpenAIEmbeddings } from "@langchain/openai";
+import { createStuffDocumentsChain } from "@langchain/classic/chains/combine_documents";
+import { createRetrievalChain } from "@langchain/classic/chains/retrieval";
+import { TextLoader } from "@langchain/classic/document_loaders/fs/text";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+
+// Load documents from file
+const loader = new TextLoader("./state_of_the_union.txt");
+const rawDocuments = await loader.load();
+const splitter = new RecursiveCharacterTextSplitter({
+  chunkSize: 1000,
+  chunkOverlap: 0,
+});
+const documents = await splitter.splitDocuments(rawDocuments);
+
+// Create Azure Cosmos DB for MongoDB vCore vector store
+const store = await AzureCosmosDBMongoDBVectorStore.fromDocuments(
+  documents,
+  new OpenAIEmbeddings(),
+  {
+    databaseName: "langchain",
+    collectionName: "documents",
+    indexOptions: {
+      numLists: 100,
+      dimensions: 1536,
+      similarity: AzureCosmosDBMongoDBSimilarityType.COS,
+    },
+  }
+);
+
+// Performs a similarity search
+const resultDocuments = await store.similaritySearch(
+  "What did the president say about Ketanji Brown Jackson?"
+);
+
+console.log("Similarity search results:");
+console.log(resultDocuments[0].pageContent);
+/*
+  Tonight. I call on the Senate to: Pass the Freedom to Vote Act. Pass the John Lewis Voting Rights Act. And while you’re at it, pass the Disclose Act so Americans can know who is funding our elections.
+
+  Tonight, I’d like to honor someone who has dedicated his life to serve this country: Justice Stephen Breyer—an Army veteran, Constitutional scholar, and retiring Justice of the United States Supreme Court. Justice Breyer, thank you for your service.
+
+  One of the most serious constitutional responsibilities a President has is nominating someone to serve on the United States Supreme Court.
+
+  And I did that 4 days ago, when I nominated Circuit Court of Appeals Judge Ketanji Brown Jackson. One of our nation’s top legal minds, who will continue Justice Breyer’s legacy of excellence.
+*/
+
+// Use the store as part of a chain
+const model = new ChatOpenAI({ model: "gpt-3.5-turbo-1106" });
+const questionAnsweringPrompt = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    "Answer the user's questions based on the below context:\n\n{context}",
+  ],
+  ["human", "{input}"],
+]);
+
+const combineDocsChain = await createStuffDocumentsChain({
+  llm: model,
+  prompt: questionAnsweringPrompt,
+});
+
+const chain = await createRetrievalChain({
+  retriever: store.asRetriever(),
+  combineDocsChain,
+});
+
+const res = await chain.invoke({
+  input: "What is the president's top priority regarding prices?",
+});
+
+console.log("Chain response:");
+console.log(res.answer);
+/*
+  The president's top priority is getting prices under control.
+*/
+
+// Clean up
+await store.delete();
+
+await store.close();
+```
+
+## 相关内容
+
+- Vector store [conceptual guide](/oss/integrations/vectorstores)
+- Vector store [how-to guides](/oss/integrations/vectorstores)

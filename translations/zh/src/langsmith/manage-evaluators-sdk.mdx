@@ -1,0 +1,553 @@
+---
+title: 使用 SDK 管理评估器
+sidebarTitle: 以编程方式管理评估器
+description: 使用 SDK 以编程方式创建、获取、更新、列出和删除 LangSmith 评估器。
+icon: "code"
+tag: "SDK"
+---
+
+使用 LangSmith SDK 以编程方式创建和管理[评估器](/langsmith/evaluation-concepts#evaluators)。通过 SDK 创建的评估器属于[工作区级](/langsmith/administration-overview#workspaces)资源，会显示在 [LangSmith UI](https://smith.langchain.com) 的 **Evaluators** 表格中，与[在 UI 中创建的评估器](/langsmith/evaluators#create-an-evaluator-in-the-ui)一致。您可以将它们附加到数据集上运行[离线评估](/langsmith/evaluation-concepts#offline-evaluations)，也可以附加到 tracing 项目上运行[在线评估](/langsmith/evaluation-concepts#online-evaluations)。使用 SDK 可以自动化评估器管理，并将评估集成到现有工作流中。
+
+## 前提条件
+
+通过 SDK 管理评估器需要：
+
+- Python: `langsmith>=0.9.8` (PyPI)
+- TypeScript: `langsmith>=0.7.16` (npm)
+
+<Note>
+安装和设置请参阅 [Python SDK 文档](https://reference.langchain.com/python/langsmith) 和 [TypeScript SDK 文档](https://reference.langchain.com/javascript/modules/langsmith.html)。
+</Note>
+
+本页示例都在不传参的情况下初始化客户端，因此会读取 `LANGSMITH_API_KEY` 和 `LANGSMITH_ENDPOINT` 环境变量。请通过环境变量配置您的 [API key](/langsmith/create-account-api-key)，不要将其硬编码到代码中。
+
+在下面的示例中，请将 `<evaluator-uuid>` 等占位符替换为 LangSmith 中对应的信息。本页所有 Python 异步示例都假定它们运行在 `async def main(): ... asyncio.run(main())` 中，具体可参考创建代码评估器的示例。
+
+## 创建评估器
+
+### 代码评估器
+
+代码评估器会使用您定义的函数为每个 run 或 example 打分。
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from langsmith import Client
+
+
+async def main():
+    client = Client()
+
+    created = await client.evaluators.create(
+        name="Correctness evaluator",
+        type="code",
+        code_evaluator={
+            "code": "def perform_eval(run, example):\n    return {'score': 1}",
+            "language": "python",
+        },
+    )
+    evaluator_id = created.evaluator.id
+    print("Created evaluator:", evaluator_id)
+
+
+asyncio.run(main())
+```
+```typescript TypeScript
+import { Client } from "langsmith";
+
+const client = new Client();
+
+const created = await client.evaluators.create({
+  name: "Correctness evaluator",
+  type: "code",
+  code_evaluator: {
+    code: "def perform_eval(run, example):\n    return {'score': 1}",
+    language: "python",
+  },
+});
+const evaluatorId = created.evaluator?.id;
+console.log("Created evaluator:", evaluatorId);
+```
+</CodeGroup>
+
+### LLM-as-a-judge 评估器
+
+LLM-as-a-judge 评估器会引用[prompt hub](/langsmith/prompt-engineering-quickstart)中的 prompt，并将您的 run 或 example 字段映射到 prompt 变量。
+
+<Note>
+该 prompt 必须是结构化 prompt，类型为 `StructuredPrompt`。`StructuredPrompt` 会将 prompt 模板与输出 schema 结合起来，确保模型按定义的结构返回数据。
+</Note>
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from langsmith import Client
+
+
+async def main():
+    client = Client()
+
+    created = await client.evaluators.create(
+        name="LLM judge",
+        type="llm",
+        llm_evaluator={
+            "prompt_repo_handle": "<prompt-repo-handle>",
+            "commit_hash_or_tag": "<commit-hash-or-tag>",
+            "variable_mapping": {
+                "input": "inputs.question",
+                "output": "outputs.answer",
+                "reference": "reference.answer",
+            },
+        },
+    )
+    evaluator_id = created.evaluator.id
+
+
+asyncio.run(main())
+```
+```typescript TypeScript
+const created = await client.evaluators.create({
+  name: "LLM judge",
+  type: "llm",
+  llm_evaluator: {
+    prompt_repo_handle: "<prompt-repo-handle>",
+    commit_hash_or_tag: "<commit-hash-or-tag>",
+    variable_mapping: {
+      input: "inputs.question",
+      output: "outputs.answer",
+      reference: "reference.answer",
+    },
+  },
+});
+const evaluatorId = created.evaluator?.id;
+```
+</CodeGroup>
+
+`prompt_repo_handle` 是 prompt 的内部仓库名称，不是它的展示标题或 URL。要找到它，您可以列出工作区中的 prompt 并读取 `repo_handle` 字段，也可以通过 LangSmith 中的 prompt 标识符获取指定 prompt。prompt 的标识符格式可以是：
+
+- `promptName`，用于私有 prompt，例如 `my-prompt`。
+- `owner/promptName`，用于公开 prompt，例如 `langchain-ai/correctness`。
+
+<CodeGroup>
+```python Python
+# List workspace prompts and read each repo handle
+for prompt in client.list_prompts(limit=10).repos:
+    print("prompt-repo-handle:", prompt.repo_handle)   # value to use for prompt_repo_handle
+    print("prompt-full-name:", prompt.full_name)     # display name
+    print("description:", prompt.description)
+
+# Or retrieve a specific prompt by identifier
+prompt = client.get_prompt("<prompt-identifier>")
+print("prompt-repo-handle:", prompt.repo_handle)
+```
+```typescript TypeScript
+// List workspace prompts and read each repo handle.
+// listPrompts() has no `limit` option in this SDK version — it's an async
+// generator over all prompts, so cap the count client-side and break.
+const prompts = client.listPrompts();
+let count = 0;
+for await (const prompt of prompts) {
+  console.log("prompt-repo-handle:", prompt.repo_handle);
+  console.log("prompt-full-name:", prompt.full_name);
+  console.log("description:", prompt.description);
+  console.log("---");
+  if (++count >= 10) break; // first 10 only; stops further pagination
+}
+
+// Or retrieve a specific prompt by identifier
+const prompt = await client.getPrompt("<prompt-identifier>");
+console.log("prompt-repo-handle:", prompt.repo_handle);
+```
+</CodeGroup>
+
+## 获取评估器
+
+按 ID 获取单个评估器，以读取其配置，包括名称、类型、feedback key 和 run rule。
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from langsmith import Client
+
+
+async def main():
+    client = Client()
+    evaluator_id = "<evaluator-uuid>"
+
+    evaluator = await client.evaluators.retrieve(evaluator_id)
+    print(evaluator.name)
+    print(evaluator.type)
+    print(evaluator.feedback_keys)
+    print(evaluator.run_rules)
+
+
+asyncio.run(main())
+```
+```typescript TypeScript
+const evaluator = await client.evaluators.retrieve(evaluatorId);
+console.log(evaluator.name);
+console.log(evaluator.type);
+console.log(evaluator.feedback_keys);
+console.log(evaluator.run_rules);
+```
+</CodeGroup>
+
+## 更新评估器
+
+请传入与评估器类型匹配的字段：代码评估器使用 `code_evaluator`，LLM-as-a-judge 评估器使用 `llm_evaluator`。`update` 只会修改您传入的字段。
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from langsmith import Client
+
+
+async def main():
+    client = Client()
+
+    # Update a code evaluator
+    code_evaluator_id = "<code-evaluator-uuid>"
+
+    updated = await client.evaluators.update(
+        code_evaluator_id,
+        name="Updated correctness evaluator",
+        code_evaluator={
+            "code": "def perform_eval(run, example):\n    return {'score': 0.8}",
+            "language": "python",
+        },
+    )
+    print(updated.evaluator.name if updated.evaluator else None)
+
+    # Update the name and prompt of an LLM-as-a-judge evaluator
+    llm_evaluator_id = "<llm-evaluator-uuid>"
+
+    await client.evaluators.update(
+        llm_evaluator_id,
+        name="Updated LLM judge",
+        llm_evaluator={
+            "prompt_repo_handle": "<prompt-repo-handle>",
+            "commit_hash_or_tag": "<commit-hash-or-tag>",
+        },
+    )
+
+
+asyncio.run(main())
+```
+```typescript TypeScript
+// Update a code evaluator
+const codeEvaluatorId = "<code-evaluator-uuid>";
+
+const updated = await client.evaluators.update(codeEvaluatorId, {
+  name: "Updated correctness evaluator",
+  code_evaluator: {
+    code: "def perform_eval(run, example):\n    return {'score': 0.8}",
+    language: "python",
+  },
+});
+console.log(updated.evaluator?.name);
+
+// Update the name and prompt of an LLM-as-a-judge evaluator
+const llmEvaluatorId = "<llm-evaluator-uuid>";
+
+await client.evaluators.update(llmEvaluatorId, {
+  name: "Updated LLM judge",
+  llm_evaluator: {
+    prompt_repo_handle: "<prompt-repo-handle>",
+    commit_hash_or_tag: "<commit-hash-or-tag>",
+  },
+});
+```
+</CodeGroup>
+
+### 配置运行时设置
+
+LLM-as-a-judge 评估器支持额外设置，用于控制它如何为 trace 打分：
+
+- **`variable_mapping`**：将 run 或 example 字段映射到 judge prompt 变量。评估器运行时会应用该映射。
+- **`use_corrections_dataset`** 和 **`num_few_shot_examples`**：启用基于人工分数修正的 few-shot 学习。只有当评估器已附加到项目或数据集，且已经提交过修正时，这两个设置才会生效。
+
+<Note>
+这些设置会在下一次评估运行时生效，而不是在您调用 `update` 时立即生效。
+</Note>
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from langsmith import Client
+
+
+async def main():
+    client = Client()
+    llm_evaluator_id = "<llm-evaluator-uuid>"
+
+    await client.evaluators.update(
+        llm_evaluator_id,
+        llm_evaluator={
+            "prompt_repo_handle": "<prompt-repo-handle>",
+            "commit_hash_or_tag": "<commit-hash-or-tag>",
+            "variable_mapping": {
+                "input": "inputs.question",
+                "output": "outputs.answer",
+            },
+            "use_corrections_dataset": True,
+            "num_few_shot_examples": 3,
+        },
+    )
+
+
+asyncio.run(main())
+```
+```typescript TypeScript
+const llmEvaluatorId = "<llm-evaluator-uuid>";
+
+await client.evaluators.update(llmEvaluatorId, {
+  llm_evaluator: {
+    prompt_repo_handle: "<prompt-repo-handle>",
+    commit_hash_or_tag: "<commit-hash-or-tag>",
+    variable_mapping: {
+      input: "inputs.question",
+      output: "outputs.answer",
+    },
+    use_corrections_dataset: true,
+    num_few_shot_examples: 3,
+  },
+});
+```
+</CodeGroup>
+
+## 列出评估器
+
+您可以按名称、类型、feedback key、附加资源或 tag value 进行过滤，也可以排序或分页。直接迭代 `list()` 返回对象时，它会自动遍历所有匹配结果。`limit` 设置的是每次请求的分页大小，范围为 1 到 100，而不是总结果数。`sort_by` 是可选项，接受 `created_at` 或 `updated_at`，默认值为 `created_at`。
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from langsmith import Client
+
+
+async def main():
+    client = Client()
+
+    # Read a single page of results
+    page = await client.evaluators.list(
+        name_contains="correctness",
+        type="code",
+        limit=10,
+    )
+    for evaluator in page.evaluators:
+        print(evaluator.id, evaluator.name, evaluator.type)
+
+    # Collect every match into a list
+    evaluators = [
+        evaluator
+        async for evaluator in client.evaluators.list(feedback_key="correctness", limit=20)
+    ]
+
+    # Filter, sort, and paginate
+    page = await client.evaluators.list(
+        feedback_key="correctness",
+        name_contains="judge",
+        resource_id=["<project-or-dataset-uuid>"],
+        tag_value_id=["<tag-value-uuid>"],
+        type="llm",
+        sort_by="updated_at",  # "created_at" (default) or "updated_at"
+        sort_by_desc=False,
+        limit=20,
+        offset=0,
+    )
+
+
+asyncio.run(main())
+```
+```typescript TypeScript
+// Read a single page of results
+const page = await client.evaluators.list({
+  name_contains: "correctness",
+  type: "code",
+  limit: 10,
+});
+for (const evaluator of page.evaluators) {
+  console.log(evaluator.id, evaluator.name, evaluator.type);
+}
+
+// Collect every match into an array
+const evaluators = [];
+for await (const evaluator of client.evaluators.list({
+  feedback_key: "correctness",
+  limit: 20,
+})) {
+  evaluators.push(evaluator);
+}
+
+// Filter, sort, and paginate
+await client.evaluators.list({
+  feedback_key: "correctness",
+  name_contains: "judge",
+  resource_id: ["<project-or-dataset-uuid>"],
+  tag_value_id: ["<tag-value-uuid>"],
+  type: "llm",
+  sort_by: "updated_at", // "created_at" (default) or "updated_at"
+  sort_by_desc: false,
+  limit: 20,
+  offset: 0,
+});
+```
+</CodeGroup>
+
+## 跟踪评估器开销
+
+获取评估器的预估美元花费和 trace 数量：
+
+- **`period_start`**：仅包含日期的 ISO 字符串，例如 `2026-06-29`。如果传入 datetime，会返回 400 错误。
+    - **窗口**：`period_start` 会启动一个固定的 7 天窗口，包含 `period_start` 当天和之后 6 天。该窗口是半开区间 `[period_start, period_start + 7 days)`，因此 `period_end`，也就是 `period_start` 加 7 天，不包含在内。例如，`period_start` 为 `2026-06-29` 时，覆盖范围是 `2026-06-29` 到 `2026-07-05`，不包含 `2026-07-06`。
+- **`type`**：将结果限定为单一评估器类型，取值为 `llm` 或 `code`。省略该字段则包含所有类型。
+- **空结果**：如果该时间窗口内没有记录到花费，返回的 `groups` 列表为空。
+
+<Note>
+请在 `group_by`、`evaluator_id`、`session_id`，也就是 LangSmith tracing 项目 UUID，或 `dataset_id` 中恰好传入一个。
+</Note>
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from langsmith import Client
+
+
+async def main():
+    client = Client()
+    evaluator_uuid = "<evaluator-uuid>"
+    start_date = "<period-start-date>" # for example, "2026-06-29"
+
+    # Spend for a single evaluator
+    spend = await client.evaluators.spend(
+        period_start=start_date,
+        evaluator_id=evaluator_uuid,
+    )
+    for group in spend.groups or []:
+        print(group.evaluator_name, group.total_spend_usd, group.total_trace_count)
+
+    # Group spend by evaluator
+    spend_by_evaluator = await client.evaluators.spend(
+        period_start=start_date,
+        group_by="evaluator",
+        type="llm",
+    )
+    print("Group by evaluator")
+    for group in spend_by_evaluator.groups or []:
+        print(group.evaluator_name, group.total_spend_usd, group.total_trace_count)
+
+    # Group spend by resource
+    spend_by_resource = await client.evaluators.spend(
+        period_start=start_date,
+        group_by="resource",
+        type="llm",
+    )
+    print("Group by resource")
+    for group in spend_by_resource.groups or []:
+        print(group.session_name, group.dataset_name, group.total_spend_usd, group.total_trace_count)
+
+    # Group spend by run_rule
+    spend_by_run_rule = await client.evaluators.spend(
+        period_start=start_date,
+        group_by="run_rule",
+        type="llm",
+    )
+    print("Group by run_rule")
+    for group in spend_by_run_rule.groups or []:
+        print(group.run_rule_name, group.total_spend_usd, group.total_trace_count)
+
+
+asyncio.run(main())
+```
+```typescript TypeScript
+const evaluatorUUID = "<evaluator-uuid>";
+const startDate = "<period-start-date>"; // for example, "2026-06-29"
+
+// Spend for a single evaluator
+const spend = await client.evaluators.spend({
+  period_start: startDate,
+  evaluator_id: evaluatorUUID,
+});
+for (const group of spend.groups ?? []) {
+  console.log(group.evaluator_name, group.total_spend_usd, group.total_trace_count);
+}
+
+// Group spend by evaluator
+const spendByEvaluator = await client.evaluators.spend({
+  period_start: startDate,
+  group_by: "evaluator",
+  type: "llm",
+});
+console.log("Group by evaluator");
+for (const group of spendByEvaluator.groups ?? []) {
+  console.log(group.evaluator_name, group.total_spend_usd, group.total_trace_count);
+}
+
+// Group spend by resource
+const spendByResource = await client.evaluators.spend({
+  period_start: startDate,
+  group_by: "resource",
+  type: "llm",
+});
+console.log("Group by resource");
+for (const group of spendByResource.groups ?? []) {
+  console.log(group.session_name, group.dataset_name, group.total_spend_usd, group.total_trace_count);
+}
+
+// Group spend by run_rule
+const spendByRunRule = await client.evaluators.spend({
+  period_start: startDate,
+  group_by: "run_rule",
+  type: "llm",
+});
+console.log("Group by run_rule");
+for (const group of spendByRunRule.groups ?? []) {
+  console.log(group.run_rule_name, group.total_spend_usd, group.total_trace_count);
+}
+```
+</CodeGroup>
+
+## 删除评估器
+
+当评估器仍附加在 tracing 项目或数据集上时，您无法删除它。将 `delete_run_rules` 设为 `true`，可以先删除引用该评估器的 run rule，再删除评估器本身。
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from langsmith import Client
+
+
+async def main():
+    client = Client()
+    evaluator_id = "<evaluator-uuid>"
+
+    await client.evaluators.delete(
+        evaluator_id,
+        delete_run_rules=True, # run rules referencing the evaluator are deleted first
+    )
+
+
+asyncio.run(main())
+```
+```typescript TypeScript
+const evaluatorId = "<evaluator-uuid>";
+
+await client.evaluators.delete(evaluatorId, {
+  delete_run_rules: true, // run rules referencing the evaluator are deleted first
+});
+```
+</CodeGroup>
+
+## 相关内容
+
+- [管理评估器](/langsmith/evaluators)：在 LangSmith UI 中查看和管理评估器。
+- [设置 LLM-as-a-judge 在线评估器](/langsmith/online-evaluations-llm-as-judge)：在 LangSmith UI 中配置 LLM-as-a-judge 在线评估器。
+- [设置在线代码评估器](/langsmith/online-evaluations-code)：在 LangSmith UI 中配置在线代码评估器。
