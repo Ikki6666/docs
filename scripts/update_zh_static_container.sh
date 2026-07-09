@@ -25,9 +25,15 @@ rm -rf "$STATIC_DIR"
 mkdir -p "$STATIC_DIR"
 unzip -q "$EXPORT_ZIP" -d "$STATIC_DIR"
 
+if [ ! -f "$STATIC_DIR/index.html" ]; then
+  echo "ERROR: Static export is missing index.html after unzip." >&2
+  exit 1
+fi
+
+echo "==> Building static site image"
+docker compose build "$SERVICE_NAME"
+
 echo "==> Starting static container"
-# --force-recreate ensures the bind-mount is re-established after rm -rf rebuilt
-# the static-site directory above; otherwise the container keeps the old (empty) inode.
 docker compose up -d --force-recreate "$SERVICE_NAME"
 
 echo "==> Waiting for site: $HEALTH_URL"
