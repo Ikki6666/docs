@@ -70,7 +70,7 @@ async def my_agent(ctx: agents.JobContext):
     await session.start(room=ctx.room, agent=Agent(instructions="You are a helpful assistant."))
 ```
 
-这同时适用于 STT/LLM/TTS 级联方式和 speech-to-speech 模型：如果你选择使用实时模型来构建 `AgentSession`，例如 `lk_openai.realtime.RealtimeModel(...)`，跟踪设置保持不变。
+这同时适用于 STT/LLM/TTS 级联方式和 speech-to-speech（实时）模型。实时模型（例如 `lk_openai.realtime.RealtimeModel(...)`）需要额外的一次调用来捕获用户的转录文本。请参阅[在 LiveKit 中使用实时模型时](#在-livekit-中使用实时模型时)。
 
 ### 使用你自己的 tracer provider
 
@@ -98,9 +98,39 @@ configure_livekit()
 
 @server.rtc_session()
 async def my_agent(ctx: agents.JobContext):
-    set_thread_id(ctx.job.id)  # 为本次会话设置所需的 thread id
+    thread_id = ctx.job.id  # 或者任何能标识该对话的 id
+    set_thread_id(thread_id)
     ...
 ```
+
+## 在 LiveKit 中使用实时模型时
+
+使用 speech-to-speech（实时）模型时没有单独的语音转文字步骤，因此 LiveKit 会异步转录用户的音频，并通过会话的 `user_input_transcribed` 事件来交付转录文本，而不是通过它发出的 OTel traces。
+
+<Note>
+`instrument_session` 需要 `langsmith[livekit]>=0.10.4`。
+</Note>
+
+请在创建 `AgentSession` 之后立即调用一次 `instrument_session`，这样 SDK 就会为你订阅该事件，并把每段转录文本与其对应的 turn 配对。它是按 thread id 关联的，因此请先用 `set_thread_id` 设置好，并传入同一个 id：
+
+```python
+from langsmith.integrations.livekit import configure_livekit, set_thread_id
+from livekit.plugins import openai as lk_openai
+
+processor = configure_livekit()
+
+@server.rtc_session()
+async def my_agent(ctx: agents.JobContext):
+    thread_id = ctx.job.id  # 或者任何能标识该对话的 id
+    set_thread_id(thread_id)
+
+    session = AgentSession(llm=lk_openai.realtime.RealtimeModel(voice="marin"))
+    processor.instrument_session(session, thread_id)  # 捕获用户转录文本
+
+    await session.start(room=ctx.room, agent=Agent(instructions="You are a helpful assistant."))
+```
+
+仅对实时模型调用 `instrument_session`。在 STT/LLM/TTS 级联方式中，转录文本已经（从语音转文字步骤）被捕获，因此在那里调用它会重复记录用户的 turns。
 
 ## 记录对话音频
 
