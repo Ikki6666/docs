@@ -21,6 +21,7 @@ LangChain 和 [Deep Agents](/oss/deepagents/overview) 提供了一组适用于�
 | [PII detection](#pii-detection) | 检测并处理个人可识别信息（PII）。 |
 | [To-do list](#to-do-list) | 为 agent 提供任务规划和跟踪能力。 |
 | [LLM tool selector](#llm-tool-selector) | 在调用主模型之前，用 LLM 选择相关工具。 |
+| [Tool error](#tool-error) | 捕获工具执行异常并将其转换为供模型查看的错误消息。 |
 | [Tool retry](#tool-retry) | 使用指数退避自动重试失败的 tool call。 |
 | [Model retry](#model-retry) | 使用指数退避自动重试失败的模型调用。 |
 | [LLM tool emulator](#llm-tool-emulator) | 用 LLM 模拟工具执行，用于测试。 |
@@ -46,6 +47,7 @@ LangChain 和 [Deep Agents](/oss/deepagents/overview) 提供了一组适用于�
 | [PII detection](#pii-detection) | 检测并处理个人可识别信息（PII）。 |
 | [To-do list](#to-do-list) | 为 agent 提供任务规划和跟踪能力。 |
 | [LLM tool selector](#llm-tool-selector) | 在调用主模型之前，用 LLM 选择相关工具。 |
+| [Tool error](#tool-error) | 捕获工具执行异常并将其转换为供模型查看的错误消息。 |
 | [Tool retry](#tool-retry) | 使用指数退避自动重试失败的 tool call。 |
 | [Model retry](#model-retry) | 使用指数退避自动重试失败的模型调用。 |
 | [LLM tool emulator](#llm-tool-emulator) | 用 LLM 模拟工具执行，用于测试。 |
@@ -1287,6 +1289,109 @@ const agent = createAgent({
 
 </Accordion>
 
+### Tool error
+
+:::python
+
+捕获工具执行期间抛出的异常，并将其转换为模型能看到并从中恢复的错误 `ToolMessage`，而不是让 agent 运行中止。Tool error 适用于以下情况：
+
+- 让模型用修正后的参数重试失败的 tool call。
+- 输出受控、已净化的错误消息，而不是原始的异常详情。
+- 防止意外的工具异常导致 agent 崩溃。
+
+<Note>
+Tool error middleware 不会自动重试失败的调用。如需重试，请与 [Tool retry](#tool-retry) middleware 组合使用，将后者放在*更内层*（在 `middleware` 列表中更靠前），并配置 `on_failure="error"`，以便异常能到达 tool error middleware。参见下方的[完整示例](#tool-error-full-example)。
+</Note>
+
+**API reference:** @[`ToolErrorMiddleware`]
+
+<Note>
+`ToolErrorMiddleware` 需要 `langchain>=1.3.14`。
+</Note>
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import ToolErrorMiddleware
+
+
+def on_error(exc: Exception, request: ToolCallRequest) -> str | None:
+    if isinstance(exc, ValueError):
+        return f"`{request.tool_call['name']}` failed with {type(exc).__name__}."
+    # propagate everything else
+
+
+agent = create_agent(
+    model="gpt-5.5",
+    tools=[your_tools],
+    middleware=[ToolErrorMiddleware(on_error)],
+)
+```
+
+<Accordion title="Configuration options">
+
+<ParamField body="on_error" type="Callable[[Exception, ToolCallRequest], str | list[ContentBlock] | None]">
+    同步处理函数，针对工具执行期间抛出的每个异常调用。返回内容（一个 `str` 或内容块列表）可将该异常转换为 `ToolMessage(status="error")`。返回 `None` 或省略 return 语句则让异常继续传播。用于同步路径，并且除非给出了 `aon_error`，也用于异步路径。
+</ParamField>
+
+<ParamField body="aon_error" type="Callable[[Exception, ToolCallRequest], Awaitable[str | list[ContentBlock] | None]]">
+    可选的异步处理函数，用于异步执行路径。未提供时回退到 `on_error`。
+</ParamField>
+
+<ParamField body="tools" type="list[BaseTool | str]">
+    可选：要应用错误处理的工具或工具名列表。如果为 `None`，则应用于所有工具。
+</ParamField>
+
+</Accordion>
+
+<Accordion title="Tool error full example">
+
+`on_error` 处理函数接收异常和 `ToolCallRequest`（其中包含带 name、args 和 call ID 的 tool call 字典）。对于不想处理的异常，返回 `None`，它们会正常传播。
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import ToolErrorMiddleware, ToolRetryMiddleware
+
+
+def on_error(exc: Exception, request: ToolCallRequest) -> str | None:
+    # Surface ValueError to the model so it can correct the input
+    if isinstance(exc, ValueError):
+        return f"`{request.tool_call['name']}` failed: {type(exc).__name__}. Fix the input and retry."
+    # Let all other exceptions propagate (halts the run)
+    return None
+
+
+# Async-only usage
+async def aon_error(exc: Exception, request: ToolCallRequest) -> str | None:
+    if isinstance(exc, ConnectionError):
+        return f"Tool `{request.tool_call['name']}` encountered a connection error."
+    return None
+
+
+agent = create_agent(
+    model="gpt-5.5",
+    tools=[search_tool, database_tool],
+    middleware=[
+        # Place retry inner so exceptions reach ToolErrorMiddleware after retries are exhausted
+        ToolRetryMiddleware(max_retries=3, on_failure="error"),
+        ToolErrorMiddleware(on_error=on_error, tools=["search_tool"]),
+    ],
+)
+
+# Async-only: pass aon_error alone (do not pass on_error)
+async_agent = create_agent(
+    model="gpt-5.5",
+    tools=[api_tool],
+    middleware=[ToolErrorMiddleware(aon_error=aon_error)],
+)
+```
+
+<Note>
+优先返回指明异常类型的内容，而不是原始的异常消息，后者可能携带敏感或内部细节。`on_error` 处理函数控制对外披露：除非你主动包含，否则原始异常消息永远不会被发送给模型。
+</Note>
+
+</Accordion>
+:::
+
 ### Tool retry
 
 通过可配置的指数退避自动重试失败的 tool call。Tool retry 适用于以下情况：
@@ -1348,14 +1453,16 @@ const agent = createAgent({
 </ParamField>
 
 <ParamField body="retry_on" type="tuple[type[Exception], ...] | callable" default="(Exception,)">
-    要重试的异常类型元组，或者一个接受异常并返回 `True`/`False` 的函数。
+    要重试的异常类型元组，或者一个接受异常并返回 `True`/`False` 的函数。默认情况下，所有异常都会被重试。不匹配的异常会立即传播，且不会由 `on_failure` 处理。
 </ParamField>
 
-<ParamField body="on_failure" type="string | callable" default="return_message">
+<ParamField body="on_failure" type="string | callable" default="continue">
     重试耗尽后的行为。可选：
-    - `'return_message'` - 返回包含错误详情的 `ToolMessage`
-    - `'raise'` - 重新抛出异常
+    - `'continue'`（默认）- 返回包含错误详情的 `ToolMessage`，让 LLM 处理失败
+    - `'error'` - 重新抛出异常，停止 agent 执行
     - 自定义 callable - 接收异常并返回 `ToolMessage` 内容字符串
+
+    **已弃用的取值：** `'return_message'`（改用 `'continue'`）和 `'raise'`（改用 `'error'`）。
 </ParamField>
 
 <ParamField body="backoff_factor" type="number" default="2.0">
@@ -1429,8 +1536,8 @@ const agent = createAgent({
 - `jitter` - 是否加入随机变化（默认：True）
 
 **Failure handling:**
-- `on_failure='return_message'` - 返回错误消息
-- `on_failure='raise'` - 重新抛出异常
+- `on_failure='continue'`（默认）- 返回错误消息
+- `on_failure='error'` - 重新抛出异常
 - Custom function - 返回错误消息的函数
 :::
 :::js

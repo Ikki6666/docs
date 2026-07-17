@@ -14,10 +14,17 @@ description: 通过 LLM Gateway 把请求路由到任意 OpenAI-compatible endpo
 自定义 provider 由一个 **OpenAI Compatible Endpoint** [模型配置](/langsmith/model-configurations) 定义。你需要在 [LangSmith UI](https://smith.langchain.com) 的 **Settings → Model configurations** 下保存该配置。Gateway 会使用该配置中的以下选项：
 
 - 一个 **base URL**：gateway 将请求转发到的上游 endpoint。
-- 一个 **model name**：会被注入到每次请求中，因此调用方无需再显式指定。
+- 一个 **model name**：你的上游所期望的模型标识符。
 - 一个 **API key**：作为[工作区 secret](/langsmith/llm-gateway-admin-setup#2-add-provider-secrets)保存，永远不会由客户端直接发送。
 
-然后你可以通过 `https://gateway.smith.langchain.com/providers/{configName}` 这条路由，按名称访问该已保存配置。当请求到达时，gateway 会查找配置、解析 secret，并把调用代理到配置中指定的上游 URL。
+你可以通过以下两条路由中的任意一条，按名称访问该已保存配置，具体取决于你想让调用方自行选择模型，还是强制使用配置中指定的模型：
+
+| 路由 | 请求体中的 model name |
+| --- | --- |
+| `https://gateway.smith.langchain.com/providers/{configName}` | 原样转发到上游——由客户端选择模型。 |
+| `https://gateway.smith.langchain.com/models/{configName}` | 被配置中的模型名覆盖——客户端传入的值会被忽略。 |
+
+这两条路由查找的是同一个配置、解析的是同一个 secret，并代理到同一个上游 URL；它们唯一的区别在于是否强制使用模型名。
 
 <Note>
 `{configName}` 指的是你工作区中[模型配置](/langsmith/model-configurations)的配置名称。如果名称中包含 URL 不安全字符（例如 `/` 或空格），请在路径中对它做 URL 编码。例如，一个名为 `meta-llama/Llama-3.1-8B-Instruct` 的配置，会变成 `https://gateway.smith.langchain.com/providers/meta-llama%2FLlama-3.1-8B-Instruct/v1/chat/completions`。
@@ -27,30 +34,47 @@ description: 通过 LLM Gateway 把请求路由到任意 OpenAI-compatible endpo
 
 1. 在 **Settings → Integrations → Provider Secrets** 下，把上游 endpoint 的 API key 添加为工作区 secret。请使用一个有描述性的名称，例如 `MY_PROVIDER_API_KEY`。
 1. 前往 **Settings → Model configurations**，并以 **OpenAI Compatible Endpoint** 作为 provider 创建一个配置。
-1. 将 **Base URL** 设置为你的上游 endpoint，例如 `https://my-inference-server.example.com/v1`，并把 **Model Name** 设置为该 endpoint 所期望的模型标识符。
+1. 将 **Base URL** 设置为你的上游 endpoint，例如 `https://my-inference-server.example.com/v1`，并把 **Model Name** 设置为该 endpoint 所期望的某个模型标识符。
 1. 将 **API Key Name** 设置为你刚创建的 secret。
 1. 用一个**名称**保存该配置。之后你会在 gateway 路由中使用这个名称。
 
 <Note>
-每个配置都会固定到单个模型，因为 gateway 会使用配置中的值覆盖请求体里的 `model` 字段。若要通过同一个 endpoint 提供多个模型，请为每个模型分别创建一个配置，每个配置都拥有自己的名称和 `/providers/{configName}` 路由。
+你所保存的 **Model Name** 仅在通过 `/models/{configName}` 调用该配置时才有意义。通过 `/providers/{configName}` 调用时，客户端的 `model` 字段会原样发送，因此单个配置就可以服务于上游所支持的任意模型（例如，已拉取到某个共享 Ollama 实例中的任意模型）。
 </Note>
 
 ## 2. 发起调用
 
-按名称调用已保存配置。路由格式为 `https://gateway.smith.langchain.com/providers/{configName}`，其中 `{configName}` 就是你在 **Settings → Model configurations** 中保存的配置名称（下面示例中的 `my-custom-endpoint`）。
+按名称调用已保存配置（下面示例中的 `my-custom-endpoint`）。
+
+### 任意模型：`/providers/{configName}`
+
+当上游提供多个模型、并且你想让调用方自行选择时，使用这条路由：
 
 ```bash
 curl https://gateway.smith.langchain.com/providers/my-custom-endpoint/v1/chat/completions \
     -H "Authorization: Bearer $LANGSMITH_API_KEY" \
     -H "Content-Type: application/json" \
+    -d '{"model":"llama3.1:8b","messages":[{"role":"user","content":"ping"}]}'
+```
+
+Gateway 会把请求体中的 `model` 字段原样转发到上游。
+
+### 单一模型：`/models/{configName}`
+
+使用这条路由，无论客户端请求哪个模型，都会把通过该配置的每次调用固定到单个模型——适用于为某个团队或应用强制模型行为：
+
+```bash
+curl https://gateway.smith.langchain.com/models/my-custom-endpoint/v1/chat/completions \
+    -H "Authorization: Bearer $LANGSMITH_API_KEY" \
+    -H "Content-Type: application/json" \
     -d '{"messages":[{"role":"user","content":"ping"}]}'
 ```
 
-Gateway 会用已保存配置中的模型名覆盖请求体里的 `model` 字段，因此你从客户端传入的该值会被忽略。
+Gateway 会用已保存配置中的模型名覆盖请求体里的 `model` 字段，因此客户端传入的任何值（或者像示例中那样干脆不传）都会被忽略。若要从同一个上游提供多个固定模型，请为每个模型分别创建一个配置，每个配置都拥有自己的名称和 `/models/{configName}` 路由。
 
 ## 支持的 endpoints
 
-自定义 providers 采用与内置 OpenAI provider 相同的 allowlist：`POST /v1/chat/completions`（包括 streaming）、`POST /v1/responses`，以及 `GET /v1/models` 列表端点。任何其他路径都会返回 `501 Not Implemented`。
+`/providers/{configName}` 和 `/models/{configName}` 都采用与内置 OpenAI provider 相同的 allowlist：`POST /v1/chat/completions`（包括 streaming）、`POST /v1/responses`，以及 `GET /v1/models` 列表端点。任何其他路径都会返回 `501 Not Implemented`。
 
 ## 下一步
 

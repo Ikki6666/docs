@@ -26,7 +26,7 @@ In production, there are a few primitives that determine how information is shar
 - **[生产注意事项](#product-considerations)**：调用、多租户、身份验证、凭证、异步和持久性
 - **[Memory](#memory)**：在对话中保留信息
 - **[执行环境](#execution-environment)**：文件存储和代码执行
-- **[Guardrails](#guardrails)**：速率限制、错误处理和数据隐私
+- **[Guardrails](#guardrails)**：权限和数据隐私
 - **[Frontend](#frontend)**：将您的 UI 连接到已部署的代理
 
 ## LangSmith 部署
@@ -860,107 +860,19 @@ export const agent = createDeepAgent({
 </Warning>
 ## 护栏
 
-生产中的代理自主运行，这意味着它们可以无限循环、达到速率限制或处理包含敏感信息的用户数据。深度代理提供两层保护：
+生产中的代理自主运行，这意味着它们可以无限循环、达到速率限制或处理包含敏感信息的用户数据。深度代理提供以下几层保护：
 
-- **[权限](/oss/deepagents/permissions)**：声明性允许/拒绝规则，控制代理可以读取或写入哪些文件和目录。使用权限将代理隔离到工作目录、保护敏感文件或强制使用只读内存。
-- **[中间件](/oss/langchain/middleware/built-in)**：包装模型和工具调用的钩子，以实现速率限制、错误处理和数据隐私。
+- **[权限](#权限)**：声明性允许/拒绝规则，控制代理可以读取或写入哪些文件和目录。
+- **[容错](#容错)**：速率限制、重试、回退和错误处理。
+- **[数据隐私](#数据隐私)**：在 PII 到达模型或被存入日志之前检测并处理它的中间件。
 
-![中间件挂钩 - before_model、wrap_model_call、wrap_tool_call、after_model - 包装代理循环，以便策略围绕每个相关步骤确定性地运行](/oss/images/deepagents/product/middleware-lifecycle.png)
+### 权限
 
-### 速率限制
+[权限](/oss/deepagents/permissions)是声明性允许/拒绝规则，控制代理可以读取或写入哪些文件和目录。使用权限可将代理隔离到某个工作目录、保护敏感文件或强制使用只读内存。规则按声明顺序求值，第一条匹配的规则生效。
 
-这里的速率限制是指在一次运行中限制代理自己的LLM和工具的使用，而不是对传入请求的API网关速率限制。
+### 容错
 
-如果没有限制，困惑的代理可以通过循环同一工具调用或进行数百个模型调用，在几分钟内耗尽您的 LLM API 预算。设置每次运行的模型调用和工具执行上限：
-:::python
-```python
-from deepagents import create_deep_agent
-from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
-
-agent = create_deep_agent(
-    model="google_genai:gemini-3.5-flash",
-    middleware=[
-        ModelCallLimitMiddleware(run_limit=50),
-        ToolCallLimitMiddleware(run_limit=200),
-    ],
-)
-```
-:::
-
-:::js
-```typescript
-import { createAgent, modelCallLimitMiddleware, toolCallLimitMiddleware } from "langchain";
-
-const agent = createAgent({
-  model: "google_genai:gemini-3.5-flash",
-  middleware: [
-    modelCallLimitMiddleware({ runLimit: 50 }),
-    toolCallLimitMiddleware({ runLimit: 200 }),
-  ],
-});
-```
-:::
-使用“run_limit”限制单次调用内的调用（每轮重置）。使用“thread_limit”来限制整个对话中的调用（需要检查指针）。有关完整配置，请参阅@[ModelCallLimitMiddleware] 和@[ToolCallLimitMiddleware]。
-
-### 处理错误
-
-并非所有错误都应该以相同的方式处理。瞬时故障（网络超时、速率限制）应自动重试。 LLM 可以恢复的错误（错误的工具输出、解析失败）应该反馈给模型。需要人工输入的错误应暂停代理。有关代码示例的完整细分，请参阅[适当处理错误](/oss/langgraph/thinking-in-langgraph#handle-errors-properly)。
-
-中间件处理瞬态情况。模型调用和工具调用都有自己的具有指数退避功能的重试中间件。如果您的主要模型提供程序完全崩溃，后备中间件将切换到替代方案：
-:::python
-```python
-from deepagents import create_deep_agent
-from langchain.agents.middleware import (
-    ModelFallbackMiddleware,
-    ModelRetryMiddleware,
-    ToolRetryMiddleware,
-)
-
-agent = create_deep_agent(
-    model="google_genai:gemini-3.5-flash",
-    middleware=[
-        # Retry model calls on rate limits, timeouts, and 5xx errors
-        ModelRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0),
-        # If the primary model is fully down, fall back to an alternative
-        ModelFallbackMiddleware("gpt-5.5"),
-        # Retry specific tools that hit external APIs (not all tools)
-        ToolRetryMiddleware(
-            max_retries=2,
-            tools=["search", "fetch_url"],
-            retry_on=(TimeoutError, ConnectionError),
-        ),
-    ],
-)
-```
-:::
-
-:::js
-```typescript
-import {
-  createAgent,
-  modelFallbackMiddleware,
-  modelRetryMiddleware,
-  toolRetryMiddleware,
-} from "langchain";
-
-const agent = createAgent({
-  model: "google_genai:gemini-3.5-flash",
-  middleware: [
-    // Retry model calls on rate limits, timeouts, and 5xx errors
-    modelRetryMiddleware({ maxRetries: 3, backoffFactor: 2.0, initialDelayMs: 1000 }),
-    // If the primary model is fully down, fall back to an alternative
-    modelFallbackMiddleware("gpt-5.5"),
-    // Retry specific tools that hit external APIs (not all tools)
-    toolRetryMiddleware({
-      maxRetries: 2,
-      tools: ["search", "fetch_url"],
-      retryOn: [TimeoutError, TypeError],
-    }),
-  ],
-});
-```
-:::
-将 @[ToolRetryMiddleware] 范围限定为特定工具，而不是重试所有内容。失败的文件系统“read_file”不会从重试中受益，但超时的网络搜索可能会受益。有关完整配置，请参阅@[ModelRetryMiddleware] 和@[ModelFallbackMiddleware]。
+关于速率限制、重试、回退和错误处理，请参阅[容错](/oss/deepagents/fault-tolerance)。
 
 ### 数据隐私
 
