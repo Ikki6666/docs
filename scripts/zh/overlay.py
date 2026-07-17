@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 DOC_EXTENSIONS = {".md", ".mdx"}
 IGNORED_DOC_DIRS = {"code-samples", ".mintlify"}
@@ -53,6 +57,7 @@ def build_overlay(
     shutil.copytree(src_dir, output_src_dir)
 
     if not translations_src_dir.exists():
+        _link_node_modules(output_src_dir)
         return
 
     for translated_file in _iter_files(translations_src_dir):
@@ -60,6 +65,45 @@ def build_overlay(
         output_file = output_src_dir / relative_path
         output_file.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(translated_file, output_file)
+
+    _link_node_modules(output_src_dir)
+
+
+def _link_node_modules(output_src_dir: Path) -> None:
+    """Expose the project root node_modules next to the overlay source tree.
+
+    The pipeline builder copies React snippet components (such as
+    ``PatternEmbed.jsx``) from ``@langchain/docs-sandbox`` by looking them up
+    at ``src_dir.parent / "node_modules"``. The overlay source tree lives under
+    ``.generated/zh/src``, so its parent has no ``node_modules``. Create a
+    relative symlink to the project root ``node_modules`` so the builder finds
+    the npm package without changes. Skip silently (with a warning) when the
+    package has not been installed.
+    """
+    # The overlay output lives at "<project_root>/.generated/zh/src" (see
+    # DEFAULT_OUTPUT_SRC_DIR), so walking up three parents reaches the project
+    # root that holds node_modules.
+    project_root = output_src_dir.parent.parent.parent
+    source = project_root / "node_modules"
+    link = output_src_dir.parent / "node_modules"
+
+    if not source.exists():
+        logger.warning(
+            "node_modules not found at %s — run `npm install` so the builder "
+            "can copy npm snippet components",
+            source,
+        )
+        return
+
+    # Replace any stale entry (symlink, file, or directory) for idempotency.
+    if link.is_symlink() or link.exists():
+        if link.is_dir() and not link.is_symlink():
+            shutil.rmtree(link)
+        else:
+            link.unlink()
+
+    link.symlink_to(os.path.relpath(source, start=link.parent))
+    logger.debug("Linked %s -> %s", link, source)
 
 
 def scan_status(

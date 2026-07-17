@@ -99,3 +99,40 @@ def test_build_command_accepts_custom_source_and_build_dirs(tmp_path: Path) -> N
 
     assert result == 0
     assert (custom_build / "index.mdx").exists()
+
+
+def test_build_overlay_links_node_modules_for_builder(tmp_path: Path) -> None:
+    """Expose project node_modules next to the overlay so the builder finds it."""
+    src_dir = tmp_path / "src"
+    translations_src_dir = tmp_path / "translations" / "zh" / "src"
+    output_src_dir = tmp_path / ".generated" / "zh" / "src"
+
+    src_dir.mkdir()
+    (src_dir / "index.mdx").write_text("# Home\n", encoding="utf-8")
+    translations_src_dir.mkdir(parents=True)
+    (translations_src_dir / "index.mdx").write_text("# 首页\n", encoding="utf-8")
+
+    sandbox_dist = tmp_path / "node_modules" / "@langchain" / "docs-sandbox" / "dist"
+    sandbox_dist.mkdir(parents=True)
+    (sandbox_dist / "PatternEmbed.jsx").write_text("// built", encoding="utf-8")
+
+    build_overlay(src_dir, translations_src_dir, output_src_dir)
+
+    link = output_src_dir.parent / "node_modules"
+    assert link.is_symlink()
+    assert (
+        link / "@langchain" / "docs-sandbox" / "dist" / "PatternEmbed.jsx"
+    ).read_text(encoding="utf-8") == "// built"
+
+
+def test_build_overlay_skips_link_when_node_modules_missing(tmp_path: Path) -> None:
+    """Skip the node_modules link without error when npm install has not run."""
+    src_dir = tmp_path / "src"
+    output_src_dir = tmp_path / ".generated" / "zh" / "src"
+
+    src_dir.mkdir()
+    (src_dir / "index.mdx").write_text("# Home\n", encoding="utf-8")
+
+    build_overlay(src_dir, src_dir / "_unused_translations", output_src_dir)
+
+    assert not (output_src_dir.parent / "node_modules").exists()
