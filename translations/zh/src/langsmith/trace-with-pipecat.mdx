@@ -14,7 +14,7 @@ tag: Beta
 Pipecat 集成要求 `langsmith[pipecat]>=0.9.7`。
 </Note>
 
-该集成会接入 Pipecat 已经发出的 spans，并将其映射到 LangSmith 的 tracing 格式，因此每段对话都会成为一条独立的 LangSmith trace，并为每个 pipeline stage，STT、LLM、TTS，记录一个 span。
+该集成会接入 Pipecat 已经发出的 spans，并将其映射到 LangSmith 的 tracing 格式，因此每段对话都会成为一条独立的 LangSmith trace，并为每个 pipeline stage，STT、LLM、TTS，记录一个 span。这既覆盖 STT/LLM/TTS cascade，也覆盖 speech-to-speech（realtime）模型。Realtime 模型（例如 `OpenAIRealtimeLLMService`）需要额外调用一次才能捕获用户侧的 transcript。请参阅[在 Pipecat 中使用 realtime 模型时](#when-using-pipecat-with-a-realtime-model)。
 
 ## 安装
 
@@ -94,6 +94,59 @@ from langsmith.integrations.pipecat import configure_pipecat, set_thread_id
 configure_pipecat()
 set_thread_id(conversation_id)
 ```
+
+## 在 Pipecat 中使用 realtime 模型时
+
+在使用 speech-to-speech（realtime）模型时，并不存在独立的 speech-to-text stage，因此用户的 transcript 不会作为 OTel span 发出。它通过 user context aggregator 的 `on_user_turn_message_added` 回调到达——一旦 Pipecat 拿到最终的用户文本，就会触发这个回调。如果不接入这一回调，trace 中就只能看到助手侧。
+
+请在构建好 context aggregator 之后，立刻调用一次 `instrument_user_aggregator`，这样 SDK 就会替你订阅该回调，并把每段 transcript 与其对应的 turn 配对。它依据你传给 `set_thread_id` 的 id 来关联，因此请先设置好 id，再传入同一个 id：
+
+<Note>
+`instrument_user_aggregator` 要求 `langsmith[pipecat]>=0.10.6`。
+</Note>
+
+```python
+from langsmith.integrations.pipecat import configure_pipecat, set_thread_id
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.services.openai.realtime.events import (
+    AudioConfiguration,
+    AudioInput,
+    AudioOutput,
+    InputAudioTranscription,
+    SessionProperties,
+)
+from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+
+conversation_id = "..."  # any id that identifies the conversation
+span_processor = configure_pipecat()
+set_thread_id(conversation_id)
+
+llm = OpenAIRealtimeLLMService(
+    api_key=openai_api_key,
+    settings=OpenAIRealtimeLLMService.Settings(
+        model="gpt-realtime",
+        session_properties=SessionProperties(
+            # Enable input-audio transcription: OpenAI Realtime sends the model
+            # raw audio and, by default, produces no user-side text. Without this
+            # the context aggregator never fires, so the user's turns never reach
+            # the trace.
+            audio=AudioConfiguration(
+                input=AudioInput(transcription=InputAudioTranscription()),
+                output=AudioOutput(voice="marin"),
+            ),
+        ),
+    ),
+)
+
+context = LLMContext(messages=[{"role": "system", "content": "..."}])
+context_aggregator = LLMContextAggregatorPair(context, realtime_service_mode=True)
+span_processor.instrument_user_aggregator(context_aggregator, conversation_id)  # capture the user transcript
+```
+
+对于 OpenAI Realtime，还需要在 session 上启用 input-audio transcription（`InputAudioTranscription`）；否则模型只会收到原始音频，不会产生任何用户侧文本，aggregator 也永远不会触发。其他那些会自行通过 aggregator 暴露用户文本的 realtime service（例如 Gemini Live），只需要调用 `instrument_user_aggregator` 即可，无需额外的 session 配置。
+
+只有在使用 realtime 模型时才调用 `instrument_user_aggregator`。在 STT/LLM/TTS cascade 中，transcript 已经（由 speech-to-text stage）捕获，此时再调用一次会把用户的 turn 重复记录一遍。
 
 ## 记录对话音频
 
