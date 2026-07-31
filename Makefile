@@ -1,4 +1,4 @@
-.PHONY: all dev dev-zh build build-zh zh-status zh-stamp zh-sync export format lint test install clean lint_md lint_md_fix lint_prose broken-links broken-links-with-anchors format-check code-snippets test-code-samples check-cross-refs
+.PHONY: all dev dev-zh build build-zh zh-status zh-stamp zh-sync export format lint test install clean lint_md lint_md_fix lint_prose broken-links broken-links-with-anchors format-check code-snippets test-code-samples check-cross-refs start-static start-dev
 
 # Default target
 all: help
@@ -13,6 +13,18 @@ dev-zh:
 	npm install
 	uv run python -m scripts.zh.overlay build
 	PYTHONPATH=$(CURDIR) uv run pipeline dev --src-dir .generated/zh/src --build-dir build
+
+# Static mode: pre-build docs and serve with Nginx (fast page switching)
+start-static:
+	@echo "Starting static documentation server..."
+	@chmod +x scripts/start.sh
+	@./scripts/start.sh static
+
+# Development mode: file watching with live reload (slow page switching)
+start-dev:
+	@echo "Starting development server..."
+	@chmod +x scripts/start.sh
+	@./scripts/start.sh dev
 
 build:
 	@echo "Building documentation..."
@@ -177,6 +189,8 @@ help:
 	@echo "  make dev-zh             - Start development mode from the Chinese overlay"
 	@echo "  make build              - Build documentation to ./build directory"
 	@echo "  make build-zh           - Build documentation from the Chinese overlay"
+	@echo "  make start-static       - Start static server (pre-built docs, fast)"
+	@echo "  make start-dev          - Start development server (live reload, slow page switching)"
 	@echo "  make zh-status          - Show Chinese translation coverage and stale files"
 	@echo "  make zh-stamp           - Record current source hashes for translated files"
 	@echo "  make zh-sync            - Fetch upstream, merge updates, and rebuild the Chinese overlay"
