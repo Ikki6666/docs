@@ -18,7 +18,7 @@ sidebarTitle: 为你的安装镜像同步 images
 要使用该脚本，你需要执行以下命令，并指定你的 registry 和平台：
 
 ```bash
-bash mirror_images.sh <your-registry> [<platform>]
+bash mirror_langsmith_images.sh <your-registry> [<platform>]
 ```
 
 其中，`<your-registry>` 是你的 Docker registry URL，例如 `myregistry.com`，`<platform>` 是你所使用的平台，例如 `linux/amd64`、`linux/arm64` 等。如果不指定平台，默认会使用 `linux/amd64`。
@@ -93,6 +93,69 @@ images:
     pullPolicy: Always
     tag: "24.8"
 ```
+
+## Sandboxes 所需的额外 images
+
+如果你启用了 [Sandboxes](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes)，还需要同步 sandbox runtime image。sandbox runtime image 仅发布 `linux/amd64` 版本。
+
+```bash
+bash mirror_langsmith_images.sh --registry myregistry --platform linux/amd64 --version 0.16.0 --include-sandboxes
+```
+
+然后，在 `values.yaml` 中配置 sandbox runtime image：
+
+```yaml
+images:
+  sandboxHostImage:
+    repository: "(your-registry)/langchain/sandbox-host"
+    pullPolicy: IfNotPresent
+    tag: "0.16.0"
+```
+
+如果你的镜像 registry 需要认证，请配置 `images.imagePullSecrets`。sandbox runtime 使用与其他 LangSmith images 相同的 image pull secrets。
+
+`--include-sandboxes` 标志会同步 LangSmith 自有的 sandbox runtime image。如果你的集群完全无法拉取公共 images，还需要同步 sandbox 存储驱动使用的 JuiceFS images：
+
+- `docker.io/juicedata/juicefs-csi-driver:v0.31.4`
+- `registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.0`
+- `docker.io/juicedata/mount:ce-v1.3.1`，用于 JuiceFS mount pods
+
+然后，配置相应的 image 覆盖：
+
+```yaml
+images:
+  juicefsCSIImage:
+    repository: "(your-registry)/juicedata/juicefs-csi-driver"
+    tag: "v0.31.4"
+  juicefsCSINodeDriverRegistrarImage:
+    repository: "(your-registry)/sig-storage/csi-node-driver-registrar"
+    tag: "v2.9.0"
+  juicefsMountImage:
+    repository: "(your-registry)/juicedata/mount"
+    tag: "ce-v1.3.1"
+```
+
+chart 默认不会设置 `images.juicefsMountImage`。未设置时，JuiceFS CSI 驱动会使用 CSI 驱动 image 中内置的 `JUICEFS_CE_MOUNT_IMAGE` 回退值。对于 chart 当前的 `docker.io/juicedata/juicefs-csi-driver:v0.31.4` 默认值，该回退值为 `juicedata/mount:ce-v1.3.1`。在私有 registry 或 air-gapped 环境中，请同时设置 `images.juicefsMountImage.repository` 和 `images.juicefsMountImage.tag`，使 mount pods 从你的镜像 registry 拉取，而不是使用公共默认值。
+
+## Engine 所需的额外 images
+
+[Engine](/langsmith/deploy-self-hosted-full-platform#enable-engine) 运行在 `langsmith-insights-engine` 之上，该 image 由镜像同步脚本默认包含。Engine 依赖 Sandboxes，因此请使用 `--include-sandboxes` 进行同步，并按 [Sandboxes 所需的额外 images](#sandboxes-所需的额外-images) 中的说明配置 sandbox runtime image。
+
+然后，将 Engine 和 Insights 的 image 指向你的镜像：
+
+```yaml
+images:
+  engineInsightsAgentImage:
+    repository: "(your-registry)/langchain/langsmith-insights-engine"
+    pullPolicy: IfNotPresent
+    tag: "0.16.0"
+```
+
+<Note>
+repository 名称仍必须以 `langsmith-insights-engine` 结尾；chart 会对它进行校验，以防止安装仍指向已退役的 `langsmith-clio` image，该 image 仅服务于 Insights。
+</Note>
+
+Engine 还依赖 LangSmith Intelligence，它是一个网络依赖而非 image，因此镜像同步无法消除它。参见 [Engine 的 LangSmith Intelligence](/langsmith/self-host-egress#langsmith-intelligence-for-engine)。
 
 ## Fleet 和 Insights 所需的额外 images
 
@@ -214,7 +277,7 @@ cosign verify \
 - 证书链锚定到 Sigstore root，并且已记录到 [Rekor](https://docs.sigstore.dev/rekor/overview/) transparency log 中。
 - 签名证书是通过 GitHub Actions OIDC，签发给稳定分支的发布 workflow。
 
-同样的命令也适用于其他已发布镜像，只需替换 repository 名称即可，例如 `langsmith-frontend`、`langsmith-go-backend`、`agent-builder-deep-agent`、`langsmith-clio`、`langsmith-polly`、`agent-builder-tool-server`、`agent-builder-trigger-server`、`hosted-langserve-backend`、`langsmith-playground`、`langsmith-ace-backend`，以及它们的 `*-fips` 变体。
+同样的命令也适用于其他已发布镜像，只需替换 repository 名称即可，例如 `langsmith-frontend`、`langsmith-go-backend`、`agent-builder-deep-agent`、`langsmith-insights-engine`、`langsmith-polly`、`agent-builder-tool-server`、`agent-builder-trigger-server`、`hosted-langserve-backend`、`langsmith-playground`、`langsmith-ace-backend`，以及它们的 `*-fips` 变体。
 
 ### 固定到特定版本发布
 

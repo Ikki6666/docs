@@ -10,7 +10,8 @@ LangChain 和 NVIDIA 在整个 agent 栈上都展开了合作：
 3. [LangGraph acceleration primitives](#accelerate-langgraph-with-nvidia)
 4. [NeMo Agent Toolkit optimizations](#nemo-agent-toolkit-optimizations-with-langsmith-telemetry)
 5. [Post-training agent workflows](#post-training-agent-workflows)
-6. [Full Stack blueprints](#full-stack-blueprints)
+6. [Model Routing with NeMo Switchyard](#model-routing-with-nemo-switchyard)
+7. [Full Stack blueprints](#full-stack-blueprints)
 
 ## Components
 
@@ -264,6 +265,68 @@ NVIDIA NeMo Gym 为 agentic systems 提供后训练工作流，其中包括将 L
 
 - [NeMo Gym LangGraph agent example](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_agents/langgraph_agent)
 
+## 使用 NeMo Switchyard 进行模型路由
+
+实验性的 [`langchain-nvidia-switchyard`](/oss/integrations/middleware/nvidia#model-routing-with-nemo-switchyard) 包让 deep agent 能够借助 [NeMo Switchyard](https://github.com/NVIDIA-NeMo/Switchyard) 算法，在现有的 LangChain chat models 之间为每次模型调用进行路由。借助它，你可以在一个 agent 后面同时组合高效模型与高能力模型，而 Deep Agents 仍然负责管理 agent 循环、工具、状态和 middleware。
+
+该集成提供：
+
+- **与模型无关的目标**：将任意 LangChain `BaseChatModel` 适配为 Switchyard 目标。
+- **可插拔的路由**：提供已安装的 `nemo-switchyard` Python 绑定所暴露的任意算法，包括 LLM 任务分类和信号驱动的 Stage 路由。
+- **兼容 agent 的 middleware**：在路由模型调用的同时，保留 Deep Agents 的工具绑定、回调、LangChain tracing 和结构化输出。
+- **决策元数据**：可在每条返回的 `AIMessage` 上查看所选模型以及完整的有序路由 trace。
+
+### 从源码安装
+
+该包要求 Python 3.12 或更高版本。先从 Switchyard 源码树构建 Switchyard 的 `libsy` Python 绑定，然后安装带有 OpenRouter 和 Deep Agents 依赖的集成：
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Switchyard.git
+python -m pip install -e ./Switchyard
+
+git clone https://github.com/langchain-ai/langchain-nvidia.git
+python -m pip install -e "./langchain-nvidia/libs/switchyard[openrouter]"
+```
+
+### 路由一个 deep agent
+
+创建两个 LangChain chat models，将它们包装为 Switchyard 目标，并把路由算法传给 `SwitchyardRoutingMiddleware`。传给 `stage_router` 的目标顺序很重要：先传高能力目标，再传高效目标。
+
+```python
+from deepagents import create_deep_agent
+from langchain_openrouter import ChatOpenRouter
+
+from switchyard.libsy import LlmTarget, algorithms
+from langchain_nvidia_switchyard import LangChainLlmClient, SwitchyardRoutingMiddleware
+
+efficient_model = ChatOpenRouter(model="nvidia/nemotron-3-ultra-550b-a55b")
+capable_model = ChatOpenRouter(model="anthropic/claude-sonnet-4.6")
+
+router = algorithms.stage_router(
+    LlmTarget("capable", LangChainLlmClient(capable_model)),
+    LlmTarget("efficient", LangChainLlmClient(efficient_model)),
+    picker="efficient_first",
+    confidence_threshold=0.5,
+    recent_window=3,
+)
+
+agent = create_deep_agent(
+    model=efficient_model,
+    middleware=[SwitchyardRoutingMiddleware(router)],
+)
+
+result = await agent.ainvoke({
+    "messages": [
+        {
+            "role": "user",
+            "content": "Summarize the important files in this project.",
+        }
+    ]
+})
+```
+
+如需了解高级路由配置、支持的请求和响应数据以及当前限制，请参见 [`langchain-nvidia-switchyard` package README](https://github.com/langchain-ai/langchain-nvidia/tree/main/libs/switchyard#readme)。
+
 ## 全栈 Blueprints
 
 NVIDIA 与 LangChain 共同协作了 [full stack examples](https://github.com/langchain-ai/deepagents/tree/main/examples)，展示如何将这些组件组合起来，面向两个企业场景，并聚焦于生产可用性：
@@ -275,6 +338,7 @@ NVIDIA 与 LangChain 共同协作了 [full stack examples](https://github.com/la
 
 - [`langchain-nvidia-ai-endpoints` package README](https://github.com/langchain-ai/langchain-nvidia/blob/main/libs/ai-endpoints/README.md)
 - [`langchain-nvidia-langgraph` package](https://github.com/langchain-ai/langchain-nvidia/tree/main/libs/langgraph)
+- [`langchain-nvidia-switchyard` package](https://github.com/langchain-ai/langchain-nvidia/tree/main/libs/switchyard)
 - [Nemotron model family](https://www.nvidia.com/en-us/ai-data-science/foundation-models/nemotron/)
 - [`langchain-nvidia-openshell` package](https://github.com/langchain-ai/langchain-nvidia/tree/main/libs/openshell)
 - [LangChain NVIDIA samples](https://github.com/langchain-samples/langchain-nvidia-samples)

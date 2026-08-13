@@ -17,7 +17,7 @@ sidebarTitle: Alerts
 LangSmith 中的 alerts 按项目作用域划分，因此每个受监控项目都需要单独配置。
 
 <Tip>
-Alerts 可以通过 [route](#step-4-configure-notification-channel) 发送到 Slack、PagerDuty、Dynatrace，或任意 HTTP endpoint 的 webhook。**Webhook** 标签页中还提供了面向 Microsoft Teams、email，以及 self-hosted 部署上的 Slack 的 [example recipes](#example-recipes)。
+Alerts 可以通过 [route](#step-4-configure-notification-channel) 发送到 Slack、PagerDuty、Dynatrace，或任意 HTTP endpoint 的 webhook。**Webhook** 标签页中还提供了面向 Microsoft Teams、email、self-hosted 部署上的 Slack，以及 Google Chat（需要中间层）的 [example recipes](#example-recipes)。
 </Tip>
 
 按照以下步骤配置 alert。
@@ -259,11 +259,15 @@ Alert 条件由以下几个部分组成：
 
     - **Request Body Template**：自定义发送到 endpoint 的 JSON payload
       - 默认情况下，LangSmith 会发送其定义的 payload，并附加以下顶层 key-value：
-        - `project_name`：触发 alert 的项目名称
+        - `project_name`：alert 所作用域的 LangSmith 项目名称。
+        - `workspace_name`：LangSmith workspace 的名称。
         - `alert_rule_id`：用于标识 LangSmith alert 的 UUID，可在 webhook 服务中用作去重 key
         - `alert_rule_name`：alert rule 的名称
+        - `alert_rule_description`：alert rule 的描述（未设置时为空字符串）。
         - `alert_rule_type`：alert 类型，截至 2025-04-01，所有 alert 均为 `threshold`
         - `alert_rule_attribute`：与 alert rule 关联的属性，例如 `error_count`、`feedback_score`、`latency` 或 `cost`
+        - `alert_rule_url`：指向 LangSmith 中该 alert rule 的直接链接。
+        - `runs_url`：指向 LangSmith 中触发该 alert 的 runs 的直接链接。
         - `triggered_metric_value`：阈值被触发时的指标值
         - `triggered_threshold`：触发 alert 的阈值
         - `timestamp`：触发 alert 的时间戳
@@ -285,6 +289,10 @@ Alert 条件由以下几个部分组成：
     - 确认接收 endpoint 接受 POST 请求
     - 检查接收 endpoint 的日志，看是否有收到但被拒绝的请求
     - 确认自定义 payload template 是合法 JSON
+
+    <Warning>
+    **Send Test Alert 不会校验下游响应。**即使接收 endpoint 返回了错误（例如 400 或 422 拒绝），UI 也会报告 **your configuration is working correctly and the test notification was delivered**。请始终在接收方确认是否收到，检查你的 endpoint 日志或目标平台的消息历史，而不是仅依赖 LangSmith 的成功提示。
+    </Warning>
 
     ### Security considerations
 
@@ -589,6 +597,142 @@ Alert 条件由以下几个部分组成：
       然后根据各自服务商的 payload 结构调整 **Request Body Template**。Amazon SES 不能直接兼容这种方式，因为 SES API 需要对每个请求执行 AWS SigV4 签名，这无法通过静态 header 表达。如果要使用 SES，请通过中间层处理，例如带 HTTP 触发器的 Lambda 函数。
     </Accordion>
 
+    <Accordion title="Configure Google Chat notifications via webhook (requires middleware)">
+      Google Chat 的 incoming webhook API（`spaces.messages.create`）只接受顶层的 `text` 字段。由于 LangSmith 会把全部 12 个 alert 元数据 key 作为顶层字段合并到请求 body 中，Google Chat 会以 400 错误拒绝每个请求：
+
+      ```
+      Invalid JSON payload received. Unknown name "project_name" at 'message': Cannot find field.
+      ```
+
+      没有任何 Request Body Template 可以避免这个问题，即使是最小 body 如 `{"text": "hello", "project_name": "x"}` 也会失败。**必须使用一个转换层（中间层）**，类似于 [email recipe](#configure-email-notifications-via-webhook) 中关于 Amazon SES 的说明。
+
+      **Option A：Cloud Run 或 Cloud Functions 中间层（推荐）**
+
+      该方案使用一个轻量 HTTP handler，接收 LangSmith webhook，提取相关字段，并向 Google Chat space 的 webhook URL 转发一个干净的 `{"text": "..."}` payload。
+
+      **Prerequisites**
+
+      - 一个已配置 incoming webhook 的 Google Chat space。在 Google Chat 中，打开该 space → **Apps & integrations** → **Add webhooks**，创建一个 webhook 并复制 URL。
+      - 一个已启用 Cloud Run 或 Cloud Functions 的 Google Cloud project，或等效的托管环境。
+
+      **Step 1：部署 handler**
+
+      将以下 Python 函数部署为 Cloud Run service 或 Cloud Function：
+
+      ```python
+      import json
+      import os
+      import re
+      import urllib.request
+      from urllib.parse import urlparse
+
+      ALLOWED_LINK_HOSTS = {"smith.langchain.com"}
+
+      def build_text(payload):
+          def safe(v):
+              # Strip angle brackets to prevent <url|label> link injection
+              return re.sub(r"[<>]", "", str(v if v is not None else ""))
+
+          parsed = urlparse(str(payload.get("runs_url") or ""))
+          trusted = parsed.scheme == "https" and parsed.hostname in ALLOWED_LINK_HOSTS
+          return (
+              f"*{safe(payload.get('alert_rule_name'))}* triggered for "
+              f"`{safe(payload.get('project_name'))}`\n"
+              f"{safe(payload.get('alert_rule_attribute'))}: "
+              f"{safe(payload.get('triggered_metric_value'))} "
+              f"(threshold {safe(payload.get('triggered_threshold'))})"
+              + (f"\n<{parsed.geturl()}|View runs>" if trusted else "")
+          )
+
+      def handler(request):
+          if request.headers.get("X-Webhook-Secret") != os.environ["LANGSMITH_SHARED_SECRET"]:
+              return ("forbidden", 403)
+          payload = request.get_json(silent=True) or {}
+          urllib.request.urlopen(
+              urllib.request.Request(
+                  os.environ["GCHAT_WEBHOOK_URL"],
+                  data=json.dumps({"text": build_text(payload)}).encode(),
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              ),
+              timeout=10,
+          )
+          return ("ok", 200)
+      ```
+
+      为部署的函数设置以下环境变量：
+
+      - `GCHAT_WEBHOOK_URL`：Google Chat space 的 webhook URL。
+      - `LANGSMITH_SHARED_SECRET`：你选择的一个 secret 字符串（用于对来自 LangSmith 的传入请求进行认证）。
+
+      **Step 2：在 LangSmith 中配置 webhook alert**
+
+      将 LangSmith webhook 指向你已部署的 handler URL。
+
+      **Webhook URL**
+
+      ```
+      https://<your-cloud-run-service-url>/
+      ```
+
+      **Headers**
+
+      ```json
+      {
+        "Content-Type": "application/json",
+        "X-Webhook-Secret": "<your-shared-secret>"
+      }
+      ```
+
+      **Request Body Template**
+
+      ```json
+      {}
+      ```
+
+      元数据字段（`alert_rule_name`、`project_name`、`runs_url` 等）会由 LangSmith 合并到 body 中，无论你在这里填什么，因此空 body 就足够了。
+
+      <Note>
+      不要在你的 handler 中从 alert 字段值中剥离 `*` 或 `_`。这些字符也用于 Google Chat 的基础文本格式化，但它们会出现在 LangSmith 标识符中（例如 `run_count`）。剥离它们会破坏消息中的字段名称。
+      </Note>
+
+      <Note>
+      Google Chat 对每个 space 强制执行 **每秒 1 条消息** 的写入速率限制，该限制由所有写入该 space 的 webhook 共享。如果你有多个 LangSmith alert 路由到同一个 space 并且同时触发，部分消息可能会被丢弃。
+      </Note>
+
+      **Option B：Google Apps Script（无需基础设施）**
+
+      Google Apps Script 可以作为轻量级中间层，无需部署任何云基础设施。
+
+      在 [script.google.com](https://script.google.com) 创建一个新的 Apps Script 项目，粘贴以下代码，并将其部署为 web app（以你的身份执行，访问权限设为任何人）：
+
+      ```javascript
+      function doPost(e) {
+        var payload = JSON.parse(e.postData.contents);
+        var secret = e.parameter.secret; // shared secret passed as query param
+        if (secret !== PropertiesService.getScriptProperties().getProperty("LANGSMITH_SHARED_SECRET")) {
+          return ContentService.createTextOutput("forbidden").setMimeType(ContentService.MimeType.TEXT);
+        }
+        var text =
+          "*" + (payload.alert_rule_name || "") + "* triggered for `" + (payload.project_name || "") + "`\n" +
+          (payload.alert_rule_attribute || "") + ": " + (payload.triggered_metric_value || "") +
+          " (threshold " + (payload.triggered_threshold || "") + ")";
+        UrlFetchApp.fetch(PropertiesService.getScriptProperties().getProperty("GCHAT_WEBHOOK_URL"), {
+          method: "post",
+          contentType: "application/json",
+          payload: JSON.stringify({ text: text }),
+        });
+        return ContentService.createTextOutput("ok").setMimeType(ContentService.MimeType.TEXT);
+      }
+      ```
+
+      在 **Project Settings → Script Properties** 中设置 `GCHAT_WEBHOOK_URL` 和 `LANGSMITH_SHARED_SECRET`。
+
+      <Warning>
+      Apps Script web app 无法读取自定义 HTTP 请求 header，因此共享 secret 必须作为 **query string 参数**（`?secret=...`）传递，而不是作为 header。请将其包含在 LangSmith webhook URL 中，而不是 Headers 字段中。
+      </Warning>
+    </Accordion>
+
     ### Additional resources
 
     - [Slack chat.postMessage API Documentation](https://api.slack.com/methods/chat.postMessage)
@@ -597,6 +741,7 @@ Alert 条件由以下几个部分组成：
     - [Power Automate documentation](https://learn.microsoft.com/en-us/power-automate/)
     - [langsmith-teams-webhook sample repo](https://github.com/langchain-samples/langsmith-teams-webhook)
     - [SendGrid Mail Send API Documentation](https://docs.sendgrid.com/api-reference/mail-send/mail-send)
+    - [Google Chat incoming webhooks](https://developers.google.com/chat/how-tos/webhooks)
   </Tab>
 </Tabs>
 

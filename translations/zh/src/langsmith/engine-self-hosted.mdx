@@ -1,18 +1,16 @@
 ---
 title: 自托管环境中的 LangSmith Engine
 sidebarTitle: 自托管
-description: LangSmith Engine 在自托管部署中如何运行、它如何通过私有链路访问托管推理，以及这对你的数据意味着什么。
+description: LangSmith Engine 在自托管部署中如何运行、它在你的环境之外依赖什么，以及它如何处理你的数据。
 ---
 
-<Note>
-  自托管版 Engine 即将推出！
-</Note>
+<Info>
+自托管版 Engine 需要 LangSmith Helm chart `0.16.0` 或更高版本，并且需要包含 Engine 授权的 license。在更早的 chart 版本上不可用。[联系你的客户团队](https://www.langchain.com/contact-sales)，将该授权添加到你的订单中。
+</Info>
 
 LangSmith Engine 是 LangSmith 内的一个 agent，它会监控你的生产 traces，将它们聚类成 issues，结合你的源代码诊断每个问题，提出一个修复 PR，并识别应添加到 datasets 中的 ground truth evals。关于产品概览，请参阅 [Engine](/langsmith/engine-overview)。
 
-本页解释 Engine 在自托管部署中如何运行、它如何访问托管推理，以及这对你的数据意味着什么。
-
-{/* TODO(author): Add a version-added <Note> stating the minimum LangSmith / Helm chart version that supports self-hosted Engine managed inference. Required by the docs style guide for new features. */}
+本页解释 Engine 在自托管 LangSmith 中如何运行、它在你的环境之外依赖什么，以及这对你的数据意味着什么。安装方式请参见[启用 Engine](/langsmith/deploy-self-hosted-full-platform#enable-engine)。若要将其连接到你的源代码，请按[将 Engine 连接到 GitHub](/langsmith/engine-github) 中的说明创建并配置你自己的 GitHub App。
 
 Engine 会处理三类数据：
 
@@ -20,52 +18,70 @@ Engine 会处理三类数据：
 - **Traces：**来自 agents 的运行时数据，其中可能包含用户消息、工具输出和 PII。
 - **Model：**Engine 为执行诊断、生成修复方案和编写 evaluators 而发起的 LLM 调用。
 
-在自托管部署中，Engine 的编排逻辑作为 LangSmith 的一部分运行在你的 VPC 内：读取 traces、读取代码，并执行 detect、fix、verify 循环。模型调用是唯一的例外。Engine 不会在本地运行模型，而是通过私有网络连接访问由 LangChain 托管、具备零数据保留（ZDR）的推理服务。Traces 是最敏感的数据类型，下方架构会将 trace 数据保留在你的云服务提供商（CSP）内部的私有网络中。
+在自托管 LangSmith 中，Engine 的编排逻辑作为 LangSmith 的一部分运行在你的 VPC 内：读取 traces、读取代码，并执行 detect、fix、verify 循环。但它无法完全在其中运行。Engine 依赖 LangSmith Intelligence（LSI），一个由 LangChain 托管的零数据保留（ZDR）服务，并向 LSI 发送其工作所需的内容。
 
-## 推理如何工作
+## 按云和区域的可用性
 
-Engine 的推理由 LangChain 托管的 LangSmith Intelligence 服务提供。该服务与 LangSmith 完全隔离，不会对任何客户数据做 tracing、存储或持久化。
+Engine 依赖 LSI 的覆盖范围。该覆盖范围正在扩展，因此可用性因云和区域而异：
+
+| 云 | 区域 | 状态 |
+| --- | --- | --- |
+| AWS | US | 可用 |
+| GCP | US | 可用 |
+| AWS | EU | 计划中 |
+| Azure | US | 计划中 |
+
+请联系你的客户团队，确认你所在区域的覆盖情况及当前时间安排。
+
+## 工作原理
+
+LSI 是为 Engine 提供支持的 LangChain 托管服务。
 
 流程如下：
 
-- 你的自托管部署通过私有链路连接到 LangSmith Intelligence（AWS 和 Azure 使用 PrivateLink，GCP 使用 Private Service Connect）。
-- LangSmith Intelligence 在你的云服务提供商环境内运行模型（Bedrock、Vertex 或 Foundry），因此数据不会离开你的 CSP。
-- 该服务只记录用于计费的请求元数据，以及保持服务可靠性所需的遥测信息。
+- 你的自托管 Engine 向其所在云的 LSI gateway 发送 HTTPS 请求，本页后续的各云小节中列出了这些 gateway。
+- Engine 使用在 LangSmith license 校验期间获得的短期 license JWT 进行认证。你无需提供单独的模型提供商凭据。
+- LSI 校验该 JWT，并通过 LangChain 环境内部的私有网络将请求路由到模型提供商。
+- LSI 将响应返回给你的自托管 Engine。
 
-{/* TODO(author): For security review, enumerate exactly what "request metadata" includes (for example, token counts, timestamps, model ID) and confirm that no request payload is recorded. Do not ship vague wording. */}
+每次请求都会携带 Engine 工作所需的 trace 内容、代码和中间输出。LSI 和模型提供商会处理这些内容以服务该请求。LSI 不会持久化 prompt 或 completion body。
 
-每次推理请求都会携带模型完成推理所需的 trace 内容、代码和中间输出。请求会在运行于你的云提供商内部的模型中处理，并且绝不会被存储。你的数据不会在 CSP 之外留下任何持久化副本。
+你的集群必须允许到该 gateway 的出站 HTTPS。本文档不假设从你的环境到 LSI 的连接使用 AWS PrivateLink。如果你的安全策略要求私有连接，请在启用 Engine 之前联系你的客户团队，确认可用性和设置方式。
 
-{/* TODO(author): State data residency: which region(s) the models run in, whether the customer selects the region, and whether any cross-region inference can occur. */}
+如果到 LSI 的连接不可用，Engine 会 fail closed。集群内没有模型，也没有备用提供商可以回退，因此受影响的 run 会以错误结束，而不是降级到较低质量的输出。你的 LangSmith 部署的其余部分不受影响，Engine 会在下一次计划扫描时重试。
 
-{/* TODO(author): Document the failure mode: what happens to the detect-fix-verify loop if the private link to LangSmith Intelligence is unavailable (degrade, queue, or fail closed). */}
+## LangSmith Intelligence 保留了什么
 
-{/* TODO(author): Link or list the specific models served on each platform so customers can validate against approved-model policies. */}
+LSI 不会持久化 prompt 或 completion body。它会保留以下用于使用量归因和计费的元数据：
 
-### AWS
+- 用于归因使用量的 Account、workspace 和 project 标识符。
+- 用于计费的模型和 token 使用量元数据。
 
-<Frame caption="AWS：通过 PrivateLink 连接 LangSmith Intelligence，模型由 Bedrock 提供">
+关于模型提供商的保留和训练承诺，请参阅 [Engine security](/langsmith/engine-security)。
+
+### AWS（美国可用）
+
+gateway 主机为 `beacon.aws.langchain.com`。LSI 会将请求路由到 LangChain AWS 环境中的 AWS Bedrock。
+
+<Frame caption="AWS：LangSmith 和 Engine 运行在你的 VPC 中；LSI 和 Bedrock 运行在 LangChain 的 AWS 环境中。">
   <img
     src="/langsmith/images/engine-self-hosted-aws.png"
-    alt="Architecture diagram showing a self-hosted LangSmith deployment on AWS connecting to LangSmith Intelligence over PrivateLink, with inference served by Bedrock inside the customer's account"
+    alt="架构图。你的 VPC 中包含 LangSmith UI、一个 NLB、运行 LangSmith 服务的 EKS 集群，以及 S3、RDS 和 ElastiCache 上的存储。LangChain 的云中包含计费、一个监控栈和 LangSmith Intelligence，后者向 Bedrock 发送模型推理请求。两个环境通过私有链路连接。"
   />
 </Frame>
 
-### GCP
+### GCP（美国可用）
 
-<Frame caption="GCP：通过 Private Service Connect 连接 LangSmith Intelligence，模型由 Vertex 提供">
+gateway 主机为 `beacon.langchain.com`。LSI 会将请求路由到 LangChain GCP 环境中的 Vertex。
+
+<Note>
+该主机与自托管 LangSmith 已用于 license 校验和计费遥测的主机相同，因此 GCP 部署只是新增了一条路径，而不是一个新的 egress 目标。参见[配置 egress](/langsmith/self-host-egress)。
+</Note>
+
+<Frame caption="GCP：LangSmith 和 Engine 运行在你的 project 中；LSI 和 Vertex 运行在 LangChain 的 GCP 环境中。">
   <img
     src="/langsmith/images/engine-self-hosted-gcp.png"
-    alt="Architecture diagram showing a self-hosted LangSmith deployment on GCP connecting to LangSmith Intelligence over Private Service Connect, with inference served by Vertex inside the customer's project"
-  />
-</Frame>
-
-### Azure
-
-<Frame caption="Azure：通过 PrivateLink 连接 LangSmith Intelligence，模型由 Foundry 提供">
-  <img
-    src="/langsmith/images/engine-self-hosted-azure.png"
-    alt="Architecture diagram showing a self-hosted LangSmith deployment on Azure connecting to LangSmith Intelligence over PrivateLink, with inference served by Foundry inside the customer's environment"
+    alt="架构图，展示你的 GCP project 中的自托管 LangSmith 部署连接到 LangChain 云中的 LangSmith Intelligence，后者向 Vertex 发送模型推理请求"
   />
 </Frame>
 
@@ -77,16 +93,17 @@ Engine 的推理由 LangChain 托管的 LangSmith Intelligence 服务提供。�
 
 ## 这对你的数据意味着什么
 
-在自托管部署中，Engine 在每种部署通用的控制项之上，额外提供了两项数据驻留保障：
+在自托管部署中，Engine 将数据处理分为你的环境和 LangChain 的环境两部分：
 
-- **仅私有网络：**所有数据传输都通过私有链路完成，不经过公网。
-- **In-CSP：**模型运行在你的 CSP 内，因此数据不会离开该环境。
+- **你的环境：**Engine 编排逻辑和 LangSmith 存储的 traces 保留在你的自托管环境中。
+- **LangChain 的环境：**Engine 发送的内容由 LSI 和模型提供商处理。LSI 会保留上文列出的计费元数据，但不会持久化 prompt 或 completion body。
 
 Engine 与部署无关的数据处理方式——包括与每家模型服务商之间的零数据保留，以及不会使用客户数据来训练或微调模型——已在 [Engine security](/langsmith/engine-security) 中说明。
 
 ## 另请参阅
 
+- [在自托管环境中启用 Engine](/langsmith/deploy-self-hosted-full-platform#enable-engine)
+- [将 Engine 连接到 GitHub](/langsmith/engine-github)
 - [Engine](/langsmith/engine-overview)
 - [配置 Engine](/langsmith/engine)
 - [Engine security](/langsmith/engine-security)
-- [Engine webhooks](/langsmith/engine-webhooks)
