@@ -10,7 +10,9 @@ description: LangSmith Engine 在自托管部署中如何运行、它在你的�
 
 LangSmith Engine 是 LangSmith 内的一个 agent，它会监控你的生产 traces，将它们聚类成 issues，结合你的源代码诊断每个问题，提出一个修复 PR，并识别应添加到 datasets 中的 ground truth evals。关于产品概览，请参阅 [Engine](/langsmith/engine-overview)。
 
-本页解释 Engine 在自托管 LangSmith 中如何运行、它在你的环境之外依赖什么，以及这对你的数据意味着什么。安装方式请参见[启用 Engine](/langsmith/deploy-self-hosted-full-platform#enable-engine)。若要将其连接到你的源代码，请按[将 Engine 连接到 GitHub](/langsmith/engine-github) 中的说明创建并配置你自己的 GitHub App。
+在自托管 LangSmith 中，Engine 的编排逻辑（包括其 detect、fix 和 verify 循环）作为 LangSmith 的一部分运行在你的 VPC 内。模型工作无法完全运行在你的 VPC 中：Engine 会将其所需的内容发送到 LangSmith Intelligence（LSI），一个由 LangChain 托管的零数据保留（ZDR）服务。本页解释这对你的数据意味着什么。
+
+安装方式请参见[启用 Engine](/langsmith/deploy-self-hosted-full-platform#enable-engine)。若要将其连接到你的源代码，请按[将 Engine 连接到 GitHub](/langsmith/engine-github) 中的说明创建并配置你自己的 GitHub App。
 
 Engine 会处理三类数据：
 
@@ -18,20 +20,16 @@ Engine 会处理三类数据：
 - **Traces：**来自 agents 的运行时数据，其中可能包含用户消息、工具输出和 PII。
 - **Model：**Engine 为执行诊断、生成修复方案和编写 evaluators 而发起的 LLM 调用。
 
-在自托管 LangSmith 中，Engine 的编排逻辑作为 LangSmith 的一部分运行在你的 VPC 内：读取 traces、读取代码，并执行 detect、fix、verify 循环。但它无法完全在其中运行。Engine 依赖 LangSmith Intelligence（LSI），一个由 LangChain 托管的零数据保留（ZDR）服务，并向 LSI 发送其工作所需的内容。
-
 ## 按云和区域的可用性
 
-Engine 依赖 LSI 的覆盖范围。该覆盖范围正在扩展，因此可用性因云和区域而异：
+Engine 在 LSI 可用的地方提供：
 
 | 云 | 区域 | 状态 |
 | --- | --- | --- |
 | AWS | US | 可用 |
 | GCP | US | 可用 |
-| AWS | EU | 计划中 |
-| Azure | US | 计划中 |
 
-请联系你的客户团队，确认你所在区域的覆盖情况及当前时间安排。
+关于其他区域的可用性，请联系你的客户团队。
 
 ## 工作原理
 
@@ -44,66 +42,144 @@ LSI 是为 Engine 提供支持的 LangChain 托管服务。
 - LSI 校验该 JWT，并通过 LangChain 环境内部的私有网络将请求路由到模型提供商。
 - LSI 将响应返回给你的自托管 Engine。
 
-每次请求都会携带 Engine 工作所需的 trace 内容、代码和中间输出。LSI 和模型提供商会处理这些内容以服务该请求。LSI 不会持久化 prompt 或 completion body。
+每次请求都会携带 Engine 工作所需的 trace 内容、代码和中间输出。LSI 和模型提供商会处理这些内容以服务该请求。
 
-你的集群必须允许到该 gateway 的出站 HTTPS。本文档不假设从你的环境到 LSI 的连接使用 AWS PrivateLink。如果你的安全策略要求私有连接，请在启用 Engine 之前联系你的客户团队，确认可用性和设置方式。
+你的集群必须允许到该 gateway 的出站 HTTPS。该连接可以使用公共 egress 或私有连接。在 AWS 上，请按照[通过 AWS PrivateLink 连接](#connect-with-aws-privatelink)将 Engine 流量保持在私有网络上。
 
-如果到 LSI 的连接不可用，Engine 会 fail closed。集群内没有模型，也没有备用提供商可以回退，因此受影响的 run 会以错误结束，而不是降级到较低质量的输出。你的 LangSmith 部署的其余部分不受影响，Engine 会在下一次计划扫描时重试。
+如果到 LSI 的连接不可用，Engine 会停止并返回错误，而不是降级到较低质量的输出。集群内没有模型，也没有备用提供商可以回退。你的 LangSmith 部署的其余部分不受影响，Engine 会在下一次计划扫描时重试。
 
 ## LangSmith Intelligence 保留了什么
 
-LSI 不会持久化 prompt 或 completion body。它会保留以下用于使用量归因和计费的元数据：
+LSI 不会持久化 prompt 或模型响应的内容。它会保留以下用于使用量归因和计费的元数据：
 
 - 用于归因使用量的 Account、workspace 和 project 标识符。
 - 用于计费的模型和 token 使用量元数据。
 
 关于模型提供商的保留和训练承诺，请参阅 [Engine security](/langsmith/engine-security)。
 
+## 按云连接
+
 ### AWS（美国可用）
 
-gateway 主机为 `beacon.aws.langchain.com`。LSI 会将请求路由到 LangChain AWS 环境中的 AWS Bedrock。
+gateway 主机为 [`beacon.aws.langchain.com`](/langsmith/deploy-self-hosted-full-platform#allow-egress-to-langsmith-intelligence)。LSI 会将请求路由到 LangChain AWS 环境中的 AWS Bedrock。
+
+#### 通过 AWS PrivateLink 连接
+
+在配置 PrivateLink 之前，请先完成[启用 Engine](/langsmith/deploy-self-hosted-full-platform#enable-engine)，包括其 Helm 和 egress 配置。
+
+[AWS PrivateLink](https://docs.aws.amazon.com/vpc/latest/privatelink/) 会将 Engine 流量从你的 VPC 路由到 LSI，而不会将该流量暴露到公共互联网。LSI endpoint service 托管在 `us-east-2` 中，AWS 支持从其他区域的 VPC 访问。
+
+在开始之前，请收集你的 AWS 账户 ID、VPC ID、私有子网 ID，以及用于 interface endpoint 的安全组。将该 endpoint 安全组配置为仅允许来自运行 Engine 的节点或工作负载所关联安全组的入站 TCP 443 端口流量，或来自包含它们的最小私有 CIDR。不要允许 `0.0.0.0/0`。
+
+要将你的 VPC 连接到 LSI：
+
+<Steps>
+  <Step title="申请访问">
+    联系你的客户代表或 [sales@langchain.dev](mailto:sales@langchain.dev) 并提供你的 AWS 账户 ID。LangChain 会将你的账户添加到 endpoint service 的 allowed principals 列表中。
+  </Step>
+
+  <Step title="创建 interface VPC endpoint">
+    为包含你的 VPC 的区域配置 AWS provider。请将 `service_region` 保持为 `us-east-2`，即使你的 VPC 位于其他区域。每个可用区选择一个私有子网。
+
+    <Note>
+    `service_region` 参数需要 HashiCorp AWS provider `5.82.0` 或更高版本。
+    </Note>
+
+    ```hcl
+    resource "aws_vpc_endpoint" "langsmith_intelligence" {
+      vpc_id              = var.vpc_id
+      service_name        = "com.amazonaws.vpce.us-east-2.vpce-svc-054f37092752bff6b"
+      service_region      = "us-east-2"
+      vpc_endpoint_type   = "Interface"
+      subnet_ids          = var.private_subnet_ids
+      security_group_ids  = [var.security_group_id]
+      private_dns_enabled = false
+    }
+    ```
+  </Step>
+
+  <Step title="等待 LangChain 接受连接">
+    在 LangChain 接受连接之后，endpoint 状态会从 `pendingAcceptance` 变为 `available`。请等待几分钟让更改传播，然后再测试连通性。
+  </Step>
+
+  <Step title="将 LSI 主机名路由到该 endpoint">
+    为你的 VPC 启用 DNS resolution 和 DNS hostnames。然后创建一个 Route 53 私有托管区和别名记录，使 `beacon.aws.langchain.com` 在你的 VPC 内解析到该 VPC endpoint。保持此主机名不变，以便 TLS 证书校验成功。该私有托管区还可以防止在 endpoint 不可用时回退到公共 DNS。
+
+    ```hcl
+    resource "aws_route53_zone" "langsmith_intelligence" {
+      name = "beacon.aws.langchain.com"
+
+      vpc {
+        vpc_id = var.vpc_id
+      }
+    }
+
+    resource "aws_route53_record" "langsmith_intelligence" {
+      zone_id = aws_route53_zone.langsmith_intelligence.zone_id
+      name    = "beacon.aws.langchain.com"
+      type    = "A"
+
+      alias {
+        name                   = aws_vpc_endpoint.langsmith_intelligence.dns_entry[0].dns_name
+        zone_id                = aws_vpc_endpoint.langsmith_intelligence.dns_entry[0].hosted_zone_id
+        evaluate_target_health = true
+      }
+    }
+    ```
+
+    如果工作负载使用企业 DNS 解析器而不是 Amazon 提供的解析器，请配置到 Route 53 Resolver 的条件转发，或为 `beacon.aws.langchain.com` 创建等效的私有 DNS 覆盖，指向该 endpoint 的 DNS 名称。
+  </Step>
+
+  <Step title="验证私有连接">
+    从运行 Engine 的节点或容器中解析 gateway 主机名：
+
+    ```bash
+    getent ahostsv4 beacon.aws.langchain.com
+    ```
+
+    确认结果中包含分配给该 endpoint 网络接口的私有 IP 地址。然后[启用 Engine](/langsmith/deploy-self-hosted-full-platform#enable-engine)，启动一次分析，并确认它能成功完成。如果分析未能完成，请检查 Engine 安装和 egress 配置。
+  </Step>
+</Steps>
 
 <Frame caption="AWS：LangSmith 和 Engine 运行在你的 VPC 中；LSI 和 Bedrock 运行在 LangChain 的 AWS 环境中。">
   <img
     src="/langsmith/images/engine-self-hosted-aws.png"
-    alt="架构图。你的 VPC 中包含 LangSmith UI、一个 NLB、运行 LangSmith 服务的 EKS 集群，以及 S3、RDS 和 ElastiCache 上的存储。LangChain 的云中包含计费、一个监控栈和 LangSmith Intelligence，后者向 Bedrock 发送模型推理请求。两个环境通过私有链路连接。"
+    alt="自托管 LangSmith 在你的 VPC 中通过 AWS PrivateLink 连接到 LangChain AWS 环境中的 LangSmith Intelligence 和 Bedrock 的架构图。"
   />
 </Frame>
 
 ### GCP（美国可用）
 
-gateway 主机为 `beacon.langchain.com`。LSI 会将请求路由到 LangChain GCP 环境中的 Vertex。
+gateway 主机为 [`beacon.langchain.com`](/langsmith/deploy-self-hosted-full-platform#allow-egress-to-langsmith-intelligence)。LSI 会将请求路由到 LangChain GCP 环境中的 Vertex。
 
 <Note>
-该主机与自托管 LangSmith 已用于 license 校验和计费遥测的主机相同，因此 GCP 部署只是新增了一条路径，而不是一个新的 egress 目标。参见[配置 egress](/langsmith/self-host-egress)。
+该主机与自托管 LangSmith 用于 license 校验和计费遥测的主机相同，因此 GCP 部署只是新增了一条路径，而不是一个新的 egress 目标。参见[配置 egress](/langsmith/self-host-egress)。
 </Note>
 
 <Frame caption="GCP：LangSmith 和 Engine 运行在你的 project 中；LSI 和 Vertex 运行在 LangChain 的 GCP 环境中。">
   <img
     src="/langsmith/images/engine-self-hosted-gcp.png"
-    alt="架构图，展示你的 GCP project 中的自托管 LangSmith 部署连接到 LangChain 云中的 LangSmith Intelligence，后者向 Vertex 发送模型推理请求"
+    alt="自托管 LangSmith 在你的 GCP project 中连接到 LangChain GCP 环境中的 LangSmith Intelligence 和 Vertex 的架构图。"
   />
 </Frame>
 
 ## 模型选择与质量
 
-模型选择在很大程度上决定了 Engine 的效果。Engine 会为工作流中的不同步骤使用不同模型，并进行不同调优，例如聚类 issues、结合代码诊断根因、生成修复方案，以及编写用于验证修复的 evaluator。LangChain 会针对质量和 token 效率同时调优这些模型，并随着更优秀模型的发布进行升级。
+Engine 会为不同角色使用不同模型，分别用于聚类 issues、结合代码诊断根因、生成修复方案，以及编写用于验证修复的 evaluator。LangChain 会针对质量和 token 效率调优这些模型，并随着更优秀模型的推出进行更新。
 
-托管推理正是实现这一点的关键。由于 Engine 始终使用 LangChain 为各步骤调优后的模型，所以其行为能够保持一致，并随着这些模型升级而持续改进。如果采用自带 key（bring-your-own-key）的方式，Engine 就会受限于你配置的模型，因此调优效果和 token 效率会因请求不同而波动。
+Engine 使用托管推理，而不是自带 key（bring-your-own-key）的方式。这使 Engine 的行为保持一致，并随着 LangChain 更新模型而持续改进。如果采用自带 key 的方式，模型选择、调优和 token 效率可能会因请求不同而波动。
 
-## 这对你的数据意味着什么
+## Engine 在哪里处理数据
 
 在自托管部署中，Engine 将数据处理分为你的环境和 LangChain 的环境两部分：
 
 - **你的环境：**Engine 编排逻辑和 LangSmith 存储的 traces 保留在你的自托管环境中。
-- **LangChain 的环境：**Engine 发送的内容由 LSI 和模型提供商处理。LSI 会保留上文列出的计费元数据，但不会持久化 prompt 或 completion body。
+- **LangChain 的环境：**Engine 发送的内容由 LSI 和模型提供商处理。LSI 会保留上文所述的计费元数据。
 
 Engine 与部署无关的数据处理方式——包括与每家模型服务商之间的零数据保留，以及不会使用客户数据来训练或微调模型——已在 [Engine security](/langsmith/engine-security) 中说明。
 
 ## 另请参阅
 
-- [在自托管环境中启用 Engine](/langsmith/deploy-self-hosted-full-platform#enable-engine)
-- [将 Engine 连接到 GitHub](/langsmith/engine-github)
 - [Engine](/langsmith/engine-overview)
 - [配置 Engine](/langsmith/engine)
 - [Engine security](/langsmith/engine-security)

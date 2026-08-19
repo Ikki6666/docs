@@ -68,6 +68,7 @@ embeddings = HanaInternalEmbeddings(internal_embedding_model_id="SAP_NEB.2024071
 
 # embeddings = HanaInternalEmbeddings(
 #     internal_embedding_model_id="your-embedding-model-id",
+#     remote_source_schema="your-remote-source-schema-name",
 #     remote_source="your-remote-source-name",
 # )
 ```
@@ -111,6 +112,15 @@ docs = [
     ),
 ]
 db.add_documents(docs)
+```
+
+通过 map merge 插入文档
+
+> 注意，`use_map_merge` 仅作为关键字参数传入，且仅允许用于 `HanaInternalEmbeddings` 实例。
+
+```python
+# 可以传入 use_map_merge 标志以加速插入
+db.add_documents(docs, use_map_merge=True)
 ```
 
 ### Delete items from vector store
@@ -227,21 +237,21 @@ db.create_hnsw_index(
 除了基础的基于值的过滤能力外，还可以使用更高级的过滤方式。
 下表展示了可用的过滤操作符。
 
-| Operator | Semantic                 |
-|----------|-------------------------|
-| `$eq`    | Equality (==)           |
-| `$ne`    | Inequality (!=)         |
-| `$lt`    | Less than (&lt;)           |
-| `$lte`   | Less than or equal (&lt;=) |
-| `$gt`    | Greater than (>)        |
-| `$gte`   | Greater than or equal (>=) |
-| `$in`    | Contained in a set of given values  (in)    |
-| `$nin`   | Not contained in a set of given values  (not in)  |
-| `$between` | Between the range of two boundary values |
-| `$like`  | Text equality based on the "LIKE" semantics in SQL (using "%" as wildcard)  |
-| `$contains` | Filters documents containing a specific keyword |
-| `$and`   | Logical "and", supporting two or more operands |
-| `$or`    | Logical "or", supporting two or more operands |
+| Operator | Semantic                 | Supported data types for Operands |
+|----------|-------------------------|-----------------------------------|
+| `$eq`    | Equality (==)           | int, float, str, bool, date object, None      |
+| `$ne`    | Inequality (!=)         | int, float, str, bool, date object, None      |
+| `$lt`    | Less than (<)           | int, float, str, date object         |
+| `$lte`   | Less than or equal (<=) | int, float, str, date object         |
+| `$gt`    | Greater than (>)        | int, float, str, date object         |
+| `$gte`   | Greater than or equal (>=) | int, float, str, date object         |
+| `$in`    | Contained in a set of given values  (in)    | list of same values of type (int, float, str, bool, date object) |
+| `$nin`   | Not contained in a set of given values  (not in)  | list of same values of type (int, float, str, bool, date object) |
+| `$between` | Between the range of two boundary values | list of 2 values of (int, float, str, date object) |
+| `$like`  | Text equality based on the "LIKE" semantics in SQL (using "%" as wildcard)  | str |
+| `$contains` | Filters documents containing a specific keyword | non-empty str |
+| `$and`   | Logical "and", supporting two or more operands | list(filters) |
+| `$or`    | Logical "or", supporting two or more operands | list(filters) |
 
 ```python
 # Prepare some test documents
@@ -440,6 +450,220 @@ Filter: {'$and': [{'name': {'$contains': 'bob'}}, {'name': {'$contains': 'johnso
 - [Retrieval docs](/oss/langchain/retrieval)
 - [Build a RAG app with LangChain](/oss/deepagents/rag)
 - [Agentic RAG](/oss/langgraph/agentic-rag)
+
+## 结果重排序
+
+可以通过向 `similarity_search` 方法传入 `rerank_config` 字典来对相似度搜索的结果进行重排序。重排序使用 SAP HANA 的 `CROSS_ENCODE` 函数和 Cross Encoding 模型完成。
+
+`rerank_config` 字典支持以下字段：
+
+- **`query`** *(str, required)* — 用于重排序的查询文本。若未提供，则使用原始相似度搜索的查询。
+
+- **`model_id`** *(str, required)* — 用于重排序的 cross-encoding 模型的模型 ID。
+
+- **`top_n`** *(int, optional)* — 重排序后返回的顶部结果数量。默认为 3。
+
+- **`rank_fields`** *(list[str], optional)* — 参与重排序的 metadata 字段列表。指定后，这些字段会与内容拼接在一起用于评分。
+
+> **注意：** 要使用重排序功能，请确保 SAP HANA Cloud 实例已启用 NLP。更多详情请参阅 [SAP HANA Database Additional Features](https://help.sap.com/docs/hana-cloud/sap-hana-cloud-administration-guide/sap-hana-database-additional-features?version=hanacloud)。
+
+```python
+# Prepare sample documents with metadata
+docs = [
+    Document(
+        page_content="Python is a programming language",
+        metadata={"category": "programming", "difficulty": "beginner"},
+    ),
+    Document(
+        page_content="Machine learning uses algorithms to learn patterns",
+        metadata={"category": "AI", "difficulty": "intermediate"},
+    ),
+    Document(
+        page_content="Neural networks are inspired by the human brain",
+        metadata={"category": "AI", "difficulty": "advanced"},
+    ),
+]
+
+db = HanaDB(
+    connection=connection,
+    embedding=embeddings,
+    table_name="LANGCHAIN_DEMO_RERANKING",
+)
+
+# Delete existing entries and add new documents
+db.delete(filter={})
+db.add_documents(docs)
+```
+
+### 基本重排序
+
+使用 `rerank_config` 参数执行带重排序的相似度搜索：
+
+```python
+# Basic reranking - rerank similarity search results using a cross-encoding model
+rerank_config = {
+    "model_id": os.environ.get("HANA_DB_RERANK_MODEL_ID"),  # e.g., "SAP_CER.20250701"
+    "top_n": 2,
+}
+
+results = db.similarity_search(
+    "AI technology",
+    k=3,
+    rerank_config=rerank_config
+)
+
+print("Reranked results:")
+for doc in results:
+    print("-" * 80)
+    print(f"Content: {doc.page_content}")
+    print(f"Metadata: {doc.metadata}")
+```
+
+```text
+Reranked results:
+--------------------------------------------------------------------------------
+Content: Machine learning uses algorithms to learn patterns
+Metadata: {'category': 'AI', 'difficulty': 'intermediate'}
+--------------------------------------------------------------------------------
+Content: Python is a programming language
+Metadata: {'category': 'programming', 'difficulty': 'beginner'}
+```
+
+### 带 metadata 字段的重排序
+
+使用 `rank_fields` 将 metadata 纳入重排序过程。当 metadata 中包含应当影响排序的相关信息时，这会很有用：
+
+```python
+# Reranking with metadata fields included in the scoring
+rerank_config_with_fields = {
+    "query": "beginner AI concepts",
+    "model_id": os.environ.get("HANA_DB_RERANK_MODEL_ID"),
+    "top_n": 2,
+    "rank_fields": ["category", "difficulty"],  # Include these metadata fields in reranking
+}
+
+results = db.similarity_search(
+    "learning algorithms",
+    k=3,
+    rerank_config=rerank_config_with_fields
+)
+
+print("Reranked results with metadata fields:")
+for doc in results:
+    print("-" * 80)
+    print(f"Content: {doc.page_content}")
+    print(f"Metadata: {doc.metadata}")
+```
+
+```text
+Reranked results with metadata fields:
+--------------------------------------------------------------------------------
+Content: Neural networks are inspired by the human brain
+Metadata: {'category': 'AI', 'difficulty': 'advanced'}
+--------------------------------------------------------------------------------
+Content: Machine learning uses algorithms to learn patterns
+Metadata: {'category': 'AI', 'difficulty': 'intermediate'}
+```
+
+### 带分数的重排序
+
+使用 `similarity_search_with_score` 在获取文档的同时得到重排序分数：
+
+```python
+# Get reranking scores with the results
+rerank_config = {
+    "model_id": os.environ.get("HANA_DB_RERANK_MODEL_ID"),
+    "top_n": 3,
+}
+
+results_with_scores = db.similarity_search_with_score(
+    "neural network architecture",
+    k=3,
+    rerank_config=rerank_config
+)
+
+print("Reranked results with scores:")
+for doc, score in results_with_scores:
+    print("-" * 80)
+    print(f"Score: {score:.4f}")
+    print(f"Content: {doc.page_content}")
+```
+
+```text
+Reranked results with scores:
+--------------------------------------------------------------------------------
+Score: 0.0435
+Content: Neural networks are inspired by the human brain
+--------------------------------------------------------------------------------
+Score: 0.0146
+Content: Python is a programming language
+--------------------------------------------------------------------------------
+Score: 0.0145
+Content: Machine learning uses algorithms to learn patterns
+```
+
+### 使用 HanaReranker 进行独立重排序
+
+若需要对重排序过程有更多控制，可以直接将 `HanaReranker` 类作为文档压缩器使用。当你希望对来自任意来源（而不仅仅是相似度搜索）的文档进行重排序时，这会很有用：
+
+```python
+from langchain_hana import HanaReranker
+
+# Create a standalone reranker
+reranker = HanaReranker(
+    connection=connection,
+    model_id=os.environ.get("HANA_DB_RERANK_MODEL_ID"),
+)
+
+# Documents to rerank (can come from any source)
+documents = [
+    Document(page_content="Python programming basics"),
+    Document(page_content="Advanced machine learning techniques"),
+    Document(page_content="Introduction to neural networks"),
+    Document(page_content="Deep learning applications"),
+    Document(page_content="Reinforcement learning strategies"),
+    Document(page_content="Natural language processing techniques"),
+]
+
+# Rerank documents based on a query using compress_documents (returns top min(5, len(documents)))
+# Reranking scores will be added to the metadata of each document under the key "relevance_score"
+reranked_docs = reranker.compress_documents(documents, query="AI and deep learning")
+
+print("Compressed documents:")
+for doc in reranked_docs:
+    print("-" * 80)
+    print(f"Content: {doc.page_content}")
+    print(f"Relevance score: {doc.metadata.get('relevance_score'):.4f}")
+
+# Or use the rerank method for more control over top_n
+results = reranker.rerank(documents, query="machine learning", top_n=2)
+print("\nTop 2 reranked results:")
+for idx, score, doc in results:
+    print(f"  [{idx}] Score: {score:.4f} - {doc.page_content}")
+```
+
+```text
+Compressed documents:
+--------------------------------------------------------------------------------
+Content: Deep learning applications
+Relevance score: 0.2188
+--------------------------------------------------------------------------------
+Content: Advanced machine learning techniques
+Relevance score: 0.0748
+--------------------------------------------------------------------------------
+Content: Introduction to neural networks
+Relevance score: 0.0079
+--------------------------------------------------------------------------------
+Content: Natural language processing techniques
+Relevance score: 0.0040
+--------------------------------------------------------------------------------
+Content: Reinforcement learning strategies
+Relevance score: 0.0036
+
+Top 2 reranked results:
+  [1] Score: 0.4351 - Advanced machine learning techniques
+  [3] Score: 0.0342 - Deep learning applications
+```
 
 ## 标准表与带向量数据的“自定义”表
 

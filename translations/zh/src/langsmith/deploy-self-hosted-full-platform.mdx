@@ -1139,17 +1139,16 @@ Sandboxes 不会被主动重启。当用户或 API 操作启动 Sandbox 时，�
 ## 启用 Engine
 
 <Info>
-自托管 Engine 需要 LangSmith Helm chart `0.16.0` 或更高版本，并且需要包含 Engine 授权的 license。[联系你的客户团队](https://www.langchain.com/contact-sales)将其添加到你的订单中。
+自托管部署需要 LangSmith Helm chart `0.16.0` 或更高版本，并且需要包含 Engine 授权的 license。Engine 单独授权，并以 LCU 计量自己的使用量。[联系你的客户团队](https://www.langchain.com/contact-sales)将其添加到你的订单中。
 </Info>
 
-[Engine](/langsmith/engine-overview) 监控某个 tracing project，将重复故障聚类为 issues，逐个诊断，并提出修复方案。Engine 默认禁用。
+[Engine](/langsmith/engine-overview) 监控生产 traces，将重复故障聚类为 issues，逐个诊断，并提出修复方案。Engine 默认禁用。
 
-Engine 需要 Sandboxes，并与 Insights 共享一个 runtime：
+Engine 需要 [Sandboxes](#enable-sandboxes)、到 [LangSmith Intelligence](#allow-egress-to-langsmith-intelligence) 的连接、一个外部可达的 [`config.hostname`](#verify-your-hostname-is-externally-reachable)，以及一个 [Engine 加密密钥](#generate-the-engine-encryption-key)。请在启用 Engine 之前完成这些前置条件。
 
-- **[Sandboxes](#enable-sandboxes)：**每个 Engine run 都在其中执行。请先启用 Sandboxes。当设置了 `engine.enabled` 但没有 Sandboxes 时，chart 拒绝渲染。
-- **[Insights](#enable-fleet-insights-and-chat)：**Engine 和 Insights 由同一个 image 提供服务，并共享一个 deployment。Insights 不是 Engine 的前提条件。在已运行 Insights 的安装上，启用 Engine 只是添加配置而不是新增 pods。
+Engine 和 [Insights](#enable-fleet-insights-and-chat) 运行在同一个 image 上，并共享一个 deployment。Insights 不是 Engine 的前提条件。如果你的安装已运行 Insights，启用 Engine 只是添加配置而不是新增 pods。
 
-与本页其他功能不同，Engine 无法完全在集群内运行。它依赖 LangSmith Intelligence，一个由 LangChain 管理的零数据保留服务，并使用在 LangSmith license 校验期间获得的短期 license JWT 进行认证。关于数据流和保留的计费元数据，请参阅[自托管 Engine](/langsmith/engine-self-hosted)。
+与本页其他功能不同，Engine 无法完全在集群内运行。Engine 使用 LangSmith Intelligence，一个由 LangChain 管理的零数据保留服务，来执行驱动诊断和修复的模型工作。关于数据流和保留的计费元数据，请参阅[自托管 Engine](/langsmith/engine-self-hosted)。
 
 ### 组件
 
@@ -1168,12 +1167,16 @@ Engine 还向 `platform-backend` 和 `ingest-queue` 添加配置，它们负责�
   <Step title="启用 Sandboxes">
     请先完成[启用 Sandboxes](#enable-sandboxes)，包括支持 KVM 的节点池和 JuiceFS 存储。
 
-    Engine 的 sandboxes 由单个 workspace 拥有。默认情况下 LangSmith 解析安装自身的 workspace，这在恰好有一个非个人 organization 时有效；如果有多个，它会拒绝而不是猜测，你必须设置 `engine.sandboxTenantId`。
+    Engine 的 sandboxes 关联到一个 workspace。启用 Engine 的安装必须有一个[共享 organization](/langsmith/administration-overview#organizations)。如果该共享 organization 恰好有一个 workspace，LangSmith 会使用该 workspace。如果该共享 organization 有多个 workspace，LangSmith 不会自动选择其中一个。你必须将 `engine.sandboxTenantId` 设置为该 workspace ID。
 
     <Warning>
-    建议使用一个为 Engine 保留的 workspace。Engine 的 sandboxes 不按 Sandboxes 产品计费，因为 Engine 以 LCU 计量自己的使用量。它们确实计入该 workspace 的并发 sandbox、CPU 和内存配额。一个已接近上限的 workspace 可能会将 Engine run 推入配额错误，Engine 自己的 sandboxes 也可能挤占交互式 sandboxes。
+    建议使用一个为 Engine 保留的 workspace：
 
-    这些 sandboxes 也会在该 workspace 中列出，任何有权访问该 workspace 的人都可以停止它们。每个 sandbox 运行 agent 生成的代码。仓库凭据由 sandbox auth proxy 持有，在 sandbox 内部不可读。
+    - Engine 的 sandboxes 不按 Sandboxes 产品计费，因为 Engine 以 LCU 计量自己的使用量。
+    - Engine 的 sandboxes 与该 workspace 中其他 sandboxes 使用相同的并发 sandbox、CPU 和内存配额。如果该 workspace 接近上限，Engine runs 可能会失败，或为交互式 sandboxes 留下更少的容量。
+    - Engine 的 sandboxes 会在该 workspace 中列出，任何有权访问该 workspace 的人都可以停止它们。
+    - 每个 sandbox 运行 agent 生成的代码。
+    - 仓库凭据保留在 sandbox auth proxy 中，对 sandbox 内部运行的代码不可用。
     </Warning>
   </Step>
 
@@ -1181,34 +1184,34 @@ Engine 还向 `platform-backend` 和 `ingest-queue` 添加配置，它们负责�
     Engine 单独授权，方式与 Sandboxes 相同。你的 license 必须携带 Engine 授权。LangSmith 在启动时及此后定期针对 `https://beacon.langchain.com` 校验你的 license key，因此一旦授权添加到你的订单，无需更改任何配置即可生效。
   </Step>
 
-  <Step title="允许到 LangSmith Intelligence 的 egress">
-    允许从集群到你所用云的 LangSmith Intelligence gateway 的出站 HTTPS。即 `engine.intelligenceBaseUrl` 中的主机。
+  <Step title="允许到 LangSmith Intelligence 的 egress" id="allow-egress-to-langsmith-intelligence">
+    允许从集群到你所用云的 LangSmith Intelligence gateway URL 的出站 HTTPS。将此 URL 作为 `engine.intelligenceBaseUrl` 的值。
 
-    | 云 | Gateway 主机 |
+    | 云 | `engine.intelligenceBaseUrl` |
     | --- | --- |
-    | AWS | `beacon.aws.langchain.com` |
-    | GCP | `beacon.langchain.com` |
+    | AWS | `https://beacon.aws.langchain.com/intelligence` |
+    | GCP | `https://beacon.langchain.com/intelligence` |
 
-    在 GCP 上，它与 LangSmith 已用于 license 校验和计费遥测的主机相同，因此 Engine 只是新增了一条路径而不是一个新的 egress 目标。
+    在 GCP 上，这与 LangSmith 已用于 license 校验和计费遥测的主机相同，因此 Engine 只是新增了一条路径而不是一个新的 egress 目标。
 
     <Note>
-    Engine 在 **AWS US** 和 **GCP US** 的自托管部署中可用。AWS EU 和 Azure 已计划。在规划推出之前，请查看[按云和区域的可用性](/langsmith/engine-self-hosted#availability-by-cloud-and-region)并与你的客户团队确认覆盖情况。
+    Engine 在 **AWS US** 和 **GCP US** 的自托管部署中可用。在规划推出之前，请查看[按云和区域的可用性](/langsmith/engine-self-hosted#availability-by-cloud-and-region)并与你的客户团队确认覆盖情况。
     </Note>
 
-    将该 gateway 作为特定的 allowlist 条目添加，而不是开放通用 egress。请求使用在 LangSmith license 校验期间获得的短期 license JWT。Engine 的流量与[配置 egress](/langsmith/self-host-egress) 中描述的计费和运营遥测是分开的，即使它们共享一个主机。
+    将该 gateway 作为特定的 allowlist 条目添加，而不是开放通用 egress。要将 AWS 流量保持在私有网络上，请[通过 AWS PrivateLink 连接到 LangSmith Intelligence](/langsmith/engine-self-hosted#connect-with-aws-privatelink)。请求使用在 LangSmith license 校验期间获得的短期 license JWT。Engine 的流量与[配置 egress](/langsmith/self-host-egress) 中描述的计费和运营遥测是分开的，即使它们共享一个主机。
 
     <Note>
     离线（air-gapped）安装无法运行 Engine。没有集群内模型可以回退。
     </Note>
   </Step>
 
-  <Step title="验证你的 hostname 外部可达">
-    Engine 的 sandboxes 使用 `langsmith` CLI 调用你的 LangSmith 安装，因此 `config.hostname` 必须从 sandbox 网络可达。Chart 拒绝 `localhost` 和集群内 `*.svc` 地址。
+  <Step title="验证你的 hostname 外部可达" id="verify-your-hostname-is-externally-reachable">
+    Engine 的 sandboxes 使用 `langsmith` CLI 调用你的 LangSmith 安装，因此 `config.hostname` 必须从 sandbox 网络可达。Helm 校验会拒绝 `localhost` 和集群内 `*.svc` 地址。
 
     通过你的 ingress 以 TLS 提供该 hostname，如[设置 ingress](/langsmith/self-host-ingress) 中所述。Engine 不要求你暴露用户已访问地址之外的任何内容。Sandbox egress 已 allowlist 到你的 LangSmith hostname、`github.com`、`api.github.com` 和 Python 包注册表。每次运行的凭据由 sandbox 外部的代理注入，而不是在 sandbox 内部可读。
   </Step>
 
-  <Step title="生成 Engine 加密密钥">
+  <Step title="生成 Engine 加密密钥" id="generate-the-engine-encryption-key">
     Engine 使用自己的 Fernet key 来加密 LangSmith 传递给它的 run payloads，这些 payloads 携带短期凭据。生成一个：
 
     ```bash
@@ -1223,7 +1226,7 @@ Engine 还向 `platform-backend` 和 `ingest-queue` 添加配置，它们负责�
 
 ### 使用 Helm 启用
 
-将以下内容添加到你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中，连同[启用 Sandboxes](#enable-sandboxes) 中的 Sandboxes values：
+将以下内容添加到你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中，连同[启用 Sandboxes](#enable-sandboxes) 中的完整 Sandboxes values。这些示例仅展示 Engine 特有的值和 `sandboxes.enabled` 标志。
 
 <Tabs>
   <Tab title="使用 Kubernetes secrets（推荐）">
@@ -1237,7 +1240,6 @@ Engine 还向 `platform-backend` 和 `ingest-queue` 添加配置，它们负责�
 
     engine:
       enabled: true
-      # AWS; on GCP use https://beacon.langchain.com/intelligence
       intelligenceBaseUrl: "https://beacon.aws.langchain.com/intelligence"
 
     sandboxes:
@@ -1257,7 +1259,6 @@ Engine 还向 `platform-backend` 和 `ingest-queue` 添加配置，它们负责�
 
     engine:
       enabled: true
-      # AWS; on GCP use https://beacon.langchain.com/intelligence
       intelligenceBaseUrl: "https://beacon.aws.langchain.com/intelligence"
       encryptionKey: "<engine-encryption-key>"
 
@@ -1267,16 +1268,29 @@ Engine 还向 `platform-backend` 和 `ingest-queue` 添加配置，它们负责�
   </Tab>
 </Tabs>
 
-<Warning>
-Engine 运行在 `langsmith-insights-engine` 上，这是同时服务于 `engine` 和 `insights` graphs 的组合 image。Chart 默认使用它，因此新安装不需要 image 配置。如果你要升级一个 values 将 `images.engineInsightsAgentImage.repository` 固定为已退役的 `langsmith-clio` image 的安装，请移除或更新该设置。`langsmith-clio` 仅服务于 Insights，chart 会拒绝它。
-</Warning>
-
-如果你的安装有多个非个人 organization，还需设置拥有 Engine sandboxes 的 workspace：
+<Note>
+如果你的安装有一个包含多个 workspace 的共享 organization，请设置拥有 Engine sandboxes 的 workspace：
+</Note>
 
 ```yaml
 engine:
   sandboxTenantId: "<workspace-id>"
 ```
+
+<Warning>
+从旧的 Insights image 设置升级需要额外检查一次：如果你的 values 将 `images.engineInsightsAgentImage.repository` 固定为已退役的 `langsmith-clio` image，请移除或更新该设置。Engine 和 Insights 现在运行在 `langsmith-insights-engine` 上，chart 会拒绝 `langsmith-clio`。更多信息，请参见[为 LangSmith 安装镜像](/langsmith/self-host-mirroring-images#additional-images-for-engine)。
+</Warning>
+
+在应用之前验证更新后的 chart：
+
+```bash
+helm template langsmith langchain/langsmith \
+  --values langsmith_config.yaml \
+  --version <version> \
+  --namespace <namespace>
+```
+
+Chart 在渲染时验证 Engine 配置，并以消息指出缺失的值而失败，因此此命令可以在配置错误到达集群之前捕获它。
 
 应用更新后的 chart：
 
@@ -1287,10 +1301,6 @@ helm upgrade -i langsmith langchain/langsmith \
   --namespace <namespace> \
   --wait
 ```
-
-<Tip>
-Chart 在渲染时验证 Engine 配置，并以消息指出缺失的值而失败，因此 `helm template` 可以在配置错误到达集群之前捕获它。
-</Tip>
 
 ### 验证安装
 
@@ -1308,16 +1318,18 @@ kubectl rollout status deployment/langsmith-platform-backend -n <namespace>
 
 如果 Engine 在此之后仍未出现在 LangSmith UI 中，最常见的原因是 license 没有 Engine 授权，以及[在 LangSmith 中开启 Engine](#turn-on-engine-in-langsmith) 中描述的 organization 级别开关。
 
-完成产品内设置后，启动一个 Engine 分析并确认 tracing project 是否出现结果。这验证了通过 Engine、Sandboxes 和 LangSmith Intelligence 的完整路径。仅运行 pods 不能验证该路径。
+在 LangSmith UI 中[启用并配置 Engine](#turn-on-engine-in-langsmith) 后，启动一个 Engine 分析并确认 tracing project 是否出现结果。这验证了通过 Engine、Sandboxes 和 LangSmith Intelligence 的完整路径。仅运行 pods 不能验证该路径。
+
+如果分析未能完成，请检查 Engine pods 是否正在运行、sandbox workspace 是否有可用配额，以及集群能否访问在 `engine.intelligenceBaseUrl` 中配置的 LangSmith Intelligence gateway URL。
 
 ### 在 LangSmith 中开启 Engine
 
-在 Helm 中启用 Engine 会使该功能可用，但不会启动任何扫描。还有两个产品内步骤，均在[发现并修复 issues](/langsmith/engine) 中介绍：
+在 Helm 中启用 Engine 会使该功能可用，但不会启动任何扫描。启用 chart values 后，请在 LangSmith 中完成设置：
 
-1. [Organization Admin](/langsmith/rbac#organization-admin) 在 **Settings > Engine enablement** 下为 organization 开启 Engine。
-1. 任意用户从项目的 **Engine** 标签页为某个 tracing project 设置 Engine。
+1. [Organization Admin](/langsmith/rbac#organization-admin) 在 **Settings > Engine enablement** 下为 organization 开启 Engine。更多信息，请参见[发现并修复 issues](/langsmith/engine#enable-engine-for-your-organization)。
+1. 任意用户从项目的 **Engine** 标签页为某个 tracing project 设置 Engine。更多信息，请参见[为 tracing project 设置 Engine](/langsmith/engine#set-up-engine-for-a-tracing-project)。
 
-连接 GitHub 仓库是可选的，但可以改善 Engine 的诊断和修复。没有它，Engine 仍会检测和诊断 issues 并提出 prompt 修复，但无法读取你的源代码或提交 pull requests。要创建 GitHub App 并配置 `host-backend`，请参见[将 Engine 连接到 GitHub](/langsmith/engine-github#self-hosted)。
+连接 GitHub 仓库是可选的，但可以改善 Engine 的诊断和修复。没有它，Engine 无法读取你的源代码或提交 pull requests。要创建 GitHub App 并配置 `host-backend`，请参见[将 Engine 连接到 GitHub](/langsmith/engine-github#self-hosted)。
 
 ### 禁用 Engine
 
@@ -1328,7 +1340,7 @@ engine:
   enabled: false
 ```
 
-Engine 停止调度 runs。现有 issues 保留在数据库中，如果你重新启用它会再次出现。Insights 共享同一个 deployment，因此当 `insights.enabled` 为 `true` 时，`standalone-insights` pods 会继续运行。
+Engine 停止调度 runs。Insights 共享同一个 deployment，因此当 `insights.enabled` 为 `true` 时，`standalone-insights` pods 会继续运行。
 
 ## 可选配置
 

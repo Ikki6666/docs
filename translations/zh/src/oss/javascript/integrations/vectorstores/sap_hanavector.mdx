@@ -81,11 +81,8 @@ await db.initialize()
 
 ```typescript
 import { Document } from "@langchain/core/documents";
-
-await db.addDocuments([
-  new Document({ pageContent: "Hello world" }),
-  new Document({ pageContent: "Other docs"})
-]);
+const docs = [new Document({ pageContent: "Some text" }), new Document({ pageContent: "Other docs" })];
+await db.addDocuments(docs);
 ```
 
 添加带 metadata 的文档：
@@ -95,6 +92,16 @@ await db.addDocuments([
   { pageContent: "foo", metadata: { start: 100, end: 150, docName: "foo.txt", quality: "bad" } },
   { pageContent: "bar", metadata: { start: 200, end: 250, docName: "bar.txt", quality: "good" } },
 ]);
+```
+
+通过 map merge 插入文档
+
+> 注意，`useMapMerge` 仅允许用于 `HanaInternalEmbeddings` 实例。
+
+```typescript
+// 可以在 options 中传入 useMapMerge 标志以加速插入
+// map merge 仅适用于内部 Embeddings
+await db.addDocuments(docs, { useMapMerge: true });
 ```
 
 ### 删除内容
@@ -165,21 +172,236 @@ dbHnsw.createHnswIndex({
 
 支持的过滤操作符包括：
 
-| Operator | Semantic |
-|----------|---------|
-| `$eq` | Equality (==) |
-| `$ne` | Inequality (!=) |
-| `$lt` | Less than (&lt;) |
-| `$lte` | Less than or equal (&lt;=) |
-| `$gt` | Greater than (&gt;) |
-| `$gte` | Greater than or equal (&gt;=) |
-| `$in` | Contained in a set of given values (in) |
-| `$nin` | Not contained in a set of given values (not in) |
-| `$between` | Between the range of two boundary values |
-| `$like` | Text equality based on SQL `LIKE` semantics |
-| `$contains` | Filters documents containing a specific keyword |
-| `$and` | Logical "and" |
-| `$or` | Logical "or" |
+| Operator | Semantic                 | Supported data types for Operands |
+|----------|-------------------------|-----------------------------------|
+| `$eq`    | Equality (==)           | number, string, boolean, DateValue, null      |
+| `$ne`    | Inequality (!=)         | number, string, boolean, DateValue, null     |
+| `$lt`    | Less than (<)           | number, string, DateValue         |
+| `$lte`   | Less than or equal (<=) | number, string, DateValue         |
+| `$gt`    | Greater than (>)        | number, string, DateValue       |
+| `$gte`   | Greater than or equal (>=) | number, string, DateValue        |
+| `$in`    | Contained in a set of given values  (in)    | Array of same values of type (number, string, boolean, DateValue) |
+| `$nin`   | Not contained in a set of given values  (not in)  | Array of same values of type (number, string, boolean, DateValue) |
+| `$between` | Between the range of two boundary values | Array of 2 values of (number, string, DateValue) |
+| `$like`  | Text equality based on the "LIKE" semantics in SQL (using "%" as wildcard)  | string |
+| `$contains` | Filters documents containing a specific keyword | non-empty string |
+| `$and`   | Logical "and", supporting two or more operands | list(Filter) |
+| `$or`    | Logical "or", supporting two or more operands | list(Filter) |
+
+## 结果重排序
+
+可以通过向 `similaritySearch` 方法传入 `rerank_config` 字典来对相似度搜索的结果进行重排序。重排序使用 SAP HANA 的 `CROSS_ENCODE` 函数和 Cross Encoding 模型完成。
+
+`rerank_config` 字典支持以下字段：
+
+- **`query`** *(string, required)* — 用于重排序的查询文本。若未提供，则使用原始相似度搜索的查询。
+
+- **`modelId`** *(string, required)* — 用于重排序的 cross-encoding 模型的模型 ID。
+
+- **`topN`** *(number, optional)* — 重排序后返回的顶部结果数量。默认为 3。
+
+- **`rankFields`** *(string[], optional)* — 参与重排序的 metadata 字段列表。指定后，这些字段会与内容拼接在一起用于评分。
+
+> **注意：** 要使用重排序功能，请确保 SAP HANA Cloud 实例已启用 NLP。更多详情请参阅 [SAP HANA Database Additional Features](https://help.sap.com/docs/hana-cloud/sap-hana-cloud-administration-guide/sap-hana-database-additional-features?version=hanacloud)。
+
+```typescript
+// Prepare sample documents with metadata
+const docs = [
+    new Document({
+        pageContent: "Python is a programming language",
+        metadata: { category: "programming", difficulty: "beginner" },
+    }),
+    new Document({
+        pageContent: "Machine learning uses algorithms to learn patterns",
+        metadata: { category: "AI", difficulty: "intermediate" },
+    }),
+    new Document({
+        pageContent: "Neural networks are inspired by the human brain",
+        metadata: { category: "AI", difficulty: "advanced" },
+    }),
+];
+
+// Initialize embeddings
+const embeddings = new OpenAIEmbeddings();
+
+const args: HanaDBArgs = {
+  connection: client,
+  tableName: "testReranking",
+};
+
+// Create a LangChain VectorStore interface for the HANA database and specify the table (collection) to use in args.
+const vectorStore = new HanaDB(embeddings, args);
+// need to initialize once an instance is created.
+await vectorStore.initialize();
+// Delete already existing documents from the table
+await vectorStore.delete({ filter: {} });
+await vectorStore.addDocuments(docs);
+```
+
+### 基本重排序
+
+使用 `rerankConfig` 参数执行带重排序的相似度搜索：
+
+```typescript
+const rerankConfig: RerankConfigOptions = {
+  modelId: process.env.HANA_DB_RERANKING_MODEL_ID || "SAP_CER.20250701",
+  topN: 2,
+}
+
+const docsReranked = await vectorStore.similaritySearch("AI Technology", 3, undefined, undefined, rerankConfig);
+console.log("Reranked Results:");
+docsReranked.forEach((doc) => {
+  console.log("-".repeat(80));
+  console.log(`Content: ${doc.pageContent}`);
+  console.log("Metadata:", doc.metadata);
+});
+```
+
+```text
+Reranked Results:
+--------------------------------------------------------------------------------
+Content: Machine learning uses algorithms to learn patterns
+Metadata: { category: 'AI', difficulty: 'intermediate' }
+--------------------------------------------------------------------------------
+Content: Python is a programming language
+Metadata: { category: 'programming', difficulty: 'beginner' }
+```
+
+### 带 metadata 字段的重排序
+
+使用 `rankFields` 将 metadata 纳入重排序过程。当 metadata 中包含应当影响排序的相关信息时，这会很有用：
+
+```typescript
+const rerankConfigWithFields: RerankConfigOptions = {
+  query: "beginner AI Concepts",
+  modelId: process.env.HANA_DB_RERANKING_MODEL_ID || "SAP_CER.20250701",
+  topN: 2,
+  rankFields: ["category", "difficulty"],
+};
+
+const docsRerankedwithFields = await vectorStore.similaritySearch("learning algorithm", 3, undefined, undefined, rerankConfigWithFields);
+console.log("Reranked results with metadata fields:");
+docsRerankedwithFields.forEach((doc) => {
+  console.log("-".repeat(80));
+  console.log(`Content: ${doc.pageContent}`);
+  console.log("Metadata:", doc.metadata);
+});
+```
+
+```text
+Reranked results with metadata fields:
+--------------------------------------------------------------------------------
+Content: Neural networks are inspired by the human brain
+Metadata: { category: 'AI', difficulty: 'advanced' }
+--------------------------------------------------------------------------------
+Content: Machine learning uses algorithms to learn patterns
+Metadata: { category: 'AI', difficulty: 'intermediate' }
+```
+
+### 带分数的重排序
+
+使用 `similaritySearchWithScore` 在获取文档的同时得到重排序分数：
+
+```typescript
+const rerankConfigWithScores: RerankConfigOptions = {
+  modelId: process.env.HANA_DB_RERANKING_MODEL_ID || "SAP_CER.20250701",
+  topN: 3,
+};
+
+const docsRerankedwithScores = await vectorStore.similaritySearchWithScore("neural network architecture", 3, undefined, undefined, rerankConfigWithScores);
+console.log("Reranked results with scores:");
+docsRerankedwithScores.forEach(([doc, score]) => {
+  console.log("-".repeat(80));
+  console.log("Score:", score.toFixed(4));
+  console.log(`Content: ${doc.pageContent}`);
+});
+```
+
+```text
+Reranked results with scores:
+--------------------------------------------------------------------------------
+Score: 0.0435
+Content: Neural networks are inspired by the human brain
+--------------------------------------------------------------------------------
+Score: 0.0146
+Content: Python is a programming language
+--------------------------------------------------------------------------------
+Score: 0.0145
+Content: Machine learning uses algorithms to learn patterns
+```
+
+### 使用 HanaReranker 进行独立重排序
+
+若需要对重排序过程有更多控制，可以直接将 `HanaReranker` 类作为文档压缩器使用。当你希望对来自任意来源（而不仅仅是相似度搜索）的文档进行重排序时，这会很有用：
+
+```typescript
+import { HanaReranker, RerankConfigOptions } from "@sap/hana-langchain";
+
+// Documents to rerank (can come from any source)
+const docsToCompress = [
+  new Document({
+    pageContent: "Python programming basics",
+  }),
+  new Document({
+    pageContent: "Advanced machine learning techniques",
+  }),
+  new Document({
+    pageContent: "Introduction to neural networks",
+  }),
+  new Document({
+    pageContent: "Deep learning applications",
+  }),
+  new Document({
+    pageContent: "Reinforcement learning strategies",
+  }),
+  new Document({
+    pageContent: "Natural language processing techniques",
+  }),
+];
+const reranker = new HanaReranker(client, process.env.HANA_DB_RERANKING_MODEL_ID || "SAP_CER.20250701");
+await reranker.initialize();
+
+// Rerank documents based on a query using compress_documents (returns top Math.min(5, documents.length))
+// Reranking scores will be added to the metadata of each document under the key "relevance_score"
+const compressedDocs = await reranker.compressDocuments(docsToCompress, "AI and deep learning");
+
+console.log("Reranked documents:");
+compressedDocs.forEach((doc) => {
+  console.log("-".repeat(80));
+  console.log(`Content: ${doc.pageContent}`);
+  console.log(`Relevance score: ${doc.metadata?.relevance_score?.toFixed(4)}`);
+});
+
+// Or use the rerank method for more control over topN
+const rerankedDocs = await reranker.rerank(docsToCompress, "machine learning", 2);
+console.log("Top 2 reranked results:");
+rerankedDocs.forEach(([idx, score, doc]) => {
+  console.log(`  [${idx}] Score: ${score.toFixed(4)} - ${doc?.pageContent}`);
+});
+```
+
+```text
+Compressed documents:
+--------------------------------------------------------------------------------
+Content: Deep learning applications
+Relevance score: 0.2188
+--------------------------------------------------------------------------------
+Content: Advanced machine learning techniques
+Relevance score: 0.0748
+--------------------------------------------------------------------------------
+Content: Introduction to neural networks
+Relevance score: 0.0079
+--------------------------------------------------------------------------------
+Content: Natural language processing techniques
+Relevance score: 0.0040
+--------------------------------------------------------------------------------
+Content: Reinforcement learning strategies
+Relevance score: 0.0036
+
+Top 2 reranked results:
+  [1] Score: 0.4351 - Advanced machine learning techniques
+  [3] Score: 0.0342 - Deep learning applications
+```
 
 ### 用于检索增强生成
 
