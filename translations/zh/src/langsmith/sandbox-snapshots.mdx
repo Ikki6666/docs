@@ -196,7 +196,7 @@ const snapshot = await client.createSnapshotFromDockerfile(
 
 ### 加速冷启动构建
 
-`vcpus` / `vCpus` 和 `mem_bytes` / `memBytes` 用于配置临时 builder sandbox 的资源。构建过程中，BuildKit 和 native snapshotter 的 layer 复制都在其中运行，默认情况下会争抢单个 CPU core，因此多给 builder 一个 vCPU，通常能显著缩短冷构建的总耗时。
+`vcpus` / `vCpus` 和 `mem_bytes` / `memBytes` 用于配置临时 builder sandbox 的资源。构建过程中，BuildKit 和 native snapshotter 的 layer 复制都在其中运行，默认情况下会争抢 builder 默认的 0.5 vCPU，因此多给 builder 一些 CPU 通常能显著缩短冷构建的总耗时。内存与 CPU 按 4 GiB 每 vCPU 绑定，并且必须在该目标的 50% 范围内，因此一个 2-vCPU 的 builder 接受 4 到 12 GiB。省略内存时它会遵循该比例。
 
 <CodeGroup>
 
@@ -206,7 +206,7 @@ snapshot = client.create_snapshot_from_dockerfile(
     dockerfile="Dockerfile",
     fs_capacity_bytes=2 * 1024**3,
     vcpus=2,
-    mem_bytes=4 * 1024**3,  # 4 GiB
+    mem_bytes=8 * 1024**3,  # 8 GiB
     timeout=600,
 )
 ```
@@ -218,7 +218,7 @@ const snapshot = await client.createSnapshotFromDockerfile(
   2_147_483_648,
   {
     vCpus: 2,
-    memBytes: 4_294_967_296, // 4 GiB
+    memBytes: 8_589_934_592, // 8 GiB
     timeout: 600,
   },
 );
@@ -276,7 +276,7 @@ try {
 </CodeGroup>
 
 <Note>
-捕获时只会保留**持久化文件系统**。安装的 packages，位于 `/usr/local`、`/root`、`/opt`、home 目录等，和你写入这些位置的文件都会被保留。运行中的进程、打开的 sockets、内存中的状态，以及 `/tmp` 下的任何内容，该目录是 tmpfs，**都不会**被保留。新 sandbox 启动后，仍需重新启动你需要的进程。
+默认情况下，捕获时只会保留**文件系统**。安装的 packages，位于 `/usr/local`、`/root`、`/opt`、home 目录等，和你写入这些位置的文件都会被保留，`/tmp` 也会被保留。只有 `/dev/shm` 是 tmpfs，其他所有内容都存放在 sandbox 的磁盘上。运行中的进程、打开的 sockets 和内存中的状态**不会**被保留：新 sandbox 启动后，仍需重新启动你需要的进程，或者[连同内存一起捕获](#resume-from-memory)。
 </Note>
 
 <Tip>
@@ -312,6 +312,49 @@ const snapshot = await sb.captureSnapshot("ml-ready-v2", { timeout: 600 });
 ```
 
 </CodeGroup>
+
+### 从内存恢复
+
+一个 snapshot 可以在携带文件系统的同时携带 sandbox 的 RAM。从这样的 snapshot 启动时，sandbox 会从上次中断处恢复，其进程仍在运行，而不是冷启动。对于预热较慢的环境（例如已加载的模型或已启动的数据库）非常有用。
+
+<Note>
+内存快照仅通过 REST API 提供。`langsmith.sandbox` 的 Python 和 TypeScript 客户端目前尚未暴露这些字段。
+</Note>
+
+在捕获时设置 `include_memory` 即可捕获内存：
+
+```bash
+curl -X POST \
+  "$LANGSMITH_ENDPOINT/api/v2/sandboxes/boxes/my-vm/snapshot" \
+  -H "x-api-key: $LANGSMITH_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "warm-model", "include_memory": true}'
+```
+
+当捕获了内存时，响应中会报告 `memory_snapshot_size_bytes`。`include_memory` 要求 sandbox 处于运行中或已停止状态，且不能与 `checkpoint` 或 `docker_image` 组合使用。
+
+某些 sandbox 运行在无法携带内存镜像的 overlay 文件系统 runtime 上。捕获此类内存会返回 `include_memory is not supported for overlay-rootfs sandboxes`。该 runtime 由 LangSmith 分配，因此不是你可以按 sandbox 选择的内容。
+
+创建时有两个字段控制另一半行为：
+
+| 字段 | 作用 |
+|-------|--------------|
+| `restore_memory` | 省略时：当 snapshot 拥有内存则从内存恢复，否则冷启动。`true` 要求必须有内存，若 snapshot 没有内存则请求失败。`false` 始终冷启动。 |
+| `preserve_memory_on_stop` | `true` 时，在主动停止（空闲超时或显式停止）时挂起 RAM，使 sandbox 下次唤醒时从上次中断处恢复，而非冷启动。默认为 `false`，即仅保留文件系统。由基础设施维护触发的重启无论该值如何都会保留内存。 |
+
+```bash
+curl -X POST "$LANGSMITH_ENDPOINT/api/v2/sandboxes/boxes" \
+  -H "x-api-key: $LANGSMITH_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "warm-vm",
+    "snapshot": "warm-model",
+    "restore_memory": true,
+    "preserve_memory_on_stop": true
+  }'
+```
+
+从**已停止**的 sandbox 捕获内存，仅在该 sandbox 创建时设置了 `preserve_memory_on_stop` 时才有效。否则停止会丢弃 RAM，没有可捕获的内容。
 
 ## 列出、获取和删除 snapshots
 
@@ -360,9 +403,9 @@ const page = await client.listSnapshots({ nameContains: "ml", limit: 100 });
 
 </Note>
 
-## 停止和启动 sandboxes
+## 已停止的 sandboxes
 
-Sandboxes 可以在不丢失文件系统状态的情况下停止并重新启动。你在上一次运行期间写入的文件，在 sandbox 重启后仍然存在。
+已停止的 sandbox 会保留其文件系统，下一次请求会自动唤醒它。你无需自行启动：发送你想运行的命令，sandbox 就会重新启动来处理它。
 
 <CodeGroup>
 
@@ -370,12 +413,10 @@ Sandboxes 可以在不丢失文件系统状态的情况下停止并重新启动�
 sb = client.create_sandbox(snapshot_id=snapshot.id, name="my-vm")
 sb.run("echo 'hello' > /tmp/state.txt")
 
-# Stop the sandbox — preserves files on disk
+# Stop early to release resources. The idle timeout does this for you.
 sb.stop()
 
-# Later: start it again (blocks until ready, default timeout=120s)
-sb.start()
-
+# No start call: this wakes the sandbox and runs once it is up.
 result = sb.run("cat /tmp/state.txt")
 assert result.stdout.strip() == "hello"
 ```
@@ -386,15 +427,13 @@ await sb.run("echo 'hello' > /tmp/state.txt");
 
 await sb.stop();
 
-await sb.start();
-
 const result = await sb.run("cat /tmp/state.txt");
 console.log(result.stdout.trim()); // "hello"
 ```
 
 </CodeGroup>
 
-你也可以直接通过名称在 client 上停止和启动 sandbox，Python 中使用 `client.stop_sandbox(name)` / `client.start_sandbox(name)`，TypeScript 中使用 `client.stopSandbox(name)` / `client.startSandbox(name)`。
+停止后的第一次请求需要承担启动开销，因此比之后的请求更慢。在创建 sandbox 时设置 `preserve_memory_on_stop`，即可[从内存恢复](#resume-from-memory)而非冷启动。
 
 ## 下一步
 

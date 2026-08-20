@@ -1,95 +1,119 @@
 ---
-title: Build a scheduled research agent
-sidebarTitle: 教程
-description: 构建一个带 tool、持久 memory 和每日 schedule 的 Managed Deep Agent，然后将其部署。
+title: Add a custom search tool, memory, and a schedule
+sidebarTitle: 构建定时 agent
+description: 把 provider 搜索替换为 Tavily tool，然后为 quickstart 中的研究助手添加持久 memory 和每日 schedule。
 ---
 
 import ManagedDeepAgentsPrivateBetaNote from '/snippets/langsmith/managed-deep-agents-private-beta-note.mdx';
 
-本教程会逐步为研究助手添加能力。请先完成 [quickstart](/langsmith/managed-deep-agents-quickstart)，创建项目脚手架、添加 API keys 并在本地运行 `mda dev`。然后你会继续添加搜索 tool、使用持久 memory、配置每日 schedule，并将其部署到 LangSmith。
+本教程从 [quickstart](/langsmith/managed-deep-agents-quickstart) 继续。使用你在那里创建的 `research-assistant` 项目，包括你的 model、instructions 和可用的 `mda dev` 配置。
+
+`mda init` 可能还会生成 `identity` 和 `sandbox/` 等文件。保持它们不变即可；本教程不会改动这些文件。
+
+本指南会把 quickstart 中内置的 provider 搜索替换为一个已编写的 [Tavily](https://tavily.com) 搜索 tool，启用持久 memory，添加每日 schedule，然后部署。
 
 <ManagedDeepAgentsPrivateBetaNote />
 
-## 构建 agent
+## 扩展 agent
 
 <Steps>
-  <Step title="编写 instructions" id="instructions">
+  <Step title="添加自定义搜索 tool" id="add-tool">
 
-将 `instructions.md` 替换为研究助手的行为说明。Instructions 会引用你下一步添加的 tool，以及你稍后在本教程中显式启用的共享持久 memory：
+内置的 provider 搜索便于首次运行。已编写的 tools 给你更多控制权：可以选择搜索 API、调整参数，并把 tool 代码保留在你的项目中。
 
-```markdown instructions.md
-# Research assistant
+<Note>
+如果你已经在 [Quickstart](/langsmith/managed-deep-agents-quickstart) 中按步骤使用了 Tavily，请跳到下一步。
+</Note>
 
-You are a careful research assistant. Find sources, keep notes, and return
-concise answers with citations.
+将 [Tavily API key](https://app.tavily.com) 添加到 `.env`：
 
-## Behavior
-
-- Use the `web_search` tool to find sources instead of guessing.
-- Cite the sources you used.
-
-## Memory
-
-- Record reusable research procedures and project knowledge that can improve future work.
-- For release research, check the project's official changelog before secondary sources.
-- Never store personal data or secrets in memory.
+```text .env
+TAVILY_API_KEY=<TAVILY_API_KEY>
 ```
 
-  </Step>
+安装 Tavily 客户端：
 
-  <Step title="添加搜索 tool" id="add-tool">
+:::python
+```bash
+uv add tavily-python
+```
+:::
 
-创建 `tools/` 模块并加入一个搜索 tool，然后在 agent 入口中导入它。这个示例返回占位结果，因此无需外部 API 也能运行。你可以把函数体替换为调用自己的搜索 provider。
+:::js
+```bash
+npm install @langchain/tavily
+```
+:::
+
+创建一个自定义 `internet_search` tool：
 
 :::python
 ```python tools/search.py
+import os
+from typing import Literal
+
 from langchain.tools import tool
+from tavily import TavilyClient
 
 
-@tool(parse_docstring=True)
-def web_search(query: str) -> str:
-    """Search the web for a query and return result snippets.
+tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 
-    Args:
-        query: The search query.
-    """
-    # Replace this stub with a call to your search provider.
-    return f"Top results for '{query}': ..."
+
+@tool
+def internet_search(
+    query: str,
+    max_results: int = 5,
+    topic: Literal["general", "news", "finance"] = "general",
+) -> dict:
+    """Search the internet for relevant sources."""
+    return tavily_client.search(
+        query,
+        max_results=max_results,
+        topic=topic,
+    )
 ```
 :::
 
 :::js
 ```ts tools/search.ts
+import { TavilySearch } from "@langchain/tavily";
 import { tool } from "langchain";
 import { z } from "zod";
 
-export const webSearch = tool(
-  async ({ query }) => {
-    // Replace this stub with a call to your search provider.
-    return `Top results for '${query}': ...`;
+export const internetSearch = tool(
+  async ({ query, maxResults = 5, topic = "general" }) => {
+    const tavilySearch = new TavilySearch({
+      maxResults,
+      tavilyApiKey: process.env.TAVILY_API_KEY,
+      topic,
+    });
+    return tavilySearch._call({ query });
   },
   {
-    name: "web_search",
-    description: "Search the web for a query and return result snippets.",
+    name: "internet_search",
+    description: "Search the internet for relevant sources.",
     schema: z.object({
       query: z.string().describe("The search query."),
+      maxResults: z.number().optional().default(5),
+      topic: z.enum(["general", "news", "finance"]).optional().default("general"),
     }),
   },
 );
 ```
 :::
 
-把这个 tool 导入 agent 入口，并传给 agent 定义：
+用你编写的 tool 替换 provider 搜索 tool dict。保留 quickstart 中的 `model` 值：
 
 :::python
 ```python agent.py
 from managed_deepagents import define_deep_agent
 
-from tools.search import web_search
+from tools.search import internet_search
 
 agent = define_deep_agent(
+    name="research-assistant",
     model="openai:gpt-5.5",
-    tools=[web_search],
+    tools=[internet_search],
 )
 ```
 :::
@@ -98,39 +122,42 @@ agent = define_deep_agent(
 ```ts agent.ts
 import { defineDeepAgent } from "managed-deepagents";
 
-import { webSearch } from "./tools/search";
+import { internetSearch } from "./tools/search";
 
 export const agent = defineDeepAgent({
+  name: "research-assistant",
   model: "openai:gpt-5.5",
-  tools: [webSearch],
+  tools: [internetSearch],
 });
 ```
 :::
 
-关于自定义 tools 的更多信息，请参见 [Custom tools](/langsmith/managed-deep-agents-tools)。
+如果 `mda dev` 已经在运行，请重启它。在 Studio 中提问：
+
+```txt wrap
+What were the main announcements from the latest LangChain release?
+```
+
+确认 agent 调用了 `internet_search` 并返回了带引用的答案。关于更多已编写的 tools，请参见 [Custom tools](/langsmith/managed-deep-agents-tools)。
 
   </Step>
 
-  <Step title="本地运行 agent" id="run-local">
+  <Step title="为 memory 更新 instructions" id="instructions">
 
-安装依赖并启动本地 dev server：
+扩展 `instructions.md`，让 agent 知道需要保留哪些共享知识。保留研究行为，并添加一个 memory 策略：
 
-:::python
-```bash uv
-uv sync
-mda dev .
+```markdown instructions.md
+# Research assistant
+
+You are a careful research assistant. Use internet search to find sources,
+keep notes, and return concise answers with citations.
+
+## Memory
+
+- Record reusable research procedures and project knowledge that can improve future work.
+- For release research, check the project's official changelog before secondary sources.
+- Never store personal data or secrets in memory.
 ```
-:::
-
-:::js
-```bash npm
-npm install
-mda dev .
-```
-:::
-
-`mda dev` 会在 LangSmith Studio 中打开这个 agent。发送一个问题，确认 agent 会调用 `web_search`，并基于返回的 snippets 作答。
-
   </Step>
 
   <Step title="启用并使用持久 memory" id="memory">
@@ -172,7 +199,10 @@ from managed_deepagents import define_schedule
 schedule = define_schedule(
     cron="0 8 * * 1-5",
     timezone="America/Los_Angeles",
-    prompt="Summarize what you learned yesterday and list open questions.",
+    prompt=(
+        "Review durable memory for reusable research rules. "
+        "Summarize anything useful, then list open questions for today."
+    ),
 )
 ```
 :::
@@ -184,16 +214,26 @@ import { defineSchedule } from "managed-deepagents";
 export const schedule = defineSchedule({
   cron: "0 8 * * 1-5",
   timezone: "America/Los_Angeles",
-  prompt: "Summarize what you learned yesterday and list open questions.",
+  prompt:
+    "Review durable memory for reusable research rules. " +
+    "Summarize anything useful, then list open questions for today.",
 });
 ```
 :::
 
-在 deployment 可用后，`mda deploy` 会把这个 schedule reconcile 成 LangSmith cron job。关于 thread 行为和限制，请参见 [Schedules](/langsmith/managed-deep-agents-schedules)。
+如果首次触发时 memory 为空，agent 仍会返回开放问题。
+
+在 deployment 可用后，`mda deploy` 会把这个 schedule reconcile 成 LangSmith cron job。在你完成下一步部署后，你应该会看到：
+
+- `mda deploy` 完成，没有 schedule 错误（不要传入 `--no-wait`，否则 schedules 不会被 reconcile）。
+- 该 deployment 上存在一个对应此文件的托管 cron。Schedule 名称与模块名一致：`daily_digest`（Python）或 `daily-digest`（TypeScript）。
+- 该 cron 不会立即运行摘要。首次触发会等到工作日太平洋时间 8:00。
+
+关于 thread 行为和限制，请参见 [Schedules](/langsmith/managed-deep-agents-schedules)。
 
   </Step>
 
-  <Step title="部署 agent" id="deploy">
+  <Step title="部署并检查" id="deploy">
 
 将项目部署到 LangSmith：
 
@@ -201,13 +241,15 @@ export const schedule = defineSchedule({
 mda deploy .
 ```
 
-成功后，CLI 会打印 deployment dashboard URL。Deploy 会把 instructions 同步到 Context Hub，上传编译后的项目，并对每日 schedule 执行 reconcile。关于 deploy flags 和故障排查，请参见 [Deploy an agent](/langsmith/managed-deep-agents-deploy) 与 [CLI reference](/langsmith/managed-deep-agents-cli#deploy-projects)。
+成功后，CLI 会打印 deployment dashboard URL。Deploy 会把 instructions 同步到 Context Hub，上传编译后的项目，并对每日 schedule 执行 reconcile。
 
-  </Step>
+打开该 URL 并确认：
 
-  <Step title="检查运行" id="inspect">
+- Deployment 处于 ready 状态。
+- 存在 `daily_digest` 或 `daily-digest` cron。
+- 一次测试对话 run 在 traces 中展示了模型调用、`internet_search` tool 调用，以及 memory 的读写。
 
-在 LangSmith 中打开打印出的 URL，查看 build 状态和 revisions。打开 traces，检查 agent 的输入、模型调用、`web_search` 调用、memory 读写以及最终响应。
+关于 deploy flags 和故障排查，请参见 [Deploy an agent](/langsmith/managed-deep-agents-deploy) 与 [CLI reference](/langsmith/managed-deep-agents-cli#deploy-projects)。
 
   </Step>
 </Steps>
@@ -221,13 +263,7 @@ mda deploy .
   <Card title="Identity" icon="fingerprint" href="/langsmith/managed-deep-agents-identity">
     认证调用方，并在 tools 和 middleware 中使用已验证的 identity。
   </Card>
-  <Card title="Memory" icon="brain" href="/langsmith/managed-deep-agents-memory">
-    跨 threads 持久化共享的过程性知识和项目知识。
-  </Card>
   <Card title="Evals" icon="flask" href="/langsmith/managed-deep-agents-evals">
     编写 Harbor tasks，并为 Harbor 编译托管 agent。
-  </Card>
-  <Card title="Sandboxes" icon="box" href="/langsmith/managed-deep-agents-sandboxes">
-    为 agent 工作配置隔离的文件系统和 shell 访问。
   </Card>
 </CardGroup>

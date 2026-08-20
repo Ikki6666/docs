@@ -333,6 +333,116 @@ try {
 
 </CodeGroup>
 
+## 挂载 Context Hub 仓库
+
+挂载一个 [Context Hub](/langsmith/use-the-context-hub) 仓库，可以让 sandbox 中的代码以文件系统方式访问你的 agents 和 skills。该仓库的最新 commit tree 会被镜像到挂载路径，并在 sandbox 的整个生命周期内保持同步，因此新提交无需重启即可出现在正在运行的 sandbox 中。
+
+<Warning>
+Context Hub 挂载是**只读**的。同步是单向的，从仓库到 sandbox：agent 写到挂载路径下的文件永远不会被推送回仓库，并且下一次同步会覆盖它们。请将 sandbox 的输出写到挂载路径之外的地方，如果它属于仓库，请[通过 SDK 推送](/langsmith/manage-contexts-sdk)。
+</Warning>
+
+通过 `mount_config` 传入挂载。创建 sandbox 所用的 API key 必须对该仓库有访问权限，否则创建会以 `403` 失败。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import AsyncSandboxClient, context_hub_mount, mount_config
+
+
+async def main():
+    async with AsyncSandboxClient() as client:
+        async with await client.sandbox(
+            name="context-hub-mount-sandbox",
+            mount_config=mount_config(
+                mounts=[
+                    context_hub_mount(
+                        id="memories",
+                        mount_path="/memories",
+                        repo="-/my-agent",
+                    )
+                ],
+            ),
+        ) as sb:
+            result = await sb.run("ls /memories")
+            print(result.stdout)
+```
+
+```ts TypeScript
+import {
+  SandboxClient,
+  contextHubMount,
+  mountConfig,
+} from "langsmith/sandbox";
+
+const client = new SandboxClient();
+
+const sandbox = await client.createSandbox({
+  name: "context-hub-mount-sandbox",
+  mountConfig: mountConfig({
+    mounts: [
+      contextHubMount({
+        id: "memories",
+        mountPath: "/memories",
+        repo: "-/my-agent",
+      }),
+    ],
+  }),
+});
+
+try {
+  const result = await sandbox.run("ls /memories");
+  console.log(result.stdout);
+} finally {
+  await sandbox.delete();
+}
+```
+
+</CodeGroup>
+
+`repo` 是仓库 handle，可选地以 `owner/repo` 形式限定，其中 `-` 表示当前工作区。
+
+`mount_path` 必须是一个绝对、干净的路径，且不能是文件系统根目录，也不能位于 `/etc` 或 `/usr` 等系统目录下或其下层。任何其他路径都可以。与 bucket 和 Git 挂载不同，Context Hub 挂载不限于 `/mnt/mounts`。
+
+传入 `initial_pull_only` / `initialPullOnly` 可仅在启动时同步一次，而不再轮询仓库更新。
+
+## 为 sandbox 设定规格
+
+在创建时传入 `vcpus`、`mem_bytes` 和 `fs_capacity_bytes`（TypeScript 中为 `vCpus`、`memBytes`、`fsCapacityBytes`）来设定 sandbox 规格。省略它们时，sandbox 会使用以下默认值。
+
+<CodeGroup>
+
+```python Python
+sb = client.create_sandbox(
+    name="big-vm",
+    vcpus=4,
+    mem_bytes=16 * 1024**3,        # 16 GiB
+    fs_capacity_bytes=32 * 1024**3, # 32 GiB
+)
+```
+
+```ts TypeScript
+const sb = await client.createSandbox({
+  name: "big-vm",
+  vCpus: 4,
+  memBytes: 17_179_869_184,        // 16 GiB
+  fsCapacityBytes: 34_359_738_368, // 32 GiB
+});
+```
+
+</CodeGroup>
+
+| 资源 | 默认值 | 范围 |
+|----------|---------|-------|
+| CPU | 0.5 vCPU | 0.05 到 16 vCPU。子核请求请使用 `cpu_millicores`（`500` 即 0.5 vCPU）；它优先于 `vcpus`。 |
+| 内存 | 每 vCPU 4 GiB | 最多 64 GiB。必须保持在每 vCPU 目标的 50% 范围内，因此一个 1 vCPU 的 sandbox 接受 2 到 6 GiB。只设置内存而不设置 CPU 时，CPU 会按相同比例推导。 |
+| 文件系统 | Snapshot 容量 | 最多 64 GiB，且永远不会小于其启动所用的 snapshot。 |
+
+当宿主机有空闲容量时，sandboxes 可以突发到所请求 CPU 的两倍。通过 `update_sandbox` / `updateSandbox` 调整现有 sandbox 的规格会在其下次启动时生效，并且调整时只强制 64 GiB 上限，而不强制每 vCPU 比例。
+
+<Note>
+自由格式的 `labels`（每个 sandbox 最多 128 个，每个 key 最多 256 字节，每个 value 最多 4096 字节）可以在创建时通过 REST API 设置。Sandboxes 会继承其 snapshot 的 labels，除非被覆盖。`langsmith.sandbox` 客户端目前尚未暴露该字段。
+</Note>
+
 ## Sandbox 生命周期与保留策略
 
 Sandbox 采用两阶段保留模型，以**空闲活动**和 **`stopped`** 状态为锚点。
@@ -342,13 +452,13 @@ Sandbox 采用两阶段保留模型，以**空闲活动**和 **`stopped`** 状�
 | `idle_ttl_seconds` | 启动器会在 sandbox 空闲达到该秒数后将其停止。任何命令执行或文件 I/O 都会重置该计时器。`0` 表示禁用空闲停止。 | 未显式设置时，默认值为 `600`（10 分钟）。 |
 | `delete_after_stop_seconds` | 一旦 sandbox 进入 `stopped` 状态，该计时器就会开始。到期后，sandbox 记录和文件系统克隆会由服务端清理任务永久删除。`0` 表示禁用基于停止状态的自动删除（需要手动清理）。 | 未显式设置时，服务端会套用其配置的默认值（通常为 14 天）。 |
 
-这两个值都必须是 60 的倍数（按分钟粒度）。完整生命周期如下：
+这两个值都必须是 60 的倍数（按分钟粒度），且 `delete_after_stop_seconds` 的上限为 2592000（30 天）。完整生命周期如下：
 
 ```
 running ──(idle for idle_ttl_seconds)──▶ stopped ──(delete_after_stop_seconds)──▶ deleted
 ```
 
-你也可以显式调用 `stop_sandbox` / `stopSandbox`，这同样会填充 `stopped_at` 并启动删除计时器。
+你也可以显式调用 `stop_sandbox` / `stopSandbox`，在空闲超时触发前提前释放资源；这同样会填充 `stopped_at` 并启动删除计时器。此后无需再次启动它：已停止的 sandbox 会在下一次命令、文件操作或 service-URL 请求时自动唤醒。
 
 <CodeGroup>
 
@@ -406,8 +516,8 @@ await client.updateSandbox(sb.name, {
 
 Sandbox daemon 通过两类超时机制管理命令会话生命周期：
 
-- **Session TTL（已完成命令）**：命令结束后，其会话会在内存中保留一段 TTL 时间。在此期间你可以重新连接并取回输出。TTL 到期后，会话会被清理。
-- **Idle timeout（运行中的命令）**：如果运行中的命令没有任何客户端连接，就会在空闲超时后被终止（默认 5 分钟）。每当客户端连接时，空闲计时器都会重置。设置为 `-1` 可禁用空闲超时。
+- **Session TTL（已完成命令）**：命令结束后，其会话会在内存中保留一段 TTL 时间（默认 5 分钟）。在此期间你可以重新连接并取回输出。TTL 到期后，会话会被清理。将 `ttl_seconds` 设置为 `-1` 可永久保留会话。
+- **Idle timeout（运行中的命令）**：如果运行中的命令没有任何客户端连接，就会在空闲超时后被终止（默认 1 小时）。每当客户端连接时，空闲计时器都会重置。将 `idle_timeout` 设置为 `-1` 可禁用空闲超时。
 
 ### 组合使用生命周期选项
 

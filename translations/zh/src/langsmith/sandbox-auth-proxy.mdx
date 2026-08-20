@@ -59,7 +59,6 @@ curl -X POST "$LANGSMITH_ENDPOINT/v2/sandboxes/boxes" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "db-sandbox",
-    "wait_for_ready": true,
     "proxy_config": {
       "access_control": {
         "allow_list": [
@@ -72,6 +71,10 @@ curl -X POST "$LANGSMITH_ENDPOINT/v2/sandboxes/boxes" \
 ```
 
 到 `db.example.com:5432` 的连接会在 TCP 层直接透传，不做拦截，因此 PostgreSQL wire protocol，以及其上的 TLS、host-key checking 和其他端到端协议都能原样工作。
+
+<Note>
+创建 sandbox 时会启动它，并在其报告 `ready` 后返回，因此无需额外添加等待步骤。如果之后需要再次检查状态，可通过 `GET /api/v2/sandboxes/boxes/{name}/status` 查看当前状态。
+</Note>
 
 ### 通过 SDK 配置
 
@@ -118,6 +121,7 @@ await client.createSandbox({
 | `match_hosts` | 要拦截的主机，支持 `*.github.com` 这样的 glob |
 | `match_paths` | 要匹配的路径，为空则表示所有路径 |
 | `headers` | 要注入的请求头，每个都包含 `name`、`type` 和 `value` |
+| `env_vars` | 在该规则启用期间为 sandbox 设置的环境变量 |
 | `no_proxy` | 完全绕过 proxy 的主机，例如 `localhost` |
 
 ### Header 类型
@@ -129,6 +133,29 @@ await client.createSandbox({
 | `workspace_secret` | 使用 `{KEY}` 语法引用一个工作区密钥。在应用 proxy 配置时解析 |
 | `plaintext` | 原样存储并原样返回。适用于非敏感 header |
 | `opaque` | 只写。值会静态加密保存，且永远不会通过 API 返回 |
+
+### 从规则设置环境变量
+
+一条规则的 `env_vars` 是明文环境变量，在该规则启用期间会为 sandbox 中的每个 command 设置。当某个工具拒绝运行，除非存在某个凭据环境变量时（即使 proxy 会在传输中注入真实凭据）可以使用：给变量设置一个占位值让 command 启动，而由 proxy 提供真实凭据。
+
+这些值是明文的，且会通过 API 返回，因此切勿将 secret 放入 `env_vars`。请改用 `workspace_secret` 或 `opaque` 类型的 header。
+
+环境变量按以下顺序解析，从最低优先级到最高优先级：
+
+1. **已启用的 proxy 规则**：当两条已启用的规则声明了相同的名称时，`rules` 中靠后的规则优先。
+2. **sandbox 自身的 `env_vars`**：显式按 sandbox 设置的值会覆盖来自规则的值。
+3. **由已启用的 AWS 或 GCP auth 规则管理的变量**：当匹配的 auth 规则启用时，声明了这些名称之一的规则会被拒绝。
+
+```json
+{
+  "name": "github-api",
+  "match_hosts": ["api.github.com"],
+  "headers": [
+    {"name": "Authorization", "type": "opaque", "value": "Bearer <github-token>"}
+  ],
+  "env_vars": {"GH_TOKEN": "proxy-injected"}
+}
+```
 
 ## 对 AWS 请求进行身份验证
 
@@ -145,7 +172,7 @@ AWS auth 规则与 header 注入规则不同：
 - `type` 必须设置为 `aws`
 - 凭证需要放在 `aws` 对象下
 - 不要再设置 `match_hosts`、`match_paths` 或 `headers`，因为 AWS 主机匹配逻辑内建在 proxy 中
-- 每个 sandbox 最多只能配置一个 AWS auth 规则
+- 每个 sandbox 最多只能配置一个 AWS auth 规则。该上限会计入所有 AWS 规则，包括已禁用的规则。
 
 ```bash
 curl -X POST "$LANGSMITH_ENDPOINT/v2/sandboxes/boxes" \
@@ -153,7 +180,6 @@ curl -X POST "$LANGSMITH_ENDPOINT/v2/sandboxes/boxes" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "aws-sandbox",
-    "wait_for_ready": true,
     "proxy_config": {
       "rules": [
         {
@@ -250,7 +276,7 @@ GCP auth 规则与 header 注入规则不同：
 - 凭证需要放在 `gcp.service_account_json` 下
 - `gcp.scopes` 必须是一个非空的 OAuth scopes 列表
 - proxy 会自动匹配 Google API 主机，并使用配置好的 service account 为这些请求进行身份验证
-- 每个 sandbox 最多只能有一个启用中的 GCP auth 规则
+- 每个 sandbox 最多只能配置一个 GCP auth 规则。该上限会计入所有 GCP 规则，包括已禁用的规则。
 
 SDK 中的 `gcp_auth` 和 `gcpAuth` 辅助函数会生成相同的规则结构。
 
@@ -260,7 +286,6 @@ curl -X POST "$LANGSMITH_ENDPOINT/v2/sandboxes/boxes" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "gcp-sandbox",
-    "wait_for_ready": true,
     "proxy_config": {
       "rules": [
         {
@@ -346,7 +371,6 @@ curl -X POST "$LANGSMITH_ENDPOINT/v2/sandboxes/boxes" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "openai-sandbox",
-    "wait_for_ready": true,
     "proxy_config": {
       "rules": [
         {
@@ -377,7 +401,6 @@ curl -X POST "$LANGSMITH_ENDPOINT/v2/sandboxes/boxes" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "multi-api-sandbox",
-    "wait_for_ready": true,
     "proxy_config": {
       "rules": [
         {
@@ -460,6 +483,7 @@ def github_proxy_rules(github_token: str) -> list[dict[str, Any]]:
                     "value": f"Bearer {github_token}",
                 }
             ],
+            "env_vars": {"GH_TOKEN": "proxy-injected"},
         },
         {
             "name": "github",
@@ -490,15 +514,15 @@ def configure_github_proxy(sandbox_name: str, github_token: str) -> None:
 
 在创建 sandbox 之后，或重新附着到一个 sandbox 之后，调用 `configure_github_proxy`。由于 GitHub App installation tokens 会过期，因此每次你为新一轮运行复用 sandbox 时，都需要刷新 proxy 配置。
 
-在 sandbox 内部，如果某个 CLI 在发出请求前要求本地先有一个非敏感占位 token，请这样设置：
+`github-api` 规则会把 `GH_TOKEN` 设置为一个非敏感占位值，从而满足 `gh` CLI 的本地凭据检查。命令随后无需逐条加前缀即可运行：
 
 ```bash
-GH_TOKEN=dummy gh repo view langchain-ai/langchain
-GH_TOKEN=dummy gh pr list --repo langchain-ai/langchain
-GH_TOKEN=dummy gh repo clone langchain-ai/langchain
+gh repo view langchain-ai/langchain
+gh pr list --repo langchain-ai/langchain
+gh repo clone langchain-ai/langchain
 ```
 
-这个占位值只用于满足 `gh` CLI 的本地检查。真正的 `Authorization` 请求头仍然由 proxy 注入。
+该占位值永远不会离开 sandbox。真正的 `Authorization` 请求头由 proxy 注入到出站请求中。
 
 ## 通过 SDK 配置
 
@@ -607,7 +631,6 @@ curl -X POST "$LANGSMITH_ENDPOINT/v2/sandboxes/boxes" \
   -d '{
     "snapshot_id": "<snapshot-uuid>",
     "name": "callback-sandbox",
-    "wait_for_ready": true,
     "proxy_config": {
       "callbacks": [
         {
