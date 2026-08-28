@@ -5,7 +5,7 @@ icon: "code"
 tag: "SDK"
 ---
 
-使用 LangSmith SDK 以编程方式管理反馈配置和[标注队列](/langsmith/evaluation-concepts#human) rubric。你可以在组织层定义可复用的反馈 schema，例如准确率分数或 pass/fail 判断，然后把它们配上自定义说明，分配给具体队列。这样可以实现版本控制、跨项目自动化，以及评估配置的一致性，尤其适合用于 CI/CD pipeline，或在不同环境间复制同一套评估设置。
+使用 LangSmith SDK 以编程方式管理反馈配置和[标注队列](/langsmith/evaluation-concepts#human) rubric，并将 runs 和 threads 添加到队列以供审查。你可以在组织层定义可复用的反馈 schema，例如准确率分数或 pass/fail 判断，然后把它们配上自定义说明，分配给具体队列。这样可以实现版本控制、跨项目自动化，以及评估配置的一致性，尤其适合用于 CI/CD pipeline，或在不同环境间复制同一套评估设置。
 
 <Callout icon="code">
 本指南使用 Python 和 TypeScript SDK。安装与初始化请参阅 [Python SDK documentation](https://reference.langchain.com/python/langsmith) 和 [TypeScript SDK documentation](https://reference.langchain.com/javascript/modules/langsmith.html)。
@@ -277,6 +277,134 @@ await client.updateAnnotationQueue(queue.id, {
 });
 ```
 </CodeGroup>
+
+## 将 runs 和 threads 添加到队列
+
+使用标注队列的 `items` 资源，可以将[runs](/langsmith/observability-concepts#runs)和[threads](/langsmith/observability-concepts#threads)添加到单个 run 的标注队列中。单个请求可以同时接收 run items 和 thread items 的混合批次，因此这个方法覆盖了 UI [添加流程](/langsmith/annotation-queues#assign-runs-and-threads-to-a-single-run-queue)支持的一切操作。
+
+<Note>
+`items` 资源要求 Python 版 `langsmith>=0.10.13` 或 TypeScript 版 `langsmith>=0.8.8`，并由 `0.16.14` 或更高版本的 LangSmith 后端提供支持。
+</Note>
+
+每个 item 都会将 `item_type` 设置为 `RUN` 或 `THREAD`：
+
+- **RUN items** 需要 `run_id`。同时提供 `project_id`（project UUID）和 `start_time`，两者一起可以准确定位到具体的 run。
+- **THREAD items** 需要 `thread_id` 和 `project_id`。
+
+使用 SDK 查找这些 ID：
+
+- **`project_id`**：用 @[`read_project`] 按名称查找 project 并读取其 `id`，例如 `client.read_project(project_name="my-project").id`。
+- **`run_id`**：使用 `client.runs.query()` 查询 runs。每个 run 都会暴露 `id`、`project_id` 和 `start_time`，这正是 RUN item 需要的字段。
+- **`thread_id`**：使用 `client.threads.query()` 查询 threads。每个结果都会暴露其 `thread_id`。
+
+你也可以在 [LangSmith UI](https://smith.langchain.com) 中找到这些 ID：
+
+- **`project_id`**：在[tracing project](/langsmith/observability-concepts#projects)中，点击 project 名称旁边的 **ID** 徽章即可复制 project UUID。
+- **`run_id`**：在 [Details view](/langsmith/view-traces#details-view) 中打开一个 run，点击 run 名称旁边的 **ID** 徽章即可复制 run ID。
+- **`thread_id`**：在 tracing project 的 **Threads** 视图中，从 **Thread ID** 列复制该值。
+
+如需延长所添加 run items 的 trace 保留时间，请传入 `extend_trace_retention=True`。响应是一个信封，其中包含一个 `items` 数组，每个已添加的 item 对应一个条目。
+
+<Note>
+在 Python 中，`annotation_queues.items.create` 是异步方法，因此需要在事件循环中 `await` 它。
+</Note>
+
+<CodeGroup>
+```python Python
+import asyncio
+
+async def main():
+    queue_name = "<queue_name>"
+    project_id = "<project_id>"
+    run_id = "<run_id>"
+    thread_id = "<thread_id>"
+
+    # Look up the annotation queue by name to get its ID.
+    queue = next(client.list_annotation_queues(name=queue_name), None)
+    if queue is None:
+        raise SystemExit(f"No annotation queue named {queue_name!r}")
+
+    # Fetch the run to add by id + project_id. runs.retrieve() requires
+    # `selects` (uppercase RunSelectField names) to return fields like
+    # start_time.
+    run = await client.runs.retrieve(
+        run_id=run_id,
+        project_id=project_id,
+        selects=["ID", "PROJECT_ID", "START_TIME"],
+    )
+
+    response = await client.annotation_queues.items.create(
+        str(queue.id),
+        items=[
+            {
+                "item_type": "RUN",
+                "run_id": run_id,
+                "project_id": project_id,
+                "start_time": run.start_time,
+            },
+            {
+                "item_type": "THREAD",
+                "thread_id": thread_id,
+                "project_id": project_id,
+            },
+        ],
+    )
+
+    # response.items contains one entry per added item.
+    for item in response.items or []:
+        print(item.id, item.item_type)
+
+asyncio.run(main())
+```
+```typescript TypeScript
+const queueName = "<queue_name>";
+const projectId = "<project_id>";
+const runId = "<run_id>";
+const threadId = "<thread_id>";
+
+// Look up the annotation queue by name to get its ID.
+let queue;
+for await (const q of client.listAnnotationQueues({ name: queueName })) {
+  queue = q;
+  break;
+}
+if (!queue) {
+  throw new Error(`No annotation queue named ${queueName}`);
+}
+
+// Fetch the run to add by id + project_id. retrieve() requires `selects`
+// (uppercase RunSelectField names) to return fields like start_time.
+const run = await client.runs.retrieve(runId, {
+  project_id: projectId,
+  selects: ["ID", "PROJECT_ID", "START_TIME"],
+});
+
+const response = await client.annotationQueues.items.create(queue.id, {
+  items: [
+    {
+      item_type: "RUN",
+      run_id: runId,
+      project_id: projectId,
+      start_time: run.start_time,
+    },
+    {
+      item_type: "THREAD",
+      thread_id: threadId,
+      project_id: projectId,
+    },
+  ],
+});
+
+// response.items contains one entry per added item.
+for (const item of response.items ?? []) {
+  console.log(item.id, item.item_type);
+}
+```
+</CodeGroup>
+
+<Note>
+对于只添加 runs 的场景，@[`add_runs_to_annotation_queue`] 仍然可用，并且在你不需要添加 threads 时是最简单的选项。需要同时添加 threads 或混合 run、thread 批次的新代码，应使用 `items` 资源。
+</Note>
 
 ## 反馈配置类型详解
 

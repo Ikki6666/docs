@@ -220,8 +220,8 @@ const agent = createAgent({
     可选：要应用重试逻辑的工具或工具名列表。如果为 `None`，则应用于所有工具。
 </ParamField>
 
-<ParamField body="retry_on" type="tuple[type[Exception], ...] | callable" default="(Exception,)">
-    要重试的异常类型元组，或者一个接受异常并返回 `True`/`False` 的函数。默认情况下，所有异常都会被重试。不匹配的异常会立即传播，且不会由 `on_failure` 处理。
+<ParamField body="retry_on" type="tuple[type[Exception], ...] | callable" default="default_retry_on">
+    要重试的异常类型元组，或者一个接受异常并返回 `True`/`False` 的函数。使用 `langchain>=1.3.16` 时，默认值会重试可重试的[模型错误](/oss/langchain/models#model-exceptions)以及所有未分类的异常，并且不再重试被标记为不可重试的模型错误。
 </ParamField>
 
 <ParamField body="on_failure" type="string | callable" default="continue">
@@ -259,8 +259,8 @@ const agent = createAgent({
     可选：要应用重试逻辑的工具或工具名数组。可以是 `BaseTool` 实例或工具名字符串列表。如果为 `undefined`，则应用于所有工具。
 </ParamField>
 
-<ParamField body="retryOn" type="((error: Error) => boolean) | (new (...args: any[]) => Error)[]" default="() => true">
-    要么是错误构造函数数组，要么是接收错误并返回 `true` 的函数。默认对所有错误重试。
+<ParamField body="retryOn" type="((error: Error) => boolean) | (new (...args: any[]) => Error)[]" default="(error) => getRetryable(error) ?? true">
+    要么是错误构造函数数组，要么是接收错误并返回 `true` 的函数。使用 `langchain>=1.5.9` 时，默认值不再重试被标记为不可重试的错误，其余所有错误都会被重试。
 </ParamField>
 
 <ParamField body="onFailure" type="'error' | 'continue' | ((error: Error) => string)" default="continue">
@@ -427,6 +427,62 @@ const strictRetry = toolRetryMiddleware({
 
 </Accordion>
 
+:::js
+#### 将错误标记为可重试
+
+<Note>
+需要 `@langchain/core>=1.2.8` 和 `langchain>=1.5.9`。
+</Note>
+
+在抛出错误前将其标记，重试中间件就会遵循该判定。这样可以避免在会以完全相同方式重复出现的失败上浪费重试次数，例如无效输入或被拒绝的凭证。
+
+使用 `@langchain/core/errors` 中的 `stampRetryable`：
+
+```typescript
+import { stampRetryable } from "@langchain/core/errors";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+
+const lookupRecord = tool(
+  async ({ id }) => {
+    const response = await fetch(`https://api.example.com/records/${id}`);
+
+    if (response.status === 422) {
+      // Retrying the same identifier fails the same way
+      throw stampRetryable(new Error("Malformed record identifier"), false);
+    }
+    if (response.status === 503) {
+      throw stampRetryable(new Error("Record service unavailable"), true);
+    }
+
+    return response.json();
+  },
+  {
+    name: "lookup_record",
+    description: "Look up a record by identifier",
+    schema: z.object({ id: z.string() }),
+  }
+);
+```
+
+对于另一次尝试也无法成功的失败，传入 `false`；对于瞬时失败传入 `true`。你未标记的错误会被重试，因此现有工具会保持其当前行为。
+
+标记错误并不会改变其类型或形态，因此针对它的 `instanceof` 检查仍可正常使用。若要读取标记，可调用 `getRetryable(error)`，对于从未被标记的错误，它会返回 `true`、`false` 或 `undefined`。
+
+聊天模型集成已经会标记它们能识别的失败，因此你无需手动标记这些错误。以下失败会在第一次尝试时就发生，而非消耗重试次数：
+
+- **身份验证失败**：API 密钥缺失、无效或已过期。
+- **权限被拒绝**：凭证有效，但无权访问所请求的资源。
+- **未知模型**：提供方无法识别的模型标识符。
+- **上下文窗口溢出**：输入超过模型可接受的长度。
+- **无效的工具结果**：格式错误的工具结果块。
+- **载荷过大**：请求体因体积过大而被提供方拒绝。
+- **配额耗尽**：达到计费或用量限制，而非速率限制。
+- **调用被取消**：通过中止信号停止的请求。
+
+速率限制、超时和服务器错误仍然保持可重试。任何提供方无法识别的错误都不会被标记，并照常重试。
+:::
+
 ### Model retry
 
 通过可配置的指数退避自动重试失败的模型调用。Model retry 适用于以下情况：
@@ -483,8 +539,8 @@ const agent = createAgent({
     初始调用后的最大重试次数（默认总共 3 次尝试）。
 </ParamField>
 
-<ParamField body="retry_on" type="tuple[type[Exception], ...] | callable" default="(Exception,)">
-    要么是错误类型元组，要么是接收异常并返回 `True` 的函数。
+<ParamField body="retry_on" type="tuple[type[Exception], ...] | callable" default="default_retry_on">
+    要么是错误类型元组，要么是接收异常并返回 `True` 的函数。使用 `langchain>=1.3.16` 时，默认值会重试可重试的[模型错误](/oss/langchain/models#model-exceptions)以及所有未分类的异常，并且不再重试被标记为不可重试的模型错误。
 </ParamField>
 
 <ParamField body="on_failure" type="string | callable" default="continue">
@@ -516,8 +572,8 @@ const agent = createAgent({
     初始调用后的最大重试次数（默认总共 3 次尝试）。必须大于等于 0。
 </ParamField>
 
-<ParamField body="retryOn" type="((error: Error) => boolean) | (new (...args: any[]) => Error)[]" default="() => true">
-    要么是错误构造函数数组，要么是接收错误并返回 `true` 的函数。默认对所有错误重试。
+<ParamField body="retryOn" type="((error: Error) => boolean) | (new (...args: any[]) => Error)[]" default="(error) => getRetryable(error) ?? true">
+    要么是错误构造函数数组，要么是接收错误并返回 `true` 的函数。使用 `langchain>=1.5.9` 时，默认值不再重试被标记为不可重试的错误，其余所有错误都会被重试。
 </ParamField>
 
 <ParamField body="onFailure" type="'error' | 'continue' | ((error: Error) => string)" default="continue">
