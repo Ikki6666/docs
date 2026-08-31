@@ -4,15 +4,83 @@ sidebarTitle: Snapshots
 description: 构建并捕获可复用的 sandbox 文件系统镜像。
 ---
 
-**snapshot** 是一个可复用的文件系统 bundle，其底层由 Docker image 支撑。当你希望从自定义文件系统镜像启动 sandboxes 时，就可以构建或捕获 snapshot。
+**snapshot** 是一个可复用的 sandbox 文件系统。当你希望从自定义文件系统镜像启动 sandboxes 时，可以基于某个 container image 构建自定义 snapshot。
 
 你也可以从一个正在运行的 sandbox 中捕获 snapshot，例如安装 packages、写入数据文件，或配置状态，然后把结果 snapshot 下来，作为新的起始镜像重复使用。
 
 ![Sandboxes snapshots page](/images/langsmith/sandboxes/sb-snapshots.png)
 
-## 从 Docker image 构建 snapshot
+## 了解默认 snapshot
 
-你可以直接基于任意 Docker image 构建 snapshot。这个调用会阻塞，直到 snapshot 准备完成，默认超时 60 秒；如果镜像较大，请调高。
+当你创建 sandbox 时未选择 snapshot，LangSmith 会使用内置的默认 snapshot。该默认 snapshot 提供 Ubuntu 24.04 文件系统，并附带常用开发工具。LangSmith 可能会随时间更新默认 snapshot 中包含的 packages 和工具。
+
+### 在自托管部署中检查默认 snapshot 文件系统
+
+在自托管部署中，LangSmith 会基于 sandbox 运行时 container image（`sandbox-host`）中内嵌的文件系统来创建默认 snapshot：
+
+1. 在构建 `sandbox-host` 镜像时，LangSmith 以 Ubuntu 24.04 为起点并安装默认开发工具。
+2. LangSmith 将该文件系统打包为一个 16 GiB 的压缩 ext4 文件，位于 `/opt/sandbox-host/bin/builder-base.ext4.gz`。
+3. 当 `sandbox-host` 启动时，LangSmith 使用该内嵌文件系统创建默认 snapshot。
+
+默认 snapshot 文件系统的来源是这个压缩的 ext4 文件，而不是单独拉取的 container image。
+
+仅扫描 `sandbox-host` container image 并不会检查这个压缩制品内部的文件。要验证默认 snapshot，请单独提取并扫描内嵌的文件系统。
+
+<Note>
+此流程验证的是默认 snapshot 文件系统。LangSmith 会在 sandbox 启动时单独提供其他所需的运行时组件；它们不属于 snapshot。
+</Note>
+
+要独立检查默认 snapshot，请使用你的 Helm release 所配置的确切 `sandbox-host` container image。如果你将镜像同步到了私有 registry，请使用该 registry 中 `images.sandboxHostImage` 的引用。
+
+你需要准备：
+
+- 对已部署的 `sandbox-host` 镜像的访问权限。
+- 一个 Linux 系统，其上装有 Docker、`gzip`、GNU `dd`，以及来自 `e2fsprogs` 包的 `debugfs`。
+- 一个支持 sparse files 的本地文件系统，以及足以容纳压缩制品和提取后文件的空间。该 ext4 镜像的逻辑大小为 16 GiB，但稀疏解压可以避免为其全零的空闲空间分配磁盘。
+
+将文件提取到一个临时目录，然后用你惯用的文件系统或软件物料清单（SBOM）扫描器扫描该目录。
+
+设置你的部署实际使用的镜像引用，并创建一个临时工作目录：
+
+```bash
+export SANDBOX_HOST_IMAGE="<sandbox-host-image-reference>"
+export SNAPSHOT_WORKDIR="$(mktemp -d)"
+
+docker pull "$SANDBOX_HOST_IMAGE"
+```
+
+在不启动 `sandbox-host` 进程的情况下提取该压缩 ext4 文件：
+
+```bash
+SANDBOX_HOST_CONTAINER="$(docker create "$SANDBOX_HOST_IMAGE")"
+docker cp \
+  "${SANDBOX_HOST_CONTAINER}:/opt/sandbox-host/bin/builder-base.ext4.gz" \
+  "$SNAPSHOT_WORKDIR/"
+docker rm "$SANDBOX_HOST_CONTAINER"
+```
+
+将文件系统解压为稀疏文件：
+
+```bash
+gzip -dc "$SNAPSHOT_WORKDIR/builder-base.ext4.gz" | \
+  dd of="$SNAPSHOT_WORKDIR/builder-base.ext4" \
+    bs=1M conv=sparse status=progress
+```
+
+使用 `debugfs` 提取 ext4 内容。除非传入 `-w`，否则 `debugfs` 以只读方式打开文件系统：
+
+```bash
+mkdir -p "$SNAPSHOT_WORKDIR/rootfs"
+debugfs \
+  -R "rdump / $SNAPSHOT_WORKDIR/rootfs" \
+  "$SNAPSHOT_WORKDIR/builder-base.ext4"
+```
+
+将你的文件系统或 SBOM 扫描器指向 `$SNAPSHOT_WORKDIR/rootfs`。扫描器读取的 package 数据库和文件，与 LangSmith 用于默认 snapshot 的根文件系统完全相同。
+
+## 从 container image 构建 snapshot
+
+你可以直接基于任意 container image 构建 snapshot。这个调用会阻塞，直到 snapshot 准备完成，默认超时 60 秒；如果镜像较大，请调高。
 
 <CodeGroup>
 
@@ -45,6 +113,16 @@ console.log(snapshot.id);
 ```
 
 </CodeGroup>
+
+### 验证基于 container image 构建的 snapshot
+
+LangSmith 会基于你提供的 container image 中的文件系统构建自定义 snapshot。要独立验证这些内容：
+
+1. 将来源 container image 解析为一个不可变的引用，例如 `registry.example.com/example/image@sha256:<digest>`。
+2. 检查并扫描这个确切的镜像。
+3. 在创建 snapshot 时，将同一个带 digest 的引用作为 `docker_image` 使用。
+
+LangSmith 会在 sandbox 启动时单独提供其所需的运行时工具。它们既不会被添加到你提供的 container image 中，也不包含在自定义 snapshot 里。
 
 ### 私有 registry
 

@@ -17,6 +17,7 @@ destination 是一个具名配置，用来告诉 LangSmith 应该把导出的 tr
 - AWS S3 与 GCS 所需的 bucket [权限](#permissions-required)。
 - 如何通过 API [创建 destination](#create-a-destination)，包括 provider 专属示例和凭证选项。
 - 如何在不重建 destination 的前提下[轮换 destination 凭证](#rotate-destination-credentials)。
+- 如何在静态凭证与 AWS IAM 角色扮演之间[切换认证模式](#switch-authentication-mode)。
 - 如何[排查 destination 错误](#debug-destination-errors)。
 
 ## 配置字段
@@ -286,7 +287,7 @@ curl --request PATCH \
 
 `session_token` 字段是可选的，适用于[临时凭证](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp_use-resources.html)。
 
-[**Required permission**](/langsmith/organization-workspace-operations)：`bulk-exports:manage`（或历史上同样授予该权限的 `workspaces:manage`）。
+[**Required permission**](/langsmith/organization-workspace-operations#bulk-exports)：`bulk-exports:manage`。
 
 在保存新凭证之前，LangSmith 会用现有 destination 配置对 bucket 执行一次测试写入，以验证凭证是否有效。如果凭证没有足够写权限，请求会返回 `400`。此时请参阅[排查 destination 错误](#debug-destination-errors)。
 
@@ -310,6 +311,197 @@ curl --request PATCH \
 1. 调用 PATCH endpoint 提交新凭证。LangSmith 会在保存前先完成校验。
 1. 保留旧凭证，直到所有 in-flight bulk export runs 完成（最长可达[单 run 最大时长](/langsmith/data-export-monitor#automatic-retry-behavior)）。
 1. 在确认没有 runs 仍在使用旧凭证后，再吊销旧凭证。
+
+## 使用 AWS IAM 角色认证
+
+AWS IAM 角色扮演让 GCP 托管的 LangSmith SaaS 无需存储静态 AWS 凭证即可导出到 S3。配置一个信任你生产区域的 LangSmith service accounts 的 AWS 角色，然后在创建或更新 destination 时提供其 ARN。
+
+传入 `aws_role_arn` 而不是 `credentials` 即可使用 IAM 角色扮演。
+
+<Note>
+IAM 角色扮演仅在 GCP 托管的 LangSmith SaaS 上可用。AWS 托管的 SaaS 和自托管部署不支持。
+</Note>
+
+### 创建 AWS 角色
+
+创建一个 AWS IAM 角色，其信任策略允许来自你所在区域三个 subject ID 的 web identity federation。为该角色授予对导出 bucket 的访问权限。选择你的 LangSmith 区域以使用相应的 subject ID。每个 Terraform 示例都只使用最低要求的 `s3:PutObject` 权限：
+
+<CodeGroup>
+
+```hcl US
+resource "aws_iam_role" "langsmith_bulk_export" {
+  name                 = "langsmith-bulk-export"
+  max_session_duration = 43200
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = "accounts.google.com" }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "accounts.google.com:oaud" = "langsmith-bulk-export"
+          "accounts.google.com:sub" = [
+            "110136955440523778103",
+            "116331607438151298187",
+            "115251468294701876731",
+          ]
+        }
+      }
+    }]
+  })
+
+  inline_policy {
+    name = "langsmith-bulk-export-s3"
+    policy = jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+      }]
+    })
+  }
+}
+```
+
+```hcl EU
+resource "aws_iam_role" "langsmith_bulk_export" {
+  name                 = "langsmith-bulk-export"
+  max_session_duration = 43200
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = "accounts.google.com" }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "accounts.google.com:oaud" = "langsmith-bulk-export"
+          "accounts.google.com:sub" = [
+            "110207823358662523645",
+            "115689110758588220909",
+            "109691164801275818274",
+          ]
+        }
+      }
+    }]
+  })
+
+  inline_policy {
+    name = "langsmith-bulk-export-s3"
+    policy = jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+      }]
+    })
+  }
+}
+```
+
+```hcl APAC
+resource "aws_iam_role" "langsmith_bulk_export" {
+  name                 = "langsmith-bulk-export"
+  max_session_duration = 43200
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = "accounts.google.com" }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "accounts.google.com:oaud" = "langsmith-bulk-export"
+          "accounts.google.com:sub" = [
+            "105923862603785245337",
+            "114288557158507552617",
+            "116622461022404604716",
+          ]
+        }
+      }
+    }]
+  })
+
+  inline_policy {
+    name = "langsmith-bulk-export-s3"
+    policy = jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+      }]
+    })
+  }
+}
+```
+
+</CodeGroup>
+
+可选权限请参见 [AWS S3 权限](#aws-s3-permissions)。
+
+## 切换认证模式
+
+在不重建 destination 的情况下，将现有 destination 在静态凭证与 [AWS IAM 角色扮演](#authenticate-with-an-aws-iam-role)之间切换。使用 `PATCH /api/v1/bulk-exports/destinations/{destination_id}`。
+
+[**Required permission**](/langsmith/organization-workspace-operations#bulk-exports)：`bulk-exports:manage`。
+
+LangSmith 支持两种互斥的模式：
+
+- **静态凭证**（`credentials`）：一个 `access_key_id` 和 `secret_access_key`（临时凭证可附带可选的 `session_token`）。
+- **IAM 角色扮演**（`aws_role_arn`）：LangSmith 扮演指定的 AWS IAM 角色，因此不会存储静态凭证。
+
+要切换到 AWS IAM 角色扮演，请在 PATCH body 中提供 `aws_role_arn`。要切换到静态凭证，请提供 `credentials`。当任一字段存在且非空时，LangSmith 会清除另一个。
+
+切换之前，请确保新的认证配置对 destination bucket 具有写权限。LangSmith 会在保存前通过测试写入来验证配置。
+
+### 从静态凭证切换到 AWS IAM 角色
+
+在 PATCH body 中提供 `aws_role_arn`。这会清除之前存储的所有凭证。
+
+```bash
+curl --request PATCH \
+  --url 'https://api.smith.langchain.com/api/v1/bulk-exports/destinations/{destination_id}' \
+  --header 'Content-Type: application/json' \
+  --header 'X-API-Key: YOUR_API_KEY' \
+  --header 'X-Tenant-Id: YOUR_WORKSPACE_ID' \
+  --data '{
+    "aws_role_arn": "arn:aws:iam::123456789012:role/LangSmithBulkExportRole"
+  }'
+```
+
+### 从 AWS IAM 角色切换到静态凭证
+
+在 PATCH body 中提供 `credentials` 对象。这会清除已存储的角色 ARN。
+
+```bash
+curl --request PATCH \
+  --url 'https://api.smith.langchain.com/api/v1/bulk-exports/destinations/{destination_id}' \
+  --header 'Content-Type: application/json' \
+  --header 'X-API-Key: YOUR_API_KEY' \
+  --header 'X-Tenant-Id: YOUR_WORKSPACE_ID' \
+  --data '{
+    "credentials": {
+      "access_key_id": "YOUR_NEW_ACCESS_KEY_ID",
+      "secret_access_key": "YOUR_NEW_SECRET_ACCESS_KEY"
+    }
+  }'
+```
+
+### 切换期间的行为
+
+[凭证轮换](#credential-rotation-behavior)中描述的相同过渡行为也适用于切换认证模式：
+
+- **新启动的 bulk export runs** 会在 PATCH 完成后立即使用新的认证模式。
+- **已经在运行中的 bulk export runs** 会继续使用之前的认证模式，直到它们结束。
+
+如果因为新配置没有足够写权限导致测试写入失败，请求会返回 `400`。
 
 ## 排查 destination 错误
 

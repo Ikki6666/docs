@@ -621,10 +621,14 @@ response_without_anonymization = openai_client.chat.completions.create(
 ### Amazon Comprehend
 
 <Info>
-下面的实现提供了一个通用示例，用于匿名化用户与 LLM 之间消息中的敏感信息。它并不穷尽所有情况。请在生产环境使用前充分测试任何实现。
+下面的实现提供了一个通用示例，用于演示如何使用 Amazon Comprehend 匿名化敏感信息。它并不穷尽所有 run 形态和内容类型。请在生产环境使用前充分测试任何实现。
 </Info>
 
-Comprehend 是一个自然语言处理服务，可以检测个人身份信息。下面的实现使用 Comprehend 在数据发送到 LangSmith 之前对输入和输出做匿名化。最新信息请参阅 Comprehend 的[官方文档](https://docs.aws.amazon.com/comprehend/latest/APIReference/API_DetectPiiEntities.html)。
+Comprehend 是一个自然语言处理服务，可以检测个人身份信息。下面的实现使用 Comprehend 的 [`DetectPiiEntities`](https://docs.aws.amazon.com/comprehend/latest/APIReference/API_DetectPiiEntities.html) API 在数据发送到 LangSmith 之前对输入和输出做匿名化。
+
+<Warning>
+Amazon Comprehend **不**提供批量 PII endpoint。`detect_pii_entities` 每次调用只处理一个文档，而 `batch_detect_entities` 检测的是通用实体（人物、地点、组织）——它不是 PII 专用 API。要处理大量文档，可以循环调用 `detect_pii_entities`（如下所示），或对 S3 中的文档使用异步的 [`start_pii_entities_detection_job`](https://docs.aws.amazon.com/comprehend/latest/APIReference/API_StartPiiEntitiesDetectionJob.html)。
+</Warning>
 
 要使用 Comprehend，请安装 [boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/quickstart.html)：
 
@@ -652,113 +656,110 @@ uv add openai
 
 你还需要在 AWS 中配置凭据，并通过 AWS CLI 完成认证。请遵循 [AWS Comprehend setup instructions](https://docs.aws.amazon.com/comprehend/latest/dg/setting-up.html)。
 
+下面的示例会递归遍历整个输入/输出 payload，并把其中每个字符串都送入 Comprehend。遍历整个 payload（而不是只检查 `data["messages"]` 或 `data["choices"][0]["message"]`）可以确保在所有形态的 spans 中清除 PII，而不只是 chat-completion 形态的 runs。
+
 ```python
 import openai
 import boto3
 from langsmith import Client
 from langsmith.wrappers import wrap_openai
 
-comprehend = boto3.client('comprehend', region_name='us-east-1')
+comprehend = boto3.client("comprehend", region_name="us-east-1")
 
-def redact_pii_entities(text, entities):
-    """
-    根据检测到的实体隐藏文本中的 PII。
-    Args:
-        text (str): 包含 PII 的原始文本。
-        entities (list): 检测到的 PII 实体列表。
-    Returns:
-        str: 已隐藏 PII 的文本。
-    """
-    sorted_entities = sorted(entities, key=lambda x: x['BeginOffset'], reverse=True)
-    redacted_text = text
-    for entity in sorted_entities:
-        begin = entity['BeginOffset']
-        end = entity['EndOffset']
-        entity_type = entity['Type']
-        # 根据实体类型定义替换占位符
-        placeholder = f"[{entity_type}]"
-        # 用占位符替换文本中的 PII
-        redacted_text = redacted_text[:begin] + placeholder + redacted_text[end:]
-    return redacted_text
+# 跳过短于此长度的字符串——Comprehend 几乎不会在其中发现 PII，
+# 跳过它们可以显著减少 API 调用。
+MIN_LENGTH_FOR_DETECTION = 3
+# Comprehend 每次调用的文本上限是 100 KB UTF-8。
+MAX_BYTES_PER_CALL = 100_000
 
-def detect_pii(text):
-    """
-    使用 AWS Comprehend 检测给定文本中的 PII 实体。
-    Args:
-        text (str): 需要分析的文本。
-    Returns:
-        list: 检测到的 PII 实体列表。
-    """
+def redact_pii_entities(text: str, entities: list) -> str:
+    """将每个检测到的实体替换为 `[TYPE]`，从后往前处理以保留偏移量。"""
+    for entity in sorted(entities, key=lambda e: e["BeginOffset"], reverse=True):
+        begin, end = entity["BeginOffset"], entity["EndOffset"]
+        text = text[:begin] + f"[{entity['Type']}]" + text[end:]
+    return text
+
+def detect_and_redact(text: str) -> str:
+    """用 Comprehend 检测 `text` 中的 PII，并返回脱敏后的版本。"""
+    if not text or len(text) < MIN_LENGTH_FOR_DETECTION:
+        return text
+    if len(text.encode("utf-8")) > MAX_BYTES_PER_CALL:
+        # 跳过超大的字符串——如需对其脱敏，请自行分块。
+        return text
     try:
-        response = comprehend.detect_pii_entities(
-            Text=text,
-            LanguageCode='en',
-        )
-        entities = response.get('Entities', [])
-        return entities
+        response = comprehend.detect_pii_entities(Text=text, LanguageCode="en")
     except Exception as e:
-        print(f"Error detecting PII: {e}")
-        return []
+        print(f"Comprehend error: {e}")
+        return text
+    entities = response.get("Entities", [])
+    return redact_pii_entities(text, entities) if entities else text
 
-def comprehend_anonymize(data):
+def comprehend_anonymize(data, depth: int = 10):
     """
-    匿名化用户发送或模型返回的敏感信息。
-    Args:
-        data (any): 需要匿名化的输入数据。
-    Returns:
-        any: 匿名化后的数据。
+    递归遍历 payload，并对其中每个字符串做 PII 脱敏。
+    这适用于任意 run 形态——chat 消息、tool 输入/输出、
+    检索结果、自定义 run 类型等。
     """
-    message_list = (
-        data.get('messages') or [data.get('choices', [{}])[0].get('message')]
-    )
-    if not message_list or not all(isinstance(msg, dict) and msg for msg in message_list):
+    if depth == 0:
         return data
-
-    for message in message_list:
-        content = message.get('content', '')
-        if not content.strip():
-            print("Empty content detected. Skipping anonymization.")
-            continue
-
-        entities = detect_pii(content)
-        if entities:
-            anonymized_text = redact_pii_entities(content, entities)
-            message['content'] = anonymized_text
-        else:
-            print("No PII detected. Content remains unchanged.")
-
+    if isinstance(data, dict):
+        return {k: comprehend_anonymize(v, depth - 1) for k, v in data.items()}
+    if isinstance(data, list):
+        return [comprehend_anonymize(item, depth - 1) for item in data]
+    if isinstance(data, str):
+        return detect_and_redact(data)
     return data
 
 openai_client = wrap_openai(openai.Client())
 
 # 使用匿名化函数初始化 langsmith Client
 langsmith_client = Client(
-  hide_inputs=comprehend_anonymize, hide_outputs=comprehend_anonymize
+    hide_inputs=comprehend_anonymize, hide_outputs=comprehend_anonymize
 )
 
 # 生成的 trace 会保留 metadata，但输入和输出会被匿名化
 response_with_anonymization = openai_client.chat.completions.create(
-  model="gpt-5.4-mini",
-  messages=[
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "My name is Slim Shady, call me at 313-666-7440 or email me at real.slim.shady@gmail.com"},
-  ],
-  langsmith_extra={"client": langsmith_client},
+    model="gpt-5.4-mini",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "My name is Slim Shady, call me at 313-666-7440 or email me at real.slim.shady@gmail.com"},
+    ],
+    langsmith_extra={"client": langsmith_client},
 )
 
 # 生成的 trace 不会匿名化输入和输出
 response_without_anonymization = openai_client.chat.completions.create(
-  model="gpt-5.4-mini",
-  messages=[
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "My name is Slim Shady, call me at 313-666-7440 or email me at real.slim.shady@gmail.com"},
-  ],
+    model="gpt-5.4-mini",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "My name is Slim Shady, call me at 313-666-7440 or email me at real.slim.shady@gmail.com"},
+    ],
 )
 ```
+
+<Note>
+由于 `comprehend_anonymize` 会对遇到的每个字符串发起一次 Comprehend API 调用，在高吞吐 traces 上可能受速率限制约束。要获得更高吞吐，请使用[下方的批处理方案](#batch-processing-for-high-throughput-masking)，或先用 [`contains_pii_entities`](https://docs.aws.amazon.com/comprehend/latest/APIReference/API_ContainsPiiEntities.html) 预过滤，只在存在 PII 时才调用 `detect_pii_entities`。
+</Note>
 
 匿名化后的 run 在 LangSmith 中看起来会像这样：![Anonymized run](/langsmith/images/aws-comprehend-anonymized.png)
 
 未匿名化的 run 在 LangSmith 中看起来会像这样：![Non-anonymized run](/langsmith/images/aws-comprehend-not-anonymized.png)
+
+#### 配合 Comprehend 使用 `create_anonymizer`
+
+如果你更倾向于使用 LangSmith 内置的 [`create_anonymizer`](#rule-based-masking-of-inputs-and-outputs) 辅助函数（它已经处理了递归遍历，并能与 `langchain` agent middleware 干净地集成），可以向它传入一个由 Comprehend 支持的可调用对象，而不必自己编写遍历逻辑：
+
+```python
+from langsmith import Client
+from langsmith.anonymizer import create_anonymizer
+
+def comprehend_replacer(value: str, path: list) -> str:
+    return detect_and_redact(value)
+
+client = Client(anonymizer=create_anonymizer(comprehend_replacer))
+```
+
+这与上面的 `comprehend_anonymize` 具有相同的脱敏行为，但样板代码更少；当你在技术栈的其他地方也使用 `create_anonymizer` 时，推荐采用这种方式。
 
 ### 为高吞吐屏蔽进行批处理
 
@@ -809,7 +810,11 @@ LangSmith 会把 runs 暂存在内存缓冲区中，并在以下任一条件满�
 }
 ```
 
-下面的示例使用 Comprehend 的 [`batch_detect_entities` endpoint](https://docs.aws.amazon.com/comprehend/latest/APIReference/API_BatchDetectEntities.html)，它每次调用最多接受 25 条文本。若使用逐条 run 方案（`hide_inputs`），每条 run 都会触发一次 API 调用。这里会先收集整个缓冲区中的所有消息文本，再按每批 25 条发送到 Comprehend，因此在高吞吐场景下可以显著减少 API 调用次数。
+<Warning>
+Amazon Comprehend **不**提供批量 PII endpoint。`batch_detect_entities` 检测的是通用实体（人物、地点、组织），而不是 PII，不能直接替代 `detect_pii_entities`。下面批处理方案的优化来自对 runs 之间相同字符串的去重，以及分摊逐条 run 的缓冲开销，而不是一次批量 API 调用。如果确实需要批量 PII 检测，请在 tracing 路径之外，对 S3 中的文档运行异步的 [`start_pii_entities_detection_job`](https://docs.aws.amazon.com/comprehend/latest/APIReference/API_StartPiiEntitiesDetectionJob.html)。
+</Warning>
+
+下面的示例会收集整个缓冲区中的所有字符串，对其去重，然后对每个唯一字符串调用一次 Comprehend 的 [`detect_pii_entities`](https://docs.aws.amazon.com/comprehend/latest/APIReference/API_DetectPiiEntities.html) endpoint。对于重复出现常见 prompt、system message 或 tool 输入的流量，相比逐条 run 方案，这可以大幅减少 Comprehend 调用次数。该示例会递归遍历完整 payload，因此适用于任意 run 形态——chat 消息、tool 输入/输出、retriever spans 等。
 
 ```python
 import boto3
@@ -817,44 +822,53 @@ from langsmith import Client, traceable
 
 comprehend = boto3.client("comprehend", region_name="us-east-1")
 
+MIN_LENGTH_FOR_DETECTION = 3
+MAX_BYTES_PER_CALL = 100_000
+
 def redact_entities(text: str, entities: list) -> str:
     for entity in sorted(entities, key=lambda e: e["BeginOffset"], reverse=True):
         placeholder = f"[{entity['Type']}]"
         text = text[:entity["BeginOffset"]] + placeholder + text[entity["EndOffset"]:]
     return text
 
+def detect_and_redact(text: str) -> str:
+    if len(text) < MIN_LENGTH_FOR_DETECTION:
+        return text
+    if len(text.encode("utf-8")) > MAX_BYTES_PER_CALL:
+        return text
+    try:
+        response = comprehend.detect_pii_entities(Text=text, LanguageCode="en")
+    except Exception as e:
+        print(f"Comprehend error: {e}")
+        return text
+    entities = response.get("Entities", [])
+    return redact_entities(text, entities) if entities else text
+
+def _redact_in_place(data, cache: dict, depth: int = 10):
+    """递归脱敏 `data` 中的每个字符串，并用 `cache` 去重 API 调用。"""
+    if depth == 0:
+        return data
+    if isinstance(data, dict):
+        return {k: _redact_in_place(v, cache, depth - 1) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_redact_in_place(item, cache, depth - 1) for item in data]
+    if isinstance(data, str):
+        if data not in cache:
+            cache[data] = detect_and_redact(data)
+        return cache[data]
+    return data
+
 def comprehend_anonymize_batch(runs: list[dict]) -> list[dict]:
-    # 收集所有消息文本，并记录它们原本所在的位置。
-    # 注意：同一个 run ID 可能出现两次，一次是 create（带 inputs）
+    # 每次缓冲区刷新共享一个 cache。相同的字符串（例如跨 runs 重复的
+    # 同一条 system prompt）只会调用 Comprehend 一次。
+    # 注意：同一个 run ID 可能出现两次——一次是 create（带 inputs）
     # 一次是 update（带 outputs）。
-    locations = []  # (run_idx, field, msg_idx)
-    texts = []
-    for run_idx, run in enumerate(runs):
+    cache: dict[str, str] = {}
+    for run in runs:
         for field in ("inputs", "outputs"):
             data = run.get(field)
-            if not isinstance(data, dict):
-                continue
-            for msg_idx, message in enumerate(data.get("messages") or []):
-                content = message.get("content", "")
-                if content.strip():
-                    locations.append((run_idx, field, msg_idx))
-                    texts.append(content)
-
-    # 按每批 25 条发送到 Comprehend（API 上限）。
-    # 对于 1000 条 op（约 500 条 run），每条 2 条消息：只需 40 次 API 调用，而不是 1000 次。
-    redacted_texts = []
-    for i in range(0, len(texts), 25):
-        chunk = texts[i : i + 25]
-        response = comprehend.batch_detect_entities(
-            TextList=chunk, LanguageCode="en"
-        )
-        for text, result in zip(chunk, response["ResultList"]):
-            redacted_texts.append(redact_entities(text, result.get("Entities", [])))
-
-    # 将脱敏后的文本写回 run dict
-    for (run_idx, field, msg_idx), redacted in zip(locations, redacted_texts):
-        runs[run_idx][field]["messages"][msg_idx]["content"] = redacted
-
+            if isinstance(data, (dict, list)):
+                run[field] = _redact_in_place(data, cache)
     return runs
 
 client = Client(
