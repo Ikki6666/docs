@@ -65,6 +65,11 @@ LINK_MAPS: list[LinkMap] = [
             "create_agent(response_format)": "langchain/agents/factory/create_agent",
             "create_agent(name)": "langchain/agents/factory/create_agent",
             "system_prompt": "langchain/agents/#langchain.agents.create_agent(system_prompt)",
+            # MCP
+            "MCPAdapter": "langchain/mcp/adapter/MCPAdapter",
+            "MCPAdapter.list_tools": "langchain/mcp/adapter/MCPAdapter/list_tools",
+            "MCPToolArtifact": "langchain/mcp/tools/MCPToolArtifact",
+            "as_langchain_tool": "langchain/mcp/tools/as_langchain_tool",
             "AgentState": "langchain/agents/middleware/types/AgentState",
             "ModelRequest": "langchain/agents/middleware/types/ModelRequest",
             "ModelResponse": "langchain/agents/middleware/types/ModelResponse",
@@ -301,6 +306,11 @@ LINK_MAPS: list[LinkMap] = [
             "langsmith-python": "langsmith/observability/sdk/",
             "langsmith-js": "https://reference.langchain.com/javascript/modules/langsmith.html",
             "wrapGemini": "https://reference.langchain.com/javascript/functions/langsmith.wrappers_gemini.wrapGemini.html",
+            "wrapOpenAI": "https://reference.langchain.com/javascript/langsmith/wrappers/wrapOpenAI",
+            "wrapAnthropic": "https://reference.langchain.com/javascript/functions/langsmith.wrappers_anthropic.wrapAnthropic.html",
+            # Distinct key so shared prose can link the JS traceable helper
+            # without colliding with Python's traceable / @traceable entries.
+            "traceableJS": "https://reference.langchain.com/javascript/langsmith/traceable/traceable",
             "expect": "langsmith/observability/sdk/expect/",
             "Client": "langsmith/client/Client",
             "process_buffered_run_ops": "langsmith/client/Client",
@@ -500,7 +510,6 @@ LINK_MAPS: list[LinkMap] = [
             "load_mcp_tools": "langchain-mcp-adapters/tools/load_mcp_tools",
             "load_mcp_prompt": "langchain-mcp-adapters/prompts/load_mcp_prompt",
             "load_mcp_resources": "langchain-mcp-adapters/resources/load_mcp_resources",
-            "MCPToolArtifact": "langchain-mcp-adapters/tools/MCPToolArtifact",
             "ToolCallInterceptor": "langchain-mcp-adapters/interceptors/ToolCallInterceptor",
             "CallbackContext": "langchain-mcp-adapters/callbacks/CallbackContext",
             "Callbacks": "langchain-core/callbacks/base/Callbacks",
@@ -594,6 +603,14 @@ LINK_MAPS: list[LinkMap] = [
             "langsmith": "langsmith/",
             "langsmith-js": "modules/langsmith.html",
             "langsmith-python": "https://reference.langchain.com/python/langsmith/observability/sdk/",
+            # Python-only wrapper / decorator names used in shared LangSmith
+            # snippets; point JS-scope builds at the Python reference.
+            "wrap_openai": "https://reference.langchain.com/python/langsmith/wrappers/_openai/wrap_openai",
+            "wrap_anthropic": "https://reference.langchain.com/python/langsmith/wrappers/_anthropic/wrap_anthropic",
+            "@traceable": "https://reference.langchain.com/python/langsmith/run_helpers/traceable",
+            "wrapOpenAI": "langsmith/wrappers/wrapOpenAI",
+            "wrapAnthropic": "functions/langsmith.wrappers_anthropic.wrapAnthropic.html",
+            "traceableJS": "langsmith/traceable/traceable",
             "tracingEnabled": "classes/langsmith.run_trees.RunTree.html#tracingenabled",
             "wrapGemini": "functions/langsmith.wrappers_gemini.wrapGemini.html",
             # LangGraph SDK references
@@ -722,6 +739,8 @@ LINK_MAPS: list[LinkMap] = [
             "ContextEdit": "langchain/index/ContextEdit",
             "toolRetryMiddleware": "langchain/index/toolRetryMiddleware",
             "ToolRetryMiddleware": "langchain/index/toolRetryMiddleware",
+            "toolErrorMiddleware": "langchain/index/toolErrorMiddleware",
+            "ToolErrorMiddleware": "langchain/index/toolErrorMiddleware",
             "modelRetryMiddleware": "langchain/index/modelRetryMiddleware",
             "ModelRetryMiddleware": "langchain/index/modelRetryMiddleware",
             "ModelFallbackMiddleware": "langchain/index/modelFallbackMiddleware",

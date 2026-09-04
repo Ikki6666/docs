@@ -101,7 +101,7 @@ Two language dropdowns (Python, TypeScript) with the same 10 tabs each. Most con
 | Managed Deep Agents | `src/langsmith/managed-deep-agents*.mdx` | Get started, Agent definition (Channels), Build and deploy |
 | LangChain | `src/oss/langchain/` | Get started, Core components, Middleware, Frontend (Patterns → Generative UI, Integrations), Advanced usage (Multi-agent), Agent development (Test), Production |
 | LangGraph | `src/oss/langgraph/` | Get started, Capabilities, Production, Frontend, LangGraph APIs (Graph API, Functional API) |
-| OpenWiki | `src/oss/openwiki/` | Modes |
+| OpenWiki | `src/oss/openwiki/` | Modes, Integrations, Visualize, CLI reference, Customize, Providers, Automate updates, Changelog |
 | Integrations | `src/oss/python/integrations/` or `src/oss/javascript/integrations/` | Python: Popular Providers, Integrations by component. TypeScript: Popular Providers (OpenAI, Anthropic, Google, AWS, Microsoft), General integrations, RAG integrations |
 | Learn | `src/oss/` (various) | Tutorials (Deep Agents, LangChain, Multi-agent, LangGraph), Conceptual overviews, Additional resources. TypeScript adds LangChain Academy |
 | Reference | `src/oss/reference/` | Reference, Releases (Releases, Migration guides), Policies — short entry pages linking to reference.langchain.com |
@@ -289,6 +289,32 @@ Common Tabler names: `home` (not house), `tool` (not wrench), `player-play` (not
 | `<CodeGroup>` | Tabbed code blocks |
 | `<Card>` / `<CardGroup>` | Navigation/overview links only (not for highlighting points) |
 | `<Note>`, `<Tip>`, `<Warning>`, `<Info>` | Callouts |
+| `<Prompt>` | Copyable AI-assistant prompt — **required at the top of every migration guide** |
+
+### Migration guide convention
+
+Every migration guide (any page under `src/oss/python/migrate/` or `src/oss/javascript/migrate/`) **must** include a `<Prompt>` component as the very first element after the frontmatter and any import statements. The prompt should be a complete, paste-ready instruction that an AI coding assistant can use to perform the migration automatically.
+
+Minimal template:
+
+```mdx
+<Prompt
+    description="Short one-line description of the migration."
+    icon="arrow-right"
+    actions={["copy"]}
+>
+Migrate this codebase from `old-package` to `new-package` (requires `new-package>=x.y.z`).
+
+Key changes:
+
+1. ...
+2. ...
+
+Search the codebase for all usages of `OldClass`, `old_function`, and imports from `old_module`, and apply the necessary changes. Flag anything that cannot be migrated automatically.
+</Prompt>
+```
+
+The prompt must cover every API rename, import path change, behavioral difference, and removed feature that the page documents. End with an explicit instruction to search and flag.
 
 ### Version-added admonitions
 
@@ -509,3 +535,16 @@ When extracting data from PRs or changelogs, use the "Release Note:" section in 
 - Explain the "why" of changes
 - Highlight areas needing careful review
 - Disclose AI agent involvement in description
+
+<!-- OPENWIKI:START -->
+
+## OpenWiki
+
+This repository has a generated `openwiki/` evidence index. It is optional just-in-time context, not required startup reading.
+
+- Treat source code and tests as authoritative. A brief's unknowns and review items are verification gaps, not automatic requirements.
+- Prefer the narrowest quiet validation that proves the changed behavior. Preserve complete failure output.
+
+The scheduled OpenWiki GitHub Actions workflow refreshes the repository wiki. Do not hand-edit generated OpenWiki pages unless explicitly asked; prefer updating source code/docs and letting OpenWiki regenerate.
+
+<!-- OPENWIKI:END -->
