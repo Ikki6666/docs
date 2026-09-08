@@ -1,6 +1,6 @@
 ---
 title: CopilotKit
-description: 结合 CopilotKit、LangGraph、Deep Agents 和 React，自定义端点、Python AG-UI 桥接和结构化生成式 UI
+description: 结合 CopilotKit、LangGraph、Deep Agents 和 React，自定义端点、Python AG-UI 桥接、结构化生成式 UI 和消息平台通道
 ---
 
 [CopilotKit](https://www.copilotkit.ai/) 提供了完整的 React chat runtime，特别适合与 LangGraph 搭配使用，尤其是在你希望 agent 返回 **结构化 UI payload**，而不仅仅是纯文本的时候。在这种模式下，你的 LangGraph 部署会同时提供 graph API 和一个自定义 CopilotKit endpoint，而前端则把 assistant messages 解析成动态 React 组件。
@@ -22,6 +22,9 @@ description: 结合 CopilotKit、LangGraph、Deep Agents 和 React，自定义�
 </Info>
 
 import { ExampleEmbed } from "/snippets/example-embed.jsx"
+import ChannelsTsconfig from "/snippets/code-samples/copilotkit-channels-tsconfig.mdx"
+import ChannelsAgent from "/snippets/code-samples/copilotkit-channels-agent-js.mdx"
+import ChannelsChannel from "/snippets/code-samples/copilotkit-channels-channel-js.mdx"
 
 <ExampleEmbed example="copilotkit" minHeight={700} />
 
@@ -638,6 +641,86 @@ export function CustomMessageRenderer({ message }: RenderMessageProps) {
 - CopilotKit 负责 chat state 和 transport
 - 自定义 renderer 负责把 assistant payload 变成 UI
 - [Hashbrown](https://hashbrown.dev/) 把经过校验的结构化数据变成具体的 React elements
+
+## Channels
+
+驱动应用内 copilot 的同一个 agent，也可以作为 bot 运行在 Slack 及其他消息平台上。[CopilotKit Channels](https://docs.copilotkit.ai/channels) 通过一个托管的 CopilotKit Intelligence 连接，把你的 LangChain agent 接入消息平台：Intelligence 负责保管平台凭证和消息投递，而你的进程负责运行 agent。
+
+<Note>
+  Channels 要求 `@copilotkit/channels` 0.6.1 和 `@copilotkit/runtime` 1.65.0，两者需要作为经过测试的配套版本一起安装，宿主机还需要 Node.js 22 或更高版本。Channel 连接的 LangChain 部署可以是 Python，也可以是 TypeScript。
+</Note>
+
+<Info>
+  本页说明 Channels 如何与 LangChain agent 配合。关于 LangGraph 后端的完整 Slack 实操指南，请参见 [Connect and run your agent in Slack](https://docs.copilotkit.ai/slack/langgraph-typescript/connect)。关于其他 agent 后端和平台支持情况，请参见 [Channels overview](https://docs.copilotkit.ai/channels)。
+</Info>
+
+### 整体如何协作
+
+CopilotKit Intelligence 持有平台连接（Slack、Microsoft Teams 等）及其凭证；你的长期运行的 Channels listener 持有 agent、工具和应用逻辑。每一轮对话都遵循相同的路径：
+
+1. 用户在 Slack 里给你的应用发消息。
+2. Intelligence 使用为该 Channel 配置的凭证接收平台事件。
+3. 一条持久的 Intelligence 网关连接把这一轮对话投递给你的 Channels listener。
+4. listener 通过 [AG-UI](https://docs.ag-ui.com/) 运行你的 LangChain agent 并渲染回复。
+5. Intelligence 以原生 Slack Block Kit 的形式返回结果。
+
+平台凭证永远不会进入 agent 进程。在 [CopilotKit Intelligence](https://docs.copilotkit.ai/slack/intelligence) 中创建一个托管 Channel 并连接 Slack：Intelligence 会保存 Slack 凭证，并提供 **Channel code**（`CHANNEL_CODE`）和项目作用域的 **Intelligence API key**（`INTELLIGENCE_API_KEY`）给 listener 使用。
+
+### 安装
+
+先安装经过测试的 SDK 配对版本，再安装 TypeScript 工具链：
+
+<CodeGroup>
+```bash npm
+npm install --save-exact @copilotkit/channels@0.6.1 @copilotkit/runtime@1.65.0
+npm install -D tsx typescript @types/node
+```
+
+```bash pnpm
+pnpm add --save-exact @copilotkit/channels@0.6.1 @copilotkit/runtime@1.65.0
+pnpm add -D tsx typescript @types/node
+```
+
+```bash yarn
+yarn add --exact @copilotkit/channels@0.6.1 @copilotkit/runtime@1.65.0
+yarn add -D tsx typescript @types/node
+```
+</CodeGroup>
+
+使用 NodeNext 的 TypeScript 配置：
+
+<ChannelsTsconfig />
+
+### 连接你的 LangChain agent
+
+每个会话都返回一个全新的 agent，并按 thread 区分，避免状态在 Slack thread 之间泄漏。LangGraph Server 使用 LangGraph API 协议，所以要使用 `@copilotkit/runtime/langgraph` 中的 `LangGraphAgent`，而不是 `HttpAgent`。把它指向你[已经在运行的 deployment](#extend-the-langgraph-deployment-with-a-custom-endpoint)：
+
+<ChannelsAgent />
+
+### 运行 Channel listener
+
+使用 Intelligence 给出的 `Code` 声明 Channel，并把每条消息转发给 agent。创建 Node listener 这一步就是连接 Channel 的动作。在创建 listener 之前先注册进程退出清理逻辑，这样在连接窗口期间按下 Ctrl-C 也能干净地停止 Channel。
+
+<ChannelsChannel />
+
+设置运行时密钥，然后启动进程：
+
+```bash .env
+INTELLIGENCE_API_KEY=<project-api-key>
+CHANNEL_CODE=support-slack
+LANGGRAPH_DEPLOYMENT_URL=http://127.0.0.1:2024
+PORT=3000
+```
+
+```bash Terminal
+node --env-file=.env --import tsx channel.ts
+```
+
+进程连接成功后，Intelligence 中的 Channel 会从 **Waiting for runtime** 转为 **Online**。
+
+### 其他平台
+
+托管的 Slack 已正式可用。托管的 Teams 是受控的集成目标。Channels SDK 还为 Teams、Discord、Telegram 和 WhatsApp 提供直连适配器。当前支持的平台列表和各平台的配置方法，请参见 [Channels overview](https://docs.copilotkit.ai/slack)。
 
 ## 资源
 
