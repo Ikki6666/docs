@@ -28,7 +28,7 @@ sidebarTitle: 多轮 evaluators
 
 ## 前置条件
 
-- 你的 tracing project 必须使用了 [threads](/langsmith/threads)。
+- 你的 tracing project 或 agent environment 必须使用了 [threads](/langsmith/threads)。
 - Thread 中每条 trace 的顶层 inputs 和 outputs 都必须包含一个 `messages` 键，其值为消息列表。我们支持 [LangChain](/langsmith/log-llm-trace#messages-format)、[OpenAI Chat Completions](https://platform.openai.com/docs/api-reference/chat/create) 和 [Anthropic Messages](https://platform.claude.com/docs/en/api/messages) 格式的消息。
     - 如果每条 trace 的顶层 inputs 和 outputs 只包含对话中的最新消息，LangSmith 会自动把各轮消息合并成一个 thread。
     - 如果每条 trace 的顶层 inputs 和 outputs 已包含完整对话历史，LangSmith 会直接使用它。
@@ -41,7 +41,7 @@ sidebarTitle: 多轮 evaluators
 
 ## 配置
 
-1. 进入 **Tracing** 页面，并选择一个 tracing project。
+1. 进入 **Tracing** 页面，并选择一个 tracing project 或 agent environment。
 2. 点击 **Evaluators** 标签页，然后点击 **+ Evaluator**。在 **Create from scratch** 下选择 **LLM-as-a-Judge Evaluator**。在 **Source** 下选择 **Threads**。
 3. **命名 evaluator**。
 4. 应用 **Filters** 或 **Sampling Rate**。<br />
@@ -75,6 +75,62 @@ sidebarTitle: 多轮 evaluators
 
 保存后，evaluator 会出现在 **Evaluators** 标签页中。对新建 thread 而言，一旦 idle time 过去，就可以开始测试该 evaluator。
 
+## 评估 trajectory
+
+`trajectory` 是 thread evaluator 可以使用的变量之一，与 `all_messages`、`human_ai_pairs` 和 `first_human_last_ai` 并列。它解析为对话的 [trajectory](/langsmith/observability-concepts#trajectories)：从开始到结束的扁平、有序消息列表，包括 tool calls 及其结果。用它来给 agent 走过的路径打分，例如是否选对了工具、是否按计划执行，以及是否没有浪费步骤。
+
+<Note>
+`trajectory` 变量仅在 GCP US 区域的 [LangSmith Cloud](/langsmith/cloud)（[smith.langchain.com](https://smith.langchain.com)）上可用。GCP EU、GCP APAC 和 AWS US 区域不可用，[self-hosted](/langsmith/self-hosted) 和 [BYOC](/langsmith/byoc) 部署也不可用。LangSmith v0.16.0 stable release 不包含 self-hosted 支持。对 self-hosted 和 BYOC 部署的支持将在未来的版本中提供。
+</Note>
+
+这些变量在 judge 接收到的内容上有所不同：
+
+- **`all_messages`、`human_ai_pairs` 和 `first_human_last_ai`** 解析为从 thread 中每个 root run 的 inputs 和 outputs 组装出的对话。发生在 child runs 中的工作（例如中间 model calls、tool calls 和 tool results）不会被包含，除非某个 root run 自身的 inputs 或 outputs 中包含这些内容。human_ai_pairs 和 first_human_last_ai 会进一步缩小到仅包含 user 和 assistant 消息。
+- **`trajectory`** 解析为从每条 trace 内部的 model calls 和 tool calls 构建出的 trajectory。其他视图省略的 tool calls 和 tool results 在这里会保留。
+
+关于每个变量解析到的消息结构，请参见 [Thread message variables](/langsmith/prompt-template-format#thread-message-variables)。
+
+<Warning>
+trajectory 通常比其他任何视图都大，因为它同时涵盖 root runs 和 child runs。请按照[配置](#configuration)第 6 步中的说明，选择上下文窗口较大的模型，并预期每次评估会消耗更多 token。
+</Warning>
+
+### 使用 trajectory 变量
+
+按照上文的[配置](#configuration)步骤操作，其中有两处变化：
+
+1. 在 **Source** 下选择 **Threads**。该变量只在针对 tracing project 运行的 evaluator 上可用，不支持针对 dataset 运行。
+2. 在 prompt 中引用 `{{trajectory}}`，并将该变量映射到 `trajectory` source。变量必须命名为 `trajectory`：指向该 source 的其他名称的变量会被拒绝。种子默认 prompt 和映射已经这样做了，因此新建的 evaluator 在这里无需任何更改。
+
+在 **Runs** 和 **Threads** 之间切换 **Source** 时，只有在你尚未编辑默认 prompt 的情况下，默认 prompt 才会被重新播种。一旦你编辑了 prompt，就会保留你的版本，由你自己映射变量。
+
+`{{trajectory}}` 不能与 `{{all_messages}}`、`{{human_ai_pairs}}` 或 `{{first_human_last_ai}}` 同时出现。一旦你映射了 trajectory source，变量 source 下拉菜单中的其他 source 就会被禁用；而一旦你映射了其他 source，trajectory source 就会被禁用。无论哪种情况，下拉菜单都会说明 trajectory 变量与非 trajectory 变量不能一起使用。保存混用两者的 evaluator 时也会以同样的方式失败。
+
+Evaluator 完成后，LangSmith 会将 feedback 写入 thread 中最近的一个 root run（使用你配置的 feedback key），并将该 feedback 与该 thread 关联。之后要找到它，请参见 [View feedback](/langsmith/threads#view-feedback)。
+
+关于一个可以改编的完整 prompt，请参见 [Example with trajectory context](/langsmith/prompt-template-format#example-with-trajectory-context)。
+
+<Warning>
+这个选择在创建 evaluator 时就已固定。要将现有 evaluator 在 `trajectory` 与其他 thread 变量之间切换，请删除它并重新创建。
+</Warning>
+
+### 设置与限制
+
+使用 `trajectory` 的 evaluator 支持以下设置：
+
+- **Filters**：限制 evaluator 在哪些 threads 上运行。
+- **Sampling rate**：按比例评估符合你的 filters 的 threads。
+- **Idle time**：项目级 thread idle time，作用于项目中的每个 thread-level evaluator。
+
+以下选项不可用，包含其中任何一项的配置都会被拒绝：
+
+- 以 datasets 和 experiments 作为 source。
+- 对现有 threads 进行 backfill。
+- Trace filters 和 tree filters。
+- Few-shot examples、extended stats 和 dataset corrections。
+- 同一条自动化规则上的 code evaluators，以及非 evaluator 动作（例如将 threads 添加到 annotation queue）。
+
+trajectory 不是 run，因此任何读取 run-level 字段的选项都不可用。
+
 ## 限制
 
 以下是当前 thread-level 处理的限制（后续可能调整）。它们适用于多轮在线 evaluators，以及条目类型为 **Threads** 的[自动化规则](/langsmith/rules#set-the-item-type-to-runs-or-threads)。如果你遇到这些限制，请联系我们。
@@ -86,9 +142,9 @@ sidebarTitle: 多轮 evaluators
 ## 故障排查
 
 **检查 evaluator 状态** <br />
-可以进入 tracing project 内的 **Evaluators** 标签页，点击所创建 evaluator 的 **Logs** 按钮，查看其运行历史，从而确认 evaluator 上次运行的时间。
+可以进入 tracing project 或 agent environment 内的 **Evaluators** 标签页，点击所创建 evaluator 的 **Logs** 按钮，查看其运行历史，从而确认 evaluator 上次运行的时间。
 
 **检查发送给 evaluator 的数据** <br />
-进入 tracing project 内的 **Evaluators** 标签页，点击所创建的 evaluator，然后进入 **Evaluator traces** 标签页，即可检查发送给 evaluator 的数据。
+进入 tracing project 或 agent environment 内的 **Evaluators** 标签页，点击所创建的 evaluator，然后进入 **Evaluator traces** 标签页，即可检查发送给 evaluator 的数据。
 
 在该标签页中，可以看到传给 LLM-as-a-judge evaluator 的输入。如果消息没有被正确传入，那么在 inputs 中会看到空值。这通常是因为消息未采用[预期格式之一](/langsmith/online-evaluations-multi-turn#prerequisites)。

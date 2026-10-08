@@ -86,16 +86,16 @@ sidebarTitle: Model providers
 
 ## Amazon Bedrock
 
-在使用这个模型前，请确保你拥有 [AWS credentials 或 IAM role](https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam.html)。
+在使用这个模型前，请确保你拥有 AWS credentials、一个 [IAM role](https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam.html)，或一个 [Amazon Bedrock API key](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html)。
 
 ### Authentication
 
-Amazon Bedrock 支持两种鉴权方式。**IAM trusted entity 是推荐方案**，因为它不需要把长期有效的 AWS access keys 共享给 LangSmith。
+Amazon Bedrock 支持三种鉴权方式。**IAM trusted entity 是推荐方案**，因为它不需要把长期有效的 AWS access keys 共享给 LangSmith。
 
 #### IAM trusted entity（推荐）
 
 <Note>
-**不适用于 [self-hosted LangSmith](/langsmith/self-hosted)。** 这类场景请改用 Access Keys（或 Bedrock API Key）。
+**不适用于 [self-hosted LangSmith](/langsmith/self-hosted) 或 [BYOC](/langsmith/byoc)。** 这类场景请改用 access keys 或 Bedrock API key。
 </Note>
 
 使用 IAM trusted entity 鉴权时，你需要在自己的 AWS 账号中创建一个 IAM role，并允许 LangSmith 去 assume 这个 role。LangSmith 不会存储任何 access keys，而是会在每次请求时通过 [AWS STS](https://docs.aws.amazon.com/STS/latest/APIReference/welcome.html) 来 assume 该 role。
@@ -138,6 +138,17 @@ Amazon Bedrock 支持两种鉴权方式。**IAM trusted entity 是推荐方案**
 #### Access keys
 
 另一种方式是使用 AWS access keys（`AWS_ACCESS_KEY_ID` 和 `AWS_SECRET_ACCESS_KEY`）进行鉴权。你可以在 Playground 的 Bedrock provider 配置中填入这些值。这种方式配置更简单，但安全性较低，因为它要求在 LangSmith 中存储长期有效的凭据。
+
+#### Bedrock API key
+
+Bedrock API keys 使用 bearer token（而非 AWS credentials）对请求进行认证。要配置 Bedrock API key：
+
+1. 在 Amazon Bedrock 控制台中[生成一个 API key](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html)。
+2. 在 LangSmith 中，前往 **Settings** > **Provider Secrets**，添加一个新 secret，并选择 **Amazon Bedrock** 作为 provider。
+3. 在 **Authentication** 下选择 **Bearer token**。
+4. 将 API key 作为 `AWS_BEARER_TOKEN_BEDROCK` 填入。
+5. （可选）设置 `AWS_BEDROCK_REGION`。默认值为 `us-east-1`。
+6. 点击 **Save**。
 
 ### Available models
 
@@ -231,7 +242,45 @@ Temperature、Top P 和 Top K 都是可选项。取消勾选后，Claude 会使�
 
 ## Azure OpenAI
 
-在使用这个模型前，请确保你拥有 [Azure OpenAI credentials](https://learn.microsoft.com/en-us/azure/ai-services/openai/quickstart)（endpoint + API key）。
+在使用这个模型前，请创建一个 [Azure OpenAI 资源和模型部署](https://learn.microsoft.com/en-us/azure/ai-services/openai/quickstart)。
+
+### Authentication
+
+#### API key
+
+在 Azure OpenAI provider 配置中，输入你的 endpoint、deployment 名称、API version 和 API key。
+
+#### Workload identity for self-hosted LangSmith
+
+<Note>
+Azure OpenAI workload identity 要求 self-hosted LangSmith 为 `0.16.58` 或更高版本，且运行在 Azure Kubernetes Service（AKS）上。
+</Note>
+
+使用 [AKS workload identity](https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview) 进行鉴权，无需存储 API key：
+
+1. 在你的 AKS 集群上启用 OIDC issuer 和 workload identity。
+2. 创建或选择一个 user-assigned managed identity。
+3. 为该 managed identity 添加一条[联合身份凭据](https://learn.microsoft.com/en-us/azure/aks/workload-identity-deploy-cluster#create-the-federated-identity-credential)。使用 AKS OIDC issuer，audience 为 `api://AzureADTokenExchange`，并将 subject 设置为 `system:serviceaccount:<namespace>:<playground-service-account-name>`。
+4. 为该 managed identity 分配最小权限的 `Cognitive Services OpenAI User` 角色，并将该角色限定在 Azure OpenAI 资源上。参见 [Azure OpenAI role-based access control](https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/role-based-access-control)。
+5. 在 LangSmith Helm 配置中添加以下值：
+
+```yaml Helm
+playground:
+  serviceAccount:
+    annotations:
+      azure.workload.identity/client-id: "<managed-identity-client-id>"
+  deployment:
+    labels:
+      azure.workload.identity/use: "true"
+```
+
+在 Azure OpenAI provider 配置中，输入 endpoint、deployment 名称和 API version，将 API key 留空。
+
+当没有显式提供 API key 或 token provider 时，LangSmith 会自动使用 Playground workload identity。它会为 Playground 调用和 evaluator 批量调用获取短期 token。显式凭据的优先级高于 workload identity。
+
+Workload identity token 仅限于端口 `443` 上的 HTTPS Azure AI 和 Azure OpenAI endpoint。每个配置必须使用一种受支持的 Azure cloud：public、US Government 或 China。LangSmith 会拒绝无效的 endpoint 以及混用 Azure clouds 的配置。
+
+关于更广泛的 AKS 部署指南，请参见 [Self-host LangSmith on Azure](/langsmith/azure-self-hosted)。
 
 ### Available models
 
@@ -362,19 +411,21 @@ Google 提供多个层级的 Gemini 模型（Ultra、Pro、Flash），分别针�
 
 ### Authentication
 
-Gemini Enterprise Agent Platform 在 LangSmith Playground 中使用 **service account JSON key** 进行认证。这是一个从 Google Cloud Console 下载的 JSON 文件，其中包含一个具备 Gemini Enterprise Agent Platform 访问权限的 service account 的凭据。
+#### Service account JSON key
 
-#### Step 1：创建 service account
+你可以通过在 LangSmith 中存储 service account JSON key 进行认证。该 JSON 文件包含一个具备 Gemini Enterprise Agent Platform 访问权限的 service account 的凭据。
 
-1. 前往 [Google Cloud Console → IAM & Admin → Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts)。
+**Step 1：创建 service account**
+
+1. 前往 [Google Cloud Console > IAM & Admin > Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts)。
 2. 选择你的项目，点击 **Create Service Account**。
 3. 为其命名（例如 `langsmith-vertex-ai`），然后点击 **Create and Continue**。
 4. 分配 **Vertex AI User**（`roles/aiplatform.user`）角色，然后点击 **Done**。
 
-#### Step 2：下载 JSON key
+**Step 2：下载 JSON key**
 
 1. 点击你刚刚创建的 service account。
-2. 进入 **Keys** 标签页，点击 **Add Key → Create new key**。
+2. 进入 **Keys** 标签页，点击 **Add Key > Create new key**。
 3. 选择 **JSON** 并点击 **Create**。一个 `.json` 文件会下载到你的机器上。
 
 下载的文件格式如下：
@@ -392,13 +443,17 @@ Gemini Enterprise Agent Platform 在 LangSmith Playground 中使用 **service ac
 }
 ```
 
-#### Step 3：在 LangSmith Playground 中配置
+**Step 3：在 LangSmith Playground 中配置**
 
 在 LangSmith Playground 中，打开 Gemini Enterprise Agent Platform provider 配置，将下载的 JSON key 文件的**完整内容**粘贴到 **Service Account JSON** 字段中。
 
 <Warning>
 请像对待密码一样保管你的 service account JSON key。不要分享它，也不要提交到源代码管理中。如果密钥泄露，请立即从 [Google Cloud Console](https://console.cloud.google.com/iam-admin/serviceaccounts) 撤销并创建新的密钥。
 </Warning>
+
+#### Workload identity for self-hosted LangSmith
+
+GKE 上的 self-hosted LangSmith 可以使用 Workload Identity Federation 和 Application Default Credentials（ADC）代替 JSON key。这种无密钥方式支持 Playground、Chat（Helm 中的 `polly`）和 Insights。参见 [Authenticate Vertex AI with GKE workload identity](/langsmith/self-host-gke-vertex-ai-workload-identity) 来配置各个 workload identity。
 
 ### Available models
 

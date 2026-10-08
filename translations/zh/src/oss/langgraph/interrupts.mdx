@@ -100,7 +100,7 @@ interrupt 暂停执行后，你可以再次调用图，并传入包含 resume �
 - 恢复时必须使用和 interrupt 发生时相同的 **thread ID**
 - 传给 `Command(resume=...)` 的值会成为 @[`interrupt`] 调用的返回值
 - 恢复时，节点会从调用 @[`interrupt`] 的那个节点的开头重新运行，因此 `interrupt` 之前的代码会再次执行
-- resume 值可以是任意 JSON 可序列化值
+- resume 值可以是任意 JSON 可序列化值，但当你指定了类型化的 `response_schema` 时，需要通过其校验
 
 <Warning>
 
@@ -134,7 +134,7 @@ await graph.invoke(new Command({ resume: true }), config);
 - 恢复时必须使用和 interrupt 发生时相同的 **thread ID**
 - 传给 `new Command({ resume: ... })` 的值会成为 @[`interrupt`] 调用的返回值
 - 恢复时，节点会从调用 @[`interrupt`] 的那个节点的开头重新运行，因此 `interrupt` 之前的代码会再次执行
-- resume 值可以是任意 JSON 可序列化值
+- resume 值可以是任意 JSON 可序列化值，但当你指定了 Zod 的 `responseSchema` 时，需要通过其校验
 
 <Warning>
 
@@ -143,6 +143,124 @@ await graph.invoke(new Command({ resume: true }), config);
 </Warning>
 
 :::
+
+## 定义 interrupt 响应模式
+
+:::python
+@[`interrupt`] 的 `response_schema` 参数描述了恢复图执行时预期的输入。客户端可以使用该模式渲染类型化的输入表单。
+
+<Note>
+Interrupt 响应模式需要 `langgraph>=1.2.12`。
+</Note>
+
+传入 Pydantic 模型类、`typing_extensions` 中的 `TypedDict` 或 dataclass 来校验 resume 值。LangGraph 会把该类型转换为 JSON Schema，并将其包含在 `Interrupt.response_schema` 中，与 interrupt 的 `value` payload 分开。该模式在返回给调用方的 interrupt 以及 checkpoint 任务 interrupt 中都可用。
+
+本示例使用 LangGraph interrupt 测试中的审批模式：
+
+```python
+from typing import Any
+
+from pydantic import BaseModel
+from typing_extensions import TypedDict
+
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import START, StateGraph
+from langgraph.types import Command, interrupt
+
+
+class Decision(BaseModel):
+    approved: bool
+    note: str | None = None
+
+
+class State(TypedDict):
+    answer: Any
+
+
+def node(state: State) -> State:
+    answer = interrupt({"question": "approve?"}, response_schema=Decision)
+    return {"answer": answer}
+
+
+graph = (
+    StateGraph(State)
+    .add_node("node", node)
+    .add_edge(START, "node")
+    .compile(checkpointer=InMemorySaver())
+)
+config = {"configurable": {"thread_id": "1"}}
+
+result = graph.invoke({"answer": None}, config)
+pending = result["__interrupt__"][0]
+assert pending.response_schema == Decision.model_json_schema()
+
+result = graph.invoke(Command(resume={"approved": True}), config)
+assert result["answer"] == Decision(approved=True)
+```
+
+有了类型化的模式后，`interrupt()` 会返回校验后的对象：Pydantic 模型实例、`TypedDict` 对应的字典，或 dataclass 实例。Pydantic 的校验和类型转换规则同样适用。无效输入会引发 `pydantic.ValidationError`；你可以使用相同的 thread ID，通过更正后的 `Command(resume=...)` 重试。
+
+你还可以传入一个 JSON Schema 字典作为 `response_schema`。LangGraph 会原样暴露该字典，但**不会**用它校验 resume 值。当省略 `response_schema` 时，其值为 `None`，resume 值会直接传递，不做模式校验。
+:::
+
+:::js
+@[`interrupt`] 的 `responseSchema` 选项描述了恢复图执行时预期的输入。客户端可以使用该模式渲染类型化的输入表单。
+
+<Note>
+Interrupt 响应模式需要 `@langchain/langgraph` 1.4.16 或更高版本。
+</Note>
+
+传入 Zod 模式来校验 resume 值。LangGraph 会把它转换为 JSON Schema，并将其包含在 `Interrupt.response_schema` 中，与 interrupt 的 `value` payload 分开。该模式在返回给调用方的 interrupt 以及 checkpoint 任务 interrupt 中都可用。
+
+本示例使用 LangGraph interrupt 测试中的审批模式：
+
+```typescript
+import {
+  Annotation,
+  Command,
+  MemorySaver,
+  START,
+  StateGraph,
+  interrupt,
+} from "@langchain/langgraph";
+import { z } from "zod/v4";
+
+const Decision = z.object({
+  approved: z.boolean(),
+  note: z.string().default(""),
+});
+
+const State = Annotation.Root({
+  answer: Annotation<unknown>(),
+});
+
+const graph = new StateGraph(State)
+  .addNode("node", () => ({
+    answer: interrupt({ question: "approve?" }, { responseSchema: Decision }),
+  }))
+  .addEdge(START, "node")
+  .compile({ checkpointer: new MemorySaver() });
+
+const config = { configurable: { thread_id: "1" } };
+
+const result = await graph.invoke({ answer: null }, config);
+console.log(result.__interrupt__?.[0].response_schema);
+
+const resumed = await graph.invoke(
+  new Command({ resume: { approved: true } }),
+  config
+);
+console.log(resumed.answer);
+```
+
+使用 Zod 模式时，`interrupt()` 会返回解析后的值。在本示例中，结果是 `{ approved: true, note: "" }`，其中包含默认的 `note`。无效输入会引发 `ZodError`；你可以使用相同的 thread ID，通过更正后的 `new Command({ resume: ... })` 重试。
+
+你还可以传入一个 JSON Schema 对象作为 `responseSchema`。LangGraph 会原样暴露该对象，但**不会**用它校验 resume 值。当省略 `responseSchema` 时，interrupt 上没有 `response_schema` 字段，resume 值会直接传递，不做模式校验。
+:::
+
+Studio 会把 interrupt 响应模式渲染为类型化的输入字段，而不是 JSON 编辑器。这个 Studio 组件预览使用了包含审批开关、备注和数字金额字段的示例数据。
+
+![Studio interrupt 表单，包含一个审批开关、一个备注字段和一个设置为 125.50 的数字金额](/images/langgraph-interrupt-response-schema.png)
 
 ## 常见模式
 

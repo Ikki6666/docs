@@ -1,0 +1,135 @@
+---
+title: "Stagehand + Browserbase 集成"
+description: "使用 LangChain Python 集成 Stagehand 和 Browserbase 浏览器工具。"
+integration:
+  name: Stagehand
+---
+
+Stagehand 是一个面向浏览器 agent 的开源 SDK，由 [Browserbase](https://browserbase.com) 提供支持——这是一个运行像人类一样使用网络的 agent 的完整平台。该集成附带一个开箱即用的 MCP server，直接向你的 Deep Agent 暴露三个工具——`run`、`snapshot` 和 `screenshot`——无需自定义工具定义。
+
+<Note>
+  Stagehand 从其自己的仓库发布该集成。请 clone 该仓库，并从 `packages/integrations/deepagents` 运行示例。
+</Note>
+
+## 工具
+
+| Tool | 描述 |
+|------|-------------|
+| `run` | 对当前浏览器页面执行 JavaScript 或 snapshot 操作 |
+| `snapshot` | 检查当前页面，并填充带括号的元素 ID，供 `run` 使用 |
+| `screenshot` | 截取渲染后页面的屏幕截图 |
+
+## 设置
+
+### 前提条件
+
+- Python 3.11–3.13
+- [uv](https://docs.astral.sh/uv/)
+- 一个 model-provider API key（例如 `OPENAI_API_KEY`）
+- 本地 Chrome，或用于托管远程浏览器的 [Browserbase](https://browserbase.com) API key
+
+### Clone 并安装
+
+```bash
+git clone https://github.com/browserbase/stagehand.git
+cd stagehand/packages/integrations/deepagents
+uv sync --locked
+uv sync --project examples/local --locked
+```
+
+### 环境变量
+
+```bash
+# Model provider
+export OPENAI_API_KEY="..."
+
+# Browser: local Chrome (default) or Browserbase
+export STAGEHAND_BROWSER="browserbase"    # omit to use local Chrome
+export BROWSERBASE_API_KEY="bb_live_..."  # required for Browserbase
+```
+
+## 与 Deep Agent 一起使用
+
+该集成的 MCP server（`stagehand-deepagents-mcp`）由 @[`MCPAdapter`] 通过 stdio 启动。使用 `list_tools()` 发现工具，并把它们传给 `create_deep_agent`——无需手动定义工具：
+
+```python
+import asyncio
+import os
+
+import dotenv
+from deepagents import create_deep_agent
+from langchain.mcp import MCPAdapter
+
+dotenv.load_dotenv()
+
+BROWSER_INSTRUCTIONS = """You control one persistent browser through exactly three tools:
+- snapshot: inspect the active page and hydrate bracketed element IDs.
+- run: provide either snapshot actions or JavaScript using the Playwright-shaped page API.
+- screenshot: inspect the rendered page visually.
+
+Use snapshot actions for simple interactions and run code for multi-step workflows.
+Snapshot IDs are valid only for the latest snapshot of the active page.
+Snapshot again after navigation or stale IDs. Do not launch another browser.
+"""
+
+CONFIG = {
+    "mcpServers": {
+        "stagehand_browser": {
+            "command": "uv",
+            "args": ["run", "--project", ".", "--locked", "stagehand-deepagents-mcp"],
+            "env": {
+                k: v for k, v in os.environ.items()
+                if k.startswith(("STAGEHAND_", "BROWSERBASE_")) and v
+            },
+        }
+    }
+}
+
+
+async def main():
+    async with MCPAdapter(CONFIG) as adapter:
+        tools = await adapter.list_tools()
+        agent = create_deep_agent(
+            model="openai:gpt-4o",
+            tools=tools,
+            system_prompt=BROWSER_INSTRUCTIONS,
+        )
+        result = await agent.ainvoke({
+            "messages": [{"role": "user", "content": "Go find me a summary of all main sports events today"}]
+        })
+    print(result["messages"][-1].content)
+
+
+asyncio.run(main())
+```
+
+<Warning>
+  在 agent 运行期间，请保持 @[`MCPAdapter`] 上下文管理器处于打开状态。浏览器 session 和 snapshot ID 绑定到底层的 stdio 进程——关闭 adapter 会结束该 session。
+</Warning>
+
+## Server 配置
+
+| Variable | Default | 用途 |
+|----------|---------|---------|
+| `STAGEHAND_BROWSER` | `local` | 选择 `local` 或 `browserbase` |
+| `STAGEHAND_HEADLESS` | `false` | 无头模式运行本地 Chrome |
+| `STAGEHAND_START_URL` | 未设置 | server 启动时打开的 URL |
+| `STAGEHAND_MODEL` | 未设置 | 可选——用于在 `run` 内调用的 Stagehand AI 方法的模型；未设置时默认提供推理 |
+| `STAGEHAND_MODEL_API_KEY` | 未设置 | 可选——`STAGEHAND_MODEL` 的 API key；使用默认推理时不需要 |
+| `STAGEHAND_RUN_TIMEOUT_MS` | `60000` | JavaScript 和 snapshot 操作批次的超时时间 |
+| `BROWSERBASE_API_KEY` | 未设置 | 使用 Browserbase 时必需 |
+
+<Note>
+  MCP server 和 agent 运行在独立的 Python 环境中。Stagehand 要求 `websockets>=16.1.1`，而当前的 LangGraph SDK 要求 `websockets<16`——stdio transport 隔离了这两组依赖。
+</Note>
+
+## 相关资源
+
+<CardGroup cols={2}>
+  <Card title="Integration source + examples" icon="brand-github" href="https://github.com/browserbase/stagehand/tree/main/packages/integrations/deepagents">
+    MCP server、托管工具和可运行的 agent 示例。
+  </Card>
+  <Card title="Browserbase provider page" icon="browser" href="/oss/integrations/providers/browserbase">
+    完整的 Browserbase provider 概览与设置。
+  </Card>
+</CardGroup>

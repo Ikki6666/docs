@@ -10,6 +10,7 @@ import HitlDecisionTypesTable from '/snippets/oss/hitl-decision-types-table.mdx'
 
 某些工具操作可能比较敏感，需要在执行前获得人工批准。Deep Agents 通过 LangGraph 的 interrupt 能力支持 human-in-the-loop 工作流。你可以使用 `interrupt_on` 参数配置哪些工具需要批准。设置 `interrupt_on` 后，`HumanInTheLoopMiddleware` 会被添加到 [Deep Agents 栈](/oss/deepagents/customization#deep-agents-stack)中。如果在工具返回结果之前运行被取消或中断，堆栈中的 @[PatchToolCallsMiddleware] 会自动修复消息历史。
 
+:::python
 ```mermaid
 graph LR
     Agent[Agent] --> Check{Interrupt?}
@@ -34,12 +35,45 @@ graph LR
     class Execute process
     class ToolMessage process
 ```
+:::
+
+:::js
+```mermaid
+graph LR
+    Agent[Agent] --> Check{Interrupt?}
+    Check --> |no| Execute[Execute]
+    Check --> |yes| Human{Human}
+
+    Human --> |approve| Execute
+    Human --> |edit| Execute
+    Human --> |reject| ToolMessage[ToolMessage]
+
+    Execute --> Agent
+    ToolMessage --> Agent
+
+    classDef trigger fill:#F6FFDB,stroke:#6E8900,stroke-width:2px,color:#2E3900
+    classDef process fill:#E5F4FF,stroke:#006DDD,stroke-width:2px,color:#030710
+    classDef decision fill:#FDF3FF,stroke:#7E65AE,stroke-width:2px,color:#504B5F
+    classDef alert fill:#F8E8E6,stroke:#B27D75,stroke-width:2px,color:#634643
+
+    class Agent trigger
+    class Check,Human decision
+    class Execute process
+    class ToolMessage process
+```
+:::
 
 ## 基本配置
 
 `interrupt_on` 参数接收一个字典，把工具名映射到 interrupt 配置。每个工具可以配置为：
 
-- **`True`**：使用默认行为启用中断（允许 approve、edit、reject、respond）
+- **`True`**：使用默认行为启用中断
+  :::python
+  （允许 approve、edit、reject、respond）
+  :::
+  :::js
+  （允许 approve、edit、reject）
+  :::
 - **`False`**：为这个工具禁用中断
 - **`InterruptOnConfig`**：自定义配置。设置 `allowed_decisions` 来控制审核选项。
   :::python
@@ -60,7 +94,13 @@ graph LR
 
 <HitlDecisionTypesTable />
 
+:::python
 当人工拒绝某个拟执行动作时，使用 `reject`。只有当人工是在充当工具时才使用 `respond`，比如回答 `ask_user` 提示时。不要用 `respond` 来拒绝有副作用的工具，因为模型可能会把这条消息当成成功的 tool result。
+:::
+
+:::js
+当人工拒绝某个拟执行动作时，使用 `reject`。
+:::
 
 <Tip>
 在**编辑**工具参数时，请尽量保守。对原始参数做大幅修改，可能会让模型重新评估自己的方案，并可能多次执行该工具，或者做出意外动作。
@@ -129,14 +169,13 @@ config = {"configurable": {"thread_id": str(uuid7())}}
 # 调用 agent
 result = agent.invoke(
     {"messages": [{"role": "user", "content": "Delete the file temp.txt"}]},
-    config=config,
-    version="v2",  # [!code highlight]
+    config=config
 )
 
 # 检查是否被中断
-if result.interrupts:  # [!code highlight]
+if result.get("__interrupt__"):  # [!code highlight]
     # 提取 interrupt 信息
-    interrupt_value = result.interrupts[0].value  # [!code highlight]
+    interrupt_value = result["__interrupt__"][0].value  # [!code highlight]
     action_requests = interrupt_value["action_requests"]
     review_configs = interrupt_value["review_configs"]
 
@@ -161,8 +200,7 @@ if result.interrupts:  # [!code highlight]
     # 用决策恢复执行
     result = agent.invoke(
         Command(resume={"decisions": decisions}),
-        config=config,
-        version="v2",
+        config=config  # 必须使用同一个 config！
     )
 ```
 :::
@@ -202,6 +240,128 @@ if (result.__interrupt__) {
 ```
 :::
 
+## 处理流式传输中的 interrupts
+
+对于实时 UI，请使用 `.stream()` 而不是 `.invoke()`，以便在处理 HITL interrupts 的同时显示 token 和工具调用进度。Interrupts 会以 `__interrupt__` 条目的形式出现在 `updates` 流中。流结束后，收集人工决策，并使用 `Command(resume=...)` 再次流式传输以恢复执行。
+
+<Note>
+对于典型的 `interrupt_on` HITL 暂停，请使用扁平的 `{"decisions": [...]}` 负载恢复，与 `.invoke()` 的形状相同。当同时有多个 interrupt 待处理时（例如并行分支），请改为把每个 interrupt ID 映射到它的恢复值。参见 [处理多个 interrupts](/oss/langgraph/interrupts#handling-multiple-interrupts)。
+</Note>
+
+:::python
+```python
+from langchain_core.utils.uuid import uuid7
+from langgraph.types import Command
+
+config = {"configurable": {"thread_id": str(uuid7())}}
+stream_input = {"messages": [{"role": "user", "content": "Delete the file temp.txt"}]}
+
+while True:
+    pending_interrupt = None
+
+    for mode, data in agent.stream(  # [!code highlight]
+        stream_input,
+        stream_mode=["messages", "updates"],  # [!code highlight]
+        config=config,
+    ):
+        if mode == "messages":
+            token, metadata = data
+            # Display tokens in real time
+            if token.content:
+                print(token.content, end="", flush=True)
+
+        elif mode == "updates" and isinstance(data, dict):
+            if "__interrupt__" in data:  # [!code highlight]
+                pending_interrupt = data["__interrupt__"][0]  # [!code highlight]
+
+    # If no interrupt occurred, the agent finished
+    if pending_interrupt is None:
+        break
+
+    interrupt_value = pending_interrupt.value
+    action_requests = interrupt_value["action_requests"]
+    review_configs = interrupt_value["review_configs"]
+    config_map = {cfg["action_name"]: cfg for cfg in review_configs}
+
+    for action in action_requests:
+        review = config_map[action["name"]]
+        print(f"\nTool: {action['name']}")
+        print(f"Arguments: {action['args']}")
+        print(f"Allowed: {review['allowed_decisions']}")
+
+    # Collect one decision per action_request, in order
+    decisions = [{"type": "approve"} for _ in action_requests]
+    stream_input = Command(resume={"decisions": decisions})  # [!code highlight]
+
+print()
+```
+:::
+
+:::js
+```typescript
+import { v7 as uuid7 } from "uuid";
+import { Command } from "@langchain/langgraph";
+
+const config = { configurable: { thread_id: uuid7() } };
+let streamInput: Record<string, any> | Command = {
+  messages: [{ role: "user", content: "Delete the file temp.txt" }],
+};
+
+while (true) {
+  let pendingInterrupt: { value: any } | undefined;
+
+  for await (const chunk of await agent.stream(  // [!code highlight]
+    streamInput,
+    {
+      streamMode: ["messages", "updates"],  // [!code highlight]
+      ...config,
+    }
+  )) {
+    const [mode, data] = chunk;
+
+    if (mode === "messages") {
+      const [token] = data;
+      // Display tokens in real time
+      if (token.text) {
+        process.stdout.write(token.text);
+      }
+    }
+
+    if (mode === "updates" && data?.__interrupt__) {  // [!code highlight]
+      pendingInterrupt = data.__interrupt__[0];  // [!code highlight]
+    }
+  }
+
+  // If no interrupt occurred, the agent finished
+  if (!pendingInterrupt) break;
+
+  const interruptValue = pendingInterrupt.value;
+  const actionRequests = interruptValue.actionRequests;
+  const reviewConfigs = interruptValue.reviewConfigs;
+  const configMap = Object.fromEntries(
+    reviewConfigs.map((cfg: any) => [cfg.actionName, cfg])
+  );
+
+  for (const action of actionRequests) {
+    const review = configMap[action.name];
+    console.log(`\nTool: ${action.name}`);
+    console.log(`Arguments: ${JSON.stringify(action.args)}`);
+    console.log(`Allowed: ${review.allowedDecisions}`);
+  }
+
+  // Collect one decision per actionRequest, in order
+  const decisions = actionRequests.map(() => ({ type: "approve" }));
+  streamInput = new Command({ resume: { decisions } });  // [!code highlight]
+}
+
+process.stdout.write("\n");
+```
+:::
+
+<Tip>
+组合 `"messages"` 和 `"updates"` 两种流模式，既能向用户实时展示 LLM token，又能捕获 HITL interrupts。`"messages"` 模式流式传输 token；`"updates"` 模式传递 interrupt 负载。
+</Tip>
+
 ## 拒绝消息
 
 当审查者返回 `reject` 决策时，Deep Agents 会跳过该 tool call，并把拒绝反馈发回给 agent。如果你省略 `message`，默认反馈会告诉模型该工具没有执行，并且除非用户要求，否则不要重试同一个 tool call。
@@ -236,8 +396,8 @@ const decisions = [
 
 :::python
 ```python
-if result.interrupts:  # [!code highlight]
-    interrupt_value = result.interrupts[0].value  # [!code highlight]
+if result.get("__interrupt__"):  # [!code highlight]
+    interrupt_value = result["__interrupt__"][0].value  # [!code highlight]
     action_request = interrupt_value["action_requests"][0]
 
     # 来自 agent 的原始参数
@@ -254,8 +414,7 @@ if result.interrupts:  # [!code highlight]
 
     result = agent.invoke(
         Command(resume={"decisions": decisions}),
-        config=config,
-        version="v2",
+        config=config
     )
 ```
 :::
@@ -343,7 +502,9 @@ const agent = createDeepAgent({
 ```
 :::
 
-当 subagent 触发 interrupt 时，处理方式相同：检查结果中的 `interrupts`，然后用 `Command` 恢复。
+当 subagent 触发 interrupt 时，处理方式相同：检查结果中的 `__interrupt__`，然后用 `Command` 恢复。
+
+流式传输时，subagent interrupts 也会以 `__interrupt__` 条目的形式出现在父级的 `updates` 流中。interrupt 传递不需要 `subgraphs=True`。如果你还想流式传输 subagent 的 token 和进度事件，请启用 `subgraphs=True`。完整模式请参见 [处理流式传输中的 interrupts](#handle-interrupts-with-streaming)。
 
 ### Tool 内部的 interrupts
 
@@ -418,9 +579,37 @@ def main():
                 )
             ]
         },
-        config=config,
-        version="v2",  # [!code highlight]
+        config=config
     )
+
+    # 检查是否有 interrupt
+    if result.get("__interrupt__"):  # [!code highlight]
+        interrupt_value = result["__interrupt__"][0].value  # [!code highlight]
+        print(f"\nInterrupt received!")
+        print(f"  Type: {interrupt_value.get('type')}")
+        print(f"  Action: {interrupt_value.get('action')}")
+        print(f"  Message: {interrupt_value.get('message')}")
+
+        print("\nResuming with Command(resume={'approved': True})...")
+        result2 = parent_agent.invoke(
+            Command(resume={"approved": True}),
+            config=config
+        )
+
+        if "__interrupt__" not in result2:  # [!code highlight]
+            print("\nExecution completed!")
+            # 查找 tool 返回值
+            tool_msgs = [m for m in result2.get("messages", []) if m.type == "tool"]  # [!code highlight]
+            if tool_msgs:
+                print(f"  Tool result: {tool_msgs[-1].content}")
+        else:
+            print("\nAnother interrupt occurred")
+    else:
+        print("\n  No interrupt - the model may not have called request_approval")
+
+
+if __name__ == "__main__":
+    main()
 ```
 :::
 
@@ -500,37 +689,44 @@ async function main() {
       ],
     },
     config
+  );
+
+  if (result.__interrupt__) {
+    const interruptValue = result.__interrupt__[0].value as {
+      type?: string;
+      action?: string;
+      message?: string;
+    };
+    console.log("\nInterrupt received!");
+    console.log(`  Type: ${interruptValue.type}`);
+    console.log(`  Action: ${interruptValue.action}`);
+    console.log(`  Message: ${interruptValue.message}`);
+
+    console.log("\nResuming with Command(resume={'approved': true})...");
+    const result2 = await parentAgent.invoke(
+      new Command({ resume: { approved: true } }),
+      config
     );
 
-    # 检查是否有 interrupt
-    if result.interrupts:  # [!code highlight]
-        interrupt_value = result.interrupts[0].value  # [!code highlight]
-        print(f"\nInterrupt received!")
-        print(f"  Type: {interrupt_value.get('type')}")
-        print(f"  Action: {interrupt_value.get('action')}")
-        print(f"  Message: {interrupt_value.get('message')}")
+    if (!result2.__interrupt__) {
+      console.log("\nExecution completed!");
+      // Find the tool response
+      const toolMsgs = result2.messages?.filter((m) => m.type === "tool") || [];
+      if (toolMsgs.length > 0) {
+        const lastToolMsg = toolMsgs[toolMsgs.length - 1];
+        console.log(`  Tool result: ${lastToolMsg.content}`);
+      }
+    } else {
+      console.log("\nAnother interrupt occurred");
+    }
+  } else {
+    console.log(
+      "\n  No interrupt - the model may not have called request_approval"
+    );
+  }
+}
 
-        print("\nResuming with Command(resume={'approved': True})...")
-        result2 = parent_agent.invoke(
-            Command(resume={"approved": True}),
-            config=config,
-            version="v2",  # [!code highlight]
-        )
-
-        if not result2.interrupts:  # [!code highlight]
-            print("\nExecution completed!")
-            # 查找 tool 返回值
-            tool_msgs = [m for m in result2.value.get("messages", []) if m.type == "tool"]  # [!code highlight]
-            if tool_msgs:
-                print(f"  Tool result: {tool_msgs[-1].content}")
-        else:
-            print("\nAnother interrupt occurred")
-    else:
-        print("\n  No interrupt - the model may not have called request_approval")
-
-
-if __name__ == "__main__":
-    main()
+main().catch(console.error);
 ```
 
 运行时，输出如下：
@@ -617,12 +813,11 @@ result = agent.invoke(
         "role": "user",
         "content": "Delete temp.txt and send an email to admin@example.com"
     }]},
-    config=config,
-    version="v2",  # [!code highlight]
+    config=config
 )
 
-if result.interrupts:  # [!code highlight]
-    interrupt_value = result.interrupts[0].value  # [!code highlight]
+if result.get("__interrupt__"):  # [!code highlight]
+    interrupt_value = result["__interrupt__"][0].value  # [!code highlight]
     action_requests = interrupt_value["action_requests"]
 
     # 需要批准两个工具
@@ -639,3 +834,7 @@ if result.interrupts:  # [!code highlight]
 
     result = agent.invoke(
         Command(resume={"decisions": decisions}),
+        config=config
+    )
+```
+:::

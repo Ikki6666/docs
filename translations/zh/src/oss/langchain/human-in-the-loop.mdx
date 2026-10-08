@@ -9,11 +9,23 @@ import HitlDecisionTypesTable from '/snippets/oss/hitl-decision-types-table.mdx'
 
 它的做法是把每个工具调用拿去和可配置策略做比对。如果需要人工介入，中间件就会发出一个 @[interrupt]，从而中止执行。图状态会通过 LangGraph 的 [持久化层](/oss/langgraph/persistence) 保存，因此执行可以安全暂停，并在之后恢复。
 
+:::python
 人工决策随后决定下一步怎么做：动作可以原样批准（`approve`）、执行前修改（`edit`）、带反馈拒绝（`reject`），或者在 "ask user" 这类工具里直接回复（`respond`）。
+:::
+
+:::js
+人工决策随后决定下一步怎么做：动作可以原样批准（`approve`）、执行前修改（`edit`），或者带反馈拒绝（`reject`）。
+:::
 
 ## 中断决策类型
 
+:::python
 [中间件](/oss/langchain/middleware/built-in#human-in-the-loop) 定义了四种人类对中断的内置响应方式：
+:::
+
+:::js
+[中间件](/oss/langchain/middleware/built-in#human-in-the-loop) 定义了三种人类对中断的内置响应方式：
+:::
 
 <HitlDecisionTypesTable />
 
@@ -21,7 +33,13 @@ import HitlDecisionTypesTable from '/snippets/oss/hitl-decision-types-table.mdx'
 当多个工具调用同时暂停时，每个动作都需要单独决策。
 决策的顺序必须和中断请求里动作出现的顺序一致。
 
+:::python
 当人类是在拒绝请求的动作时，请使用 `reject`。只有在人工是在充当工具本身时才使用 `respond`，例如回答一个 `ask_user` 提示。不要用 `respond` 去拒绝会产生副作用的工具，因为它的消息会被当作成功的工具结果。
+:::
+
+:::js
+当人类是在拒绝请求的动作时，请使用 `reject`。
+:::
 
 <Tip>
 在**编辑**工具参数时，请尽量保守地修改。对原始参数做大幅更改，可能会让模型重新评估方案，并且可能多次执行工具，或者采取意料之外的动作。
@@ -74,7 +92,7 @@ const agent = createAgent({
     middleware: [
         humanInTheLoopMiddleware({
             interruptOn: {
-                write_file: true, // 允许所有决策（approve、edit、reject、respond）
+                write_file: true, // 允许所有决策（approve、edit、reject）
                 execute_sql: {
                     allowedDecisions: ["approve", "reject"],
                     // 不允许编辑
@@ -138,21 +156,25 @@ const agent = createAgent({
 
 :::js
 <ParamField body="interruptOn" type="object" required>
-    工具名到批准配置的映射
+    工具名到批准配置的映射。值可以是 `true`（使用默认配置中断）、`false`（自动批准），或者一个 `InterruptOnConfig` 对象。
 </ParamField>
 
-**工具批准配置选项：**
-
-<ParamField body="allowAccept" type="boolean" default="false">
-    是否允许批准
+<ParamField body="descriptionPrefix" type="string" default="Tool execution requires approval">
+    动作请求描述的前缀
 </ParamField>
 
-<ParamField body="allowEdit" type="boolean" default="false">
-    是否允许编辑
+**`InterruptOnConfig` 选项：**
+
+<ParamField body="allowedDecisions" type="string[]">
+    允许的决策列表：`'approve'`、`'edit'` 或 `'reject'`
 </ParamField>
 
-<ParamField body="allowRespond" type="boolean" default="false">
-    是否允许回复/拒绝
+<ParamField body="description" type="string | callable">
+    用于自定义描述的静态字符串或可调用函数
+</ParamField>
+
+<ParamField body="when" type="callable">
+    可选谓词，接收一个 @[ToolCallRequest]，并返回 `true` 表示中断，返回 `false` 表示自动批准。可用它按调用参数来控制中断。需要 `langchain>=1.4.6`。
 </ParamField>
 :::
 
@@ -210,7 +232,48 @@ agent = create_agent(
 :::
 
 :::js
-条件中断目前只支持 Python。
+<Note>
+条件中断需要 `langchain>=1.4.6`。
+</Note>
+
+```typescript
+import { createAgent, humanInTheLoopMiddleware } from "langchain";
+import type { ToolCallRequest } from "langchain";
+import { MemorySaver } from "@langchain/langgraph";
+
+// Pause writes to paths outside the workspace directory.
+const writesOutsideWorkspace = (request: ToolCallRequest) =>
+  !String(request.toolCall.args.path ?? "").startsWith("/workspace/");
+
+// Pause SQL that isn't a read-only SELECT.
+const isWriteQuery = (request: ToolCallRequest) =>
+  !String(request.toolCall.args.query ?? "")
+    .trimStart()
+    .toUpperCase()
+    .startsWith("SELECT");
+
+const agent = createAgent({
+  model: "gpt-5.5",
+  tools: [writeFile, executeSql, readData],
+  middleware: [
+    humanInTheLoopMiddleware({
+      interruptOn: {
+        write_file: {
+          allowedDecisions: ["approve", "edit", "reject"],
+          when: writesOutsideWorkspace,
+        },
+        execute_sql: {
+          allowedDecisions: ["approve", "reject"],
+          when: isWriteQuery,
+        },
+      },
+    }),
+  ],
+  checkpointer: new MemorySaver(),
+});
+```
+
+当 `when` 谓词返回 `false` 时，调用会直接运行而不中断。当它返回 `true`，或者你省略 `when` 时，调用就会像平常一样暂停。评估为 `false` 的调用不会被加入中断批次，因此审查者只会看到需要决策的动作。
 :::
 
 ## 响应中断
@@ -485,10 +548,10 @@ await agent.invoke(
 
 </Tab>
 
+:::python
 <Tab title="💬 respond">
     当工具本质上是“ask user”这类场景时，请使用 `respond`，此时工具的真实实现就是人类的回复。`message` 内容会直接作为工具结果返回；工具本身不会执行。
 
-    :::python
     ```python
     agent.invoke(
         Command(
@@ -508,32 +571,12 @@ await agent.invoke(
         version="v2",
     )
     ```
-    :::
-
-    :::js
-    ```typescript
-    await agent.invoke(
-        new Command({
-            // 决策以列表形式提供，每个待审动作对应一个。
-            // 决策顺序必须和中断请求中动作的顺序一致。
-            resume: {
-                decisions: [
-                    {
-                        type: "respond",
-                        // 人类的回复，会直接作为工具结果返回
-                        message: "Blue.",
-                    }
-                ]
-            }
-        }),
-        config  // 相同 thread ID，用于恢复已暂停的会话
-    );
-    ```
-    :::
 
 `respond` 适合把 human input 直接作为工具输出的情形，例如问答式工具。消息会被直接传回智能体，并像正常工具结果一样继续流转。
 
 </Tab>
+:::
+
 </Tabs>
 
 ---
@@ -665,7 +708,13 @@ for await (const message of resumeStream.messages) {  // [!code highlight]
 2. 中间件检查回复中是否有工具调用。
 3. 如果任何调用需要人工输入，中间件会构建一个带有 `action_requests` 和 `review_configs` 的 @[HITLRequest]，并调用 @[interrupt]。
 4. 智能体等待人工决策。
+:::python
 5. 根据 `HITLResponse` 中的决策，中间件会执行已批准或已编辑的调用，为被拒绝的调用合成 @[ToolMessage]，对于 `respond` 决策则直接把人类回复作为 @[ToolMessage] 返回，然后继续执行。
+:::
+
+:::js
+5. 根据 `HITLResponse` 中的决策，中间件会执行已批准或已编辑的调用，为被拒绝的调用合成 @[ToolMessage]，然后继续执行。
+:::
 
 ## 自定义 HITL 逻辑
 

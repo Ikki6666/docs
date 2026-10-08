@@ -1,0 +1,295 @@
+---
+title: 按客户划分的策略
+description: 通过自定义请求 header 拆分 gateway 支出上限和速率限制，让每个终端客户在单个 API key 下拥有自己的限额。
+---
+
+import LLMGatewayBetaNote from '/snippets/langsmith/llm-gateway-beta-note.mdx';
+
+<LLMGatewayBetaNote />
+
+一条 [spend policy](/langsmith/llm-gateway-spend-policies) 可以按自定义请求 header 拆分默认限额，让每个 header 值获得独立的限额。Spend 和 [rate limit policies](/langsmith/llm-gateway-rate-limit-policies) 也可以匹配某个特定的 header 值。使用这些选项为你的终端客户、租户或团队设置上限，而无需为每个对象单独发放 [LangSmith API key](/langsmith/create-account-api-key)。
+
+例如，一条按 `X-Gateway-Customer-Id` 拆分的工作区默认 spend limit，会让 `acme` 和 `globex` 在每个[工作区](/langsmith/administration-overview#workspaces)内拥有独立的限额。一条带有条件 `X-Gateway-Customer-Id: acme` 的显式策略，只限制携带该精确值的请求。
+
+## 可匹配的 header
+
+gateway 匹配以 `X-Gateway-` 为前缀的请求 header，以及 `X-Gateway-Metadata` JSON header 内部的 key。其他请求 header 都不可匹配。
+
+header 名称在匹配前会被规范化：剥离 `X-Gateway-` 前缀，剩余部分转为小写，并把 `a-z`、`0-9` 和 `_` 之外的每个字符替换为 `_`。`X-Gateway-Customer-Id`、`x-gateway-customer_id` 和 `X-Gateway-CUSTOMER.ID` 都会解析为 matcher key `customer_id`。header 值按精确、区分大小写的字符串进行比较，不支持通配符或模式匹配。
+
+gateway 会自己标记调用者身份，并忽略 client 试图覆盖它的行为。解析为 `organization_id`、`workspace_id`、`workspace_handle`、`user_id`、`user_email`、`api_key_id`、`api_key_short`、`auth_mode`、`user_agent`、`applied_policy_ids` 或 `applied_policy_names` 的 header，以及规范化名称以 `gateway` 开头的任何 header，都会被丢弃。
+
+<Warning>
+gateway 信任入站请求上的 `X-Gateway-*` header。请在你自己的后端完成终端用户认证之后设置该 header，并且不要把 gateway API key 分发给终端用户。一个同时控制 key 和 header 的调用者可以自行选择使用哪个限额。
+</Warning>
+
+<Warning>
+创建和管理策略需要 `organization:manage` 权限。完整的权限说明请参见 [Traces、Engine 与访问控制](/langsmith/llm-gateway-access)。
+</Warning>
+
+## 按 header 拆分默认 spend limit
+
+默认 spend limit 会对 subject 维度的每个成员应用相同的 cap。按 header 拆分后，该 cap 会独立应用于每个 subject 和 header 值的组合，而无需为每个值创建一条策略。
+
+默认 spend bucketing 遵循以下规则：
+
+- **每条默认策略一个 header**：只输入 header 名称。请求会提供标识 bucket 的值。
+- **独立限额**：每个 subject 和 header 值的组合都会获得配置的 spend limit。
+- **Fallback 限额**：不携带该配置 header 的请求共享其 subject 的 fallback 限额。
+
+按 header 拆分默认 spend limit 的步骤：
+
+1. 前往 **LLM Gateway** 并选择 **Cost Controls**。
+1. 点击 **Create spend limit**。
+1. 选择 **Workspace**、**User** 或 **API Key**，然后选择默认把限额应用于该类型每个 subject 的选项。
+1. 选择 **Separate limits by custom header**。
+1. 输入不带 `X-Gateway-` 前缀的 **Header name**。例如，对于 `X-Gateway-Customer-Id` 请求 header，输入 `Customer-Id`。
+1. 设置 spend limit，然后点击 **Create spend limit**。
+
+策略表会显示用于拆分默认限额的 header。你也可以编辑已有的默认 spend limit 来添加、更改或移除该 header。
+
+当不同的 header 值需要不同的限额时，请改用显式策略。
+
+## 添加显式 header 条件
+
+显式 spend 或 rate limit policy 可以匹配某个精确的 header 值。使用显式策略为不同的 header 值分配不同的限额。
+
+显式 header 条件遵循以下规则：
+
+- **每条策略一个条件**：一条策略接受一个 header 名称和一个值。
+- **一个 subject 范围**：把条件与 organization、workspace、user 或 API key 范围组合。subject 一侧接受多个值并匹配其中任意一个。
+- **缺失的 header 不匹配**：不携带该配置 header 的请求不会匹配该策略。
+- **每条匹配的策略都会被强制执行**：一个同时匹配普通 subject 策略和带 header 条件策略的请求会同时计入两者，其中任意一条都可以拦截它。
+- **最多 10 个条件**：一条策略总共最多携带 10 个 subject 条件。
+
+1. 前往 **LLM Gateway**。
+1. 点击 **Create policy**。
+1. 选择策略类型和 subject 范围，然后设置限额。
+1. 在 **Custom header condition (optional)** 下，输入不带 `X-Gateway-` 前缀的 **Header name**（例如 `Customer-Id`）和要匹配的 **Header value**（例如 `acme`）。
+1. 保存。
+
+策略创建后，你无法在 UI 中编辑该 header 条件。要更改它，请删除该策略并创建一个新策略，或通过 API 更新 `subject_matchers`。
+
+## 为每个终端客户设置支出上限
+
+转售商或多租户应用通常从自己的后端调用 gateway，使用一个工作区范围的 API key 代表多个终端客户。当每个客户需要不同的上限时，请使用显式 header 条件。如果每个客户使用相同的上限，请改用[按 header 拆分一条默认 spend limit](#separate-a-default-spend-limit-by-header)。
+
+### Step 1. 每次调用都发送客户 header
+
+把该 header 附加到你的后端代表终端客户发出的每个请求上：
+
+<CodeGroup>
+
+```bash curl
+curl https://gateway.smith.langchain.com/openai/v1/chat/completions \
+    -H "Authorization: Bearer $LANGSMITH_API_KEY" \
+    -H "Content-Type: application/json" \
+    -H "X-Gateway-Customer-Id: acme" \
+    -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"ping"}]}'
+```
+
+```python OpenAI SDK
+import os
+
+from openai import OpenAI
+
+client = OpenAI(
+    base_url=os.environ["OPENAI_BASE_URL"],
+    api_key=os.environ["LANGSMITH_API_KEY"],
+)
+customer_id = "acme"
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "ping"}],
+    extra_headers={"X-Gateway-Customer-Id": customer_id},
+)
+print(response.choices[0].message.content)
+```
+
+</CodeGroup>
+
+<Note>
+如果你的 LangSmith account 位于区域实例上，请使用对应的[区域 gateway](/langsmith/llm-gateway-how-it-works#use-a-regional-gateway)。
+</Note>
+
+### Step 2. 为一个客户创建上限
+
+通过 [LangSmith REST API](/langsmith/smith-api-ref) 为每个终端客户创建一条 spend policy：
+
+<CodeGroup>
+
+```bash curl
+curl -X POST "https://api.smith.langchain.com/v1/platform/gateway-policies" \
+    -H "X-Api-Key: $LANGSMITH_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{
+          "name": "customer-acme-monthly-cap",
+          "policy_type": "spend_cap",
+          "action": "block",
+          "subject_matchers": [
+            {"key": "workspace_id", "value": "0b1c2d3e-4f56-7890-abcd-ef1234567890"},
+            {"key": "customer_id", "value": "acme"}
+          ],
+          "config": {"window": "monthly", "limit_usd": 250}
+        }'
+```
+
+```python Python
+import os
+
+import httpx
+
+response = httpx.post(
+    "https://api.smith.langchain.com/v1/platform/gateway-policies",
+    headers={"X-Api-Key": os.environ["LANGSMITH_API_KEY"]},
+    json={
+        "name": "customer-acme-monthly-cap",
+        "policy_type": "spend_cap",
+        "action": "block",
+        "subject_matchers": [
+            {"key": "workspace_id", "value": "0b1c2d3e-4f56-7890-abcd-ef1234567890"},
+            {"key": "customer_id", "value": "acme"},
+        ],
+        "config": {"window": "monthly", "limit_usd": 250},
+    },
+    timeout=30.0,
+)
+response.raise_for_status()
+```
+
+</CodeGroup>
+
+matcher key 是规范化后的名称 `customer_id`，不是 header 名称 `X-Gateway-Customer-Id`。该策略属于持有该 API key 的组织。
+
+提交一条 `subject_matchers` 已存在的策略会更新该策略而不是添加重复项，因此这个调用可以安全地重复执行。
+
+### Step 3. 让策略与你的客户列表保持同步
+
+因为每个终端客户都需要自己的策略，所以要让策略集合与客户列表保持同步。以下脚本为每个现有客户创建或更新上限，然后删除已流失客户的 cap：
+
+```python
+import os
+
+import httpx
+
+API_URL = "https://api.smith.langchain.com/v1/platform/gateway-policies"
+WORKSPACE_ID = os.environ["LANGSMITH_WORKSPACE_ID"]
+
+# Your source of truth: end customer identifier mapped to a monthly cap in USD.
+CUSTOMER_CAPS = {"acme": 250.0, "globex": 1000.0, "initech": 50.0}
+
+
+def matchers_for(customer: str) -> list[dict[str, str]]:
+    return [
+        {"key": "workspace_id", "value": WORKSPACE_ID},
+        {"key": "customer_id", "value": customer},
+    ]
+
+
+def existing_caps(client: httpx.Client) -> dict[str, dict]:
+    """Return the current per-customer spend caps, keyed by customer identifier."""
+    response = client.get(API_URL, params={"policy_type": "spend_cap"})
+    response.raise_for_status()
+    return {
+        matcher["value"]: policy
+        for policy in response.json()
+        for matcher in policy["subject_matchers"]
+        if matcher["key"] == "customer_id"
+    }
+
+
+def sync() -> None:
+    headers = {"X-Api-Key": os.environ["LANGSMITH_API_KEY"]}
+    with httpx.Client(headers=headers, timeout=30.0) as client:
+        existing = existing_caps(client)
+
+        # Posting an existing matcher set updates that policy, so this both
+        # creates caps for new customers and corrects caps that changed.
+        for customer, limit_usd in CUSTOMER_CAPS.items():
+            client.post(
+                API_URL,
+                json={
+                    "name": f"customer-{customer}-monthly-cap",
+                    "policy_type": "spend_cap",
+                    "action": "block",
+                    "subject_matchers": matchers_for(customer),
+                    "config": {"window": "monthly", "limit_usd": limit_usd},
+                },
+            ).raise_for_status()
+
+        # Deletes any per-customer cap missing from CUSTOMER_CAPS, including
+        # caps created outside this script.
+        for customer, policy in existing.items():
+            if customer not in CUSTOMER_CAPS:
+                client.delete(f"{API_URL}/{policy['id']}").raise_for_status()
+
+
+if __name__ == "__main__":
+    sync()
+```
+
+每当有客户注册、流失或更换 plan 时，运行这个脚本。
+
+### Step 4. 读取每个客户的支出
+
+API 返回的每条 spend policy 都会报告 `current_spend_usd`，即该策略活跃窗口内累计的支出。用它向每个终端客户展示其用量，或在达到上限前发出警告。当支出查询失败时，该字段会被省略，因此应把缺失的值视为未知而不是零。
+
+list endpoint 只有在 subject matcher key 与某个值配对时才会按该 key 缩小范围，因此请在自己的代码中列出 spend caps 并筛选出按客户的 cap：
+
+```python
+import os
+
+import httpx
+
+response = httpx.get(
+    "https://api.smith.langchain.com/v1/platform/gateway-policies",
+    headers={"X-Api-Key": os.environ["LANGSMITH_API_KEY"]},
+    params={"policy_type": "spend_cap"},
+    timeout=30.0,
+)
+response.raise_for_status()
+
+for policy in response.json():
+    customer = next(
+        (m["value"] for m in policy["subject_matchers"] if m["key"] == "customer_id"),
+        None,
+    )
+    if customer is None:
+        continue  # A cap on the workspace itself, not on one end customer.
+    # current_spend_usd is absent when the spend lookup fails.
+    print(customer, policy.get("current_spend_usd"), policy["config"]["limit_usd"])
+```
+
+## 为每个终端客户限制吞吐量
+
+Rate limits 使用相同的 subject matchers。交换 `policy_type` 和 `config`，即可为终端客户提供自己的请求和 token 配额：
+
+```bash
+curl -X POST "https://api.smith.langchain.com/v1/platform/gateway-policies" \
+    -H "X-Api-Key: $LANGSMITH_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{
+          "name": "customer-acme-rate-limit",
+          "policy_type": "rate_limit",
+          "action": "block",
+          "subject_matchers": [
+            {"key": "workspace_id", "value": "0b1c2d3e-4f56-7890-abcd-ef1234567890"},
+            {"key": "customer_id", "value": "acme"}
+          ],
+          "config": {
+            "version": 1,
+            "limits": [
+              {"metric": "requests", "window": "minute", "value": 100},
+              {"metric": "tokens", "window": "hour", "value": 1000000}
+            ]
+          }
+        }'
+```
+
+[Step 3](#step-3-sync-policies-with-your-customer-list) 中的同步脚本同样适用于 rate limits，只需做相同的两处替换。Spend caps 和 rate limits 属于不同的族，因此一个终端客户可以在同一个 header 值上各持有一条。
+
+## 下一步
+
+- [Spend policies](/langsmith/llm-gateway-spend-policies)：为组织、工作区、用户和 API keys 设置成本上限。
+- [Rate limit policies](/langsmith/llm-gateway-rate-limit-policies)：在滚动时间窗口内限制请求和 token。
+- [Traces and access control](/langsmith/llm-gateway-access)：了解 gateway traces 落在哪里，以及谁可以配置策略。

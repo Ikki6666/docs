@@ -1,0 +1,794 @@
+---
+title: 配置文件
+sidebarTitle: config.toml
+description: 在 config.toml 中配置模型 provider、默认值、retry 和 gateway
+---
+
+`~/.deepagents/config.toml` 允许你自定义模型 provider、设置默认值，并向模型构造函数传递额外参数。环境变量和检查命令请参见 [Configuration](/oss/deepagents/code/configuration)。本页面涵盖：
+
+- **默认值**：固定[默认模型](#default-and-recent-model)、[摘要模型](#set-a-summarization-model)或 [agent](#default-and-recent-agent)，或使用 allowlist [限制可用模型](#allowed-models)。
+- **警告**：[会话成本](#session-cost-warning)阈值、[缓存过期提示](#cold-prompt-cache-warning)和[受信任的 gateway 端点](#trust-a-gateway-endpoint-for-cache-policies)。
+- **显示**：[provider 可见的 reasoning](#show-provider-visible-reasoning) 和 diff 行号。
+- **Threads**：陈旧对话的[恢复限制](#limit-thread-resume-age)。
+- **Interpreter**：内置 QuickJS REPL 的 [`[interpreter]` 设置](#js-interpreter)。
+- **Python extensions**：自定义工具、middleware 和存储路由的[发现与项目信任](#python-extensions)。
+- **Tracing**：LangSmith traces 的[客户端密钥脱敏](#redact-langsmith-trace-secrets)。
+- **Provider 设置**：[`[models.providers.<name>]` 表](#provider-configuration)、[构造函数参数](#model-constructor-params)、[retries](#retries)、[profile 覆盖](#profile-overrides-advanced)，以及[向 `/model` 切换器添加模型](#adding-models-to-the-interactive-switcher)。
+- **Auto 模式**：[Auto 分类器超时](#auto-classifier-timeout)。
+- **自定义端点与 provider**：[自定义 base URL](#custom-base-url)、[OpenAI 或 Anthropic 兼容的 API](#compatible-apis)，以及[任意 provider](#arbitrary-providers)。
+- **端点与 gateway**：[API key 与 base URL 如何一起解析](#endpoints-keys-and-gateways)，包括通过受管 gateway。
+
+## 默认模型与最近模型
+
+```toml
+[models]
+default = "ollama:qwen3:4b"             # your intentional long-term preference
+recent = "google_genai:gemini-3.6-flash"   # last /model switch (written automatically)
+auto_classifier = "openai:gpt-5.6-luna"  # optional: cheaper model for Auto approval review
+```
+
+`[models].default` 始终优先于 `[models].recent`。`/model` 命令只写入 `[models].recent`，因此你配置的默认值不会被会话中途的切换覆盖。要移除默认值，请使用 `/model --default --clear` 或从配置文件中删除 `default` 键。
+
+`[models].auto_classifier` 设置 [Auto 批准分类器](/oss/deepagents/code/approval-modes#select-a-classifier-model)用于审查受控 tool calls 的模型。未设置时，Deep Agents Code 会为受支持的主模型 provider 选择延迟更低的默认值：Anthropic 使用 Claude Sonnet，Google 使用 Gemini Flash，OpenAI 使用 GPT Luna。其他 provider 继承主 agent 模型。你可以在运行时用 `--auto-classifier-model` 或 `/auto model` 覆盖。确切的模型规格、完整优先级和安全说明请参见 [Select a classifier model](/oss/deepagents/code/approval-modes#select-a-classifier-model)。
+
+## 设置摘要模型
+
+为自动上下文压缩、`/offload` 和 `/compact` 设置专用模型：
+
+```toml title="~/.deepagents/config.toml"
+[models]
+summarization_default = "openai:gpt-5.6-sol"
+```
+
+摘要模型按以下顺序解析：
+
+1. 当前启动的 `--summarization-model`。
+2. `[models].summarization_default`。
+3. 主 agent 模型。
+
+在交互式会话中，运行 `/offload model` 打开模型选择器，`/offload model <provider:model>` 直接切换，或 `/offload model clear` 重新跟随主 agent 模型。更改摘要模型不会更改主 agent 模型。
+
+## 默认 agent 与最近 agent
+
+```toml
+[agents]
+default = "backend-dev"  # your intentional long-term preference (Ctrl+S in /agents picker)
+recent = "frontend-dev"  # last /agents switch (written automatically)
+```
+
+`[agents].default` 始终优先于 `[agents].recent`。在 `/agents` 选择器中用 `Enter` 选择 agent 会写入 `recent`；在高亮行上按 `Ctrl+S` 会将其固定为 `default`。在同一行再次按 `Ctrl+S` 会清除默认值。
+
+显式的 `-a`/`--agent` 始终覆盖两者，`-r`/`--resume` 会绕过两者以恢复该 thread 原来的 agent。相关 flag 请参见 [Command reference](/oss/deepagents/code/cli-reference#command-line-options)。
+
+## 会话成本警告
+
+当累计估算成本超过 $50 时，Deep Agents Code 会对每个 thread 警告一次，并建议使用 `/offload` 或 `/clear`。你可以以美元配置该阈值，或将其设为 `0` 或负值以禁用警告：
+
+```toml
+[warnings]
+session_cost_threshold_usd = 25
+```
+
+## Cold prompt-cache 警告
+
+cache prompt 让你可以在 provider 的缓存保留窗口过期后，选择开始一个摘要 thread 还是继续当前对话。Deep Agents Code 会跟踪受支持的 Anthropic 和 OpenAI 模型的保留时间。当定价信息可用时，它会显示继续对话的预估输入成本，以及与 warm cache 命中相比的额外成本。
+
+### 计时器过期后继续
+
+默认情况下，当页脚的缓存保留计时器归零且 Deep Agents Code 处于空闲状态时，该提示会打开。当 agent 正在工作或另一个模态窗口打开时它会等待。计时器已过表示可能发生 cache miss，而不是保证。
+
+当提示打开时，选择如何继续：
+
+- **按 `Enter` 开始一个摘要 thread**：Deep Agents Code 使用你的[摘要模型](#set-a-summarization-model)总结对话并打开一个新 thread。新 thread 包含摘要、原始 thread ID，以及一个用于恢复摘要中省略细节的记录路径。原始 thread 保留其完整消息，并仍可通过 `/threads` 访问。
+- **按 `Esc` 留在当前 thread**：Deep Agents Code 保留你的草稿而不发送它。你的下一次显式发送将继续进行，同一个缓存窗口内不会再出现过期警告。
+
+两种选择都不会发送你的草稿。准备好继续时再提交它。摘要会进行一次付费模型调用，并且不保证节省成本。如果摘要失败，Deep Agents Code 会让你留在原始 thread 中。
+
+记录路径指的是 agent 的文件系统。归档遵循[对话历史保留](/oss/deepagents/code/configuration#conversation-history-retention)策略，临时存储可能无法在重启后保留。如果原始对话的归档不可用，请使用 `/threads` 恢复它。
+
+与过期提示的开始新 thread 操作不同，`/offload`（别名 `/compact`）是在当前 thread 内释放上下文。
+
+### 选择何时提示
+
+在 `/config` 中设置 `warnings.cache_prompt`，或编辑 `~/.deepagents/config.toml`：
+
+```toml title="~/.deepagents/config.toml"
+[warnings]
+cache_prompt = "expiry"
+```
+
+- **`"expiry"`（默认）**：在缓存计时器过期且应用空闲时显示提示。如果你在提示出现之前提交，则会在发送之前显示它。
+- **`"send"`**：等到过期后你提交消息时，再显示相同的提示。`Esc` 会恢复已提交的草稿而不发送它；再次提交以继续在当前 thread 中。`Enter` 会打开摘要 thread，并在那里恢复草稿供你提交。
+- **`"off"`**：禁用 cache prompt，包括发送时的缓存成本确认。这不会禁用单独的会话成本警告。
+
+这些设置适用于交互式聊天，不适用于 headless 模式。旧的 `warnings.cache_expiry_prompt = false` 偏好会映射到 `"send"`，除非你显式设置了 `warnings.cache_prompt`。
+
+### 设置发送时的成本阈值
+
+过期提示的出现与估算成本无关。如果估算不可用，提示会说明这一点，而不是假设下一轮是免费的。
+
+模型、端点或缓存设置的更改仍可能触发单独的发送时成本确认。确认过期不会抑制这些警告。该确认也涵盖未知的缓存年龄，例如没有记录请求时间的较旧 thread。
+
+为这些发送时确认设置以美元计的最低估算额外成本。默认值为 `0.50`；`0` 或负值会禁用它们，但不会禁用过期提示。使用 `cache_prompt = "off"` 可以同时禁用两者：
+
+```toml title="~/.deepagents/config.toml"
+[warnings]
+cold_cache_min_delta_usd = 1.00
+```
+
+发送时成本确认提供以下选择：
+
+- **仍然发送**：发送本轮，并为未来的轮次保持警告启用。
+- **发送且本次会话不再警告**：静音发送时成本确认，直到应用重启。
+- **发送且不再警告**：持久抑制发送时成本确认。可以从 `/notifications` 重新启用。
+- **不发送（保留草稿）**：将消息恢复到聊天输入框而不发送它。
+
+这些通知选择不会禁用过期提示。使用 `warnings.cache_prompt` 控制该流程。
+
+### 为缓存策略信任 gateway 端点
+
+如果请求通过 gateway 或代理而不是官方 API 到达 provider，cold-cache 警告会保持静默。声明端点受信任即断言它会原样转发缓存设置，并遵守 provider 文档记载的保留策略：
+
+```toml title="~/.deepagents/config.toml"
+[warnings]
+trusted_cache_endpoints = ["smith.langchain.com"]
+```
+
+条目是精确匹配的主机名—信任 `example.com` 并不会信任 `gw.example.com`。一个条目覆盖通过该端点路由的所有 provider。通过 LangSmith Gateway 的跨格式路由（例如路由到 Anthropic 模型的 OpenAI 格式请求）即使受信任也保持静默，因为转换会重写估算所假设的缓存设置。
+
+## 显示 provider 可见的 reasoning
+
+provider 可见的 reasoning 默认是隐藏的。要在交互式记录和非交互式输出中显示它，请设置：
+
+```toml title="~/.deepagents/config.toml"
+[ui]
+show_reasoning = true
+```
+
+在交互式会话中，reasoning 会流式输出到一个单独的行中，该行在阶段结束时折叠。点击该行或按 `Ctrl+O` 可以重新打开它。在非交互式模式下，reasoning 会输出到 stderr，因此 stdout 上的最终答案仍可通过管道传输。
+
+设置 `DEEPAGENTS_CODE_SHOW_REASONING=1` 可以覆盖 `config.toml`，或传入 `--show-reasoning` 为一次启动启用该设置。启动 flag 优先于环境变量，环境变量优先于 `config.toml`。
+
+<Note>
+    Deep Agents Code 只显示模型 provider 暴露的 reasoning 内容。已脱敏或不透明的 reasoning 保持隐藏。
+</Note>
+
+## Diff 行号
+
+默认情况下，Deep Agents Code 在记录和批准 diff 中显示相对于文件的行号。要隐藏它们，请设置：
+
+```toml
+[ui]
+show_diff_line_numbers = false
+```
+
+在会话中运行 `/line-numbers` 切换该偏好并保存到 `config.toml`。更改只应用于新的 diff；已经渲染的 diff 不会改变。
+
+## 自定义终端 tab 标题
+
+在交互式会话中，终端 tab 标题显示命令名称和活动对话名称。默认模板是 `{app_name} - {thread_name}`。未命名的对话只显示命令名称。
+
+在 `~/.deepagents/config.toml` 中设置 `terminal.tab_title` 以覆盖默认值：
+
+```toml title="~/.deepagents/config.toml"
+[terminal]
+tab_title = "{app_name} - {thread_name} | {cwd} [{branch}]"
+```
+
+模板支持以下占位符：
+
+- **`{app_name}`**：用于启动应用的命令名称，例如 `dcode` 或自定义 shim 名称。
+- **`{thread_name}`**：活动对话名称，未命名对话为空字符串。
+- **`{cwd}`**：活动工作目录。
+- **`{branch}`**：活动 Git 分支。
+
+标题会随着对话名称、目录或分支的变化而更新。设置 `tab_title = "{app_name}"` 可以只保留命令名称。编辑模板后重启 Deep Agents Code。
+
+## 限制 thread 恢复时长
+
+限制用户可以恢复哪些已保存的 thread，防止旧对话在模型或策略更改后恢复过时的上下文。
+
+使用 `threads.max_resume_age` 设置滚动最大时长：
+
+```toml title="~/.deepagents/config.toml"
+[threads]
+max_resume_age = "7d"
+```
+
+该值必须是正整数，后跟以下时长后缀之一：`s` 表示秒，`m` 表示分钟，`h` 表示小时，`d` 表示天，`w` 表示周。
+
+对于固定的迁移或策略边界，将 `threads.resume_after` 设置为 ISO 8601 日期或带时区的日期时间。日期使用 UTC 午夜：
+
+```toml title="~/.deepagents/config.toml"
+[threads]
+resume_after = "2025-06-01T00:00:00Z"
+```
+
+当两个选项都设置时，Deep Agents Code 应用更晚、更严格的截止时间。该限制适用于你在启动时恢复、在会话中恢复或切换 thread、选择 thread，或切换到另一个 agent 拥有的 thread。如果某个已保存 thread 的最后更新时间戳缺失或无效，Deep Agents Code 会在任一限制活动时阻止恢复。
+
+管理员可以在 `managed_config.toml` 中强制执行任一选项。无效的受管值会阻止启动，而不是回退到用户配置。
+
+## 允许的模型
+
+使用 `[models].allowed` 列表将 `dcode` 限制在一组已批准的模型：
+
+```toml title="~/.deepagents/config.toml"
+[models]
+allowed = ["anthropic:claude-fable-5", "openai:*"]
+```
+
+条目是精确的 `provider:model` spec，或接纳一个 provider 全部产品线的 `provider:*` 通配符。设置该列表后，被阻止的模型会从 `/model` 切换器中隐藏，并且在其他地方选择时会被拒绝。
+
+未设置该键时，所有模型都被允许。显式的空列表不允许任何模型：
+
+```toml
+[models]
+allowed = []   # no model may be used
+```
+
+通配符包括从捆绑的 provider profile 或你配置的 `models` 列表发现的模型。如果该 provider 没有可用模型，通配符不会允许任何模型。
+
+<Accordion title="允许 Amazon Bedrock 模型">
+    将 Bedrock model ID 写为 `bedrock:<id>`，包括 ID 中的版本冒号：
+
+    ```toml title="~/.deepagents/config.toml"
+    [models]
+    allowed = ["bedrock:anthropic.claude-3-5-sonnet-20241022-v2:0"]
+    ```
+</Accordion>
+
+## 脱敏 LangSmith trace 密钥
+
+在启用 LangSmith tracing 的情况下，Deep Agents Code 会在上传之前从 agent-trace 的输入和输出中脱敏检测到的密钥。默认启用。
+
+要禁用脱敏：
+
+<Tabs>
+    <Tab title="Config file">
+        ```toml title="~/.deepagents/config.toml"
+        [tracing]
+        langsmith_redact = false
+        ```
+    </Tab>
+    <Tab title="环境变量">
+        ```bash
+        export DEEPAGENTS_CODE_LANGSMITH_REDACT=false
+        ```
+    </Tab>
+</Tabs>
+
+环境变量优先于配置文件。启用脱敏时，如果无法配置脱敏，Deep Agents Code 会为该次运行禁用 tracing。密钥脱敏不会脱敏一般个人身份信息（PII）、trace 元数据或 shell 进程发出的 traces。更广泛的选项请参见 [Redact secrets from traces](/langsmith/redact-secrets)。
+
+## Provider 配置
+
+每个 provider 是 `[models.providers]` 下的一个 TOML 表：
+
+```toml
+[models.providers.<name>]
+display_name = "My Provider"
+api_key_url = "https://provider.example/keys"
+models = ["gpt-5.5"]
+api_key_env = "OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
+class_path = "my_package.models:MyChatModel"
+enabled = true
+
+[models.providers.<name>.params]
+temperature = 0
+max_tokens = 4096
+
+[models.providers.<name>.params."gpt-5.5"]
+temperature = 0.7
+```
+
+Provider 有以下配置选项：
+
+<ResponseField name="models" type="string[]" post={["optional"]}>
+    要在 `<name>` 定义的 provider 的交互式 `/model` 切换器中显示的模型名称列表。对于已随附 model profiles 的 provider，你在这里添加的名称会与捆绑的名称一起出现（适用于尚未加入包中的新发布模型）。对于[任意 provider](#arbitrary-providers)，此列表是切换器中模型的唯一来源。
+
+    此处列出的模型会**绕过**任何基于 profile 的[过滤标准](/oss/deepagents/code/providers#which-models-appear-in-the-switcher)，始终出现在切换器中。这使它成为呈现那些因为 profile 缺少 `tool_calling` 支持或尚不存在而被排除的模型的推荐方式。
+
+    此键是可选的。无论模型是否出现在切换器中，你始终可以将任何模型名称直接传给 `/model` 或 `--model`；provider 会在请求时验证该名称。
+</ResponseField>
+
+<ResponseField name="api_key_env" type="string" post={["optional"]}>
+    保存 API key 的环境变量的**名称**（例如 `"OPENAI_API_KEY"`）。Deep Agents Code 在启动时从这个环境变量读取凭据，在创建模型之前验证访问权限。
+
+    大多数 chat model 包会自动从默认环境变量读取。每个内置 provider 检查哪个变量名请参见 [Provider reference](/oss/deepagents/code/providers#provider-reference) 表。对于不在该表中的 provider，将 `api_key_env` 设置为它的变量名（参见 [Arbitrary providers](#arbitrary-providers)）。
+</ResponseField>
+
+<ResponseField name="display_name" type="string" post={["optional"]}>
+    在 auth UI 中显示的人类可读的 provider 名称。适用于配置键为机器优化（例如 `my_gateway`）但 UI 标签应包含空格或品牌大小写的任意 provider。
+</ResponseField>
+
+<ResponseField name="api_key_url" type="string" post={["optional"]}>
+    用户创建或管理 API key 的 provider 页面的 URL。`/auth` 模态框会在 API key 输入之前链接到该页面。此值是 URL，不是凭据。
+</ResponseField>
+
+<ResponseField name="base_url" type="string" post={["optional"]}>
+    在受支持的情况下覆盖 provider 使用的 base URL。更多信息请参考你的 provider 包的[参考文档](https://reference.langchain.com/python/integrations/)。
+
+    将内置 provider 指向线上兼容的端点请参见 [Compatible APIs](#compatible-apis)，通过 `class_path` 配置的 provider 请参见 [Arbitrary providers](#arbitrary-providers)。
+</ResponseField>
+
+<ResponseField name="base_url_env" type="string" post={["optional"]}>
+    保存该 provider 的 base URL 的环境变量名称，与 `api_key_env` 平行。当端点来自环境而不是固定值时使用它而不是 `base_url`—例如因机器或 CI job 而异的 gateway URL—这样它可以在不编辑 `config.toml` 的情况下变化，并可以参与端点解析和 key/端点配对（参见 [Endpoints, keys, and gateways](#endpoints-keys-and-gateways)）。它还将这些能力扩展到[内置集合](/oss/deepagents/code/providers#provider-reference)之外的 provider；参见 [Arbitrary providers](#arbitrary-providers)。
+
+    如果两者都设置，静态 `base_url` 优先：
+
+    ```toml
+    [models.providers.example]
+    base_url = "https://fixed.example/v1"   # used
+    base_url_env = "EXAMPLE_BASE_URL"        # ignored while base_url is set
+    ```
+</ResponseField>
+
+<ResponseField name="params" type="object" post={["optional"]}>
+    转发给模型构造函数的额外关键字参数。扁平键（例如 `temperature = 0`）适用于该 provider 的每个模型。以模型为键的子表（例如 `[params."gpt-5.5"]`）仅覆盖该模型的单个值；合并是浅层的（冲突时模型优先）。
+
+    不要把凭据（例如 `api_key`）放在 `params` 中。改用 [`api_key_env`](#provider-configuration) 指向环境变量。
+</ResponseField>
+
+<ResponseField name="profile" type="object" post={["optional"]}>
+    （高级）覆盖模型运行时 [profile](/oss/langchain/models#model-profiles) 中的字段（例如 `max_input_tokens`）。扁平键适用于该 provider 的每个模型。以模型为键的子表（例如 `[profile."claude-sonnet-4-5"]`）仅覆盖该模型的单个值；合并是浅层的（冲突时模型优先）。这些覆盖在模型创建之后应用，因此它们对上下文限制显示、自动摘要以及读取 profile 的任何其他功能生效。示例和 `--profile-override` flag 请参见 [Profile overrides](#profile-overrides-advanced)。
+</ResponseField>
+
+<ResponseField name="class_path" type="string" post={["optional"]}>
+    用于[任意模型](#arbitrary-providers) provider。`module.path:ClassName` 格式的完全限定 Python 类。设置后，Deep Agents Code 会直接为 provider `<name>` 导入并实例化该类。该类必须是 `BaseChatModel` 的子类。
+</ResponseField>
+
+<ResponseField name="enabled" type="boolean" default="true" post={["optional"]}>
+    该 provider 是否出现在 `/model` 选择器中。设为 `false` 可以隐藏从已安装包中自动发现的 provider（例如你不希望塞满模型切换器的传递依赖）。你仍然可以通过 `/model provider:model` 或 `--model` 直接使用已禁用的 provider。
+</ResponseField>
+
+## 模型构造函数参数
+
+[`params` 字段](#provider-configuration)将额外参数转发给模型构造函数。要让某个模型使用不同的值，添加一个以模型为键的子表，从而不必复制整个 provider 配置：
+
+```toml
+[models.providers.ollama]
+models = ["qwen3:4b", "llama3"]
+
+[models.providers.ollama.params]
+temperature = 0
+num_ctx = 8192
+
+[models.providers.ollama.params."qwen3:4b"]
+temperature = 0.5
+num_ctx = 4000
+```
+
+使用此配置时：
+
+* `ollama:qwen3:4b` 获得 `{temperature: 0.5, num_ctx: 4000}`—模型覆盖优先。
+* `ollama:llama3` 获得 `{temperature: 0, num_ctx: 8192}`—无覆盖，只有 provider 级参数。
+
+合并是浅层的：模型子表中存在的任何键都会替换 provider 级参数中的同名键，而只在 provider 级存在的键会保留。
+
+<Tip>
+    要在不编辑 `config.toml` 的情况下进行一次性调整，可以在启动时或会话中途通过 `--model-params` 传入 JSON 对象，或使用 `/model`。CLI flag 的优先级高于配置文件。语法和 provider 特定示例请参见 providers 页面上的 [Model parameters](/oss/deepagents/code/providers#model-parameters)。
+</Tip>
+
+## Retries
+
+Deep Agents Code 在模型节点处 retry 瞬时模型错误。默认值是首次请求之后 retry 五次。设置顶层 `[retries]` 值可以更改预算，或将其设为 `0` 禁用 retry：
+
+```toml
+[retries]
+max_retries = 2
+
+[retries.fireworks]
+max_retries = 3
+
+[retries.anthropic]
+max_retries = 0
+```
+
+全局 `[retries].max_retries` 值适用于所有受支持的 provider。provider 特定的表（例如 `[retries.fireworks]`）会为该 provider 覆盖全局值。值必须是大于或等于 `0` 的整数。
+
+对于任意 provider，将 `param` 设置为其 retry 次数构造函数参数的名称。Deep Agents Code 仅使用 `param` 来禁用 provider SDK 的 retry 循环，这让模型节点 middleware 成为所配置 retry 预算的唯一所有者：
+
+```toml
+[retries]
+max_retries = 2
+
+[retries.my_custom]
+param = "retries"
+max_retries = 4
+```
+
+`param` 必须是有效的 Python 标识符字符串，例如 `"max_retries"` 或 `"retries"`。它不设置 retry 预算。使用本节中的 `max_retries` 或 `--max-retries` 设置预算。
+
+Retry 预算的优先级顺序为：
+
+1. `--max-retries N`
+2. `[retries.<provider>].max_retries`
+3. `[retries].max_retries`
+4. Deep Agents Code 默认值（`5`）
+
+## 启动时的 approval mode
+
+使用顶层 `[startup].mode` 键为交互式会话设置默认的 [approval mode](/oss/deepagents/code/approval-modes)：
+
+```toml
+[startup]
+mode = "auto"   # "manual" (default), "auto", or "yolo"
+```
+
+接受的值为 `manual`（fail-closed 默认值）、`auto`（基于分类器；需要 `DEEPAGENTS_CODE_EXPERIMENTAL=1`）和 `yolo`（不受限制；需要一次性确认）。显式的 `--yolo` 或 `-y`/`--auto-approve` flag 会为该会话覆盖此值。
+
+## Auto 分类器超时
+
+当 [Auto 模式](/oss/deepagents/code/approval-modes)处于活动状态时，分类器有一定的时间预算来审查每批受控操作。未在截止时间内审查的批次会被以 `classifier_unavailable` 拒绝；反复错过会回退到手动批准 UI。默认值为 20 秒。
+
+如果审查频繁超时，首先可以尝试[选择更快的分类器模型](#default-and-recent-model)（参见 `[models].auto_classifier`）。如果你已经这样做但仍需要更多余量，可以调高截止时间：
+
+<Tabs>
+    <Tab title="Config file">
+        ```toml title="~/.deepagents/config.toml"
+        [models]
+        auto_classifier_timeout = 60   # seconds; minimum 1, maximum 300
+        ```
+    </Tab>
+    <Tab title="环境变量">
+        ```bash
+        export DEEPAGENTS_CODE_AUTO_CLASSIFIER_TIMEOUT=60
+        ```
+    </Tab>
+</Tabs>
+
+环境变量优先于配置文件，配置文件优先于内置默认值。低于 1 或高于 300 的值会被钳制到下限或上限。非整数值会回退到默认值并发出警告。
+
+## Profile 覆盖（高级）
+
+覆盖模型运行时 profile 中的字段可以改变 Deep Agents Code 解释模型能力的方式。可覆盖字段的完整列表请参见 @[`ModelProfile`]。最常见的用例是调低 `max_input_tokens` 以更早触发自动摘要—适用于测试或约束上下文使用：
+
+```toml
+# Apply to all models from this provider
+[models.providers.anthropic.profile]
+max_input_tokens = 4096
+```
+
+以模型为键的子表的工作方式与 `params` 相同—冲突时模型级值优先：
+
+```toml
+[models.providers.anthropic.profile]
+max_input_tokens = 4096
+
+# This model gets a higher limit
+[models.providers.anthropic.profile."claude-sonnet-4-5"]
+max_input_tokens = 8192
+```
+
+Profile 覆盖会在模型创建之后合并到模型的 profile 中。任何读取 profile 的功能—状态栏中的上下文限制显示、自动摘要阈值、能力检查—都会看到覆盖后的值。
+
+<Accordion title="使用 --profile-override 进行 CLI profile 覆盖" icon="terminal">
+    要在运行时覆盖模型 profile 字段而不编辑配置文件，请通过 `--profile-override` 传入 JSON 对象：
+
+    ```bash
+    dcode --profile-override '{"max_input_tokens": 4096}'
+
+    # Combine with --model
+    dcode --model google_genai:gemini-3.6-flash --profile-override '{"max_input_tokens": 4096}'
+
+    # In non-interactive mode
+    dcode -n "Summarize this repo" --profile-override '{"max_input_tokens": 4096}'
+    ```
+
+    这些会合并到配置文件 profile 覆盖之上（CLI 优先）。优先级链为：模型默认值 < config.toml profile < CLI `--profile-override`。
+
+    `--profile-override` 值会在会话中途的 `/model` 热切换之间持久保持—切换模型会将覆盖重新应用到新模型。
+</Accordion>
+
+## 向交互式切换器添加模型
+
+一些 provider（例如 `langchain-ollama`）不捆绑模型 profile 数据（完整列表请参见 [Provider reference](/oss/deepagents/code/providers#provider-reference)）。在这种情况下，交互式 `/model` 切换器不会列出该 provider 的模型。你可以在配置文件中为该 provider 定义一个 `models` 列表来填补空缺：
+
+```toml
+[models.providers.ollama]
+models = ["gemma4", "qwen3.6", "granite4.1:3b"]
+```
+
+`/model` 切换器现在会包含一个列出这些模型的 Ollama 部分。
+
+这完全是可选的。你始终可以通过直接指定完整名称切换到任何模型：
+
+```txt
+/model ollama:qwen3.6:27b
+```
+
+<Note>
+    当 `langchain-ollama` 已安装且 daemon 可达时，Deep Agents Code 会自动发现本地拉取的模型并将它们合并到切换器中—无需 `models` 列表。拉取新模型后运行 `/reload` 刷新，或设置 `DEEPAGENTS_CODE_OLLAMA_DISCOVERY=0` 以退出。
+</Note>
+
+## 自定义 base URL
+
+一些 provider 包接受 `base_url` 以覆盖默认端点。例如，`langchain-ollama` 通过底层的 `ollama` 客户端默认使用 `http://localhost:11434`。要指向其他位置，请在配置中设置 `base_url`：
+
+```toml
+[models.providers.ollama]
+base_url = "http://your-host-here:port"
+```
+
+兼容性信息和其他注意事项请参考你的 provider 的参考文档。
+
+## 兼容的 API
+
+对于暴露与 OpenAI 或 Anthropic 线上兼容的 API 的 provider，你可以使用现有的 `langchain-openai` 或 `langchain-anthropic` 包，方法是将 `base_url` 指向该 provider 的端点：
+
+```toml
+[models.providers.openai]
+base_url = "https://api.example.com/v1"
+api_key_env = "EXAMPLE_API_KEY"
+models = ["my-model"]
+```
+
+```toml
+[models.providers.anthropic]
+base_url = "https://api.example.com"
+api_key_env = "EXAMPLE_API_KEY"
+models = ["my-model"]
+```
+
+<Note>
+    provider 在官方 spec 之上添加的任何功能都无法被捕获。如果该 provider 提供了专用的 LangChain 集成包，请优先使用它。
+</Note>
+
+<Warning>
+    OpenAI provider 默认使用 [Responses API](https://platform.openai.com/docs/api-reference/responses)，而大多数 OpenAI 兼容的 gateway 并不实现它。如果你的 provider 只支持 Chat Completions API，调用很可能会失败。显式禁用 Responses API：
+
+    ```toml
+    [models.providers.openai.params]
+    use_responses_api = false
+    ```
+</Warning>
+
+## 任意 provider
+
+Deep Agents Code 可以搭配任何以 [LangChain `BaseChatModel`](https://reference.langchain.com/python/langchain-core/language_models) 形式可用的支持 tool calling 的 LLM 使用。[内置 provider](/oss/deepagents/code/providers#provider-reference) 开箱即用；较少见或自研的模型需要多一点设置。将 `class_path` 指向它的 `BaseChatModel` 子类，Deep Agents Code 会直接导入并实例化该类。
+
+```toml
+[models.providers.my_custom]
+display_name = "My Custom Provider"
+api_key_url = "https://my-provider.example.com/keys"
+class_path = "my_package.models:MyChatModel"
+api_key_env = "MY_API_KEY"
+base_url = "https://my-endpoint.example.com"
+
+[models.providers.my_custom.params]
+temperature = 0
+max_tokens = 4096
+```
+
+`api_key_env` 和 `base_url` 是可选的。`display_name` 和 `api_key_url` 自定义 `/auth` 显示的 provider 名称和获取 key 的链接；省略它们会回退到 provider 配置键和 provider 设置文档。要从环境变量读取端点而不是硬编码 `base_url`，请使用 [`base_url_env`](#provider-configuration)；之后它会以与内置 provider 相同的方式解析并与 key 配对（参见 [Endpoints, keys, and gateways](#endpoints-keys-and-gateways)）。
+
+`class_path` provider 预期在内部处理自己的身份验证—当你的模型使用自定义 auth（JWT token、专有 header、mTLS 等）而不是标准 API key 时很有用：
+
+```toml
+[models.providers.xyz]
+class_path = "abc.integrations.deepagents:DeepAgentsXYZChat"
+models = ["abc-xyz-1"]
+
+[models.providers.xyz.params]
+bypass_auth = true
+temperature = 0
+```
+
+使用此配置后，通过 `/model xyz:abc-xyz-1` 或 `--model xyz:abc-xyz-1` 切换到该模型。
+
+<Note>
+    Deep Agents Code 需要 **tool calling** 支持。如果你的自定义模型支持 tool calling 但 Deep Agents Code 不知道这一点，请在 provider profile 中声明：
+
+    ```toml
+    [models.providers.xyz.profile]
+    tool_calling = true
+    max_input_tokens = 128000
+    ```
+
+    虽然是可选的，但强烈建议将 `max_input_tokens` 设置为模型的上下文窗口。没有它，Deep Agents Code 无法显示上下文有多满，自动摘要会回退到固定触发点（约 170,000 token）而不是模型窗口的一部分。对于窗口较小的模型，摘要可能在你达到模型的硬性限制之前不会运行，因此一旦对话增长请求就会开始失败。
+</Note>
+
+由于 Deep Agents Code 在启动时导入 `class_path` 类，定义它的包必须可以从运行 `dcode` 的同一环境中导入。内置 provider 以[安装 extras](/oss/deepagents/code/providers#quickstart) 形式提供，但自定义或自研包不是。使用 `--package` flag 将它安装到 `dcode` 环境中：
+
+```bash
+dcode --install my_package --package
+```
+
+在会话中运行 `/install my_package --package --force`。两者都会将包安装到 `dcode` 旁边。如果包缺失或无法导入，Deep Agents Code 会跳过该 provider，其模型不会出现在 `/model` 中。
+
+当你切换到 `my_custom:my-model-v1`（通过 `/model` 或 `--model`）时，模型名称（`my-model-v1`）会作为 `model` kwarg 传入：
+
+```python
+MyChatModel(model="my-model-v1", base_url="...", api_key="...", temperature=0, max_tokens=4096)
+```
+
+<Warning>
+    `class_path` 会从你的配置文件执行任意 Python 代码。它的信任模型与 `pyproject.toml` 构建脚本相同—你控制自己的机器。
+</Warning>
+
+你的 provider 包可以选择在 `<package>.data._profiles` 的 `_PROFILES` dict 中提供模型 profile，而不是在 `models` 键下定义。更多信息请参见 LangChain [model profiles](https://github.com/langchain-ai/langchain/tree/master/libs/model-profiles)。
+
+## 端点、key 与 gateway
+
+API key 与它发送到的端点必须匹配：端点必须接受该 key，否则请求很可能失败。Deep Agents Code 会一起解析 key 和端点，因此覆盖其中一个也会更新另一个以保持匹配。例如，如果你把 gateway 预置的 key 替换为你自己的，Deep Agents Code 也会丢弃 gateway 端点，因此你的 key 会直接到达 provider，而不是发到一个会拒绝它的 gateway。
+
+### `base_url` 如何解析
+
+Deep Agents Code 按以下顺序解析 provider 的端点（第一个匹配生效）：
+
+1. 该 provider 在 `config.toml` 中的 **`base_url`**。
+2. **带 `DEEPAGENTS_CODE_` 前缀的端点变量。**
+3. 环境中的**普通端点变量**（例如 `OPENAI_BASE_URL`）。
+4. **随 `/auth` 凭据保存的端点。** 此步骤为没有端点变量的 provider 应用保存的端点—例如你在添加时未声明 [`base_url_env`](#provider-configuration) 的 provider。步骤 2-3 对这些 provider 没有变量可读，因此直接在此处使用保存的端点。对于确实有端点变量的 provider，保存的端点已经在步骤 2 或 3 生效（它被写入该变量），因此此步骤不改变任何东西。无论哪种方式，在 `/auth` 中输入的端点都会生效。
+5. **provider SDK 自身的默认端点**，当以上都未设置时。
+
+<Note>
+    解析出的端点会作为 `base_url` 构造函数参数传递给模型。
+</Note>
+
+与 API key 一样，[`DEEPAGENTS_CODE_` prefix](/oss/deepagents/code/configuration#deepagents_code_-prefix) 将端点限定到 Deep Agents Code 而不影响其他工具。对于任何其他 provider，用 [`base_url_env`](#provider-configuration) 声明名称，端点会以相同的方式解析并配对：
+
+```toml
+[models.providers.myprovider]
+api_key_env = "MYPROVIDER_API_KEY"
+base_url_env = "MYPROVIDER_BASE_URL"
+models = ["my-model"]
+```
+
+字面量 `base_url` 优先于 `base_url_env`，因此只需设置你需要的那一个：
+
+```toml
+[models.providers.myprovider]
+base_url = "https://fixed.example/v1"   # used
+base_url_env = "MYPROVIDER_BASE_URL"    # ignored while base_url is set
+```
+
+### 覆盖会让 key 和端点保持成对
+
+当你用 `/auth` 存储 key 时，你输入的端点（如果留空则为 provider 默认值）会与 key 一起应用。以空白 base URL 存储 key 还会清除环境中已设置的任何端点（例如你的 shell 导出的 gateway `OPENAI_BASE_URL`），因此你的 key 会前往 provider 的默认端点，而不是该 gateway。
+
+```bash title="Scope both the key and the endpoint to Deep Agents Code"
+DEEPAGENTS_CODE_OPENAI_API_KEY=sk-cli-only
+DEEPAGENTS_CODE_OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+### 受管 gateway
+
+在预置了模型 gateway 的机器上（例如 LangSmith Gateway），gateway 通常会一起导出 gateway key 和匹配的端点变量（`OPENAI_BASE_URL`、`ANTHROPIC_BASE_URL` 或 `GOOGLE_GEMINI_BASE_URL`）。Deep Agents Code 默认使用该配对，因此无需配置。
+
+要改用自己的 key，请用 `/auth` 存储它（base URL 留空使用 provider 默认值，或显式设置），或设置带 `DEEPAGENTS_CODE_` 前缀的 key 和端点。两者都会覆盖 gateway 配对，而不会留下不匹配的端点。
+
+## JS interpreter
+
+`[interpreter]` 部分用于调整内置 JavaScript interpreter（`js_eval` 工具），它在 QuickJS sandbox 中运行 agent 编写的代码。这些键仅适用于配置文件；`--interpreter` 和 `--interpreter-tools` flag 的等价形式请参见 [Command line options](/oss/deepagents/code/cli-reference#command-line-options)。
+
+```toml title="~/.deepagents/config.toml"
+[interpreter]
+enable_interpreter = true       # default
+timeout_seconds = 5.0           # default
+memory_limit_mb = 64            # default
+max_ptc_calls = 256             # default
+max_result_chars = 4000         # default
+ptc = "safe"                    # default: "safe"
+ptc_acknowledge_unsafe = false  # default
+```
+
+<ResponseField name="enable_interpreter" type="boolean" default="true" post={["optional"]}>
+    将 QuickJS REPL middleware（`js_eval`）接入主 agent（仅限本地会话）。设为 `false` 完全禁用 interpreter；为某个会话重新启用请使用 `--interpreter`。
+</ResponseField>
+
+<ResponseField name="timeout_seconds" type="number" default="5.0" post={["optional"]}>
+    QuickJS REPL 的每次调用实际时间超时。
+</ResponseField>
+
+<ResponseField name="memory_limit_mb" type="integer" default="64" post={["optional"]}>
+    QuickJS 堆内存上限（MB），在一个会话内共享。
+</ResponseField>
+
+<ResponseField name="max_ptc_calls" type="integer" default="256" post={["optional"]}>
+    每次 `js_eval` 调用的最大 `tools.*` host-bridge 调用次数。
+</ResponseField>
+
+<ResponseField name="max_result_chars" type="integer" default="4000" post={["optional"]}>
+    `js_eval` 结果和捕获的 stdout 在截断前的字符上限。
+</ResponseField>
+
+<ResponseField name="ptc" type="string | boolean | string[]" default='"safe"' post={["optional"]}>
+    `js_eval` 的[程序化 tool calling](/oss/deepagents/interpreters#programmatic-tool-calling-ptc) allowlist。接受的值：
+
+    - `"safe"`（默认）：只读预设 `read_file`、`glob`、`grep`。这些工具在 REPL 之外不受批准控制，因此暴露它们不会引入批准绕过。网络工具、subagent 派发、shell 执行和文件写入被刻意排除。
+    - `"all"`：所有宿主工具。需要 `ptc_acknowledge_unsafe = true`，除非批准被全局禁用，因为 PTC 调用会绕过批准提示。
+    - 工具名称列表，例如 `["safe", "web_search"]`—`"safe"` 条目会展开为预设。`"all"` 不允许出现在列表中。
+    - `false` 或 `[]`：REPL 无法访问工具（纯 interpreter）。`true` 会被拒绝—请使用 `"safe"`、`"all"` 或显式列表。
+</ResponseField>
+
+<ResponseField name="ptc_acknowledge_unsafe" type="boolean" default="false" post={["optional"]}>
+    确认 `ptc = "all"` 会将所有工具暴露给绕过批准提示的 PTC 调用。`ptc = "all"` 需要此确认，除非在批准被禁用的情况下运行。
+</ResponseField>
+
+## Python extensions
+
+`[extensions]` 部分控制 [Python extension](/oss/deepagents/code/extensions) 的发现和项目信任。即使此处启用了 extension 加载，也需要实验性功能开关。
+
+```toml title="~/.deepagents/config.toml"
+[extensions]
+enabled = true
+trust = "ask"
+extra_paths = [
+    "extensions/policy.py",
+    "~/src/company-extensions",
+]
+```
+
+<ResponseField name="enabled" type="boolean" default="true" post={["optional"]}>
+    为每个来源启用 Python extension 发现，包括 `-e` / `--extension` 路径、用户和项目目录、plugins 和 entry points。设置 `DEEPAGENTS_CODE_EXTENSIONS` 可以覆盖此值。两个设置都需要在启动 Deep Agents Code 之前设置 `DEEPAGENTS_CODE_EXPERIMENTAL=1`。
+</ResponseField>
+
+<ResponseField name="trust" type="string" default='"ask"' post={["optional"]}>
+    为 `<project>/.deepagents/extensions/` 中的项目 extensions 设置默认策略：`ask` 在交互式启动时提示，`always` 加载它们，`never` 跳过它们。设置 `DEEPAGENTS_CODE_EXTENSIONS_TRUST` 可以覆盖此值。只有当你打开的每个项目都受信任时才使用 `always`。
+</ResponseField>
+
+<ResponseField name="extra_paths" type="string[]" default="[]" post={["optional"]}>
+    添加用户授权的 Python extension 文件或目录。相对路径从 Deep Agents Code profile 目录解析；`~` 展开为你的主目录。
+</ResponseField>
+
+## 设置 MCP tool-call 超时
+
+`[mcp].tool_timeout` 设置限制每个 MCP tool call 在返回错误之前可以运行多长时间。
+
+默认值为 `120` 秒。在 `[mcp]` 表中设置 `tool_timeout`。`DEEPAGENTS_CODE_MCP_TOOL_TIMEOUT` 会覆盖用户配置值。无效值会向下落到下一个配置来源。
+
+超时的操作可能仍在 server 上运行。在 retry 之前检查其状态，以避免重复工作。
+
+## Agent 运行时限制
+
+LangGraph 图步骤预算是 `dcode` agent 图在单个回合中可以执行的最大节点调用次数。使用 `[runtime]` 部分配置此 recursion limit：
+
+```toml title="~/.deepagents/config.toml"
+[runtime]
+recursion_limit = 5000
+```
+
+Deep Agents Code 不设置默认值。当没有任何来源设置有效值时，应用 LangGraph server 默认值。来自受管配置、环境和 `config.toml` 的值必须是 `25` 到 `100000`（含）之间的整数。无效值会记录警告，解析继续到下一个来源。`--recursion-limit` flag 接受任何大于或等于 `1` 的整数。
+
+优先级（从高到低）：
+
+1. 管理员拥有的 `managed_config.toml`
+2. `--recursion-limit` CLI flag
+3. `DEEPAGENTS_CODE_RECURSION_LIMIT` 环境变量
+4. `config.toml` 中的 `[runtime].recursion_limit`
+5. `LANGGRAPH_DEFAULT_RECURSION_LIMIT` 环境变量
+6. LangGraph server 默认值
+
+使用 `dcode config get runtime.recursion_limit` 查看 Deep Agents Code 的生效值及其来源。未设置的结果会将该限制留给 LangGraph server。
+
+<Tabs>
+    <Tab title="CLI flag">
+        ```bash
+        dcode --recursion-limit 5000
+        ```
+    </Tab>
+    <Tab title="环境变量">
+        ```bash
+        export DEEPAGENTS_CODE_RECURSION_LIMIT=5000
+        ```
+    </Tab>
+    <Tab title="Config file">
+        ```toml title="~/.deepagents/config.toml"
+        [runtime]
+        recursion_limit = 5000
+        ```
+    </Tab>
+</Tabs>
+
+<Note>
+    `goal_rubric` recursion limits 是独立的，不受此设置影响。
+</Note>
+
+## See also
+
+- [Configuration](/oss/deepagents/code/configuration)
+- [Provider credentials](/oss/deepagents/code/credentials)
+- [Providers](/oss/deepagents/code/providers)
+- [Python extensions](/oss/deepagents/code/extensions)
+- [CLI reference](/oss/deepagents/code/cli-reference)

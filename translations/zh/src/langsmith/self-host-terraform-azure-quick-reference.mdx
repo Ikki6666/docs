@@ -1,0 +1,219 @@
+---
+title: Azure Terraform 速查参考
+sidebarTitle: 速查参考
+description: LangSmith self-hosted 在 AKS 上的 make 目标、Terraform、kubectl、Azure CLI 与 Helm 命令速查。
+---
+
+这是针对使用 [Azure Terraform modules](https://github.com/langchain-ai/terraform/tree/main/modules/azure) 预配的 Azure LangSmith 部署进行日常操作的命令速查表。所有 `make` 目标都在 `modules/azure/` 中运行。运行 `make help` 可查看内联摘要。
+
+完整部署流程请参见 [Azure 部署指南](/langsmith/self-host-terraform-azure-deploy)。
+
+## 部署概览
+
+| 阶段 | 部署的内容 | 命令 |
+|---|---|---|
+| Infrastructure | AKS + Postgres + Redis + Blob + Key Vault + cert-manager + KEDA + ingress | `make apply` |
+| Cluster credentials | Kubeconfig + 来自 Key Vault 的 Kubernetes Secrets | `make kubeconfig && make k8s-secrets` |
+| LangSmith（Helm 路径） | LangSmith Helm（约 17 个 pods），通过 shell 脚本 | `make init-values && make deploy` |
+| LangSmith（Terraform 路径） | Secrets + SA + Helm release 纳入 Terraform state 管理 | `make init-app && make apply-app` |
+| LangSmith Deployment add-on | host-backend、listener、operator。需先将 `default_node_pool_min_count` 提高到 5 | `make apply && make init-values && make deploy` |
+| Agent Builder add-on | tool-server、trigger-server、agent-builder LGP | `make init-values && make deploy` |
+| Insights + Polly add-on | Clio 分析、Polly eval agent | `make init-values && make deploy` |
+
+## 首次设置
+
+```bash
+cd terraform/modules/azure
+
+# 1. Generate terraform.tfvars (interactive wizard)
+make quickstart
+
+# 2. Bootstrap secrets (prompts on first run, reads from Key Vault on repeat)
+make setup-env
+
+# 3. Preflight (Azure CLI, RBAC, providers)
+make preflight
+
+# 4. Deploy infrastructure (~15 to 20 min)
+#    Skip `make plan` on a fresh deploy — kubernetes_manifest needs a live cluster
+make init
+make apply
+
+# 5. Cluster credentials + Kubernetes Secrets
+make kubeconfig
+make k8s-secrets
+
+# 6. Generate Helm values from Terraform outputs
+make init-values
+
+# 7. Deploy LangSmith (~10 min)
+make deploy
+
+# 8. Health check
+make status
+```
+
+或一次性运行整个流程：
+
+```bash
+make deploy-all      # apply → kubeconfig → k8s-secrets → init-values → deploy
+make deploy-all-tf   # apply → init-values → init-app → apply-app (Terraform path)
+```
+
+## Day-2 运维
+
+```bash
+make status         # 10-section health check
+make status-quick   # skip Key Vault + K8s secret queries (faster)
+make deploy         # re-deploy after any Helm value changes
+make init-values    # re-generate values after Terraform changes
+make kubeconfig     # refresh cluster credentials
+make k8s-secrets    # re-create langsmith-config-secret from Key Vault
+
+# Manage Key Vault secrets
+make keyvault                                       # interactive menu
+./infra/scripts/manage-keyvault.sh list             # all secrets with timestamps
+./infra/scripts/manage-keyvault.sh get <secret>     # read a secret
+./infra/scripts/manage-keyvault.sh set <key> <val>  # update a secret
+./infra/scripts/manage-keyvault.sh validate         # check all required secrets exist
+./infra/scripts/manage-keyvault.sh diff             # compare KV vs K8s secret
+./infra/scripts/manage-keyvault.sh delete <key>     # soft-delete (recoverable 90 days)
+```
+
+## add-on
+
+add-on 阶段（3 到 5）由 `infra/terraform.tfvars` 中的开关控制。设置开关后，重新运行 `init-values && deploy`。`init-values.sh` 会自动把对应的示例文件复制到 `helm/values/`。
+
+```hcl
+# infra/terraform.tfvars
+sizing_profile       = "production"   # minimum | dev | production | production-large
+enable_deployments   = true           # LangSmith Deployment add-on (listener + operator + host-backend)
+enable_agent_builder = true           # Agent Builder add-on (requires enable_deployments)
+enable_insights      = true           # Insights / Clio analytics add-on
+enable_polly         = true           # Polly AI eval add-on (requires enable_deployments)
+```
+
+<Warning>
+LangSmith Deployment add-on 需要先设置 `default_node_pool_min_count = 5`。operator 派生的 pods 需要节点余量；否则 agent pods 会无限期停留在 `Pending` 状态。
+</Warning>
+
+## Sizing profile
+
+在 `terraform.tfvars` 中设置 `sizing_profile`，然后重新运行 `make init-values && make deploy`。
+
+| Profile | 适用场景 |
+|---|---|
+| `minimum` | 成本占位、CI 冒烟测试、单人演示。真实流量下会出现 OOM。 |
+| `dev` | 轻量非生产环境，用于本地开发、CI 流水线、集成测试、短期 POC。 |
+| `production` | 生产环境_推荐_。所有无状态组件多副本 + HPA。 |
+| `production-large` | 基于扩容指南的高流量起点（约 50 个并发用户、约 1000 traces/sec）。 |
+
+## kubectl
+
+```bash
+# Pod health
+kubectl get pods -n langsmith
+kubectl get pods -n langsmith -w
+kubectl describe pod <pod-name> -n langsmith
+kubectl logs <pod-name> -n langsmith --tail=100 -f
+kubectl logs <pod-name> -n langsmith --previous --tail=50
+
+# Backend logs (live)
+kubectl logs -n langsmith deploy/langsmith-backend --tail=100 -f
+
+# Ingress
+kubectl get ingress -n langsmith
+kubectl describe ingress -n langsmith
+
+# NGINX LoadBalancer external IP
+kubectl get svc ingress-nginx-controller -n ingress-nginx
+
+# TLS
+kubectl get certificate -n langsmith
+kubectl get challenges -n langsmith
+kubectl describe certificate <cert-name> -n langsmith
+kubectl get clusterissuer
+
+# Workload Identity
+kubectl get serviceaccount langsmith-ksa -n langsmith -o yaml | grep annotation -A5
+
+# Helm
+helm status langsmith -n langsmith
+helm history langsmith -n langsmith
+helm get values langsmith -n langsmith
+
+# LangSmith Deployment
+kubectl get lgp -n langsmith
+kubectl get crd | grep langchain
+```
+
+## Azure CLI
+
+```bash
+# Re-auth
+az login
+az account set --subscription <subscription-id>
+az account show
+
+# AKS
+az aks list
+az aks show --name <cluster> --resource-group <rg>
+az aks get-credentials --name <cluster> --resource-group <rg>
+
+# PostgreSQL
+az postgres flexible-server list
+az postgres flexible-server show --name <server> --resource-group <rg>
+
+# Redis
+az redis list
+az redis show --name <cache> --resource-group <rg>
+
+# Blob Storage
+az storage account list
+az storage container list --account-name <account>
+
+# Key Vault
+az keyvault list
+az keyvault secret list --vault-name <vault>
+az keyvault secret show --vault-name <vault> --name <secret> --query value -o tsv
+
+# Application Gateway (AGIC)
+az network application-gateway list
+```
+
+## Terraform
+
+```bash
+cd modules/azure/infra
+
+terraform init
+terraform plan        # skip on first run, see deploy notes
+terraform apply
+terraform apply -target=module.aks
+
+terraform output
+terraform output -raw aks_cluster_name
+terraform output -raw keyvault_name
+terraform output -raw storage_account_name
+
+terraform state list
+```
+
+## 关键约束
+
+- 全新部署时跳过 `make plan`。`kubernetes_manifest` 资源需要可用的集群 API。直接使用 `make apply`。
+- 在 `terraform destroy` 之前先卸载 Helm。Azure Load Balancer 持有子网引用；不先卸载会阻塞 VNet 删除。先运行 `make uninstall`。
+- `config.deployment.url` 必须包含 `https://`。缺少它，operator 派生的 agent 会卡在 `DEPLOYING`。
+- LangSmith Deployment add-on 必须设置 `config.deployment.enabled: true`。只设置 URL 而没有 `enabled: true`，会静默跳过 `listener` 和 `operator`。
+- 加密密钥在首次启用后绝不能更改。轮换 `insights_encryption_key` 或 `polly_encryption_key` 会永久损坏现有的已加密数据。
+- 首次启用 Polly 后重启 frontend。`agentBootstrap` 在注册之后才创建 `langsmith-polly-config`；更早启动的 frontend pods 不会拾取它。
+- `letsencrypt`（HTTP-01）仅适用于 `nginx`、`istio`（自托管）和 `envoy-gateway`。对于 `istio-addon` 或 `agic`，请使用自定义域名的 `dns01`，或仅 HTTP 的 `none`。
+- 销毁后 Key Vault 进入 90 天 soft-delete。当 `keyvault_purge_protection = false` 时，运行 `az keyvault purge` 可立即回收该名称。
+
+## 拆除
+
+```bash
+make uninstall   # removes Helm release + LGP resources; prompts to delete namespace
+make destroy     # destroys all Azure infrastructure via terraform destroy
+make clean       # removes local secrets, config, helm values, and tfstate files
+```

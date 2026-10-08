@@ -1,0 +1,164 @@
+---
+title: 为数据存储配置 IAM 身份验证
+sidebarTitle: 数据存储 IAM 身份验证
+description: 配置 Agent Server 使用云工作负载身份进行 PostgreSQL 和 Redis 身份验证。
+---
+
+Agent Server 可以使用云工作负载身份在运行时生成短期有效的 PostgreSQL 和 Redis 凭证。这会将静态数据库和缓存密码从你的部署配置中移除。连接和池化行为保持不变。
+
+<Note>
+数据存储 IAM 身份验证要求 `langgraph-api>=0.12.0`。
+</Note>
+
+## 受支持的服务
+
+| Provider 值 | PostgreSQL | Redis | 凭证来源 |
+|----------------|------------|-------|-------------------|
+| `aws` | Amazon RDS 或 Aurora PostgreSQL | Amazon ElastiCache 预置的 cache clusters 或 replication groups | AWS SDK 默认凭证链 |
+| `azure` | Azure Database for PostgreSQL Flexible Server | Azure Managed Redis 或 Azure Cache for Redis | Microsoft Entra `DefaultAzureCredential` |
+| `gcp` | Cloud SQL for PostgreSQL | Memorystore for Redis Cluster | Google Application Default Credentials (ADC) |
+
+<Warning>
+GCP PostgreSQL provider 支持 Cloud SQL。它不支持 AlloyDB，后者需要不同的 token scope。
+</Warning>
+
+provider 设置只控制身份验证。在启动 Agent Server 之前，请先配置网络访问、TLS、数据库用户、缓存用户以及 provider 权限。
+
+## 启用 IAM 身份验证
+
+启用 IAM 身份验证的步骤：
+
+1. 在托管数据存储上启用 IAM 或基于身份的身份验证。
+2. 创建数据库或缓存 principal，并只授予 Agent Server 所需的权限。
+3. 让每个 Agent Server API 和 queue 进程都能取得工作负载身份凭证。
+4. 设置一个包含 principal 名称但不包含静态密码的 connection URI。
+5. 将相应的 provider 选择器设置为 `aws`、`azure` 或 `gcp`：
+
+    ```shell
+    AGENT_POSTGRES_IAM_AUTH_PROVIDER=<provider>
+    AGENT_REDIS_IAM_AUTH_PROVIDER=<provider>
+    ```
+
+你可以为 PostgreSQL、Redis 或两者启用 IAM 身份验证。当某个选择器未设置时，Agent Server 会继续使用该数据存储的 connection URI 中的密码。
+
+根据你的部署类型使用以下 connection URI 变量：
+
+| 部署方式 | PostgreSQL URI | Redis URI |
+|------------|----------------|-----------|
+| Standalone Agent Server | `DATABASE_URI` | `REDIS_URI` |
+| 带 control plane 的 self-hosted 部署 | `POSTGRES_URI_CUSTOM` | `REDIS_URI_CUSTOM` |
+
+connection URI 必须满足以下要求：
+
+- **传输安全**：PostgreSQL 使用 `sslmode=require` 或更严格的验证模式，Redis 使用 `rediss://`。
+- **字符编码**：对用户名中的 URI 保留字符进行百分号编码，例如 `@` 编码为 `%40`。
+- **私有证书颁发机构**：如果 Redis TLS 使用私有证书颁发机构，请将 `REDIS_TLS_CA_CERT` 设置为 base64 编码的 PEM CA bundle。
+- **集群模式**：如果 Redis 服务使用 cluster mode，还需设置 `REDIS_CLUSTER=true`。
+
+## 配置 AWS
+
+Agent Server 使用 AWS SDK 默认凭证链来创建 RDS 身份验证令牌和 ElastiCache SigV4 身份验证令牌。
+
+在配置 Agent Server 之前：
+
+- 为 RDS 或 Aurora PostgreSQL [启用 IAM 数据库身份验证](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html)。为数据库用户授予 `rds_iam` 角色，并为该用户授予工作负载身份 `rds-db:connect` 权限。
+- 为 ElastiCache 用户[启用 IAM 身份验证](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/auth-iam.html)。为 ElastiCache cache 或 replication group 以及 ElastiCache 用户授予工作负载身份 `elasticache:Connect` 权限。
+- 通过 EKS Pod Identity、IAM roles for service accounts (IRSA)、instance profile 或其他 AWS SDK 凭证来源配置 AWS 凭证。将 `AWS_REGION` 或 `AWS_DEFAULT_REGION` 设置为数据存储所在的 region。
+
+在 connection URI 中设置数据库用户名：
+
+```shell
+AWS_REGION=<region>
+AGENT_POSTGRES_IAM_AUTH_PROVIDER=aws
+AGENT_REDIS_IAM_AUTH_PROVIDER=aws
+DATABASE_URI="postgresql://<rds-user>@<rds-endpoint>:5432/<database>?sslmode=require"
+REDIS_URI="rediss://<elasticache-iam-user>@<elasticache-endpoint>:6379"
+```
+
+Redis 用户名必须与启用了 IAM 的 ElastiCache 用户匹配。Agent Server 支持预置的 ElastiCache cache clusters 和 replication groups。ElastiCache IAM 身份验证要求传输中加密，以及 Valkey 7.2 或更高版本，或 Redis OSS 7.0 或更高版本。
+
+## 配置 Azure
+
+Agent Server 使用 `DefaultAzureCredential` 为 PostgreSQL 和 Redis 获取 Microsoft Entra 令牌。该凭证链支持 Azure Workload Identity、managed identities 和 service principals。
+
+在配置 Agent Server 之前：
+
+- 为 Azure Database for PostgreSQL Flexible Server [配置 Microsoft Entra 身份验证](https://learn.microsoft.com/azure/postgresql/security/security-connect-with-managed-identity)。为 managed identity 或 service principal 创建一个数据库角色，并将该角色名称用作 PostgreSQL URI 用户名。
+- 为 Azure Managed Redis [配置 Microsoft Entra 身份验证](https://learn.microsoft.com/azure/redis/entra-for-authentication)和数据访问策略。将 managed identity 或 service principal 的 object ID 用作 Redis URI 用户名。
+- 为每个 Agent Server 工作负载配置 Azure Workload Identity、managed identity 或其他 `DefaultAzureCredential` 来源。
+
+在 connection URI 中设置 Microsoft Entra principal 标识符：
+
+```shell
+AGENT_POSTGRES_IAM_AUTH_PROVIDER=azure
+AGENT_REDIS_IAM_AUTH_PROVIDER=azure
+DATABASE_URI="postgresql://<entra-principal-name>@<postgres-host>:5432/<database>?sslmode=require"
+REDIS_URI="rediss://<entra-object-id>@<redis-host>:<port>"
+```
+
+在 cluster mode 下使用 Azure Managed Redis 时，设置 `REDIS_CLUSTER=true`。Agent Server 会在令牌过期之前刷新 Microsoft Entra 令牌，并对已打开的 Redis 连接重新认证。
+
+## 配置 GCP
+
+Agent Server 使用 Google ADC 来获取 Cloud SQL 登录令牌和 Memorystore 访问令牌。ADC 支持 GKE Workload Identity Federation、附加的 service accounts、service account impersonation 以及 `GOOGLE_APPLICATION_CREDENTIALS`。
+
+在配置 Agent Server 之前：
+
+- [配置 Cloud SQL IAM 数据库身份验证](https://cloud.google.com/sql/docs/postgres/iam-logins)，将 IAM principal 添加为数据库用户，并授予其 `roles/cloudsql.instanceUser`。数据库权限单独授予。
+- [配置 Memorystore IAM 身份验证](https://cloud.google.com/memorystore/docs/cluster/manage-iam-auth)，并授予工作负载身份 `roles/redis.dbConnectionUser`。
+- 为每个 Agent Server 工作负载配置 ADC。相比 service account key，优先使用 Workload Identity Federation 或附加的 service account。
+
+在 PostgreSQL URI 中设置 Cloud SQL IAM 数据库用户。Memorystore 只支持 `default` Redis 用户名：
+
+```shell
+AGENT_POSTGRES_IAM_AUTH_PROVIDER=gcp
+AGENT_REDIS_IAM_AUTH_PROVIDER=gcp
+DATABASE_URI="postgresql://<cloud-sql-iam-user>@<cloud-sql-host>:5432/<database>?sslmode=require"
+REDIS_URI="rediss://default@<memorystore-discovery-endpoint>:<port>"
+REDIS_CLUSTER=true
+```
+
+对于 service account，Cloud SQL 数据库用户名是其不带 `.gserviceaccount.com` 后缀的电子邮件地址。
+
+## 配置 standalone Helm chart
+
+对于 Kubernetes 上的 [standalone Agent Server 部署](/langsmith/deploy-standalone-server)，请在每个 Agent Server 工作负载上设置 provider 选择器。如果启用了独立的 queue 部署，请使用相同的身份和环境变量配置 API 和 queue 部署。
+
+以下示例对两个数据存储都使用 AWS。使用其他云提供商时，将每个 provider 值设置为 `azure` 或 `gcp`：
+
+```yaml
+postgres:
+  external:
+    enabled: true
+    connectionUrl: "postgresql://<database-user>@<postgres-host>:5432/<database>?sslmode=require"
+redis:
+  external:
+    enabled: true
+    connectionUrl: "rediss://<redis-user>@<redis-host>:<port>"
+
+apiServer:
+  deployment:
+    extraEnv:
+      - name: AGENT_POSTGRES_IAM_AUTH_PROVIDER
+        value: "aws"
+      - name: AGENT_REDIS_IAM_AUTH_PROVIDER
+        value: "aws"
+
+queue:
+  enabled: true
+  deployment:
+    extraEnv:
+      - name: AGENT_POSTGRES_IAM_AUTH_PROVIDER
+        value: "aws"
+      - name: AGENT_REDIS_IAM_AUTH_PROVIDER
+        value: "aws"
+```
+
+使用云提供商的工作负载身份机制配置 `apiServer.serviceAccount` 和 `queue.serviceAccount`。两个工作负载都必须能够取得凭证并连接到数据存储。
+
+## 下一步
+
+- [自托管 standalone servers](/langsmith/deploy-standalone-server)
+- [Self-hosted Agent Server 环境变量](/langsmith/env-var-self-hosted)
+- [Self-hosted 平台功能](/langsmith/self-hosted-platform-features)
+- [为扩展性配置 Agent Server](/langsmith/agent-server-scale)

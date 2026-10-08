@@ -1,0 +1,326 @@
+---
+title: Azure Terraform 架构
+sidebarTitle: 架构
+description: LangSmith self-hosted 在 AKS 上的平台分层、服务、Workload Identity、网络、ingress 选项与 module 依赖。
+---
+
+了解 [Azure Terraform modules](https://github.com/langchain-ai/terraform/tree/main/modules/azure) 会预配哪些内容，以及各部分如何协同工作，这样你就可以在运行 `make apply` 之前规划容量、加固安全并自定义 LangSmith 部署。
+
+在规划上线或排查现有部署时，可以将本页作为参考。本页涵盖：
+
+- 平台分层与部署层级（light 与 production）。
+- 应用部署路径（Helm 与 Terraform）。
+- 网络、Workload Identity 和密钥流转。
+- Add-on：LangSmith Deployment、Agent Builder、Insights 和 Polly。
+- Ingress controller、资源规格和可选 module。
+
+如果已准备好安装，请从[部署流程指南](/langsmith/self-host-terraform-azure-deploy)开始。
+
+## 平台分层
+
+LangSmith 在 Azure 上分阶段部署。每个阶段都在前一阶段之上增加一层能力。所有层共享同一个 AKS 集群和 `langsmith` namespace。
+
+<img src="/images/self-hosted-terraform/azure-architecture.png" alt="LangSmith on Azure service layout" />
+
+| 阶段 | 分层 | 新增内容 |
+|---|---|---|
+| Infrastructure | Azure infrastructure | VNet、AKS、Postgres、Redis、Blob、Key Vault、cert-manager、KEDA、ingress controller |
+| Application | LangSmith base | frontend、backend、platform-backend、queue、ingest-queue、ace-backend、clickhouse、playground |
+| LangSmith Deployment add-on | LangSmith Deployment | host-backend、listener、operator + 每个 deployment 的 pods |
+| Agent Builder add-on | Agent Builder | agent-builder-tool-server、agent-builder-trigger-server + deep-agent LGP |
+| Insights + Polly add-on | Insights + Polly | Clio 分析（基于 ClickHouse）、Polly eval agent（由 operator 管理，动态） |
+
+## 应用部署路径
+
+| 路径 | 方式 | 适用场景 |
+|---|---|---|
+| Helm 路径 | `make init-values && make deploy` | 默认。Shell 脚本，交互式，动态读取 TF outputs。最适合首次部署和 Day-2 重新部署。 |
+| Terraform 路径 | `make init-app && make apply-app` | 声明式。Kubernetes Secrets + `langsmith-ksa` SA + Helm release 纳入 Terraform state。最适合 GitOps 和 CI/CD 流水线。 |
+
+Terraform 路径使用 `app/` module。`make init-app` 会调用 `app/scripts/pull-infra-outputs.sh`，读取所有基础设施 outputs 并写入 `app/infra.auto.tfvars.json`。
+
+## 部署层级
+
+### Light 部署（全部 in-cluster）
+
+```txt
+AKS Cluster
+├── langsmith namespace
+│   ├── frontend, backend, platform-backend, playground, queue, ace-backend
+│   ├── clickhouse (in-cluster pod)
+│   ├── postgres   (in-cluster pod)
+│   └── redis      (in-cluster pod)
+├── ingress-nginx (Azure Load Balancer → NGINX)
+└── cert-manager  (Let's Encrypt TLS)
+
+Azure
+├── Azure Blob Storage  (trace payloads, always external)
+└── Azure Key Vault     (secrets)
+```
+
+在 `terraform.tfvars` 中设置：
+
+```hcl
+postgres_source   = "in-cluster"
+redis_source      = "in-cluster"
+clickhouse_source = "in-cluster"
+```
+
+完整的 all-in-cluster 部署流程（NGINX + Let's Encrypt HTTP-01 TLS，全部数据库 in-cluster），请参见 [Azure module 仓库](https://github.com/langchain-ai/terraform/blob/main/modules/azure/BUILDING_LIGHT_LANGSMITH.md)中的 `BUILDING_LIGHT_LANGSMITH.md`。
+
+### Production（外部托管服务）
+
+```txt
+AKS Cluster
+├── langsmith namespace
+│   ├── frontend, backend, platform-backend, playground, queue, ingest-queue, ace-backend
+│   └── clickhouse (in-cluster; use LangChain Managed for production scale)
+└── ingress-nginx + cert-manager
+
+Azure Managed Services
+├── Azure DB for PostgreSQL Flexible Server (private VNet)
+├── Azure Managed Redis (private VNet)
+├── Azure Blob Storage (Workload Identity, no static keys)
+└── Azure Key Vault
+```
+
+## 网络
+
+### Light 部署
+
+```txt
+langsmith-vnet<identifier>
+└── subnet-0    (AKS nodes only)
+    No Postgres/Redis subnets; chart-managed pods handle both
+```
+
+### Production
+
+```txt
+langsmith-vnet<identifier>
+├── subnet-0              (AKS nodes)
+├── subnet-postgres       (Azure DB for PostgreSQL Flexible Server)
+└── subnet-redis          (Azure Managed Redis)
+```
+
+所有子网均为私有。Postgres 和 Redis 没有公网 endpoint；两者都只能通过私有 DNS 解析从 VNet 内访问。
+
+## 应用核心服务
+
+| 服务 | 用途 | 端口 | HPA | Workload Identity |
+|---|---|---|---|---|
+| `langsmith-frontend` | React UI | 3000 | 2 到 10 | 否 |
+| `langsmith-backend` | 主 API（traces、runs、projects、API keys、feedback） | 1984 | 3 到 10 | 是（Blob） |
+| `langsmith-platform-backend` | 组织与用户管理、认证、计费、设置 | 1986 | 2 到 10 | 是（Blob） |
+| `langsmith-playground` | LLM prompt playground UI | 3001 | 1 到 5 | 否 |
+| `langsmith-queue` | Trace ingestion worker（Redis 到 ClickHouse + Blob） | — | 3 到 10 + KEDA | 是 |
+| `langsmith-ingest-queue` | 专用的高吞吐量 ingestion worker | — | 3 到 10 + KEDA | 是 |
+| `langsmith-ace-backend` | 异步计算（dataset runs、evaluations、后台任务） | — | 1 到 5 | 否 |
+| `langsmith-clickhouse` | 列式存储（trace spans、run metadata、eval 结果） | — | StatefulSet，单副本，500Gi PVC | 否 |
+
+<Warning>
+In-cluster ClickHouse 仅适用于 dev/POC（单 pod、无副本、无备份）。生产环境请使用 [LangChain Managed ClickHouse](/langsmith/langsmith-managed-clickhouse) 或自行管理的外部集群。
+</Warning>
+
+<Note>
+[SmithDB](https://www.langchain.com/blog/introducing-smithdb?utm_source=docs) 是 LangSmith 专用的 observability 后端，self-hosted 版本 0.16.0 起可用于 Self-hosted（参见 [self-hosted support](/langsmith/smithdb-sdk-migration#about-self-hosted)）。这些 Terraform module 预配的是 ClickHouse，因此前几节中的指引适用于当前部署。
+</Note>
+
+### 一次性任务
+
+| Job | 用途 |
+|---|---|
+| `langsmith-backend-migrations` | PostgreSQL schema 迁移 |
+| `langsmith-backend-ch-migrations` | ClickHouse schema 迁移 |
+| `langsmith-backend-auth-bootstrap` | 使用 `langsmith-config-secret` 中的 `initial_org_admin_password` 创建初始组织和 admin 账号 |
+
+## LangSmith Deployment add-on
+
+| 服务 | 用途 | Workload Identity |
+|---|---|---|
+| `langsmith-host-backend` | LangGraph control plane API。管理 deployment 生命周期，提供 deployment metadata。 | 是 |
+| `langsmith-listener` | 监听 host-backend 的状态变化，创建和更新 `LangGraphPlatform` CRD。 | 是 |
+| `langsmith-operator` | Kubernetes operator。Azure 专属：注入 `azure.workload.identity/use: "true"` + `langsmith-ksa`，让每个 agent pod 通过 Workload Identity 访问 Blob Storage。 | 否 |
+
+## Agent Builder add-on
+
+| Pod | 类型 | 角色 | Workload Identity |
+|---|---|---|---|
+| `langsmith-agent-builder-tool-server` | 静态 | MCP tool 执行服务器 | 是 |
+| `langsmith-agent-builder-trigger-server` | 静态 | Webhook 接收器与定时触发引擎 | 是 |
+| `langsmith-agent-bootstrap` | Job | 注册内置的 Agent Builder agent | — |
+| `agent-builder-<hash>` + queue + redis + `lg-<hash>-0` | 动态 | Agent Builder deployment，由 operator 管理 | 继承 |
+
+## Insights 与 Polly add-on
+
+**Insights/Clio：** 无静态 pods。首次在 UI 中调用时，通过 operator 以动态 LangGraph deployment 的形式懒加载部署。从 `langsmith-config-secret` 读取 `insights_encryption_key`。切勿轮换该 key：它会永久损坏现有的 Insights 数据。
+
+**Polly：** 以动态 LangGraph deployment 形式运行，由 operator 管理。从 `langsmith-config-secret` 读取 `polly_encryption_key`。轮换警告与 Insights 相同。
+
+## Azure 托管服务
+
+当 `postgres_source = "external"` 且 `redis_source = "external"`（推荐的生产设置）时，Terraform 会预配：
+
+### Azure DB for PostgreSQL Flexible Server
+
+- 存储组织、用户、projects、API keys、设置。
+- 要求 PostgreSQL ≥ 14。`postgres` module 默认将 `postgres_version` 设为 `14`。
+- 由 `postgres` module 自动启用的扩展：`btree_gin`、`btree_gist`、`pgcrypto`、`citext`、`pg_trgm`。
+- 仅限私有 VNet（`subnet-postgres`），SSL 端口 5432。
+- 密钥：`langsmith-postgres-secret`，由 `k8s-bootstrap` Terraform module 创建。
+
+### Azure Managed Redis
+
+- Trace ingestion queue、pub/sub、短期缓存。
+- Azure Managed Redis 托管引擎版本；没有可设置的版本变量。
+- 每个 LangSmith 安装必须使用自己专属的 Redis。共享实例会导致 deployment 任务路由错误。
+- 仅限私有 VNet（`subnet-redis`），TLS 端口 10000。
+- 密钥：`langsmith-redis-secret`，由 `k8s-bootstrap` Terraform module 创建。
+
+### Azure Blob Storage
+
+- Trace payload：大型输入与输出、附件。
+- 通过 `k8s-app-identity` Managed Identity 使用 Workload Identity（无静态密钥）。
+- 始终必需。禁用 blob storage 会在大 payload 时导致集群故障。
+- 前缀：`ttl_s/`（14 天 TTL）、`ttl_l/`（400 天 TTL）。
+
+### Azure Key Vault
+
+- 所有 LangSmith 机密的集中式 secret store。
+- 密钥流转：`az keyvault secret show` → `kubectl create secret generic langsmith-config-secret`。
+
+## Workload Identity
+
+Azure AD token 交换通过 AKS OIDC issuer 完成。Pods 无需静态密钥即可访问 Blob Storage。
+
+```txt
+AKS OIDC issuer
+  → Federated credential on Azure Managed Identity (one per Kubernetes ServiceAccount)
+  → Kubernetes ServiceAccount annotated with azure.workload.identity/client-id
+  → Pod labeled with azure.workload.identity/use: "true"
+  → Azure AD issues a short-lived token; no storage keys in any Secret or env var
+```
+
+Workload Identity 集中在 `modules/k8s-cluster/` 中，与 managed identity 和 OIDC issuer 放在一起，这避免了循环依赖，也简化了新增 ServiceAccount 的过程。
+
+### 哪些 pods 需要 Workload Identity
+
+每个读取 blob storage 环境变量的 pod 必须具备：
+
+1. 在 Terraform 中注册的 federated credential（`modules/k8s-cluster/main.tf`）。
+2. Deployment 上的 `azure.workload.identity/use: "true"` 标签。
+3. ServiceAccount 上的 `azure.workload.identity/client-id` 标注。
+
+| Pod | 阶段 | 需要 WI |
+|---|---|---|
+| `langsmith-backend` | Application | 是 |
+| `langsmith-platform-backend` | Application | 是 |
+| `langsmith-queue` | Application | 是 |
+| `langsmith-ingest-queue` | Application | 是 |
+| `langsmith-host-backend` | LangSmith Deployment add-on | 是 |
+| `langsmith-listener` | LangSmith Deployment add-on | 是 |
+| `langsmith-agent-builder-tool-server` | Agent Builder add-on | 是 |
+| `langsmith-agent-builder-trigger-server` | Agent Builder add-on | 是 |
+| `langsmith-frontend` | Application | 否 |
+| `langsmith-playground` | Application | 否 |
+| `langsmith-ace-backend` | Application | 否 |
+| `langsmith-clickhouse` | Application | 否 |
+| `langsmith-operator` | LangSmith Deployment add-on | 否 |
+
+所有 federated credential 都注册在 `modules/k8s-cluster/main.tf` 的 `service_accounts_for_workload_identity` 中。新增访问 blob storage 的 pod，需要把它的 ServiceAccount 名称加入该列表，然后运行 `terraform apply -target=module.aks`。
+
+如果 pod 的 ServiceAccount 没有注册 federated credential，Azure AD 会拒绝 token 交换，pod 在启动时 panic：
+
+```txt
+panic: blob-storage health-check failed: get container properties failed:
+DefaultAzureCredential: failed to acquire a token.
+WorkloadIdentityCredential authentication failed.
+  AADSTS700213: No matching federated identity record found for presented assertion subject
+```
+
+## 密钥流转
+
+```txt
+Infrastructure stage
+
+  ./setup-env.sh   (read-only against Key Vault; never writes to KV directly)
+    First run:  prompts for postgres password, license key, admin password, admin email.
+                Generates api_key_salt, jwt_secret, Fernet keys locally.
+                Key Vault does not exist yet → writes to local dot-files + secrets.auto.tfvars.
+    Subsequent: Key Vault exists → reads the six generated secrets (api_key_salt,
+                jwt_secret, four Fernet keys) from KV. Re-prompts for postgres password,
+                license key, admin password, and admin email unless LANGSMITH_PG_PASSWORD,
+                LANGSMITH_LICENSE_KEY, LANGSMITH_ADMIN_PASSWORD, and LANGSMITH_ADMIN_EMAIL
+                are set. Writes secrets.auto.tfvars. No generation, no KV writes.
+    Output:     secrets.auto.tfvars  (gitignored, chmod 600)
+                Terraform picks this up automatically; no shell session coupling.
+
+  terraform apply
+    Reads:  terraform.tfvars (non-sensitive config)
+            secrets.auto.tfvars (sensitive values; sole input for KV secret creation)
+    Creates: Azure Key Vault + all secrets as KV secrets (Terraform is the sole KV writer)
+
+Application stage
+
+  ./setup-env.sh   (re-run on any machine; reads generated secrets from Key Vault,
+                    re-prompts for user-provided ones unless LANGSMITH_* env vars are set)
+
+  kubectl create secret generic langsmith-config-secret
+    Reads:  Key Vault secrets + Terraform outputs (postgres/redis URLs, blob account)
+    Writes: K8s secrets: langsmith-config-secret, langsmith-postgres-secret,
+                          langsmith-redis-secret
+
+  helm upgrade --install langsmith ...
+    Chart reads config.existingSecretName = "langsmith-config-secret".
+    No secrets inline in any YAML file.
+```
+
+**关键规则：** `secrets.auto.tfvars` 永远不会提交。在任何机器上运行 `./setup-env.sh` 都可以恢复它：生成的机密来自 Key Vault，用户提供的机密会重新提示输入（除非已通过 `LANGSMITH_*` 环境变量提供）。Terraform 是 Key Vault 的唯一写入者；首次 apply 之后，`setup-env.sh` 只从它读取。
+
+## Ingress 选项
+
+| Controller | 变量 | DNS label 支持 | 说明 |
+|---|---|---|---|
+| `nginx` _（默认）_ | `ingress_controller = "nginx"` | 是 | 通过 Helm 安装的 NGINX，标准 Kubernetes Ingress。 |
+| `istio-addon` | `ingress_controller = "istio-addon"` | 是 | AKS 托管的 Istio service mesh。使用 `istio_addon_revision` 锁定版本。 |
+| `istio` | `ingress_controller = "istio"` | 是 | 通过 Helm 自托管的 Istio。完全控制版本与配置。 |
+| `agic` | `ingress_controller = "agic"` | 是 | Azure Application Gateway v2 + AKS 托管的 `ingress_application_gateway` add-on。原生 L7 WAF。仅 HTTP 或 dns01 + 自定义域名。 |
+| `envoy-gateway` | `ingress_controller = "envoy-gateway"` | 是 | 原生 Gateway API。使用 `envoyproxy/gateway-helm`。 |
+| `none` | `ingress_controller = "none"` | — | 自带 ingress。 |
+
+Azure 公网 IP DNS label（`dns_label`）适用于所有 controller。`deploy.sh` 会根据所选 controller，将 `service.beta.kubernetes.io/azure-dns-label-name` 标注应用到正确的 LoadBalancer service。
+
+完整的 TLS 兼容性矩阵和各 controller 的设置，请参见 [Azure module 仓库](https://github.com/langchain-ai/terraform/blob/main/modules/azure/INGRESS_CONTROLLERS.md)中的 `INGRESS_CONTROLLERS.md`。
+
+## 资源规格
+
+提供四种 sizing profile。
+
+| Profile | 使用场景 | 设置方式 |
+|---|---|---|
+| `minimum` | 成本占位、CI 冒烟测试、单人演示 | 在 `terraform.tfvars` 中设置 `sizing_profile = "minimum"` |
+| `dev` | 开发者使用、集成测试、POC | `sizing_profile = "dev"` |
+| `production` | 真实流量，多副本 + HPA | `sizing_profile = "production"` _（推荐）_ |
+| `production-large` | 约 50 个用户、约 1000 traces/sec | `sizing_profile = "production-large"` |
+
+### AKS 节点池
+
+| 节点池 | VM 规格 | vCPU | 内存 | 最少 | 最多 | 用途 |
+|---|---|---|---|---|---|---|
+| default | `Standard_D8s_v3` | 8 | 32 GB | 1 | 10 | LangSmith 核心与系统 pods（生产环境设为 3） |
+| large | `Standard_D16s_v3` | 16 | 64 GB | 0 | 2 | ClickHouse（in-cluster）、LGP agent pods |
+
+<Note>
+ClickHouse（in-cluster 时）根据 profile 请求 1 到 4 CPU 和 2 到 16 GB 内存。使用 [LangChain Managed ClickHouse](/langsmith/langsmith-managed-clickhouse) 时，`large` 节点池只用于 LGP operator 派生的 agent pods。
+</Note>
+
+## 可选 module
+
+每个 module 都由 count 控制（`0` 禁用，`1` 启用）。可任意组合启用；核心部署（Pass 1 到 5）不依赖它们。
+
+| module | 变量 | 使用场景 |
+|---|---|---|
+| `waf` | `create_waf = true` | Azure WAF 策略（OWASP 3.2 + bot 防护）。挂载到 Application Gateway。 |
+| `diagnostics` | `create_diagnostics = true` | Log Analytics 工作区 + AKS、Key Vault 和 PostgreSQL 的诊断设置。生产 observability 推荐。 |
+| `bastion` | `create_bastion = true` | 带静态公网 IP 的跳板 VM，通过 `az ssh vm` 和 Entra ID SSH 访问私有 AKS。 |
+| `dns` | `create_dns_zone = true` | Azure DNS zone + A 记录。使用自定义域名的 DNS-01 证书签发必需。 |

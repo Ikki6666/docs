@@ -3,9 +3,17 @@ title: CopilotKit
 description: 结合 CopilotKit、LangGraph、Deep Agents 和 React，自定义端点、Python AG-UI 桥接、结构化生成式 UI 和消息平台通道
 ---
 
-[CopilotKit](https://www.copilotkit.ai/) 提供了完整的 React chat runtime，特别适合与 LangGraph 搭配使用，尤其是在你希望 agent 返回 **结构化 UI payload**，而不仅仅是纯文本的时候。在这种模式下，你的 LangGraph 部署会同时提供 graph API 和一个自定义 CopilotKit endpoint，而前端则把 assistant messages 解析成动态 React 组件。
+[CopilotKit](https://www.copilotkit.ai/) 提供了完整的 React chat runtime，特别适合与 LangGraph 搭配使用，尤其是在你希望 agent 返回 **结构化 UI payload**，而不仅仅是纯文本的时候。前端与一个 CopilotKit runtime URL 通信，并把 assistant messages 解析成动态 React 组件。
 
-在服务端，[copilotkit](https://pypi.org/project/copilotkit/) 包提供 [`CopilotKitMiddleware`](https://docs.copilotkit.ai)，因此 LangGraph graph、LangChain agent 或 [Deep Agent](/oss/deepagents/overview) 都可以说 [Agent UI (AG-UI)](https://docs.ag-ui.com/) wire protocol，向 chat UI 流式发送 tool 和 message 事件，并读写共享的 **CopilotKit** 状态片段，同时还附带工具来在 graph 前面挂载兼容 CopilotKit 的 HTTP endpoint。
+:::js
+在这种模式下，你的 LangGraph 部署在同一个进程中同时提供 graph API 和一个自定义 CopilotKit endpoint。
+:::
+
+:::python
+在这种模式下，你的 LangGraph 部署提供 graph API 和一个 AG-UI FastAPI bridge。一个小的 Node CopilotKit runtime 位于该 bridge 前面，是 React 客户端实际调用的对象。
+:::
+
+在服务端，[copilotkit](https://pypi.org/project/copilotkit/) 包提供 [`CopilotKitMiddleware`](https://docs.copilotkit.ai)，因此 LangGraph graph、LangChain agent 或 [Deep Agent](/oss/deepagents/overview) 都可以说 [Agent UI (AG-UI)](https://docs.ag-ui.com/) wire protocol，向 chat UI 流式发送 tool 和 message 事件，并读写共享的 **CopilotKit** 状态片段，同时还附带工具来在 graph 前面挂载兼容 CopilotKit 的 HTTP endpoint。TypeScript 方案通常把 CopilotKit runtime 挂在 graph API 旁边。Python 方案在部署上挂载 AG-UI FastAPI bridge，并在它前面用 Node 运行 CopilotKit runtime。
 
 这种方式适合以下场景：
 
@@ -30,12 +38,25 @@ import ChannelsChannel from "/snippets/code-samples/copilotkit-channels-channel-
 
 ## 工作原理
 
-从高层看，CopilotKit 夹在你的 React 应用和 LangGraph 部署之间。前端把会话状态发送到与 graph API 并列挂载的一个自定义 `/api/copilotkit` route，该 route 再把请求转发给 LangGraph，响应则同时带回 assistant messages 和组件注册表可以渲染的结构化 UI payload。
+从高层看，CopilotKit 夹在你的 React 应用和 LangGraph 部署之间。
+
+:::js
+前端把会话状态发送到与 graph API 并列挂载的一个自定义 `/api/copilotkit` route。该 route 再把请求转发给 LangGraph，响应则同时带回 assistant messages 和组件注册表可以渲染的结构化 UI payload。
 
 1. **正常部署 graph**，使用 LangSmith 或 LangGraph 开发服务器。
 2. **用 HTTP app 扩展部署**，在 graph API 旁边挂载一个 CopilotKit route。
 3. **用 `CopilotKit` 包裹前端**，并把它指向那个自定义 runtime URL。
 4. **注册动态 UI 组件**，并在渲染时把 assistant responses 解析成这些组件。
+:::
+
+:::python
+前端把会话状态发送到一个 Node CopilotKit runtime。该 runtime 调用你 LangGraph 部署上的 AG-UI FastAPI bridge，响应则同时带回 assistant messages 和组件注册表可以渲染的结构化 UI payload。
+
+1. **正常部署 graph**，使用 LangSmith 或 LangGraph 开发服务器。
+2. **用 HTTP app 扩展部署**，在 graph API 旁边挂载 AG-UI FastAPI bridge。
+3. **运行一个 Node CopilotKit runtime**，把一个 `HttpAgent` 指向该 bridge，然后用 `CopilotKit` 包裹前端并指向该 runtime URL。
+4. **注册动态 UI 组件**，并在渲染时把 assistant responses 解析成这些组件。
+:::
 
 ```mermaid
 %%{
@@ -54,12 +75,16 @@ graph LR
   RENDER["Hashbrown UI kit"]
 
   USER --> UI
-  UI --> ENDPOINT
-  ENDPOINT --> GRAPH
-  GRAPH --> ENDPOINT
-  ENDPOINT --> UI
+  UI --> RUNTIME
+  RUNTIME --> GRAPH
+  GRAPH --> RUNTIME
+  RUNTIME --> UI
   UI --> RENDER
 ```
+
+:::python
+在 Python 中，CopilotKit runtime 是一个独立的 Node 进程。LangGraph 部署只托管 graph API 和 AG-UI FastAPI bridge。参见[添加 CopilotKit runtime](#add-the-copilotkit-runtime)。
+:::
 
 :::python
 ## 你在 Python 服务端能得到什么
@@ -71,11 +96,11 @@ graph LR
 | `CopilotKitMiddleware` | 把 CopilotKit 和 AG-UI 状态、请求合并进你的 agent，包括前端 [tool calls](/oss/langchain/agents#tools) 和上下文。把它加到 @[create_agent] 或 @[create_deep_agent] 的 `middleware` 列表里。 |
 | `CopilotKitState`（子类） | [自定义状态](/oss/langchain/short-term-memory)：扩展 `CopilotKitState`，把 CopilotKit key 放进 graph state。 |
 | `LangGraphAGUIAgent` | 把一个编译后的 graph 打包成一个 runtime 可用的 name 和 description。 |
-| `add_langgraph_fastapi_endpoint`（来自 [ag-ui-langgraph](https://pypi.org/project/ag-ui-langgraph/)） | 连接一个 **FastAPI** app，让 CopilotKit 能在同一个 [LangGraph](/oss/langgraph/overview) 进程里运行你的 graph。适用于你在 `langgraph.json` 中添加 [custom `http` app](#extend-the-langgraph-deployment-with-a-custom-endpoint) 的场景，而不是单独起一个 HTTP server。 |
+| `add_langgraph_fastapi_endpoint`（来自 [ag-ui-langgraph](https://pypi.org/project/ag-ui-langgraph/)） | 在与你的 graph 相同的 [LangGraph](/oss/langgraph/overview) 进程上连接一个 **FastAPI** AG-UI bridge。通过在 `langgraph.json` 中添加 [custom `http` app](#extend-the-langgraph-deployment-with-a-custom-endpoint) 来挂载它。React 客户端仍然需要一个独立的 Node [CopilotKit runtime](#add-the-copilotkit-runtime)，通过 AG-UI 调用这个 bridge。 |
 
 `CopilotKitMiddleware` 对于 @[create_deep_agent] 和通过 @[create_agent] 创建、并把它加入 `middleware` 列表的 graph 来说是同一个 middleware。对于带 `CopilotKitState` 和 FastAPI bridge 的 `create_agent` graph，请参考下面的 [Python `main.py` 示例](#extend-the-langgraph-deployment-with-a-custom-endpoint)。结构化生成式 UI（例如客户端的 `useAgentContext` 和 `output_schema`）还需要额外的 middleware，把 Copilot state 映射成 [structured output](/oss/langchain/agents#structured-output) 策略，和同一节里可展开的 `src/middleware.py` 示例一样。
 
-把 `app` 挂到 `langgraph.json` 的 `http` key 上，遵循的就是通常的 [LangGraph or LangSmith deployment](/oss/langgraph/deploy) 方式，这样一个进程就能同时服务 graph 和同一个 FastAPI app 给 CopilotKit client。
+把 `app` 挂到 `langgraph.json` 的 `http` key 上，遵循的就是通常的 [LangGraph or LangSmith deployment](/oss/langgraph/deploy) 方式：一个进程同时服务 graph API 和 AG-UI FastAPI bridge。CopilotKit React 客户端与 Node runtime 通信，由后者调用这个 bridge。
 :::
 
 ## 安装
@@ -104,6 +129,12 @@ pip install -U deepagents copilotkit langchain-openai
 uv add deepagents copilotkit langchain-openai
 ```
 </CodeGroup>
+
+前端调用的 CopilotKit runtime 是一个 Node 包，因此 Python 方案还需要一个小的 Node server。下面的版本是一个已知可用的配套组合。如果你升级 `@copilotkit/runtime`，请安装该版本列为依赖的 `@ag-ui/client` 版本，以便 `HttpAgent` 类型匹配：
+
+```bash
+bun add @copilotkit/runtime@1.73.3 @ag-ui/client@0.0.59
+```
 :::
 
 对于前端 app：
@@ -117,12 +148,11 @@ bun add @copilotkit/react-core @copilotkit/react-ui @hashbrownai/core @hashbrown
 
 把 `CopilotKitMiddleware` 加到你传给 @[create_deep_agent] 的 `middleware` 列表里。这个 middleware 让 CopilotKit 可以路由前端 tool calls，并把 chat state 和你的 graph 对齐。把你配置的其他 [middleware](/oss/deepagents/customization#middleware) 也放在同一个列表里。
 
-编译后的 graph 就可以接到支持 CopilotKit 或 AG-UI 的进程里，例如下面的 [FastAPI 模式](#extend-the-langgraph-deployment-with-a-custom-endpoint)，或者 CopilotKit 文档中的 [Deep Agents and CopilotKit](https://docs.copilotkit.ai/langgraph/deep-agents) 这类指南。
+编译后的 graph 就可以接到支持 CopilotKit 或 AG-UI 的进程里，例如下面的 [FastAPI 模式](#extend-the-langgraph-deployment-with-a-custom-endpoint)，或者 CopilotKit 文档中的 [Deep Agents and CopilotKit](https://docs.copilotkit.ai/langgraph/deep-agents) 这类指南。如果你把它列在 `langgraph.json` 的 `graphs` 下，就不要在导出的 agent 上传入 checkpointer。下面的 [FastAPI 示例](#extend-the-langgraph-deployment-with-a-custom-endpoint)只在 AG-UI route 副本上附加 checkpointer。
 
 ```python
 from deepagents import create_deep_agent
 from copilotkit import CopilotKitMiddleware
-from langgraph.checkpoint.memory import MemorySaver
 
 
 def get_weather(location: str) -> str:
@@ -135,7 +165,6 @@ agent = create_deep_agent(
     tools=[get_weather],
     middleware=[CopilotKitMiddleware()],  # AG-UI、frontend tools 和 context
     system_prompt="You are a helpful research assistant.",
-    checkpointer=MemorySaver(),
 )
 ```
 :::
@@ -196,6 +225,7 @@ from ag_ui_langgraph import add_langgraph_fastapi_endpoint
 from copilotkit import CopilotKitMiddleware, CopilotKitState, LangGraphAGUIAgent
 from fastapi import FastAPI
 from langchain.agents import create_agent
+from langgraph.checkpoint.memory import MemorySaver
 
 from src.middleware import apply_structured_output_schema, normalize_context
 
@@ -230,14 +260,23 @@ add_langgraph_fastapi_endpoint(
     agent=LangGraphAGUIAgent(
         name="copilotkit_shadify",
         description="A UI assistant that returns structured component payloads.",
-        graph=agent,
+        # AG-UI bridge 会读取 graph state，所以这个 route 需要 checkpointer。
+        graph=agent.copy(update={"checkpointer": MemorySaver()}),
     ),
     path="/",
 )
 ```
+
+AG-UI bridge 在每次运行时都会读取 graph 的 state，因此 FastAPI route 背后的 graph 需要 checkpointer。请把 checkpointer 从 `agent` 本身上移除：`agent` 也会列在 `graphs` 下，而 `langgraph dev` 拒绝加载自带 checkpointer 的已列 graph，因为 LangGraph API 会为已列 graph 处理持久化。带 `MemorySaver` 的副本只服务于 FastAPI route。它的 thread 保存在进程内存中，因此不会在重启后保留，不会跨副本共享，也不会出现在部署的 threads API 中。对于这个 route 上的生产流量，请改用持久的 [checkpointer](/oss/langgraph/persistence)。
 :::
 
+:::js
 这个自定义 app 是最重要的扩展点：它会挂载一个支持 CopilotKit 的 runtime，而不会替换底层的 LangGraph deployment。
+:::
+
+:::python
+这个自定义 app 是最重要的扩展点：它会挂载 AG-UI FastAPI bridge，而不会替换底层的 LangGraph deployment。Node CopilotKit runtime 保持独立；参见[添加 CopilotKit runtime](#add-the-copilotkit-runtime)。
+:::
 
 :::js
 在这个 route 内，创建一个 `CopilotRuntime`，并通过 `LangGraphAgent` 指向已部署的 graph：
@@ -355,7 +394,7 @@ const structuredOutputMiddleware = createMiddleware({
 });
 
 export const agent = createAgent({
-  model: process.env.COPILOTKIT_MODEL ?? "google_genai:gemini-3.5-flash",
+  model: process.env.COPILOTKIT_MODEL ?? "google:gemini-3.5-flash",
   contextSchema,
   middleware: [structuredOutputMiddleware],
   tools: [searchWebTool, deepSearchTool],
@@ -419,7 +458,7 @@ function getRuntimeOutputSchema(runtime: {
 :::
 
 :::python
-在 Python 中，等价的工作发生在 middleware 里：先规范化 CopilotKit context，再把 `useAgentContext(...)` 里的 `output_schema` 传给模型的结构化输出配置。
+在 Python 中，等价的工作发生在 middleware 里：先规范化 CopilotKit context，再把 `useAgentContext(...)` 里的 `output_schema` 传给模型的结构化输出配置。Hashbrown 生成的 schema 没有顶层 `title`，而 OpenAI integration 需要一个 `title` 来命名结构化输出 schema，因此 middleware 会在缺失时补上 `title` 和 `description`。
 
 ```python expandable src/middleware.py
 import json
@@ -453,6 +492,13 @@ async def apply_structured_output_schema(request, handler):
             schema = None
 
     if isinstance(schema, dict):
+        # OpenAI 使用顶层 title 作为结构化输出的名称。
+        schema = {
+            **schema,
+            "title": schema.get("title") or "CopilotKitStructuredOutput",
+            "description": schema.get("description")
+            or "Structured response schema for the CopilotKit preview.",
+        }
         request = request.override(
             response_format=ProviderStrategy(schema=schema, strict=True),
         )
@@ -483,10 +529,44 @@ def normalize_context(state, runtime):
 - 你的自定义 endpoint 把两者粘合在同一个部署里
 
 :::python
-当你使用 [CopilotKit](https://docs.copilotkit.ai) runtime adapter 时，请把 CopilotKit `runtimeUrl` 指向 FastAPI（或其他）app 暴露的 route，而不是只指向原始 graph REST surface。
-:::
-:::js
-按照 CopilotKit 文档中关于 [LangGraphHttpAgent](https://docs.copilotkit.ai/langgraph) 的说明，或者 Node **CopilotRuntime** 里的 `LangGraphAgent` 方式来接；**Python** graph 和 middleware 仍然负责定义 tool 行为和 agent 逻辑。
+### 添加 CopilotKit runtime
+
+FastAPI route 说的是 AG-UI 协议，而不是 CopilotKit runtime 协议，因此前端无法直接调用它：把 `runtimeUrl` 指向 FastAPI route 会失败并报 `runtime_info_fetch_failed`。请在一个小的 Node server 中运行 [CopilotKit runtime](https://docs.copilotkit.ai/langgraph)，并把一个 `HttpAgent` 指向 FastAPI route。Python graph 和 middleware 仍然负责定义 tool 行为和 agent 逻辑。
+
+```ts server.ts
+import { createServer } from "node:http";
+
+import { HttpAgent } from "@ag-ui/client";
+import { CopilotRuntime } from "@copilotkit/runtime/v2";
+import { createCopilotNodeListener } from "@copilotkit/runtime/v2/node";
+
+// The FastAPI route is mounted at the root of the LangGraph deployment.
+const agentUrl = process.env.LANGGRAPH_DEPLOYMENT_URL || "http://127.0.0.1:2024";
+
+const runtime = new CopilotRuntime({
+  agents: {
+    default: new HttpAgent({ url: agentUrl }),
+  },
+});
+
+createServer(
+  createCopilotNodeListener({
+    runtime,
+    basePath: "/api/copilotkit",
+    cors: true,
+  }),
+).listen(4000);
+```
+
+在 LangGraph 部署旁边启动该 runtime：
+
+```bash
+bun server.ts
+```
+
+该 runtime 在端口 4000 上服务 `/api/copilotkit`。把前端指向它，可以设置 `VITE_RUNTIME_URL=http://localhost:4000/api/copilotkit`，或者在开发服务器中把 `/api/copilotkit` 代理到端口 4000。
+
+这个 runtime 是基础的应用内集成。[Channels](#channels) 不使用 FastAPI route：它通过部署的 graph API 使用 `LangGraphAgent` 连接到 graph。
 :::
 
 ## 组织前端 app

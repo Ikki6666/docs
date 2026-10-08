@@ -1,0 +1,183 @@
+---
+title: Sandbox download links
+sidebarTitle: Download links
+description: 将 sandbox 中的单个文件以无需 LangSmith 凭据的链接形式分享出去。
+---
+
+Download link 把一个 sandbox 文件交给无法携带 LangSmith 凭据的对象：一个浏览器标签页、邮件中的 `<a href>`、webhook 消费方，或某个会抓取你提供的 URL 的第三方服务。
+
+链接自带 token。使用 SDK 的 `read()` 读取文件时，每个请求都需要 workspace API key；而 download link 只需要 URL 本身，不需要其他任何东西。
+
+## 快速开始
+
+```python
+from langsmith.sandbox import SandboxClient
+
+client = SandboxClient()
+
+with client.sandbox() as sb:
+    sb.run("python -c \"open('/app/report.csv','w').write('a,b\\n1,2\\n')\"")
+
+    link = sb.generate_download_url("/app/report.csv")
+    print(link.download_url)
+```
+
+之后任何人都可以在无凭据的情况下抓取它：
+
+```bash
+curl -LO "<download_url>"
+```
+
+## 链接固定到什么内容
+
+token 编码了 sandbox、tenant、确切的文件路径和响应头，因此链接无法被编辑成指向其他文件或其他 sandbox。每个链接只服务一个确切的路径。
+
+链接固定的是该路径，而不是文件的快照。生成链接时，文件本身不会被捕获或复制。
+
+<Warning>
+生成链接之后不要修改该文件。之后对该路径的写入可能会也可能不会反映在链接提供的内容中，因此请在链接的有效期内把文件当作不可变的。当内容变化时，请写入一个新文件并为它生成新的链接。
+</Warning>
+
+链接从 sandbox 服务域名（sandbox 自己的主机）提供，绝不会从 LangSmith API 主机提供。因此，下载的内容与你的 LangSmith session 是隔离的。
+
+## 创建链接
+
+<CodeGroup>
+
+```python Python
+# Never expires
+link = sb.generate_download_url("/app/report.csv")
+
+# Expires in an hour
+link = sb.generate_download_url("/app/report.csv", expires_in_seconds=3600)
+
+# Rendered in the browser instead of downloaded
+link = sb.generate_download_url(
+    "/app/page.html",
+    content_type="text/html",
+    content_disposition="inline",
+)
+
+print(link.download_url)
+print(link.expires_at)  # None when the link never expires
+```
+
+```ts TypeScript
+// Never expires
+let link = await sandbox.generateDownloadURL("/app/report.csv");
+
+// Expires in an hour
+link = await sandbox.generateDownloadURL("/app/report.csv", {
+  expiresInSeconds: 3600,
+});
+
+// Rendered in the browser instead of downloaded
+link = await sandbox.generateDownloadURL("/app/page.html", {
+  contentType: "text/html",
+  contentDisposition: "inline",
+});
+
+console.log(link.download_url);
+console.log(link.expires_at); // null when the link never expires
+```
+
+</CodeGroup>
+
+在 client 上（而不是 sandbox 实例上）调用它，可以按 sandbox 名称生成链接：
+
+<CodeGroup>
+
+```python Python
+link = client.generate_download_url("my-sandbox", "/app/report.csv")
+```
+
+```ts TypeScript
+const link = await client.generateDownloadURL("my-sandbox", "/app/report.csv");
+```
+
+</CodeGroup>
+
+### 选项
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `expires_in_seconds` | 省略时链接永不过期 | 链接的有效期（秒） |
+| `content_type` | 根据文件扩展名推断 | 链接响应时使用的 `Content-Type` |
+| `content_disposition` | `attachment` | `attachment` 下载文件；`inline` 在浏览器中渲染 |
+
+## 通过 CLI 创建链接
+
+```bash
+langsmith sandbox generate-download-url my-sandbox --path /app/report.csv
+```
+
+```bash
+langsmith sandbox generate-download-url my-sandbox \
+  --path /app/page.html \
+  --expires-in-seconds 3600 \
+  --content-disposition inline
+```
+
+## 通过 REST API 创建链接
+
+```bash
+curl -X POST \
+  "$LANGSMITH_ENDPOINT/api/v2/sandboxes/boxes/{sandbox_name}/download-url" \
+  -H "x-api-key: $LANGSMITH_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/app/report.csv", "expires_in_seconds": 3600}'
+```
+
+响应：
+
+```json
+{
+  "download_url": "https://{sandbox-id}--dl.smithbox.dev/ey...",
+  "token": "ey...",
+  "expires_at": "2026-04-08T15:30:00Z"
+}
+```
+
+当省略 `expires_in_seconds` 时，`expires_at` 为 `null`。
+
+生成链接需要 `sandboxes:exec` 权限，与带凭据的下载所需的访问权限相同。请参阅 [Sandbox permissions](/langsmith/sandbox-permissions)。
+
+## 抓取链接
+
+支持 `GET` 和 `HEAD`，以及 `Range`（用于可续传和部分下载）、`If-Range` 和 `If-None-Match`。不需要也不接受任何 headers、query string 或 body。
+
+抓取链接会**唤醒已停止的 sandbox**，因此 idle stop 之后的第一个请求耗时与启动相当。生成链接时 sandbox 不需要处于运行状态。
+
+## 安全注意事项
+
+<Warning>
+Download link 是嵌入在 URL 中的 bearer 凭据。任何获得它的人都可以在链接过期之前读取那一个文件。把链接当作密码对待：通过你信任的渠道发送，并且对任何敏感内容优先使用较短的 `expires_in_seconds`。
+</Warning>
+
+- **链接无法被撤销。** 已生成的链接在过期之前一直有效，即使创建它的 API key 被删除或失去 `sandboxes:exec` 也是如此。在需要时请设置过期时间。
+- **链接随 sandbox 一起失效。** 删除 sandbox 会使指向它的所有链接失效。
+- **文件不能变化。** 链接固定到某个路径，因此生成链接之后对该路径的写入可能会也可能不会反映在链接提供的内容中。
+- **Guest headers 会被丢弃。** 响应会根据 content、range 和 validator headers 的白名单重建。sandbox 内部代码设置的 cookies 或其他 headers 绝不会被转发。
+- **渲染的内容是被沙箱化的。** 每个响应都带有 `X-Content-Type-Options: nosniff` 和 `Content-Security-Policy: sandbox`，因此以 `content_disposition=inline` 提供的文件在渲染时不具备任何能力，也无法访问你的 LangSmith session。
+
+## Download links 与其他文件访问方式
+
+| | Download links | `read()` | [Service URLs](/langsmith/sandbox-service-urls) |
+|---|---|---|---|
+| **需要凭据** | 无 | Workspace API key | Service token 或浏览器 cookie |
+| **范围** | 一个文件，一个路径 | 任意文件 | sandbox 中的任意 HTTP 服务 |
+| **sandbox 必须在运行** | 否（抓取会唤醒它） | 否（按需唤醒） | 否（抓取会唤醒它） |
+| **可分享** | 是 | 否 | 是 |
+| **过期前可撤销** | 否 | 是（轮换 key） | 否 |
+
+使用 download link 把单个文件交给外部消费方。使用 `read()` 把文件字节拉取到你自己的代码中。使用 service URL 访问 sandbox 内部运行的 HTTP 服务器。
+
+## 故障排查
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| **生成时返回 `501`** | 此 deployment 未配置 download links | 自托管 deployment 需要配置 sandbox 服务域名；请参阅 [Sandbox service URLs](/langsmith/sandbox-service-urls) |
+| **抓取时返回 `403`** | 链接过期、被篡改，或在错误的主机上被使用 | 生成新链接；逐字复制 URL |
+| **抓取时返回 `404`** | 该路径下已不存在该文件 | 链接固定到路径，而不是文件内容。为存在的路径生成链接 |
+| **浏览器下载而不是渲染** | 默认 disposition 是 `attachment` | 使用 `content_disposition="inline"` 和显式的 `content_type` 生成 |
+| **内容过期或不完整** | 链接生成之后文件被写入或替换 | 不要修改链接指向的文件。写入新文件并生成新链接 |

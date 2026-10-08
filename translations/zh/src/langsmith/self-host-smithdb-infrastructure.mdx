@@ -1,0 +1,1138 @@
+---
+title: 准备 SmithDB 支撑基础设施
+sidebarTitle: 支撑基础设施
+description: 在启用 SmithDB 之前，提供专用的 PostgreSQL metastore、object storage 和 cache storage。
+---
+
+<Note>
+对于 pods 卡在 `Pending`、object store 访问被拒绝或 metastore 连接错误等故障，请参见[故障排查 SmithDB](/langsmith/self-host-smithdb-troubleshooting#supporting-infrastructure)。
+</Note>
+
+SmithDB 为自托管 LangSmith deployment 添加了三个基础设施依赖：PostgreSQL metastore、object storage，以及供 query、ingestion 和 compaction worker 使用的 cache storage。
+
+这些是集成要求和实用建议，而不是规定的云架构。关于 AWS (EKS)、GCP (GKE) 和 Azure (AKS) 的设置，请参见 [Provider setup](#provider-setup)。最低 LangSmith 版本取决于你的云。请参见[云支持](/langsmith/self-host-smithdb#cloud-support)。
+
+## 要求
+
+在启用 SmithDB 之前，提供：
+
+- 一个用于 SmithDB metastore 的**专用、空的 PostgreSQL 数据库**。不要使用存储 LangSmith 其余运行数据的 PostgreSQL 数据库。
+- 一个用于 SmithDB 持久数据的**专用 object-storage bucket**。
+- 供 query、ingestion 和 compaction worker 使用的 **cache storage**：网络挂载磁盘，或为获得最佳缓存性能使用本地 SSD。
+- 到数据库和 object store 的私有网络连通性，外加两者的凭证或 workload identity。
+- 如果 LangSmith 使用 HTTP proxy，请为分配给 SmithDB pods 的 IP 范围和集群的内部 service domain 添加 `NO_PROXY` 条目。
+
+## PostgreSQL metastore
+
+metastore 保存 SmithDB 的目录和协调数据。为 metastore 创建一个空数据库。SmithDB 会在安装期间初始化 schema。
+
+使用 PostgreSQL 18 或更高版本，并允许来自 Kubernetes 集群的数据库连接。数据库选项和连通性请参见 [Provider setup](#provider-setup)。
+
+### Metastore Secret
+
+在 LangSmith release namespace 中创建一个包含数据库 host、名称、用户名和密码的 Kubernetes Secret。通过 `smithdb.config.metastore` 映射它的 key。
+
+<Accordion title="Metastore Secret and Helm values">
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: smithdb-metastore
+  namespace: NAMESPACE
+type: Opaque
+stringData:
+  smithdb_metastore_db_host: DB_HOST
+  smithdb_metastore_db_name: DB_NAME
+  smithdb_metastore_db_username: DB_USERNAME
+  smithdb_metastore_db_password: DB_PASSWORD
+```
+
+配置 chart 使用对应的 key：
+
+```yaml
+smithdb:
+  config:
+    existingSecretName: smithdb-metastore
+    metastore:
+      hostSecretKey: smithdb_metastore_db_host
+      databaseSecretKey: smithdb_metastore_db_name
+      usernameSecretKey: smithdb_metastore_db_username
+      passwordSecretKey: smithdb_metastore_db_password
+      port: "5432"
+      useSsl: true
+```
+
+`DB_NAME` 可以是为该专用空数据库起的任何名称，例如 `smithdb`。chart 不要求这些确切的 Secret key 名称；Helm values 会映射你选择的任何名称。
+
+</Accordion>
+
+## Object storage
+
+Object storage 是 SmithDB 的持久数据层。使用一个专供 SmithDB 数据的 bucket，并与 Kubernetes 集群位于同一 region，以最小化延迟和传输成本。
+
+这个 bucket 与可选的 [LangSmith blob storage](/langsmith/self-host-blob-storage) 是分开的，后者为更广泛的 LangSmith deployment 存储 payload 和附件。
+
+不要添加按自己的计划过期对象的 bucket 生命周期规则。删除活跃对象可能导致数据不可用。
+
+### 使用私有 object-storage 连接
+
+使用私有连接以避免不必要的数据传输和 NAT gateway 成本。在 [Provider setup](#provider-setup) 下为你的云配置 endpoint。
+
+配置访问权限，使 SmithDB 组件可以列出 bucket 并读取、写入和删除对象。
+
+### 选择 ServiceAccount
+
+SmithDB workloads 共享 `smithdb.serviceAccount`。
+
+- **Default**：chart 会创建 `<HELM_RELEASE>-smithdb`。
+- **Custom**：设置 `name` 以创建不同名称的 account。
+- **Existing**：设置 `create: false` 和 `name`，然后在外部配置 workload identity。
+
+Workload identity 必须指向所选的 namespace 和名称。使用 `create: false` 时，`name` 是必需的。否则 pods 会使用 `default` ServiceAccount。
+
+### Migration 源 bucket 访问
+
+如果你的安装使用 LangSmith blob storage，请在迁移历史数据之前，为 `smithdb.serviceAccount` 授予该 bucket 的读取权限。
+
+## Cache storage
+
+Query、ingestion 和 compaction worker 会把 trace 数据缓存在挂载到 `/data` 的卷上。Object storage 保留持久副本；替换一个 pod 会丢弃它的缓存。
+
+<Note>
+`smithdb.cache` 需要 Helm chart `0.17.0` 或更高。LangSmith 0.16 标签页展示的是更早 chart 的等效配置。
+</Note>
+
+- **网络挂载磁盘**：LangSmith 0.17 上的默认值。Kubernetes 会从一个 StorageClass 为每个 pod 预配一个卷，因此不需要专用的 node pool。
+- **本地 SSD**：LangSmith 0.16 上的默认值，在 0.17 上是显式覆盖项。推荐用于生产环境，可提供最佳缓存性能。需要一个本地磁盘支撑 Kubernetes ephemeral storage 的 node pool。
+
+升级到 0.17 会把默认缓存从 `emptyDir` 移动到每 pod 的 PersistentVolumeClaim。要继续使用本地 SSD，请在同一次升级中添加 [0.17 本地 SSD values](#local-ssd)。如果你把自定义缓存卷延续下去，请把它们从 `local-ssd-storage` 重命名为 `cache`。
+
+### 网络挂载磁盘
+
+chart 会为每个 pod 请求一个 [generic ephemeral volume](https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/#generic-ephemeral-volumes)。Kubernetes 会随 pod 创建 PersistentVolumeClaim，并随 pod 删除它。为 StorageClass 设置 `reclaimPolicy: Delete`，这样底层磁盘会随之一起释放。
+
+集群默认的 StorageClass 通常对缓存来说太慢。使用 [Provider setup](#provider-setup) 下你的 provider 对应的 StorageClass，为每个卷预配至少 7000 IOPS 和 1000 MiB/s。
+
+以下示例使用 `small` 层级。请替换为你的层级的规格。
+
+<Tabs>
+<Tab title="LangSmith 0.17">
+
+设置 `storageClassName`，或留空以使用集群默认值。层级决定卷大小、CPU 和内存。chart 会设置 `fsGroup: 1001` 和 query 磁盘缓存限制。
+
+```yaml
+smithdb:
+  resourceTier: small
+  cache:
+    storageClassName: smithdb-cache
+```
+
+要给某个组件不同的 StorageClass 或大小，把它的 `deployment.volumes` 设置为一个名为 `cache` 的 generic ephemeral volume，并填入你想要的 class 和 size。对你更改的每个组件重复此操作。不要通过 `persistentVolumeClaim.claimName` 把 `volumes` 指向已有的 claim；每个 replica 需要自己的卷。
+
+</Tab>
+<Tab title="LangSmith 0.16">
+
+在 0.16 上，替换每个组件上的 volume 和 resources 并设置 `fsGroup: 1001`。chart 会从 `ephemeral-storage` limit 派生 query 磁盘缓存限制，而该配置省略了这一项，因此按所示在 `extraEnv` 中设置该限制。
+
+```yaml
+smithdb:
+  query:
+    deployment:
+      extraEnv:
+        - name: SMITHDB_QUERY__VORTEX_CACHE__DISK__LIMIT
+          value: "200Gi"   # match the PVC size
+      podSecurityContext:
+        fsGroup: 1001
+      resources:
+        requests:
+          cpu: "4"
+          memory: "8Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      volumes:
+        - name: local-ssd-storage
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: smithdb-cache
+                resources:
+                  requests:
+                    storage: 200Gi
+
+  ingestion:
+    deployment:
+      podSecurityContext:
+        fsGroup: 1001
+      resources:
+        requests:
+          cpu: "4"
+          memory: "8Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      volumes:
+        - name: local-ssd-storage
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: smithdb-cache
+                resources:
+                  requests:
+                    storage: 100Gi
+
+  compactionWorker:
+    deployment:
+      podSecurityContext:
+        fsGroup: 1001
+      resources:
+        requests:
+          cpu: "8"
+          memory: "16Gi"
+        limits:
+          cpu: "8"
+          memory: "16Gi"
+      volumes:
+        - name: local-ssd-storage
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: smithdb-cache
+                resources:
+                  requests:
+                    storage: 100Gi
+```
+
+</Tab>
+</Tabs>
+
+不需要 node selectors 或 tolerations；SmithDB 运行在你的通用 node pool 上。Migration Job 是例外。它不使用缓存卷，默认仍然请求 100 GiB 的节点 `ephemeral-storage`，因此请把它调度到具有这么多可分配容量的节点上。
+
+确认每个 pod 都有一个已绑定的 claim，并且 `/data` 使用了它：
+
+```bash
+kubectl get pvc -n NAMESPACE
+kubectl exec -n NAMESPACE POD_NAME -- df -h /data
+```
+
+### 本地 SSD
+
+配置节点的本地 SSD 以支撑 Kubernetes ephemeral storage，可用容量以 allocatable `ephemeral-storage` 的形式报告。SmithDB 把这种存储用于它的 `emptyDir` 缓存卷。
+
+使用调度控件让 SmithDB 缓存 workloads 保留在 SSD 支撑的节点上。为节点预留超出 pod requests、镜像、logs 和 Kubernetes 预留的余量。
+
+以下示例使用 `small` 层级。请替换为你的层级的规格。
+
+<Tabs>
+<Tab title="LangSmith 0.17">
+
+在每个使用磁盘的组件上，设置一个名为 `cache` 的 `emptyDir`，以及匹配的 `ephemeral-storage` requests 和 limits。chart 会从该 limit 派生 query 磁盘缓存限制。
+
+```yaml
+smithdb:
+  resourceTier: small
+  query:
+    deployment:
+      resources:
+        requests: { cpu: "4", memory: "8Gi", ephemeral-storage: "200Gi" }
+        limits: { cpu: "4", memory: "8Gi", ephemeral-storage: "200Gi" }
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 200Gi
+  ingestion:
+    deployment:
+      resources:
+        requests: { cpu: "4", memory: "8Gi", ephemeral-storage: "100Gi" }
+        limits: { cpu: "4", memory: "8Gi", ephemeral-storage: "100Gi" }
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 100Gi
+  compactionWorker:
+    deployment:
+      resources:
+        requests: { cpu: "8", memory: "16Gi", ephemeral-storage: "100Gi" }
+        limits: { cpu: "8", memory: "16Gi", ephemeral-storage: "100Gi" }
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 100Gi
+```
+
+</Tab>
+<Tab title="LangSmith 0.16">
+
+在 0.16 上，层级已经设置了 `ephemeral-storage` requests 和 limits，以及一个名为 `local-ssd-storage` 的 `emptyDir`，因此选择层级就足够了。
+
+```yaml
+smithdb:
+  resourceTier: small
+```
+
+</Tab>
+</Tabs>
+
+#### 调度 SmithDB workloads
+
+把 query、ingestion、compaction worker 和 migration 放到本地 SSD pool 上。把 compaction 和 cluster manager 放到通用计算 pool 上。Node-pool 标签和 taint 必须与 Helm 的 selectors 和 tolerations 匹配。`metastoreMigration` 可以在任何节点上运行，不需要 selector。
+
+这些示例中的标签和 taint 值与本页的 provider 示例相匹配。SmithDB 不要求这些确切的值；任何能让缓存 workloads 保留在 SSD 支撑节点上的标签和 taint 都可以。
+
+<Accordion title="Helm scheduling values">
+
+```yaml
+smithdb:
+  query:
+    deployment:
+      nodeSelector:
+        smithdb-local/instance-store: "true"
+      tolerations:
+        - key: smithdb-local/instance-store
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+  ingestion:
+    deployment:
+      nodeSelector:
+        smithdb-local/instance-store: "true"
+      tolerations:
+        - key: smithdb-local/instance-store
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+  compactionWorker:
+    deployment:
+      nodeSelector:
+        smithdb-local/instance-store: "true"
+      tolerations:
+        - key: smithdb-local/instance-store
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+  migration:
+    job:
+      nodeSelector:
+        smithdb-local/instance-store: "true"
+      tolerations:
+        - key: smithdb-local/instance-store
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+  compaction:
+    deployment:
+      nodeSelector:
+        smithdb-local/compute: "true"
+      tolerations:
+        - key: smithdb-local/compute
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+  clusterManager:
+    deployment:
+      nodeSelector:
+        smithdb-local/compute: "true"
+      tolerations:
+        - key: smithdb-local/compute
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+```
+
+<Note>
+在 LangSmith 0.16 上，migration Job 的 pod 设置位于 `smithdb.migration.deployment` 而不是 `smithdb.migration.job`。其他所有 key 都相同。
+</Note>
+
+</Accordion>
+
+<Accordion title="验证本地 SSD 容量">
+
+确认预期的标签、taint、调度器可见容量、pod 放置位置以及缓存文件系统：
+
+```bash
+kubectl get nodes --show-labels
+kubectl describe node NODE_NAME
+kubectl get node NODE_NAME \
+  -o jsonpath='{.status.allocatable.ephemeral-storage}{"\n"}'
+kubectl get pods -n NAMESPACE -o wide
+kubectl exec -n NAMESPACE POD_NAME -- df -h /data
+```
+
+对于 pods 卡在 `Pending`、缓存 I/O 缓慢或 evictions 的情况，请参见[故障排查 SmithDB](/langsmith/self-host-smithdb-troubleshooting#supporting-infrastructure)。
+
+</Accordion>
+
+## Provider setup
+
+<Tabs>
+<Tab title="AWS">
+
+一个常见的 AWS 映射是 EKS、RDS for PostgreSQL、S3、IRSA，以及用于缓存的 EC2 instance store 或 EBS gp3。
+
+### 配置 metastore
+
+使用满足 [metastore 要求](#postgresql-metastore)的 RDS for PostgreSQL 或 Aurora PostgreSQL。
+
+### 配置 S3 访问
+
+向集群的私有路由表添加 S3 Gateway VPC endpoint，让 bucket 流量不经过公共互联网。
+
+选择 IRSA 或 EKS Pod Identity。IRSA 需要 role annotation 以及对 `system:serviceaccount:<NAMESPACE>:<HELM_RELEASE>-smithdb` 的信任。Pod Identity 使用外部关联，无需 annotation。
+
+把该 role 的 S3 访问范围限定为列出 bucket 和读取其位置，外加对象的读取、写入、删除和 multipart 操作。对于 migration 源读取，还要在 LangSmith blob-storage bucket 上授予 `s3:ListBucket` 和 `s3:GetObject`。
+
+<Accordion title="IRSA Helm values">
+
+```yaml
+smithdb:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>"
+  config:
+    objectStore:
+      type: s3
+      bucket: "<BUCKET_NAME>"
+      s3:
+        region: "<AWS_REGION>"
+        accessKeyIdSecretKey: ""
+        secretAccessKeySecretKey: ""
+```
+
+</Accordion>
+
+### 创建缓存 StorageClass
+
+对于[网络挂载磁盘](#network-attached-disk)选项，创建一个带有预配 IOPS 和吞吐量的 gp3 StorageClass。必须已安装 [EBS CSI driver](https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html)。
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: smithdb-cache
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "7000"
+  throughput: "1000"
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+```
+
+### 使用 Karpenter 预配 EKS 节点
+
+接下来的节点示例适用于[本地 SSD](#local-ssd) 选项。Karpenter 是在 EKS 上预配 SmithDB 容量的推荐方式，但不是必需的。其他节点预配器必须产生相同的标签、taint 和 Kubernetes 可见的 ephemeral-storage 容量。
+
+按照 [Karpenter EKS 指南](https://karpenter.sh/docs/getting-started/getting-started-with-karpenter/)安装 Karpenter v1 及其 CRD。在应用以下示例之前：
+
+- 替换 `CLUSTER_NAME` 和 `KarpenterNodeRole-CLUSTER_NAME`。
+- 用 `karpenter.sh/discovery: CLUSTER_NAME` 标记所选的子网和安全组，或把 selectors 替换为你的环境使用的标签或 ID。
+- 确认节点 IAM role 和 EKS access entry 已为 Karpenter 预配的节点配置好。
+
+<Note>
+应用这些 manifests 会创建预配配置。当匹配的 SmithDB pods 需要容量时，EC2 节点才会启动。
+</Note>
+
+<Accordion title="Karpenter EC2NodeClass and NodePool example">
+
+```yaml
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: smithdb-instance-store
+spec:
+  amiSelectorTerms:
+    - alias: al2023@latest
+  role: KarpenterNodeRole-CLUSTER_NAME
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: CLUSTER_NAME
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: CLUSTER_NAME
+  associatePublicIPAddress: false
+  instanceStorePolicy: RAID0
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 1
+    httpTokens: required
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        encrypted: true
+        deleteOnTermination: true
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: smithdb-instance-store
+spec:
+  template:
+    metadata:
+      labels:
+        smithdb-local/instance-store: "true"
+    spec:
+      taints:
+        - key: smithdb-local/instance-store
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: karpenter.k8s.aws/instance-local-nvme
+          operator: Gt
+          values: ["799"]
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["4xlarge", "8xlarge"]
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: smithdb-instance-store
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 2m
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: smithdb-compute
+spec:
+  amiSelectorTerms:
+    - alias: al2023@latest
+  role: KarpenterNodeRole-CLUSTER_NAME
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: CLUSTER_NAME
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: CLUSTER_NAME
+  associatePublicIPAddress: false
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 1
+    httpTokens: required
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        encrypted: true
+        deleteOnTermination: true
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: smithdb-compute
+spec:
+  template:
+    metadata:
+      labels:
+        smithdb-local/compute: "true"
+    spec:
+      taints:
+        - key: smithdb-local/compute
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["2"]
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["2xlarge", "4xlarge", "8xlarge"]
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: smithdb-compute
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 2m
+```
+
+在这个示例中，`instanceStorePolicy: RAID0` 让本地 NVMe 可用作节点 ephemeral storage。`smithdb-instance-store` NodePool 要求至少 800 GiB，并且只在空时进行整合，避免不必要地扰动带有热缓存的节点。
+
+这个 800 GiB 下限适用于 `medium` 层级。请根据你所选层级中最大的每 replica ephemeral-storage 请求，加上节点余量来设定该要求。请参见[按规模配置 SmithDB](/langsmith/self-host-smithdb-scale)。
+
+</Accordion>
+
+使用自定义 AMI 时，bootstrap 必须为 kubelet 和 container-runtime 存储格式化并挂载 instance-store 设备。
+
+### 预配 EKS managed node groups
+
+如果 Karpenter 不可用，请改用 EKS Managed Node Groups。这些示例把 instance-store NVMe 配置为 RAID0，并应用 Helm scheduling values 所使用的标签和 taint。
+
+<Warning>
+替换大写占位符。根据你的 sizing baseline 和区域可用性选择实例类型和容量。把 `AMI_TYPE` 与实例架构匹配。例如，`i8g.4xlarge` 使用 `AL2023_ARM_64_STANDARD`。
+</Warning>
+
+<Accordion title="AWS CLI">
+
+AWS CLI 需要一个用于 `nodeadm` 配置的 EC2 launch template。
+
+```bash
+USER_DATA="$(
+  base64 <<'EOF' | tr -d '\n'
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BOUNDARY"
+
+--BOUNDARY
+Content-Type: application/node.eks.aws
+
+---
+apiVersion: node.eks.aws/v1alpha1
+kind: NodeConfig
+spec:
+  instance:
+    localStorage:
+      strategy: RAID0
+
+--BOUNDARY--
+EOF
+)"
+
+LT_ID="$(aws ec2 create-launch-template \
+  --region AWS_REGION \
+  --launch-template-name smithdb-instance-store \
+  --launch-template-data "{
+    \"InstanceType\": \"INSTANCE_TYPE\",
+    \"UserData\": \"$USER_DATA\",
+    \"MetadataOptions\": {
+      \"HttpEndpoint\": \"enabled\",
+      \"HttpTokens\": \"required\",
+      \"HttpPutResponseHopLimit\": 2
+    }
+  }" \
+  --query 'LaunchTemplate.LaunchTemplateId' \
+  --output text)"
+
+aws eks create-nodegroup \
+  --region AWS_REGION \
+  --cluster-name CLUSTER_NAME \
+  --nodegroup-name smithdb-instance-store \
+  --node-role NODE_ROLE_ARN \
+  --subnets SUBNET_ID_1 SUBNET_ID_2 \
+  --launch-template id="$LT_ID",version=1 \
+  --ami-type AMI_TYPE \
+  --capacity-type ON_DEMAND \
+  --scaling-config minSize=1,maxSize=NODE_COUNT,desiredSize=NODE_COUNT \
+  --labels smithdb-local/instance-store=true \
+  --taints key=smithdb-local/instance-store,value=true,effect=NO_SCHEDULE
+```
+
+</Accordion>
+
+<Accordion title="eksctl 0.199.0+">
+
+```yaml
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: CLUSTER_NAME
+  region: AWS_REGION
+
+managedNodeGroups:
+  - name: smithdb-instance-store
+    amiFamily: AmazonLinux2023
+    instanceType: INSTANCE_TYPE
+    privateNetworking: true
+    minSize: 1
+    maxSize: NODE_COUNT
+    desiredCapacity: NODE_COUNT
+    labels:
+      smithdb-local/instance-store: "true"
+    taints:
+      - key: smithdb-local/instance-store
+        value: "true"
+        effect: NoSchedule
+    overrideBootstrapCommand: |
+      apiVersion: node.eks.aws/v1alpha1
+      kind: NodeConfig
+      spec:
+        instance:
+          localStorage:
+            strategy: RAID0
+```
+
+```bash
+eksctl create nodegroup --config-file=smithdb-nodegroup.yaml
+```
+
+</Accordion>
+
+<Accordion title="Terraform">
+
+```hcl
+module "eks" {
+  source = "terraform-aws-modules/eks/aws"
+
+  # Existing module version and cluster configuration...
+
+  eks_managed_node_groups = {
+    # Existing node groups...
+
+    smithdb_instance_store = {
+      ami_type       = "AMI_TYPE"
+      instance_types = ["INSTANCE_TYPE"]
+      min_size       = 1
+      max_size       = NODE_COUNT
+      desired_size   = NODE_COUNT
+
+      labels = {
+        "smithdb-local/instance-store" = "true"
+      }
+
+      taints = {
+        smithdb = {
+          key    = "smithdb-local/instance-store"
+          value  = "true"
+          effect = "NO_SCHEDULE"
+        }
+      }
+
+      cloudinit_pre_nodeadm = [{
+        content_type = "application/node.eks.aws"
+        content = <<-EOT
+          apiVersion: node.eks.aws/v1alpha1
+          kind: NodeConfig
+          spec:
+            instance:
+              localStorage:
+                strategy: RAID0
+        EOT
+      }]
+    }
+  }
+}
+```
+
+</Accordion>
+
+</Tab>
+<Tab title="GCP">
+
+一个常见的 GCP 映射是 GKE Standard、AlloyDB 或其他兼容的 PostgreSQL 服务、Cloud Storage、Workload Identity，以及用于缓存的 Local SSD 或 Hyperdisk Balanced。
+
+### 配置 metastore
+
+使用满足 [metastore 要求](#postgresql-metastore)的 AlloyDB 或 Cloud SQL for PostgreSQL。
+
+<Accordion title="通过 AlloyDB Auth Proxy 连接">
+
+SmithDB 可以通过在每个 SmithDB pod 中以 sidecar 方式运行的 [AlloyDB Auth Proxy](https://docs.cloud.google.com/alloydb/docs/auth-proxy/overview) 访问 AlloyDB。SmithDB 连接到 loopback 上的 proxy；proxy 向 Google Cloud 认证并加密上游连接。proxy 不会创建网络连通性，因此 GKE 仍然需要通过私有 IP、Private Service Connect 或公共 IP 到达 AlloyDB 的路由。
+
+向绑定到 SmithDB ServiceAccount 的 Google service account 授予 `roles/alloydb.client` 和 `roles/serviceusage.serviceUsageConsumer`。把 metastore Secret 的 host key 指向 `127.0.0.1` 并设置 `useSsl: false`。SmithDB 无法验证 AlloyDB 直接出示的证书，加密从 proxy 开始。
+
+`smithdb.commonInitContainers` 适用于每个 SmithDB Deployment 和 Job。设置 `restartPolicy: Always`，这样 Kubernetes 会把 proxy 作为 sidecar 运行，并让 migration Jobs 得以完成。
+
+```yaml
+smithdb:
+  commonInitContainers:
+    - name: alloydb-auth-proxy
+      image: gcr.io/alloydb-connectors/alloydb-auth-proxy:PINNED_VERSION
+      restartPolicy: Always
+      args:
+        - "--address=127.0.0.1"
+        - "--port=5432"
+        - "--structured-logs"
+        - "--health-check"
+        - "--http-address=0.0.0.0"
+        - "--http-port=9090"
+        - "projects/PROJECT_ID/locations/REGION/clusters/CLUSTER/instances/INSTANCE"
+      ports:
+        - name: proxy-health
+          containerPort: 9090
+      startupProbe:
+        httpGet:
+          path: /startup
+          port: proxy-health
+      readinessProbe:
+        httpGet:
+          path: /readiness
+          port: proxy-health
+      livenessProbe:
+        httpGet:
+          path: /liveness
+          port: proxy-health
+  config:
+    metastore:
+      useSsl: false
+```
+
+添加 `--psc` 用于 Private Service Connect，`--public-ip` 用于公共 IP，或 `--auto-iam-authn` 用于 IAM 数据库认证，后者还需要 `roles/alloydb.databaseUser` 和一个匹配的 IAM 数据库用户。如果某个 migration Job 一直没有完成，请确认 `restartPolicy: Always`。如果 loopback 连接因 TLS 错误而失败，请确认 `useSsl` 为 `false`。
+
+</Accordion>
+
+### 配置 Cloud Storage 访问
+
+使用 Private Google Access 和私有 Google APIs DNS 访问 Cloud Storage。
+
+<Note>
+使用单区域 bucket，以避免数据复制成本并提供可预测的尾部延迟。
+</Note>
+
+向某个 Google service account 授予 SmithDB bucket 上的 `roles/storage.objectAdmin`，或等效的自定义 role，然后允许 `serviceAccount:<PROJECT_ID>.svc.id.goog[<NAMESPACE>/<HELM_RELEASE>-smithdb>]` 冒充它。对于 migration 源读取，还要在 LangSmith blob-storage bucket 上授予 `roles/storage.objectViewer`。
+
+<Accordion title="GKE Workload Identity Helm values">
+
+```yaml
+smithdb:
+  serviceAccount:
+    annotations:
+      iam.gke.io/gcp-service-account: "<GSA_NAME>@<PROJECT_ID>.iam.gserviceaccount.com"
+  config:
+    objectStore:
+      type: gcs
+      bucket: "<BUCKET_NAME>"
+```
+
+</Accordion>
+
+<Accordion title="GCS HMAC migration configuration">
+
+GCS blob 访问优先使用 Workload Identity。如果 LangSmith 必须使用 GCS HMAC keys，请设置 `smithdb.migration.job.extraEnv`（LangSmith 0.16 上为 `smithdb.migration.deployment.extraEnv`）来强制使用 S3 兼容的源，并引用已有的 LangSmith secret（`blob_storage_access_key` / `blob_storage_access_key_secret`）：
+
+<CodeGroup>
+
+```yaml LangSmith 0.17
+smithdb:
+  migration:
+    job:
+      extraEnv:
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__TYPE
+          value: "s3"
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__S3__BUCKET
+          value: "BLOB_BUCKET_NAME"
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__S3__ROOT_FOLDER
+          value: "/"
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__S3__ENDPOINT
+          value: "https://storage.googleapis.com"
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__S3__ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: LANGSMITH_SECRETS_NAME
+              key: blob_storage_access_key
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__S3__SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: LANGSMITH_SECRETS_NAME
+              key: blob_storage_access_key_secret
+```
+
+```yaml LangSmith 0.16
+smithdb:
+  migration:
+    deployment:
+      extraEnv:
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__TYPE
+          value: "s3"
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__S3__BUCKET
+          value: "BLOB_BUCKET_NAME"
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__S3__ROOT_FOLDER
+          value: "/"
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__S3__ENDPOINT
+          value: "https://storage.googleapis.com"
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__S3__ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: LANGSMITH_SECRETS_NAME
+              key: blob_storage_access_key
+        - name: SMITHDB_MIGRATION__BLOB_STORE_DEFAULT__S3__SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: LANGSMITH_SECRETS_NAME
+              key: blob_storage_access_key_secret
+```
+
+</CodeGroup>
+
+</Accordion>
+
+### 创建缓存 StorageClass
+
+对于[网络挂载磁盘](#network-attached-disk)选项，创建一个带有预配 IOPS 和吞吐量的 Hyperdisk Balanced StorageClass。Hyperdisk 的可用性取决于节点机器类型；请参见 [Hyperdisk on GKE](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/hyperdisk)。
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: smithdb-cache
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: hyperdisk-balanced
+  provisioned-iops-on-create: "7000"
+  provisioned-throughput-on-create: "1000Mi"
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+```
+
+### 预配 GKE Local SSD 节点
+
+这适用于[本地 SSD](#local-ssd) 选项。使用 [Local SSD-backed ephemeral storage](https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/local-ssd)，通过 `--ephemeral-storage-local-ssd` 创建，它可以支撑 `emptyDir`、容器层和调度器容量。raw block 选项 `--local-nvme-ssd-block` 不支撑 `emptyDir`，会让 SmithDB 没有缓存容量。
+
+<Accordion title="GKE Local SSD node-pool example">
+
+```bash
+gcloud container node-pools create POOL_NAME \
+  --cluster=CLUSTER_NAME \
+  --machine-type=MACHINE_TYPE \
+  --num-nodes=NODE_COUNT \
+  --ephemeral-storage-local-ssd count=DISK_COUNT \
+  --node-labels=smithdb-local/instance-store=true \
+  --node-taints=smithdb-local/instance-store=true:NoSchedule
+```
+
+</Accordion>
+
+<Accordion title="Terraform GKE Local SSD node-pool example">
+
+<Warning>
+这个示例只配置 Local SSD 和 workload 调度。请单独配置节点 IAM、网络、安全设置和扩缩容。数值仅供参考。
+</Warning>
+
+```hcl
+resource "google_container_node_pool" "smithdb_local_ssd" {
+  name       = "POOL_NAME"
+  cluster    = google_container_cluster.primary.id
+  node_count = NODE_COUNT
+
+  node_config {
+    machine_type = "MACHINE_TYPE"
+
+    ephemeral_storage_local_ssd_config {
+      local_ssd_count = DISK_COUNT
+    }
+
+    labels = {
+      "smithdb-local/instance-store" = "true"
+    }
+
+    taint {
+      key    = "smithdb-local/instance-store"
+      value  = "true"
+      effect = "NO_SCHEDULE"
+    }
+  }
+}
+```
+
+</Accordion>
+
+支持的磁盘数量和机器类型因 zone 和机器世代而异。请在 node pool 使用的每个 zone 中验证可用性。
+
+</Tab>
+<Tab title="Azure">
+
+一个常见的 Azure 映射是 AKS、Azure Database for PostgreSQL、Azure Blob Storage、Workload Identity，以及用于缓存的 Premium SSD v2 或通过 Azure Container Storage 的本地 NVMe。
+
+### 配置 metastore
+
+使用满足 [metastore 要求](#postgresql-metastore)的 Azure Database for PostgreSQL。
+
+### 配置 Blob Storage 访问
+
+为 Blob Storage 使用私有 endpoint。
+
+`smithdb.config.objectStore.bucket` 是 Blob container 名称。`azure.accountName` 是必需的。使用 Workload Identity 时，把 `accessKeySecretKey` 留空。
+
+向 user-assigned managed identity 授予 SmithDB storage account 上的 `Storage Blob Data Contributor`，并在 LangSmith blob-storage account 上授予 `Storage Blob Data Reader` 用于 migration 源读取。用该 identity 的 client ID 注释 SmithDB ServiceAccount，并向每个 SmithDB workload 添加 `azure.workload.identity/use: "true"` 标签。
+
+<Accordion title="AKS Workload Identity Helm values">
+
+```yaml
+smithdb:
+  serviceAccount:
+    annotations:
+      azure.workload.identity/client-id: "<CLIENT_ID>"
+  config:
+    objectStore:
+      type: azure
+      bucket: "<CONTAINER_NAME>"
+      azure:
+        accountName: "<STORAGE_ACCOUNT_NAME>"
+        accessKeySecretKey: ""
+  query:
+    deployment:
+      labels:
+        azure.workload.identity/use: "true"
+  ingestion:
+    deployment:
+      labels:
+        azure.workload.identity/use: "true"
+  compaction:
+    deployment:
+      labels:
+        azure.workload.identity/use: "true"
+  compactionWorker:
+    deployment:
+      labels:
+        azure.workload.identity/use: "true"
+  clusterManager:
+    deployment:
+      labels:
+        azure.workload.identity/use: "true"
+  metastoreMigration:
+    job:
+      labels:
+        azure.workload.identity/use: "true"
+  migration:
+    job:
+      labels:
+        azure.workload.identity/use: "true"
+```
+
+</Accordion>
+
+### 创建缓存 StorageClass
+
+对于[网络挂载磁盘](#network-attached-disk)选项，创建一个带有预配 IOPS 和吞吐量的 Premium SSD v2 StorageClass。Premium SSD v2 磁盘是区域性的，只在部分 region 中可用，因此请在受支持 region 的多个可用区中部署 node pool。请参见 [Premium SSD v2 on AKS](https://learn.microsoft.com/en-us/azure/aks/use-premium-v2-disks)。
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: smithdb-cache
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: PremiumV2_LRS
+  cachingMode: None
+  DiskIOPSReadWrite: "7000"
+  DiskMBpsReadWrite: "1000"
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+```
+
+### 预配带本地 NVMe 的 AKS 节点
+
+这适用于[本地 SSD](#local-ssd) 选项。使用带有本地 NVMe 磁盘的 node pool，并通过 [Azure Container Storage](https://learn.microsoft.com/en-us/azure/storage/container-storage/container-storage-introduction) 暴露它们。
+
+为节点上的每个缓存卷设定 NVMe 规格。这些示例使用 `Standard_L16s_v4`。
+
+<Accordion title="Azure CLI node-pool example">
+
+```bash
+az aks nodepool add \
+  --resource-group RESOURCE_GROUP \
+  --cluster-name CLUSTER_NAME \
+  --name smithcache \
+  --node-vm-size Standard_L16s_v4 \
+  --labels smithdb-local/instance-store=true \
+  --node-taints smithdb-local/instance-store=true:NoSchedule
+```
+
+</Accordion>
+
+<Accordion title="Terraform AKS node-pool example">
+
+<Warning>
+这个示例只配置缓存 pool。请单独配置节点 IAM、网络、安全设置和扩缩容，并确认你的 VM size 在你的 region 中可用。
+</Warning>
+
+```hcl
+resource "azurerm_kubernetes_cluster_node_pool" "smithdb_cache" {
+  name                  = "smithcache"
+  kubernetes_cluster_id = azurerm_kubernetes_cluster.primary.id
+  vm_size               = "Standard_L16s_v4"
+  node_count            = NODE_COUNT
+
+  node_labels = {
+    "smithdb-local/instance-store" = "true"
+  }
+
+  node_taints = [
+    "smithdb-local/instance-store=true:NoSchedule",
+  ]
+}
+```
+
+</Accordion>
+
+在该 pool 上启用 Azure Container Storage。这需要 `k8s-extension` Azure CLI 扩展，并会创建 `local-csi` StorageClass。
+
+```bash
+az aks update \
+  --resource-group RESOURCE_GROUP \
+  --name CLUSTER_NAME \
+  --enable-azure-container-storage ephemeralDisk \
+  --container-storage-version 2 \
+  --azure-container-storage-nodepools smithcache
+```
+
+把每个缓存作为 ephemeral PVC 挂载到 `local-csi` 上，而不是使用 `emptyDir`。chart 会从 PVC 推导 query 磁盘缓存的大小，因此跳过 `ephemeral-storage` 设置。同时添加[调度控件](#schedule-smithdb-workloads)。
+
+<Accordion title="Azure Container Storage cache Helm values">
+
+```yaml
+smithdb:
+  resourceTier: small
+  query:
+    deployment:
+      volumes:
+        - name: cache
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: local-csi
+                resources:
+                  requests:
+                    storage: 200Gi
+  ingestion:
+    deployment:
+      volumes:
+        - name: cache
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: local-csi
+                resources:
+                  requests:
+                    storage: 100Gi
+  compactionWorker:
+    deployment:
+      volumes:
+        - name: cache
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: local-csi
+                resources:
+                  requests:
+                    storage: 100Gi
+```
+
+</Accordion>
+
+</Tab>
+</Tabs>

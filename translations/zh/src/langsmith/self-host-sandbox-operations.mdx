@@ -1,0 +1,185 @@
+---
+title: 运维自托管 Sandboxes
+sidebarTitle: 升级与运维
+description: 规划自托管 Sandbox 升级，了解 host drain 与故障恢复，保护共享存储，并监控生产环境容量。
+---
+
+import { SandboxDiagram } from '/snippets/sandbox-diagram.jsx';
+
+自托管 Sandbox 运维围绕 host pool 及其共享存储展开。替换 host 会影响运行中的工作负载；存储故障可能影响整个 pool。使用本指南来规划升级，并区分可恢复的中断与持久化数据丢失。
+
+从 [Sandbox 架构](/langsmith/self-host-sandbox-architecture)和[容量规划](/langsmith/self-host-sandbox-scaling)开始。平台级升级流程和 release 要求请遵循[自托管升级指南](/langsmith/self-host-upgrades)。
+
+## 了解滚动升级
+
+`sandbox-host` 镜像打包了 host daemon 和运行时工件，包括 Firecracker、guest 工件和 JuiceFS client。将 `images.sandboxHostImage.tag` 设置为你的 LangSmith release 对应的运行时镜像。升级较旧的存储布局时，请遵循特定 release 的说明。
+
+host Deployment 使用 `maxSurge: 0` 和 `maxUnavailable: 1`。Kubernetes 先终止一个 host 再创建它的替代者，然后等待替代者就绪。必需的单节点单 host 放置和共享的 host 端口防止两个 host pod 占用同一节点。
+
+<Frame caption="健康的四 host pool 在每次替换期间有三台就绪 host。时间线仅作示意；drain 和启动时长取决于工作负载和存储。">
+  <SandboxDiagram name="rollout" />
+</Frame>
+
+正常 rollout 会暂时移除一台 host 的容量。在单 host pool 中，在替代 host 就绪之前，创建 sandbox 的请求会失败。现有的未就绪 host 或基础设施故障可能进一步减少容量；`maxUnavailable` 不能保证免受无关故障的影响。
+
+对于 host 持有的 JuiceFS 挂载，启动包括挂载文件系统并在打开 host listener 之前检查存储访问。无法访问存储的替代者会阻塞进度，而不是接受 sandbox 流量。
+
+<Warning>
+滚动升级不是实时迁移，也不是不间断执行。正在 drain 的 host 上的 sandbox 会暂停，其已打开的连接可能断开。应用程序必须处理重连和中断的工作。
+</Warning>
+
+## 跟踪 host drain
+
+优雅的 host 关机会在 pod 退出之前尝试挂起持久化 sandbox：
+
+<Steps>
+  <Step title="停止新的放置">
+    host 进入 drain 状态并通知 platform backend。新的 sandbox 放置使用其他就绪 host。
+  </Step>
+  <Step title="保存运行中的 sandbox">
+    host 在挂起每个 VM 时停止向对应 sandbox 路由。它尝试将 VM 的内存保存到 JuiceFS，并报告该 sandbox 已停止。
+  </Step>
+  <Step title="释放 host">
+    host 在停止工作负载的同时持续续约 Lease。VM 全部停止后，它会释放 Lease 并拆除存储挂载。
+  </Step>
+  <Step title="按需恢复">
+    后续的 start 或 wake 请求会将 sandbox 放置到可用、兼容的 host 上。完整的已保存内存镜像允许进程恢复；否则恢复使用持久化的文件系统。
+  </Step>
+</Steps>
+
+替代 host 就绪时，已停止的 sandbox 并不会全部重启。它们保持停止状态，直到被显式启动，或通过某个会唤醒它们的请求路径被访问。
+
+到受影响 sandbox 的已打开执行流、隧道和服务连接需要重连。已保存的内存镜像不会保留客户端的网络连接。
+
+### 为 drain 预留足够的时间
+
+`sandboxes.sandboxHost.deployment.terminationGracePeriodSeconds` 默认为 `300`。当宽限期到期时，Kubernetes 可以杀掉 host，即使 host 尚未完成保存每个 sandbox 的内存。
+
+使用有代表性的 sandbox 密度和内存用量来测量 drain。在关机摘要中查看 drain 时长以及成功挂起或挂起失败的 sandbox 数量。当 host 无法及时保存每个 sandbox 的内存时，增加宽限期，并保持节点维护的 drain 超时时间长于该宽限期。
+
+不完整的 drain 可能丢失运行中的内存，需要对受影响的 sandbox 进行崩溃恢复。增加超时时间不能解决存储不可用或容量不足的问题。
+
+### 协调节点维护
+
+节点替换和 Kubernetes 升级也会终止 host pods。配置节点维护流程以遵循优雅关机，避免同时 drain 多个 sandbox host。
+
+启用 `sandboxes.sandboxHost.pdb.enabled` 以使用 chart 的 PodDisruptionBudget 管理自愿驱逐。其默认预算允许一台 host 不可用。PDB 不能防止节点故障、直接删除 pod，或所有提供商特定的维护操作。
+
+保持节点自动扩缩容与 host autoscaler 一致。如果你的节点 autoscaler 支持驱逐保护，应防止它在常规整理期间独立驱逐活跃的 host pods。让 host 缩容先 drain 工作负载，再移除空节点。检查你的 autoscaler 的行为，而不是假设一个 annotation 对所有提供商都有效。
+
+不要通过删除多个 host pods 或将中断扩大到已测试容量之外来加速 rollout。
+
+### 诊断停滞的 rollout
+
+比较期望、就绪和已更新的 host 数量。然后检查 pod 事件和节点预配：
+
+- **host 停留在 `Pending`**：检查 node pool 限制、基础设施配额、regional 容量、node selector、taint 和资源请求。
+- **host 启动但未就绪**：检查 KVM 可用性、运行时日志，以及对 JuiceFS metadata 和对象存储的访问。
+- **host 一直处于终止中**：在更改宽限期之前，检查 drain 进度和存储延迟。
+
+如果期望副本数超过可调度容量，rollout 可能无法满足其可用性下限。先恢复容量。启用自动扩缩容时，`sandbox-host.smith.langchain.com/autoscale-override` Deployment annotation 可以临时固定 host 数量。仅在评估剩余容量之后使用它，并在事后移除该覆盖。调低目标无法解决根本的容量短缺。
+
+## 规划机型变更
+
+内存快照包含 CPU 和虚拟机状态。不要假设已保存的 VM 可以跨不同 CPU 机型或不兼容的 host kernel 恢复。[Firecracker 的快照兼容性指南](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#where-can-i-resume-my-snapshots)要求硬件和软件配置匹配，仅有少量明确标注例外的情形。
+
+在 sandbox pool 中保持一致的 CPU 型号。将 CPU 厂商或型号、host kernel 或 sandbox 运行时的变更视为需要恢复测试的转换。更新的 CPU 或 kernel 不会自动使目标环境兼容。单向兼容不代表反向兼容。
+
+### 示例转换，而非支持矩阵
+
+<Note>
+这些是基于文档的示例，不是经过测试的 LangSmith 兼容性矩阵，也不是受支持平台的扩展。每个较低风险的候选转换仍需要在你的确切部署上进行验证。保持暴露的 CPU 型号和特性、host kernel 以及 sandbox 运行时一致。确认目标环境满足 [Sandbox 平台与 KVM 要求](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes)。
+</Note>
+
+这些示例针对的是 host 节点变更，而不是已保存 microVM 的 guest 配置变更。
+
+| 云平台 | 需验证的较低风险候选 | 不要假设内存恢复兼容 |
+| --- | --- | --- |
+| AWS | 将 `m6i.metal` 节点替换为使用相同暴露 CPU 配置和软件版本的另一个节点。[M6i 实例](https://aws.amazon.com/ec2/instance-types/m6i/)使用 Intel Ice Lake 处理器。 | `m6i.metal`（Ice Lake）→ `m5n.metal`（Cascade Lake）。Firecracker 明确指出该方向不兼容。另请参阅 [M5n 处理器规格](https://aws.amazon.com/ec2/instance-types/m5/)。 |
+| GCP | 在保持相同暴露 CPU 平台、kernel 和运行时的前提下替换或调整 N2 节点大小。验证实际 CPU，而不是依赖机型系列名称。 | Ice Lake 上的 N2 节点 → Cascade Lake 上的 N2 节点。[N2 系列](https://docs.cloud.google.com/compute/docs/general-purpose-machines#n2_series)同时包含这两种平台；停留在 N2 系列内不代表内存兼容。 |
+| Azure | `Standard_D16ds_v6` → `Standard_D32ds_v6`，kernel 和运行时相同。两种 [Ddsv6 规格](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/general-purpose/ddsv6-series)都列出 Intel Xeon Platinum 8573C（Emerald Rapids）。匹配所列处理器使其成为待测试的候选，而非保证。 | 暴露不同 CPU 型号的 Dsv3 节点替换，即使 SKU 没有变化。[Dsv3 系列](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/general-purpose/dsv3-series)列出了从 Haswell 到 Emerald Rapids 的多代处理器。 |
+
+匹配的 SKU 或机型系列不足以作为证据。提供商的放置和可用处理器可能不同。例如，[Google 的 CPU 平台文档](https://docs.cloud.google.com/compute/docs/cpu-platforms)描述了具有多种 CPU 平台的机型，以及平台选择的工作方式。
+
+<Warning>
+x86-64 内存快照无法在 Arm CPU 上恢复。指令集变更还需要架构兼容的 guest 软件；在 Arm 上启动相同的 x86-64 文件系统不是恢复策略。不要把 CPU 架构变更当成普通的节点扩缩容。
+</Warning>
+
+### 在 rollout 之前验证转换
+
+要验证从源到目标的转换：
+
+1. 确认目标暴露 `/dev/kvm` 并满足受支持的平台要求。
+2. 在源节点和目标节点上记录暴露的 CPU 型号和特性、host kernel 以及 `sandbox-host` 镜像版本。
+3. 使用与目标配置匹配的隔离测试容量。恢复一个在源节点上挂起的持久化 sandbox，并单独从在该节点捕获的内存快照创建一个 sandbox。确认两者都运行在目标节点上，而不是原来的 host。
+4. 验证内存中的状态得以保留，然后运行有代表性的工作负载路径。仅成功启动 VM 并不能证明兼容。
+5. 如果 rollout 需要回滚，请测试反向方向。不要假设在目标上捕获的快照可以在较旧的源配置上恢复。
+
+如果恢复不兼容，应规划冷启动和内存中工作的丢失，而不是依赖内存迁移。持久化磁盘恢复与内存恢复是两回事。需要持久化进度的应用程序应将进度写入持久化存储，而不是仅依赖已保存的进程内存。
+
+## 了解故障影响
+
+<div className="sandbox-impact-table">
+
+| 事件 | 平台行为 | 工作负载影响 |
+| --- | --- | --- |
+| host 崩溃或节点丢失 | 等待 fencing 完成后，才在另一台 host 上启动受影响的 sandbox。 | <span className="sandbox-impact sandbox-impact--host">单台 host 受影响</span><br />运行中的内存会丢失。持久化 sandbox 会在后续的 start 或 wake 请求中从持久化磁盘恢复。 |
+| 长时间失去 Kubernetes API 访问 | 无法续约 Lease 的 host 会自我隔离（fence）以避免写入者冲突。 | <span className="sandbox-impact sandbox-impact--pool">单台 host 或整个 pool</span><br />视故障范围而定，可能停止单台 host 或整个 pool 上的工作负载。 |
+| host 持有的 JuiceFS 挂载失败 | host 停止接受工作，并在退出前停止其 VM。 | <span className="sandbox-impact sandbox-impact--host">单台 host 受影响</span><br />受影响的 sandbox 丢失运行中的内存；恢复需要可用的共享存储。 |
+| Metadata Redis 不可用 | 文件系统操作停滞或失败；持续的挂载健康检查失败可能使 host 停止。 | <span className="sandbox-impact sandbox-impact--pool">影响整个 pool</span><br />整个 pool 的 sandbox 创建和运行中的工作负载都可能失败。 |
+| 对象存储不可用或被限流 | 未命中缓存的读取和上传停滞或失败；新 host 可能无法通过 readiness 检查。 | <span className="sandbox-impact sandbox-impact--pool">影响整个 pool</span><br />I/O 变慢或失败，就绪容量减少。 |
+| 没有就绪 host | 创建 sandbox 的请求以 `NoSandboxHostsAvailable` 失败。 | <span className="sandbox-impact sandbox-impact--api">影响 sandbox 创建</span><br />客户端必须在容量可用后重试。 |
+| Metadata 或对象数据丢失 | 仅恢复 host 无法恢复文件系统。 | <span className="sandbox-impact sandbox-impact--data">持久化数据丢失</span><br />从经过测试的备份中恢复底层存储。 |
+
+</div>
+
+fencing 可以防止替代者在旧 host 可能仍在运行时写入持久化 sandbox 的磁盘。因此 host 消失后恢复并不是即时的。不要通过手动更改 sandbox 所有权或删除共享存储状态来绕过这个延迟。
+
+## 保护 sandbox 存储
+
+JuiceFS metadata 存储和对象存储组成一个持久化文件系统。要与平台的缓存和队列 Redis 分开保护它们。
+
+- **专用 metadata Redis**：使用 `noeviction`、高可用性、持久化和备份。不要在缓存维护时清空或重建它。
+- **内存余量**：在 Redis 达到内存上限之前告警。使用 `noeviction` 时，内存耗尽后写入会失败，而不是驱逐文件系统 metadata。
+- **对象保留**：不要应用会删除活跃 JuiceFS 对象或将其移动到不可访问存储层级的 lifecycle 规则。
+- **恢复测试**：测试将文件系统 metadata 和对象数据一起恢复。副本可以提升可用性，但不能替代备份。
+- **私有访问**：将存储和 host endpoint 保持在私有网络。使用安装指南中适合你环境的身份和 secret 配置。
+
+根据恢复目标选择备份频率和保留策略。不要假设仅凭对象存储备份就包含恢复 sandbox 所需的文件树。
+
+## 监控 pool
+
+host 在其内部 `/metrics` endpoint 上暴露 Prometheus 指标。通过你的私有监控基础设施抓取它，而不是公共 ingress。平台监控设置请参阅[导出 LangSmith telemetry](/langsmith/export-backend)。
+
+被选出的 host 导出以下 pool 指标：
+
+| 指标 | 含义 |
+| --- | --- |
+| `langsmith_sandbox_host_pool_assigned_cpu_millicores` | 就绪 host 上已分配给 sandbox 的 CPU。 |
+| `langsmith_sandbox_host_pool_capacity_cpu_millicores` | 就绪 host 的 CPU 容量。 |
+| `langsmith_sandbox_host_pool_ready_hosts` | pool 中的就绪 host 数量。 |
+| `langsmith_sandbox_host_pool_desired_replicas` | 自动扩缩容激活时的副本目标。 |
+
+还要监控 host pod 就绪状态、`Pending` pods、节点内存和磁盘压力、存储延迟、Redis 内存和驱逐、sandbox 启动失败以及 drain 时长。期望 host 数与就绪 host 数之间出现持续差距时，需要检查节点预配和 host 启动，而不仅仅是工作负载需求。
+
+### 检查生产就绪状态
+
+在运行生产工作负载之前：
+
+- 确认专用节点暴露 KVM，并匹配 host selector 和 tolerations。
+- 为 guest、host 运行时、JuiceFS 和 Kubernetes 开销预留内存。
+- 对齐 host 限制、节点限制、基础设施配额和 workspace 配额。
+- 以冷缓存从最小 pool 大小测试扩容。
+- 在负载下测试单 host 丢失和一次一台 host 的升级。
+- 验证执行流或服务连接断开时应用程序的行为。
+- 测量 drain 时长，并设置兼容的 pod 和节点关机超时。
+- 确认 metadata Redis 使用 `noeviction`，并且备份和恢复流程经过测试。
+- 监控对象存储访问、metadata 容量，以及期望 host 数与就绪 host 数之间的差距。
+
+## 另请参阅
+
+- [Sandbox 架构与生命周期](/langsmith/self-host-sandbox-architecture)
+- [扩展自托管 Sandboxes](/langsmith/self-host-sandbox-scaling)
+- [启用 Sandboxes](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes)
+- [升级自托管 LangSmith](/langsmith/self-host-upgrades)
+- [规划平台灾难恢复](/langsmith/self-host-disaster-recovery)

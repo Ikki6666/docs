@@ -1,0 +1,285 @@
+---
+title: 工具
+description: 将 MCP 工具加载到 LangChain 智能体中，控制它们的执行，并处理服务器结果和请求。
+---
+
+import McpUseInAgentPy from '/snippets/code-samples/mcp-use-in-agent-py.mdx';
+import McpUseInAgentJs from '/snippets/code-samples/mcp-use-in-agent-js.mdx';
+import McpToolErrorsPy from '/snippets/code-samples/mcp-tool-errors-py.mdx';
+import McpToolErrorsJs from '/snippets/code-samples/mcp-tool-errors-js.mdx';
+import McpToolMetadataPy from '/snippets/code-samples/mcp-tool-metadata-py.mdx';
+import McpToolMetadataJs from '/snippets/code-samples/mcp-tool-metadata-js.mdx';
+import McpMultimodalToolContentPy from '/snippets/code-samples/mcp-multimodal-tool-content-py.mdx';
+import McpMultimodalToolContentJs from '/snippets/code-samples/mcp-multimodal-tool-content-v2-js.mdx';
+import McpStructuredContentPy from '/snippets/code-samples/mcp-structured-content-py.mdx';
+import McpStructuredContentJs from '/snippets/code-samples/mcp-structured-content-js.mdx';
+import McpElicitationPy from '/snippets/code-samples/mcp-elicitation-py.mdx';
+import McpElicitationJs from '/snippets/code-samples/mcp-elicitation-js.mdx';
+import McpDestructiveGatePy from '/snippets/code-samples/mcp-destructive-gate-py.mdx';
+import McpDestructiveGateJs from '/snippets/code-samples/mcp-destructive-gate-js.mdx';
+
+:::python
+<Note>
+`langchain.mcp` 命名空间需要 `langchain[mcp]>=1.4.0`，目前处于 beta 阶段。API 可能会变化。
+</Note>
+
+@[`MCPAdapter`] 在 MCP 服务器和 LangChain 智能体之间架起桥梁：它发现服务器宣告的工具，并将其适配成标准的 LangChain 工具。像使用任何其他 LangChain 工具一样，把 `list_tools()` 返回的工具传给 @[`create_agent`]。
+:::
+
+:::js
+@[`MCPAdapter`] 在 MCP 服务器和 LangChain 智能体之间架起桥梁：它发现服务器宣告的工具，并将其适配成标准的 LangChain 工具。像使用任何其他 LangChain 工具一样，把 `listTools()` 返回的工具传给 @[`createAgent`]。
+:::
+
+本页介绍该桥梁特有的内容：识别 MCP 工具、控制它们的执行、处理它们的输出，以及在调用期间服务器需要输入时进行响应。关于可运行的发现与智能体示例，参见 [MCP 快速开始](/oss/langchain/mcp)。
+
+## 在智能体中使用 MCP 工具
+
+:::python
+用 @[`MCPAdapter.list_tools`] 发现服务器的目录，然后将返回的工具交给 @[`create_agent`]。从智能体的角度看，它们表现得像 LangChain 工具：模型选择一个工具，LangChain 调用它，生成的 @[`ToolMessage`] 返回给模型。
+
+<McpUseInAgentPy />
+:::
+
+:::js
+用 @[`MCPAdapter.listTools`] 发现服务器的目录，然后将返回的工具交给 @[`createAgent`]。从智能体的角度看，它们表现得像 LangChain 工具：模型选择一个工具，LangChain 调用它，生成的 @[`ToolMessage`] 返回给模型。
+
+<McpUseInAgentJs />
+
+在智能体可以调用这些工具期间保持 adapter 打开，包括恢复被中断的运行时。用完智能体后调用 `await adapter.close()`。
+:::
+
+关于定义、绑定和使用 LangChain 工具的一般指导，参见 [Tools](/oss/langchain/tools)。关于多个 MCP 服务器及其带命名空间的工具目录，参见 [Connections](/oss/langchain/mcp/connections#multiple-servers)。
+
+## 处理工具输出
+
+MCP 工具结果会变成 @[`ToolMessage`] 对象，其中包含模型可读的内容、用于应用数据的 artifact，以及指示成功或失败的状态。
+
+### 多模态内容
+
+adapter 将模型可见的 MCP 内容转换为 LangChain [content blocks](/oss/langchain/messages#standard-content-blocks)。例如，返回带有截图的 MCP 图像 block 的工具，会以 `image` block 的形式到达模型。
+
+:::python
+<McpMultimodalToolContentPy />
+:::
+
+:::js
+<McpMultimodalToolContentJs />
+:::
+
+### 结构化内容
+
+当工具返回结构化内容时，adapter 会将其作为 artifact 附加到 @[`ToolMessage`] 上，而不是并入模型可见的文本中。运行智能体，然后从结果中的 @[`ToolMessage`] 实例读取 `artifact`：
+
+:::python
+<McpStructuredContentPy />
+
+artifact 是一个 `MCPToolArtifact`，其 `structured_content` 字段保存工具结果的 `structuredContent`。不返回结构化内容的工具会将 `artifact` 保持为 `None`。
+:::
+
+:::js
+`artifact` 是一个由 MCP 结果条目组成的数组。结构化内容出现在 `type: "mcp_structured_content"` 的条目中，其 `data` 字段保存工具结果的 `structuredContent`。
+:::
+
+### 错误
+
+:::python
+MCP 工具结果带有 `isError` 标志。当服务器报告 `isError=True` 时，adapter 会将其转换为 `status="error"` 的 @[`ToolMessage`]，并携带服务器自己的消息，这样智能体可以读取它并自我纠正：
+
+<McpToolErrorsPy />
+
+服务器报告的错误会以失败工具消息的形式到达模型，但传输或会话失败会直接抛出异常。
+:::
+
+:::js
+当服务器在智能体工具调用期间返回 `isError: true` 时，adapter 返回一个 `status: "error"` 的 @[`ToolMessage`]，并附带服务器的消息。模型可以读取该错误并重试。
+
+adapter 会抛出传输失败。当工具在 `createAgent` 内运行时，智能体的默认错误处理也会把这些失败转换为错误工具消息。仅凭消息的 `status` 无法区分原因：
+
+<McpToolErrorsJs />
+
+如果你用普通参数直接调用一个适配后的工具，带有 `isError: true` 的服务器结果会改为抛出 `ToolException`，MCP 结果位于 `error.result` 中。
+:::
+
+## 工具元数据
+
+:::python
+每个适配后的工具都可以在 LangChain 工具的 metadata 上的 `mcp` 命名空间中携带其 MCP 来源信息：
+
+```python
+tool.metadata
+# {
+#     "mcp": {
+#         "tool": {
+#             "annotations": {
+#                 "destructive_hint": True,
+#                 "read_only_hint": False,
+#             },
+#             "_meta": {"origin": "crm"},
+#         },
+#         "server": {
+#             "name": "crm",
+#             "version": "2.1.0",
+#         },
+#     },
+# }
+```
+:::
+
+:::js
+adapter 将 MCP 工具注解存储在 `tool.metadata.annotations` 中：
+
+```typescript
+tool.metadata;
+// {
+//   annotations: {
+//     destructiveHint: true,
+//     readOnlyHint: false,
+//   },
+// }
+```
+:::
+
+:::python
+每个嵌套字段都是可选的：服务器可能提供工具注解、`_meta`、服务器身份，或它们的任意组合，也可能都不提供。`annotations` 包含诸如 `read_only_hint` 和 `destructive_hint` 之类的 MCP 提示；`_meta` 是服务器提供的不透明元数据；`server` 标识宣告该工具的 MCP 实现。
+:::
+
+:::js
+`annotations` 保存服务器的 MCP 工具注解，例如 `readOnlyHint` 和 `destructiveHint`。服务器可能省略它们，因此该字段可能是 `undefined`。
+:::
+
+以防御方式读取可选元数据，这样缺失的字段会返回默认值而不是失败：
+
+:::python
+<McpToolMetadataPy />
+:::
+:::js
+本示例和 [human-in-the-loop 示例](#human-in-the-loop)从 `@modelcontextprotocol/client` 导入类型；请将其添加为直接依赖。
+
+<McpToolMetadataJs />
+:::
+
+## Human-in-the-loop
+
+读取注解让你可以基于服务器对工具的声明来控制工具，而不是硬编码工具名称。MCP 注解对工具进行分类，LangChain 的 human-in-the-loop 中间件执行审批策略。
+
+在工具发现期间从 metadata 中读取一次 destructive 提示。然后为 human-in-the-loop 配置提供一个 `when` 谓词，该谓词接收每个待处理的工具调用，并返回该调用是否需要审批：
+
+:::python
+<McpDestructiveGatePy />
+:::
+
+:::js
+<McpDestructiveGateJs />
+
+<Warning>
+`interruptOn` 的键必须是 adapter 的工具名称，其中包含服务器前缀（`crm_delete_file`）。不带前缀的键永远不会匹配，因此工具会在未经审批的情况下运行。
+</Warning>
+:::
+
+当智能体调用被谓词控制的工具时，运行会暂停。批准该调用以执行它，或拒绝它以跳过该工具并告知模型：
+
+:::python
+```python
+from langgraph.types import Command
+
+# Approve the pending destructive call and resume.
+resumed = await agent.ainvoke(
+    Command(resume={"decisions": [{"type": "approve"}]}), config
+)
+```
+:::
+
+:::js
+```typescript
+import { Command } from "@langchain/langgraph";
+
+// Approve the pending destructive call and resume.
+const resumed = await agent.invoke(
+  new Command({ resume: { decisions: [{ type: "approve" }] } }),
+  config
+);
+```
+:::
+
+谓词还可以检查调用的参数。这让工具对安全的输入自由运行，只对有风险的输入暂停，例如针对受保护路径的 `delete_file` 调用。
+
+:::python
+通过 `request.tool_call["args"]` 访问参数。
+:::
+
+:::js
+通过 `request.toolCall.args` 访问参数。
+:::
+
+结合 metadata 分类和参数检查，只在工具的类型和输入需要审批时才控制它。关于完整的审批工作流，参见 [Human-in-the-loop](/oss/langchain/human-in-the-loop)。
+
+## 工具执行期间的服务器请求
+
+大多数工具在调用中途不需要向客户端请求任何东西就能完成。当服务器需要输入时，@[`MCPAdapter`] 将 [elicitation](https://modelcontextprotocol.io/specification/draft/client/elicitation) 呈现为 LangGraph @[`interrupt`]。
+
+### Elicitation
+
+[Elicitation](https://modelcontextprotocol.io/specification/draft/client/elicitation) 让 MCP 服务器在工具调用期间请求输入。adapter 使用 LangGraph interrupt 暂停运行。你的应用程序将请求呈现给用户，并用用户的答案恢复运行。
+
+为智能体附加一个 [checkpointer](/oss/langchain/short-term-memory)，并在调用和恢复时使用相同的 `thread_id`。
+
+此示例假设预订工具请求一个日期并暂停一次。将示例日期替换为用户的答案。
+
+:::python
+<McpElicitationPy />
+
+Elicitation 默认开启。adapter 宣告该能力并驱动 interrupt 循环。已经带有自己的 elicitation 处理器的预构建客户端会被优先使用，而不是被覆盖。
+
+用 `Command(resume={"responses": {key: answer}})` 恢复。interrupt payload 和答案类型位于 `langchain.mcp.elicitation`。
+:::
+
+:::js
+基于 interrupt 的 elicitation 需要现代 MCP 服务器，并且默认开启。在服务器上设置 `elicitation: false` 以选择退出。对于旧式服务器，改为在 `mode: "legacy"` 下配置 `onElicitation` 处理器。没有 checkpointer 时，请求输入的工具会以错误 `ToolMessage` 失败，而不是暂停。
+
+<McpElicitationJs />
+
+`createMCPElicitationResume` 将答案寻址到请求它的 interrupt。响应使用服务器的请求键。请始终用 `createMCPElicitationResume` 构建每个 resume 值，而不要使用不带服务器信息的 `{ responses }` 对象，后者没有说明它回答的是哪个 interrupt。
+
+每个 interrupt 的 `value` 是一个 `MCPElicitationInterrupt`：`type: "mcp_elicitation"`、`server`、`tool`（服务器自己的工具名称，不带前缀）、`arguments`（生效的工具参数）和 `requests`。当同一个智能体还可能引发 human-in-the-loop interrupt 时，请检查 `type`。
+
+当多个调用同时暂停时，要回答每个 interrupt。将 `createMCPElicitationResume` 返回的对象合并为一个 `Command({ resume })`，例如 `Object.assign({}, ...paused.__interrupt__!.map((q) => createMCPElicitationResume(q, answers)))`，或者持续恢复直到 `__interrupt__` 为空。只回答第一个 interrupt 的 resume 会让其余的保持暂停。
+:::
+
+<Note>
+恢复会从头重新运行工具。在服务器请求输入之前执行的任何工作都可能重复。请确保这些工作可以安全地重复，而不会产生重复的副作用。
+</Note>
+
+每个答案使用以下操作之一：
+
+- **`accept`**：提供与请求 schema 匹配的表单 `content`，或者在不带 `content` 的情况下确认 URL 交互已完成。
+- **`decline`**：拒绝提供所请求的信息。
+- **`cancel`**：表示用户取消了该交互。
+
+adapter 将答案转发给服务器，由服务器决定工具调用如何结束。
+
+:::python
+只有 elicitation 是通过这种方式回答的。如果服务器改为请求 [sampling](https://modelcontextprotocol.io/specification/2025-06-18/client/sampling) 或 [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots)，则会引发错误，因为现代的无会话协议没有用于这些请求的实时回传通道。参见 [Sampling and roots](/oss/migrate/langchain-mcp-adapters#sampling-and-roots)。
+:::
+
+:::js
+只有 elicitation 是通过这种方式回答的。adapter 在每次调用中只宣告 elicitation 能力，因此需要 [sampling](https://modelcontextprotocol.io/specification/2025-06-18/client/sampling) 或 [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots) 的工具会以 `ToolException` 失败，`createAgent` 会将其作为错误 `ToolMessage` 返回给模型。参见 [Sampling and roots](/oss/migrate/langchain-mcp-adapters#sampling-and-roots)。
+:::
+
+<Note>
+基于 interrupt 的 elicitation 回答的是将其请求作为 `InputRequiredResult` 返回的服务器。只在旧式握手会话上推送 elicitation 的服务器无法通过这种方式回答。
+</Note>
+
+## 另请参阅
+
+- [Content blocks](/oss/langchain/messages#standard-content-blocks)
+- [Tools](/oss/langchain/tools)
+- [Human-in-the-loop](/oss/langchain/human-in-the-loop)
+
+:::python
+- [FastMCP calling tools](https://gofastmcp.com/clients/tools)
+- [FastMCP client elicitation](https://gofastmcp.com/clients/elicitation)
+- [FastMCP server elicitation](https://gofastmcp.com/servers/elicitation)
+:::
+
+- [MCP elicitation specification](https://modelcontextprotocol.io/specification/draft/client/elicitation)
+- [MCP tool annotations](https://modelcontextprotocol.io/specification/draft/server/tools)

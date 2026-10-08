@@ -1,0 +1,326 @@
+---
+title: GCP Terraform 架构
+sidebarTitle: 架构
+description: LangSmith self-hosted 在 GKE 上的平台分层、服务、Workload Identity、网络与 module 依赖。
+---
+
+了解 [GCP Terraform modules](https://github.com/langchain-ai/terraform/tree/main/modules/gcp) 会预配哪些内容，以及各部分如何协同工作，这样你就可以在运行 `make apply` 之前规划容量、加固安全并自定义 LangSmith 部署。
+
+在规划上线或排查现有部署时，可以将本页作为参考。本页涵盖：
+
+- 平台分层与部署档位（light 与 production）。
+- module 描述与依赖。
+- 网络、Workload Identity 与流量流向。
+- Add-on：LangSmith Deployment、Fleet、Insights 和 Polly。
+- GCP 托管服务与 Secret Manager 集成。
+
+如果已准备好安装，请从[部署流程指南](/langsmith/self-host-terraform-gcp-deploy)开始。
+
+## 平台分层
+
+LangSmith 在 GCP 上最多分五个阶段部署。每个阶段都在前一阶段之上叠加一个能力层。所有分层共享同一个 GKE 集群和 `langsmith` namespace。
+
+<img src="/images/self-hosted-terraform/gcp-architecture.png" alt="LangSmith on GCP deployment stages and service layout" />
+
+| 阶段 | 分层 | 新增内容 |
+|---|---|---|
+| 1 | GCP infrastructure | VPC、GKE、Cloud SQL、Memorystore、GCS、K8s bootstrap、cert-manager、KEDA、Envoy Gateway |
+| 2 | LangSmith base | frontend、backend、platform-backend、queue、ace-backend、clickhouse、playground |
+| 3 | LangSmith Deployment | host-backend、listener、operator + 每个 deployment 的 pods |
+| 4 | Fleet | standalone-fleet-api-server、standalone-fleet-tool-server、standalone-fleet-trigger-server、standalone-fleet-queue |
+| 5 | Insights + Polly | Clio analytics（基于 ClickHouse）、Polly eval agent |
+
+<Note>
+Fleet（chart v0.15+）是原名为 Agent Builder 的功能的当前形态。使用 `enable_fleet` 启用它。与已弃用的 `enable_agent_builder` 路径不同，它不要求 LangSmith Deployment 层。这两个开关互斥，且共享同一个加密 key。参见部署指南中的[启用 add-on](/langsmith/self-host-terraform-gcp-deploy#enable-add-ons)。
+</Note>
+
+## module 描述
+
+| module | 路径 | 用途 |
+|---|---|---|
+| `networking` | `infra/modules/networking/` | VPC、带次要范围的子网、Cloud Router、Cloud NAT、用于 Cloud SQL 和 Memorystore 的私有服务连接 |
+| `k8s-cluster` | `infra/modules/k8s-cluster/` | GKE Standard 或 Autopilot 集群、私有节点、带自动扩缩容的 node pool、启用 Workload Identity |
+| `postgres` | `infra/modules/postgres/` | Cloud SQL PostgreSQL 实例、regional HA 备用实例、私有 IP、删除保护 |
+| `redis` | `infra/modules/redis/` | Memorystore Redis STANDARD_HA 层级、VPC 内私有 IP |
+| `storage` | `infra/modules/storage/` | 带版本控制和 lifecycle 规则的 GCS bucket，针对 `ttl_s/`（14 天）和 `ttl_l/`（400 天）前缀 |
+| `k8s-bootstrap` | `infra/modules/k8s-bootstrap/` | `langsmith` namespace、用于 Postgres 和 Redis URL 的 Kubernetes Secrets、cert-manager 和 KEDA Helm release |
+| `ingress` | `infra/modules/ingress/` | Envoy Gateway Helm release、GatewayClass、HTTPRoute、可选的 HTTPS Gateway listener |
+| `iam` | `infra/modules/iam/` | 用于 GCS 访问的 GCP service account 和 Workload Identity 绑定（默认启用） |
+| `dns` | `infra/modules/dns/` | Cloud DNS managed zone 和托管证书（可选，使用 `enable_dns_module` 启用） |
+| `secrets` | `infra/modules/secrets/` | Secret Manager secret 捆绑包（可选，使用 `enable_secret_manager_module` 启用） |
+
+## 部署档位
+
+### Light 部署（全部在集群内）
+
+```txt
+VPC
+└── subnet (10.0.0.0/20, GKE nodes only)
+    No Cloud SQL or Memorystore; chart pods handle both
+
+GKE Cluster
+├── langsmith namespace
+│   ├── frontend, backend, platform-backend, queue, ace-backend, playground
+│   ├── clickhouse (in-cluster)
+│   ├── postgres   (in-cluster)
+│   └── redis      (in-cluster)
+├── cert-manager
+├── keda
+└── envoy-gateway-system
+
+GCS Bucket (trace payloads, always external)
+```
+
+在 `terraform.tfvars` 中设置：
+
+```hcl
+postgres_source   = "in-cluster"
+redis_source      = "in-cluster"
+clickhouse_source = "in-cluster"
+```
+
+### Production（外部托管服务）
+
+```txt
+VPC
+├── subnet (10.0.0.0/20, GKE nodes, pods, services)
+│   └── Secondary ranges: pods 10.4.0.0/14, services 10.8.0.0/20
+└── Private service connection (VPC peering to Google managed network)
+    ├── Cloud SQL PostgreSQL  (private IP, regional standby)
+    └── Memorystore Redis     (private IP, STANDARD_HA tier)
+
+GKE Cluster
+├── langsmith namespace
+│   ├── frontend, backend, platform-backend, queue, ace-backend, playground
+│   └── clickhouse (in-cluster; use LangChain Managed for production scale)
+├── cert-manager
+├── keda
+└── envoy-gateway-system
+
+GCS Bucket (Workload Identity, no static keys)
+```
+
+## 应用核心服务
+
+| 服务 | 用途 | 端口 | HPA | Workload Identity | 依赖 |
+|---|---|---|---|---|---|
+| `langsmith-frontend` | React UI | 3000 | 1 到 10 | 否 | `backend`、`platform-backend` |
+| `langsmith-backend` | 主 API（traces、runs、projects、API keys、feedback） | 1984 | 3 到 10 | 是（GCS） | Postgres、Redis、ClickHouse、GCS |
+| `langsmith-platform-backend` | 组织与用户管理、认证、计费、设置 | 1986 | 1 到 10 | 是（GCS） | Postgres、Redis、GCS |
+| `langsmith-playground` | LLM prompt playground UI | 3001 | 1 到 10 | 否 | `backend` |
+| `langsmith-queue` | Trace ingestion worker（Redis 到 ClickHouse + GCS） | — | 3 到 10 + KEDA | 是 | Redis、ClickHouse、GCS |
+| `langsmith-ingest-queue` | 专用的高吞吐量 ingestion worker | — | 3 到 10 + KEDA | 是 | Redis、GCS |
+| `langsmith-ace-backend` | 异步计算（dataset runs、evaluations、后台任务） | — | 1 到 5 | 否 | Postgres、Redis |
+| `langsmith-clickhouse` | 列式存储（trace spans、run metadata、eval 结果） | — | StatefulSet，单副本 | 否 | 500Gi `premium-rwo` PVC |
+
+<Warning>
+In-cluster ClickHouse 仅适用于 dev/POC（单 pod、无副本、无备份）。生产环境请使用 [LangChain Managed ClickHouse](/langsmith/langsmith-managed-clickhouse) 或自行管理的外部集群。
+</Warning>
+
+<Note>
+[SmithDB](https://www.langchain.com/blog/introducing-smithdb?utm_source=docs) 是 LangSmith 专用的 observability 后端，self-hosted 版本 0.16.0 起可用于 Self-hosted（参见 [self-hosted support](/langsmith/smithdb-sdk-migration#about-self-hosted)）。这些 Terraform module 预配的是 ClickHouse，因此前几节中的指引适用于当前部署。
+</Note>
+
+### 一次性任务
+
+| Job | 用途 |
+|---|---|
+| `langsmith-backend-migrations` | PostgreSQL schema 迁移 |
+| `langsmith-backend-ch-migrations` | ClickHouse schema 迁移 |
+| `langsmith-backend-auth-bootstrap` | 创建初始组织和 admin 账号 |
+
+## LangSmith Deployment add-on
+
+| 服务 | 用途 | Workload Identity |
+|---|---|---|
+| `langsmith-host-backend` | LangGraph control plane API。管理 deployment 生命周期，提供 deployment metadata。 | 是（GCS） |
+| `langsmith-listener` | 监听 host-backend 的状态变化，创建和更新 `LangGraphPlatform` CRD。 | 是（GCS） |
+| `langsmith-operator` | Kubernetes operator。调谐（reconcile）`LangGraphPlatform` CRD，创建和删除 Deployment 与 Service。 | Deployments 和 Services 的 RBAC |
+
+在 UI 中创建的每个 LangGraph deployment 都会在 `langsmith` namespace 中产生一个 Kubernetes Deployment，其 pods 以 `langsmith-ksa` ServiceAccount 运行。该 ServiceAccount 必须带有 `iam.gke.io/gcp-service-account` annotation，`deploy.sh` 会以幂等方式应用该 annotation。
+
+## GCP 托管服务
+
+当 `postgres_source = "external"` 且 `redis_source = "external"`（推荐的生产设置）时，Terraform 会预配：
+
+### Cloud SQL PostgreSQL
+
+- 默认规格 `db-custom-2-8192`（2 vCPU、8 GB），私有 IP，端口 5432。
+- REGIONAL 可用性，支持自动故障转移。
+- 存储组织、用户、projects、API keys、设置。
+- Terraform 会将连接 URL 直接写入 `langsmith-postgres-credentials` Kubernetes Secret。
+
+### Memorystore Redis
+
+- 默认 5 GB，STANDARD_HA 层级，私有 IP，端口 6379。
+- Trace ingestion queue、pub/sub、短期缓存。
+- 无需 auth token。访问仅由 VPC 私有 IP 控制。
+- Terraform 会将连接 URL 直接写入 `langsmith-redis-credentials` Kubernetes Secret。
+
+### Cloud Storage bucket
+
+- Trace payloads：大输入输出和附件。
+- 随附的 Helm values 使用原生 GCS 模式（`engine: GCS`、`apiURL: https://storage.googleapis.com`），通过 Workload Identity 认证，无需 HMAC keys。
+- 同样支持 S3 兼容模式（`engine: S3`），示例见 `helm/values/examples/langsmith-values.yaml`。它需要 HMAC keys：在 Cloud Storage → Settings → Interoperability 下创建一个，并通过 `config.blobStorage.accessKey` 和 `config.blobStorage.accessKeySecret` 传给 Helm。
+- Lifecycle 规则：`ttl_s/` 前缀（默认 14 天）、`ttl_l/` 前缀（默认 400 天）。
+- 无论哪种档位，GCS bucket 都是必需的。
+
+### Secret Manager（可选 module）
+
+- 当 `enable_secret_manager_module = true` 时，存储一个 JSON secret 捆绑包（生成的 LangSmith secret key、Postgres 密码、Redis 密码）。
+- 无论是否启用该 module，核心 secrets（`langsmith-postgres-credentials`、`langsmith-redis-credentials`）都由 `k8s-bootstrap` 存储在 Kubernetes Secrets 中。Secret Manager 为必须在集群重建后仍然存活的 secrets 提供额外的持久化存储。
+
+## 集群基础设施
+
+| 服务 | Namespace | 安装方 | 用于 |
+|---|---|---|---|
+| Envoy Gateway | `envoy-gateway-system` | `ingress` module（`install_ingress = true`，默认） | 所有 ingress 流量 |
+| KEDA | `keda` | `k8s-bootstrap` module，当 `enable_langsmith_deployment = true` 时 | LangSmith Deployment add-on 及之后的功能 |
+| cert-manager | `cert-manager` | `k8s-bootstrap` module，当 `tls_certificate_source = "letsencrypt"` 或 `install_cert_manager = true` 时 | Let's Encrypt TLS |
+
+<Note>
+`Gateway` 资源由 Terraform 管理；`HTTPRoute` 由 Helm 管理。不要手动删除 Gateway 资源。删除 Gateway 后 GCP 会释放 external IP，重建时会分配新的 IP。
+</Note>
+
+## Workload Identity
+
+GKE pods 通过 Workload Identity 访问 GCS。Kubernetes ServiceAccount 通过 IAM binding 绑定到 GCP service account；pods 接收临时凭证，Secrets 和环境变量中没有任何静态 key。
+
+```txt
+GKE pod
+  └── Kubernetes ServiceAccount (annotated with iam.gke.io/gcp-service-account)
+        └── IAM binding: roles/iam.workloadIdentityUser
+              └── GCP Service Account
+                    └── roles/storage.objectAdmin on the GCS bucket
+```
+
+| 组件 | Annotation | 权限 |
+|---|---|---|
+| `langsmith-backend` | `iam.gke.io/gcp-service-account: <gsa>` | LangSmith bucket 上的 GCS `storage.objectAdmin` |
+| `langsmith-platform-backend` | 同上 | GCS `storage.objectAdmin` |
+| `langsmith-queue` | 同上 | GCS `storage.objectAdmin` |
+| `langsmith-ingest-queue` | 同上 | GCS `storage.objectAdmin` |
+| `langsmith-host-backend` | 同上 | GCS `storage.objectAdmin` |
+| `langsmith-listener` | 同上 | GCS `storage.objectAdmin` |
+| `langsmith-ksa`（operator pods） | 同上 | GCS `storage.objectAdmin` |
+
+GSA 由 `iam` module 定义，并作为 `workload_identity_annotation` 输出。`init-values.sh` 会自动将这些 annotation 写入 `values-overrides.yaml`。
+
+在原生 GCS 模式（随附的默认值）下，上述 GSA 绑定已经足够。可选的 S3 兼容模式（`engine: S3`）还需要 HMAC keys：在 Cloud Storage → Settings → Interoperability 下创建一个，并传给 Helm。
+
+## 网络拓扑
+
+| 范围 | CIDR | 使用方 |
+|---|---|---|
+| Subnet | `10.0.0.0/20` | GKE 节点 |
+| Pods | `10.4.0.0/14` | GKE pod IP（次要范围） |
+| Services | `10.8.0.0/20` | GKE ClusterIP service（次要范围） |
+| Private service connection | 由 Google 分配的 `/16` | Cloud SQL、Memorystore 私有 IP |
+
+Cloud SQL 和 Memorystore 只能通过私有 IP 访问。只要 `postgres_source = "external"` 或 `redis_source = "external"`，networking module 就会建立私有服务连接（VPC peering 到 Google 托管网络）。
+
+## 流量流向
+
+```txt
+Internet (HTTPS :443)
+  ↓
+Envoy Gateway  (envoy-gateway-system, external LoadBalancer IP)
+  TLS terminated: cert-manager + Let's Encrypt or existing certificate
+  │
+  ├── /                     → frontend:80
+  ├── /api/*                → backend:1984
+  └── /api/v1/deployments/* → host-backend:1985  (LangSmith Deployment add-on)
+
+Internal traffic (private IPs, never leaving VPC):
+  backend       → Cloud SQL:5432    via private IP
+  backend       → Memorystore:6379  via private IP
+  backend       → GCS               via Workload Identity (native GCS mode)
+  host-backend  → K8s API           reads deployment pod status
+  listener      → K8s API           reconciles Deployment CRDs
+  operator      → K8s API           creates and manages deployment pods
+```
+
+## 组件与存储的对应关系
+
+| 组件 | PostgreSQL | Redis | ClickHouse | GCS |
+|---|---|---|---|---|
+| `backend` | 组织配置、run metadata | Ingestion queue | — | Trace 对象 |
+| `platform-backend` | — | — | — | Blob 路由 |
+| `queue` | — | 弹出作业 | — | 写入 trace blob |
+| `clickhouse` | — | — | Trace 搜索索引 | — |
+| `host-backend` | Deployment 生命周期状态 | — | — | — |
+
+## Secret Manager 集成
+
+不使用 Secret Manager 时：
+
+```txt
+terraform.tfvars → terraform apply → kubernetes_secret (postgres, redis)
+```
+
+使用 Secret Manager 时：
+
+```txt
+terraform.tfvars → terraform apply ─┬─→ kubernetes_secret (postgres, redis)
+                                    └─→ Secret Manager (durable copy, survives cluster recreation)
+```
+
+两种情况下 Terraform 都会直接写入 Kubernetes Secrets。启用 Secret Manager 会在集群外为 Postgres 密码、Redis 密码和生成的 secret key 额外保存一份持久化副本。没有任何机制把 Secret Manager 同步回集群，因此 GCP 上不安装 External Secrets Operator（不同于 AWS modules，后者用它从 SSM Parameter Store 同步）。
+
+## Terraform module 依赖图
+
+```txt
+google_project_service (APIs enabled)
+  └── module.networking
+        ├── module.gke_cluster
+        │     └── time_sleep.wait_for_cluster
+        │           ├── module.cloudsql      (count = postgres_source == "external")
+        │           ├── module.redis         (count = redis_source    == "external")
+        │           ├── module.storage
+        │           ├── module.iam           (count = enable_gcp_iam_module)
+        │           ├── module.secrets       (count = enable_secret_manager_module)
+        │           ├── module.dns           (count = enable_dns_module)
+        │           ├── module.k8s_bootstrap
+        │           └── module.ingress       (count = install_ingress)
+        └── (private_service_connection when external services)
+```
+
+`infra` 层不安装 LangSmith chart。应用阶段通过以下两种方式之一安装它，两者都使用 `helm/values/` 下相同的分层 values 文件：
+
+- 部署脚本：`make init-values && make deploy` 运行 `helm upgrade --install`。
+- Terraform `app` 层：`make init-values && make init-app && make apply-app` 将 chart 作为 `helm_release` 资源管理。`make init-app` 会把 `infra` 的输出（cluster、bucket、Workload Identity annotation）写入 `app/infra.auto.tfvars.json`，因此 `app` 层无需 remote-state data source 即可读取它们。
+
+## 验证命令
+
+```bash
+# Cluster connectivity
+gcloud container clusters get-credentials <cluster-name> --region <region> --project <project-id>
+kubectl cluster-info
+kubectl get nodes -o wide
+
+# All LangSmith pods
+kubectl get pods -n langsmith
+
+# Envoy Gateway
+kubectl get pods -n envoy-gateway-system
+kubectl get svc -n envoy-gateway-system
+
+# cert-manager
+kubectl get pods -n cert-manager
+kubectl get certificate -n langsmith
+
+# KEDA (LangSmith Deployment add-on)
+kubectl get pods -n keda
+
+# Cloud SQL connectivity test
+kubectl run psql-test --rm -it --image=postgres:15 -n langsmith -- \
+  psql "postgresql://langsmith:<password>@<cloud-sql-private-ip>:5432/langsmith" -c "SELECT version();"
+
+# Memorystore connectivity test
+kubectl run redis-test --rm -it --image=redis:7 -n langsmith -- \
+  redis-cli -h <redis-private-ip> ping
+
+# GCS connectivity test
+kubectl run gcs-test --rm -it --image=google/cloud-sdk -n langsmith -- \
+  gsutil ls gs://<bucket-name>
+```

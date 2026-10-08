@@ -9,6 +9,8 @@ Model Context Protocol，MCP，是一种开放协议，用于以模型无关的�
 
 MCP 端点位于 [Agent Server](/langsmith/agent-server) 的 `/mcp`。
 
+Managed Deep Agents 部署运行在 Agent Server 上，因此它们暴露相同的 `/mcp` 端点。关于 Managed Deep Agents 的 URL 发现和身份 headers，请参见 [Connect MCP clients to a managed deep agent](/langsmith/managed-deep-agents-mcp-endpoint)。
+
 你可以设置[自定义认证中间件](/langsmith/custom-auth)，让用户通过 MCP server 完成认证，从而在 LangSmith deployment 中访问用户作用域的 tools。
 
 这一流程的一个示例架构如下：
@@ -119,46 +121,48 @@ uv add "langgraph-api>=0.2.3" "langgraph-sdk>=0.1.61"
     ```
     </Tab>
     <Tab title="Python">
-    安装 adapter：
+    安装带 MCP extra 的 LangChain：
 
-    ```bash
-    pip install langchain-mcp-adapters
+    <CodeGroup>
+    ```bash pip
+    pip install "langchain[mcp]"
     ```
 
-    下面是一个连接远程 MCP 端点，并将 agent 作为 tool 使用的示例：
+    ```bash uv
+    uv add "langchain[mcp]"
+    ```
+    </CodeGroup>
+
+    连接远程 MCP 端点，并将 agent 作为 tool 使用：
 
     ```python
-    # Create server parameters for stdio connection
-    from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
     import asyncio
+    import os
 
-    from langchain_mcp_adapters.tools import load_mcp_tools
+    from fastmcp.client import Client
+    from fastmcp.client.transports import StreamableHttpTransport
     from langchain.agents import create_agent
+    from langchain.mcp import MCPAdapter
 
-
-    server_params = {
-        "url": "https://mcp-finance-agent.xxx.us.langgraph.app/mcp",
-        "headers": {
-            "X-Api-Key":"lsv2_pt_your_api_key"
-        }
-    }
 
     async def main():
-        async with streamablehttp_client(**server_params) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                # Initialize the connection
-                await session.initialize()
+        async with MCPAdapter(
+            Client(
+                StreamableHttpTransport(
+                    "https://mcp-finance-agent.xxx.us.langgraph.app/mcp",
+                    headers={"X-Api-Key": os.environ["LANGSMITH_API_KEY"]},
+                )
+            )
+        ) as adapter:
+            # Load the remote graph as if it was a tool
+            tools = await adapter.list_tools()
 
-                # Load the remote graph as if it was a tool
-                tools = await load_mcp_tools(session)
+            agent = create_agent("gpt-5.5", tools)
+            agent_response = await agent.ainvoke(
+                {"messages": "What can the finance agent do for me?"}
+            )
+            print(agent_response)
 
-                # Create and run a react agent with the tools
-                agent = create_agent("gpt-5.5", tools)
-
-                # Invoke the agent with a message
-                agent_response = await agent.ainvoke({"messages": "What can the finance agent do for me?"})
-                print(agent_response)
 
     if __name__ == "__main__":
         asyncio.run(main())
@@ -246,22 +250,21 @@ print(graph.invoke({"question": "hi"}))
 要让用户作用域的 tools 能在你的 LangSmith deployment 中使用，可以从实现下面这样的代码片段开始：
 
 ```python
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from fastmcp.client import Client
+from langchain.mcp import MCPAdapter
 
-def mcp_tools_node(state, config):
+
+async def mcp_tools_node(state, config):
     user = config["configurable"].get("langgraph_auth_user")
-         , user["github_token"], user["email"], etc.
+    # user includes github_token, email, etc.
 
-    client = MultiServerMCPClient({
-        "github": {
-            "transport": "streamable_http", # (1)
-            "url": "https://my-github-mcp-server/mcp", # (2)
-            "headers": {
-                "Authorization": f"Bearer {user['github_token']}"
-            }
-        }
-    })
-    tools = await client.get_tools() # (3)
+    async with MCPAdapter(
+        Client(
+            "https://my-github-mcp-server/mcp",  # (1)
+            auth=user["github_token"],  # (2)
+        )
+    ) as adapter:
+        tools = await adapter.list_tools()  # (3)
 
     # Your tool-calling logic here
 
@@ -269,9 +272,9 @@ def mcp_tools_node(state, config):
     return {"messages": tool_messages}
 ```
 
-1. MCP 只有在对 `streamable_http` 和 `sse` `transport` servers 发起请求时，才支持附加 headers。
-2. 你的 MCP server URL。
-3. 从你的 MCP server 获取可用 tools。
+1. 你的 MCP server URL。URL target 使用 Streamable HTTP。
+2. 通过 `Client` 上的 `auth=` 传递 bearer token。对于非 bearer headers（例如 `x-api-key`），请改用 `StreamableHttpTransport(url, headers=...)`。参见 [Authentication](/oss/langchain/mcp/auth)。
+3. 从 MCP server 中发现 tools。
 
 _也可以通过[在运行时重建 graph](/langsmith/graph-rebuild) 来实现，为新 run 使用不同配置。_
 

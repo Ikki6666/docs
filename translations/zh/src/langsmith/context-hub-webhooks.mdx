@@ -1,0 +1,145 @@
+---
+title: 配置 Context Hub commit webhooks
+sidebarTitle: Commit webhooks
+description: 将 Context Hub commit 事件发送到外部 HTTPS endpoint，并验证 LangSmith 对每个请求的签名。
+---
+
+import WebhookSignatureVerification from '/snippets/langsmith/webhook-signature-verification.mdx';
+
+[Context Hub](/langsmith/context-hub) commit webhooks 会在你的 [workspace](/langsmith/administration-overview#workspaces) 中创建 agent 或 skill commit 时通知外部服务。使用它们可以从 Context Hub 的变更触发自动化，包括通过 [LangSmith Fleet](/langsmith/fleet) 创建的 commits。
+
+管理 Context Hub webhooks 需要 [`prompts:update`](/langsmith/organization-workspace-operations) 权限，[Workspace Admins](/langsmith/rbac#workspace-admin) 和 [Workspace Editors](/langsmith/rbac#workspace-editor) 默认拥有该权限。
+
+## 添加 webhook
+
+每个 webhook 应用于整个 workspace。每个已配置的 endpoint 都会收到每一个 agent 和 skill commit，包括由 Fleet 创建的 commits。`context_hub.commit.created.v1` 事件不支持按 repository 或事件类型过滤。
+
+要添加一个 webhook：
+
+1. 在 [LangSmith UI](https://smith.langchain.com) 中，前往 **Settings** > **Integrations** > **Context Hub webhooks**。
+1. 点击 **Add webhook**。
+1. 输入一个可公开访问的 HTTPS URL。
+1. （可选）添加自定义 request headers，例如 `Authorization` header。
+1. 点击 **Add webhook**。
+1. 复制生成的 signing secret 并安全存储。
+
+你可以添加的订阅数量取决于你的 workspace 配置。
+
+## 管理 webhook
+
+webhook 列表会显示 endpoint URLs 和自定义 header 名称。header 值和 signing secrets 在你点击 **Reveal secrets** 之前保持隐藏。只要你仍有管理 Context Hub webhooks 的权限，之后可以随时重新显示它们。
+
+使用 webhook 上的控件来管理它：
+
+- **Edit webhook**：更改 HTTPS URL 或替换其自定义 headers。编辑不会更改 signing secret。
+- **Roll signing secret**：生成并显示一个新的 signing secret。LangSmith 会立即对未来的投递使用新 secret，之前的 secret 将停止工作。请更新每一个验证该 webhook 的消费方。
+- **Delete webhook**：阻止该 endpoint 继续接收来自 workspace 的 Context Hub commit 事件。
+
+## 投递
+
+LangSmith 为每个事件发送一个 JSON `POST` 请求。自定义 headers 不能覆盖 `Content-Type` 或 `X-LangSmith-Signature`，LangSmith 会在应用自定义 headers 之后设置它们。
+
+| 属性 | 值 |
+| --- | --- |
+| Method | `POST` |
+| URL | 可公开访问的 HTTPS endpoint |
+| Content type | `application/json` |
+| Signature | `X-LangSmith-Signature` header，使用该 webhook 的 signing secret 签名 |
+| Timeout | 每次尝试 20 秒 |
+| Attempts | 最多 4 次尝试：1 次初始尝试和最多 3 次重试 |
+| Retry conditions | 传输失败、HTTP `408`、`425`、`429` 和 `5xx` 响应 |
+| Permanent responses | 其他 `4xx` 响应不会重试 |
+| Response handling | 低于 `400` 的状态码视为成功。响应体不影响成功判定。 |
+
+重试包含字节完全相同的请求体，并保留事件的 `id`。在产生下游影响之前，请按 `id` 对事件去重。
+
+## 验证签名
+
+每个请求都包含一个 `X-LangSmith-Signature` header，格式如下：
+
+```text
+sha256=<lowercase hex HMAC-SHA256 digest>
+```
+
+使用该 webhook 的 signing secret，对原始请求体的确切字节计算 HMAC-SHA256 digest。在解析 JSON 之前验证签名，并以恒定时间比较完整的 header 值。在验证之前解析并重新序列化请求体可能会改变其字节，从而使签名失效。
+
+<WebhookSignatureVerification />
+
+## Event envelope
+
+外层的 `id`、`type`、`created` 和 `data` envelope 是冻结的。事件类型上的 `.v1` 后缀为 `data.commit` schema 提供版本控制。
+
+```json
+{
+  "id": "0198...",
+  "type": "context_hub.commit.created.v1",
+  "created": 1720000000,
+  "data": {
+    "commit": {
+      "repo_id": "...",
+      "repo_handle": "my-agent",
+      "repo_type": "agent",
+      "commit_hash": "newcommithash0002",
+      "parent_commit_hash": "parentcommithash0001",
+      "created_at": "2023-11-14T22:13:20Z",
+      "created_by": "user@example.com",
+      "url": "https://smith.example.com/context/my-agent/newcommithash0002",
+      "files_changed": [
+        { "path": "skills/kept", "action": "modified" },
+        { "path": "skills/added", "action": "added" },
+        { "path": "skills/gone", "action": "removed" }
+      ]
+    }
+  }
+}
+```
+
+| 字段 | 类型 | 描述 |
+| --- | --- | --- |
+| `id` | UUID | 在重试中保持稳定的唯一事件标识符。用它来对事件去重。 |
+| `type` | string | 确切的事件类型。当前为 `context_hub.commit.created.v1`。 |
+| `created` | integer | 事件入队时的 Unix 秒数（UTC）。 |
+| `data` | object | 带版本的事件数据。包含 `data.commit`。 |
+
+### `data.commit`
+
+`data.commit` 对象描述了触发该事件的 Context Hub commit。
+
+| 字段 | 类型 | 描述 |
+| --- | --- | --- |
+| `repo_id` | UUID | Context Hub repository ID。 |
+| `repo_handle` | string | Repository handle。 |
+| `repo_type` | string | Repository 类型：`agent` 或 `skill`。 |
+| `commit_hash` | string | 新 commit 的 hash。 |
+| `parent_commit_hash` | string | 父 commit 的 hash。初始 commit 或不可用时省略。 |
+| `created_at` | string | commit 创建时的 RFC 3339 时间戳。 |
+| `created_by` | string | 创建该 commit 的 LangSmith 用户 ID。不可用时省略。 |
+| `url` | string | 指向 LangSmith UI 中该 commit 的 deep link。 |
+| `files_changed` | array | commit 中包含的文件变更。每个条目包含 `path` 和 `action`。 |
+
+### `data.commit.files_changed`
+
+每个条目概括一个被更改的路径。它不包含文件内容。
+
+| 字段 | 类型 | 描述 |
+| --- | --- | --- |
+| `path` | string | 该 commit 更改的路径。 |
+| `action` | string | 变更类型：`added`、`modified` 或 `removed`。 |
+
+## 处理事件版本
+
+在解析 `data.commit` 之前，先根据完整的事件类型进行分支判断：
+
+```typescript
+if (event.type === "context_hub.commit.created.v1") {
+  await handleCommitCreatedV1(event.data.commit);
+} else {
+  // Ignore unknown event types and versions safely.
+}
+```
+
+对 `data.commit` 的破坏性变更会使用新的事件类型后缀，例如 `.v2`。请忽略未知类型，而不是尝试把它们当作 v1 解析，并允许未知字段，这样兼容性的新增就不会破坏你的 handler。
+
+## 下一步
+
+- [Use the Context Hub](/langsmith/use-the-context-hub)：创建、检查和提升 agent 与 skill commits。

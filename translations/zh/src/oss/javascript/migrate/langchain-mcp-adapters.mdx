@@ -1,0 +1,242 @@
+---
+title: 迁移到 @langchain/mcp-adapters 2.0
+sidebarTitle: MCP adapters v2
+description: 从 @langchain/mcp-adapters 1.x 升级到 2.0，涵盖重命名的 API、更严格的配置、身份验证、elicitation 和工具结果变更。
+---
+
+<Prompt
+    description="从 @langchain/mcp-adapters 1.x 迁移到 2.0。"
+    icon="arrow-right"
+    actions={["copy"]}
+>
+将此代码库从 `@langchain/mcp-adapters` 1.x 迁移到 2.0，并更新其 peer 依赖。
+
+获取并阅读 https://docs.langchain.com/oss/javascript/migrate/langchain-mcp-adapters.md 处的完整迁移指南，将其作为唯一事实来源。搜索此代码库并应用所有相关的迁移变更，包括依赖和测试更新。运行相关的检查，然后总结变更，并标记任何需要人工决策或无法验证的内容。如果你无法访问该指南，请在继续之前索取其内容。
+</Prompt>
+
+`@langchain/mcp-adapters` 2.0 在 MCP TypeScript SDK 2 客户端之上重建了 adapter。它为每个服务器协商 MCP 协议时代，并用 LangGraph interrupt 回答现代 MCP elicitation。本指南介绍影响 1.x 代码的变更。功能文档参见 [Model Context Protocol (MCP)](/oss/langchain/mcp)。
+
+## 破坏性变更
+
+- **工具名称默认以服务器名称为前缀。** `MCPAdapter`（包括已弃用的 `MultiServerMCPClient`）会将工具命名为 `{server}_{tool}`（例如 `weather_get_forecast`），即使只有一个服务器也是如此，除非你设置 `prefixToolNameWithServerName`；1.x 默认将其设为 `false`。设置 `prefixToolNameWithServerName: false` 以保留 1.x 的名称。`loadMcpTools` 仍然默认为 `false`。更新引用工具名称的代码、提示词和保存的示例。将 `interruptOn` 审批规则更新为带前缀的名称；针对 `delete_repo` 的规则不再匹配 `github_delete_repo`。adapter 不会验证服务器名称，较长的名称可能超出模型提供商的工具名称限制；参见 [Multiple servers](/oss/langchain/mcp/connections#multiple-servers)。
+- **重复的工具名称会抛出异常。** 在 `prefixToolNameWithServerName: false` 下，当两个服务器暴露相同的工具名称，或一个服务器两次列出同一个名称时，`listTools()` 和 `getTools()` 会抛出 `MCPClientError`。1.x 会返回每个工具。保留前缀，或从 `listToolsets()` 按服务器选择工具。
+- **Elicitation 默认暂停运行。** 当现代服务器在工具调用期间请求输入时，adapter 会引发一个 LangGraph @[`interrupt`]，运行会停止，直到你用 `createMCPElicitationResume` 恢复它。只有当工具发起 elicitation 时才需要 checkpointer。在服务器上设置 `elicitation: false` 以保留 1.x 的行为。参见 [Elicitation](#elicitation)。
+- **工具内容始终是标准 content blocks。** 1.x 默认将 `useStandardContentBlocks` 设为 `false`。2.0 移除了该选项，传入它会报错，并且始终返回标准 block，因此图像携带 `data` 和 `mimeType` 而不是 `image_url` data URL，音频使用 `mimeType` 而不是 `mime_type`。参见 [Tool results](#tool-results)。
+- **配置是严格的。** 未知键和已移除的选项在构造 adapter 时会抛出异常。参见 [Removed options](#removed-options)。
+- **服务器报告的工具错误返回错误消息。** 带有 `isError` 的结果在智能体的工具调用中会作为 `status: "error"` 的 `ToolMessage` 返回。用普通参数直接调用仍然会抛出异常。参见 [Tool results](#tool-results)。
+- **模型不再在单个文本 block 旁边看到 `structuredContent` 或 `_meta`。** 1.x 还会把它们复制到文本 block 上，因此它们被序列化进内容；2.0 只发送文本。从 artifact 的 `mcp_structured_content` 和 `mcp_meta` 条目读取它们，1.x 也把它们放在那里。参见 [Tool results](#tool-results)。
+
+## 安装
+
+升级 adapter 及其 peer 依赖：
+
+<CodeGroup>
+```bash npm
+npm install @langchain/mcp-adapters@^2.0.0 @langchain/core @langchain/langgraph
+```
+```bash pnpm
+pnpm add @langchain/mcp-adapters@^2.0.0 @langchain/core @langchain/langgraph
+```
+```bash yarn
+yarn add @langchain/mcp-adapters@^2.0.0 @langchain/core @langchain/langgraph
+```
+```bash bun
+bun add @langchain/mcp-adapters@^2.0.0 @langchain/core @langchain/langgraph
+```
+</CodeGroup>
+
+- **Peer 依赖**：adapter 要求 `@langchain/core` 1.2.6 或更高（之前是 1.0.0），以及 `@langchain/langgraph` 1.4.13 或更高（之前是 1.4.10）。
+- **MCP SDK**：adapter 包含 MCP SDK 2 客户端。如果你的代码为 `loadMcpTools` 创建 SDK 客户端，请将 `@modelcontextprotocol/sdk` 导入替换为 `@modelcontextprotocol/client`。从 `@modelcontextprotocol/client/stdio` 导入 stdio 传输。如果你的代码导入它，包括为了[完成 OAuth 重定向](/oss/langchain/mcp/auth#complete-the-redirect)，请将 SDK 添加为直接依赖。
+- **Zod 4**：adapter 使用内部的 Zod 4 依赖验证配置，因此配置错误是 Zod 4 错误。
+- **调试日志**：`DEBUG=@langchain/mcp-adapters:*` 不再输出日志。改用 `onConnectionError` 和每个服务器的通知回调。
+
+## 重命名的 API
+
+之前：
+
+```typescript
+import { MultiServerMCPClient } from "@langchain/mcp-adapters";
+
+const client = new MultiServerMCPClient({
+  mcpServers: {
+    math: { command: "node", args: ["./math-server.js"] },
+  },
+});
+const tools = await client.getTools();
+```
+
+之后：
+
+```typescript
+import { MCPAdapter } from "@langchain/mcp-adapters";
+
+const adapter = new MCPAdapter({
+  servers: {
+    math: { command: "node", args: ["./math-server.js"] },
+  },
+});
+const tools = await adapter.listTools();
+```
+
+| 1.x API | 推荐的 2.0 API |
+| --- | --- |
+| `MultiServerMCPClient` | `MCPAdapter` |
+| `mcpServers` 或扁平的服务器映射 | `servers` |
+| `getTools(...)` | `listTools(...)`，可执行工具的扁平列表 |
+| `initializeConnections()` | `listToolsets()`，按服务器分组的工具 |
+| `ClientConfig` 类型 | `MCPAdapterConfig` |
+
+此表中的旧 API 仍然可用，但已被弃用，未来可能会移除。
+
+其他 API 变更：
+
+- 从 `adapter.config.servers` 读取配置，而不是 `adapter.config.mcpServers`。这是一个快照；修改它不会重新配置 adapter。
+- `SSEConnection` 只接受旧式 SSE。HTTP 使用 `StreamableHTTPConnection`，任何传输使用 `Connection`。
+- `ToolException` 和 `MCPClientError` 现在已导出。用 `ToolException.isInstance(error)` 和 `MCPClientError.isInstance(error)` 识别它们，它们检查的是 brand 而不是错误的 `name`。
+- `setLoggingLevel()` 仅限旧式。如果它针对的任何服务器协商了现代协议，它会抛出异常，并且不设置任何级别。改为在每个现代服务器上设置 `logLevel`。参见 [Protocol eras](/oss/langchain/mcp/connections#protocol-eras)。现代服务器还会拒绝 `resources/subscribe`，因此请在服务器的 `resourceSubscriptions` 选项中列出要监视的资源 URI，并在 `onResourcesUpdated` 中处理更新，而不是在客户端上调用 `subscribeResource()`。
+
+`getClient()` 现在返回来自 `@modelcontextprotocol/client` 的 SDK 2 `Client`。`loadMcpTools(serverName, client)` 从你自己构建的 SDK 客户端转换工具。SDK `Client` 默认协商旧式协议，因此如果它的工具应该通过 interrupt 发起 elicitation，请用 `versionNegotiation: { mode: "auto" }` 创建它。要通过 `InMemoryTransport` 将它连接到进程内服务器，使用 `serveStdio(factory, { transport: serverSide })` 提供该服务器；`server.connect()` 只提供旧式协议。
+
+## 移除的选项
+
+设置了以下任何选项的配置现在会验证失败。`loadMcpTools` 以相同的方式验证其选项：
+
+| 选项 | 替代 |
+| --- | --- |
+| `useStandardContentBlocks` | 无。工具内容始终是标准的 LangChain content blocks。删除该选项。 |
+| `onRootsListChanged` | 无。删除该选项。 |
+| `onCancelled` | 无。删除该选项。 |
+| Stdio `encoding` | 无。删除该选项。 |
+| 顶层通知回调 | 在每个服务器上设置它们。参见 [将回调移到服务器上](#move-callbacks-onto-servers)。 |
+
+## 配置
+
+### 将回调移到服务器上
+
+通知和进度回调从顶层移入应该接收它们的服务器。这适用于 `onMessage`、`onProgress`、`onInitialized`、`onPromptsListChanged`、`onResourcesListChanged`、`onResourcesUpdated` 和 `onToolsListChanged`。
+
+之前：
+
+```typescript
+const client = new MultiServerMCPClient({
+  mcpServers: {
+    everything: {
+      command: "npx",
+      args: ["-y", "@modelcontextprotocol/server-everything"],
+    },
+  },
+  onProgress: (progress, source) => {
+    console.log(source.type, progress.progress, progress.total);
+  },
+});
+```
+
+之后：
+
+```typescript
+const adapter = new MCPAdapter({
+  servers: {
+    everything: {
+      command: "npx",
+      args: ["-y", "@modelcontextprotocol/server-everything"],
+      onProgress: (progress, source) => {
+        console.log(source.type, progress.progress, progress.total);
+      },
+    },
+  },
+});
+```
+
+工具 hooks（`beforeToolCall`、`afterToolCall`）和 `onConnectionError` 仍然是顶层的 adapter 选项。`onProgress` 回调抛出或拒绝的错误现在会被忽略；在 1.x 中，被拒绝的 promise 无人处理。
+
+### 设置协议模式
+
+每个服务器现在接受 `"auto"`（默认）、`"modern"` 或 `"legacy"` 之一的 `mode`，并独立协商。每种模式的行为参见 [Protocol eras](/oss/langchain/mcp/connections#protocol-eras)。
+
+省略 `mode` 以自动协商。设置 `mode: "modern"` 以要求现代协议，或设置 `mode: "legacy"` 以跳过对已知旧式服务器的探测。
+
+以下选项要求设置它们的服务器使用 `mode: "legacy"`：
+
+- `onInitialized`
+- `automaticSSEFallback`
+- HTTP/SSE `reconnect`
+- `onElicitation`
+
+设置了 `automaticSSEFallback` 或 `reconnect` 的 1.x 服务器现在会验证失败，直到你添加 `mode: "legacy"`：
+
+```typescript
+const adapter = new MCPAdapter({
+  servers: {
+    legacy: {
+      url: "https://legacy.example.com/sse",
+      transport: "sse",
+      mode: "legacy", // [!code ++]
+      reconnect: { enabled: true, maxAttempts: 3, delayMs: 1000 },
+    },
+  },
+});
+```
+
+`"auto"` 或 `"modern"` 模式下的 HTTP 连接不再恢复掉落的响应流。如果你依赖流恢复，请使用 `mode: "legacy"`。
+
+SSE 仍然是旧式传输，因此 SSE 服务器会拒绝 `mode: "modern"`、`elicitation` 和 `logLevel`。`"auto"` 模式下的自动 HTTP 到 SSE 回退仅限于 HTTP 404 和 405。
+
+### 预期更严格的验证
+
+- **配置**：Zod 4 验证会拒绝未知的 adapter 和服务器选项、不适用于服务器的模式或传输的选项、冲突的传输设置、空的服务器映射，以及同时设置 `servers` 和 `mcpServers`。重启和重连的 `maxAttempts` 必须是非负整数，`delayMs` 不能为负。
+- **Hooks**：在 `beforeToolCall` 和 `afterToolCall` 中，`state` 的类型是 `unknown`，因此使用前要先收窄。参数覆盖必须是对象。合并后的参数会针对工具的输入 schema 进行验证，因此添加了 schema 不允许的属性的覆盖会在发送任何内容到服务器之前以 `ToolException` 使调用失败。
+
+## 身份验证
+
+- **两种 provider 形状**：`authProvider` 接受 `AuthProvider`（`{ token, onUnauthorized? }`）和 `OAuthClientProvider`。1.x 只接受 OAuth provider。
+- **Header 优先级**：一旦 provider 拿到令牌，它就会优先于配置的 `Authorization` 头。在此之前会发送配置的头。
+- **OAuth 回调**：使用 SDK 的 `transport.finishAuth(params)` 完成重定向，并使用具有相同存储的 provider。adapter 没有 `finishAuth`。
+- **错误**：遍历身份验证失败的 `cause` 链，寻找 `UnauthorizedError`（adapter 现在已导出）或 HTTP 401 错误。发现会把它包装在 `MCPClientError` 中，当 legacy 模式回退到 SSE 时会包装两层；工具调用会把它包装在 `ToolException` 中。
+- **重试**：发现会在下一次调用时重试身份验证失败，即使设置了 `onConnectionError: "ignore"`。
+- **覆盖**：不同 headers 和 provider 对象的工具目录是分开的。当 provider 对象背后的账户变化时，重新创建 adapter。方法级的 `authProvider` 会替换配置的那个，方法级的 `headers` 会添加到每个服务器配置的 headers 中，同名配置的 header 优先。两者都适用于每个 HTTP/SSE 服务器，即使你只从一个服务器选择工具。
+
+完整指南参见 [Authentication](/oss/langchain/mcp/auth)。
+
+## Elicitation
+
+Elicitation 是 2.0 中的新功能：1.x 没有 elicitation 支持。当服务器协商现代协议时，adapter 默认将每一轮请求的输入作为一个 LangGraph @[`interrupt`] 引发，其 `requests` 保存每个问题。请求输入的工具现在会暂停运行。
+
+- **Checkpointer**：只有当工具请求输入时才需要 checkpointer。否则，直接调用仍然有效。
+- **恢复**：回答 `requests` 中的每个键，然后将 `createMCPElicitationResume(interrupt, responses)` 作为 LangGraph `Command` 中的 `resume` 值传入。
+- **重放**：恢复会从头重新运行工具，包括 `beforeToolCall`。确保重复这些工作不会产生重复的副作用。
+- **选择退出**：在单个现代服务器上，或在 `loadMcpTools` 选项中设置 `elicitation: false`，以保留 1.x 的行为。
+- **旧式服务器**：在 `mode: "legacy"` 的服务器上设置 `onElicitation` 处理器。这个处理器在 2.0 中也是新功能。
+
+关于 interrupt payload、答案操作和完整示例，参见 [Elicitation](/oss/langchain/mcp/tools#elicitation)。
+
+### Sampling 和 roots
+
+只有 elicitation 通过这些 interrupt 回答。对 [sampling](https://modelcontextprotocol.io/specification/2025-06-18/client/sampling) 或 [roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots) 的请求会以 `ToolException` 使工具调用失败，即使它们与 elicitation 一起到达。
+
+## 工具结果
+
+- **标准 content blocks**：工具内容始终是标准的 LangChain content blocks。图像和音频暴露 `data` 和 `mimeType`。默认情况下，1.x 生成带有 data URL 的 `image_url` block，以及带有 `mime_type` 的音频 block。
+- **Artifacts**：路由到 artifact 的 block 保持其 MCP 格式，包括在 `afterToolCall` 中，后者接收完整的 artifact 列表，包括 `mcp_structured_content`、`mcp_meta` 和 `mcp_content` 条目。当转换会丢失原始资源块和内容元数据时，它们会被保留在 `mcp_content` 条目中。
+- **嵌入的资源**：转换结果不再获取资源 URI。当你需要获取资源时，显式调用 `readResource()`。当路由到模型内容时，嵌入的文本资源会变成文本 block。嵌入的二进制资源根据其 MIME 类型变成 image、audio 或 file block。
+- **资源链接**：`resource_link` block 会变成带有 `url`、`mimeType` 和资源元数据的 `file` block。更新 1.x 的 `source_type` 和 `mime_type` 字段的使用方。
+- **工具错误**：当服务器返回带有 `isError` 的结果时，adapter 在智能体的工具调用中返回一个 `status: "error"` 的 `ToolMessage`。用普通参数直接调用仍然会抛出 `ToolException`，MCP 响应位于 `error.result` 中。因为这些结果是返回而不是抛出的，它们不再触发基于异常的处理，例如 `toolRetryMiddleware` 或 `ToolNode` 的 `handleToolErrors` 函数。检查 `ToolMessage.status`（例如在 `wrapToolCall` 中）以重试它们。服务器的错误文本始终会发送给模型，即使 `outputHandling` 将文本路由到 artifact。
+- **其他失败**：连接和验证失败仍然从工具中抛出。直接调用时，工具会引发异常；在 `createAgent` 智能体中，默认的工具错误处理会将其转换为 `status: "error"` 的 `ToolMessage`。读取异常的 `message` 了解详情；`cause` 不总是被设置。
+- **Hook 结果**：Hooks 会保留返回的 `ToolMessage` 和 LangGraph `Command` 对象，而不是将其展平或拒绝。`afterToolCall` 只接收成功的结果。
+- **资源读取**：`readResource()` 保留 SDK 内容元数据。用 `"text" in content` 或 `"blob" in content` 收窄每个条目。
+- **结构化内容**：带有单个文本 block 的结果会变成字符串 `content`，即使它带有 `structuredContent` 或 `_meta`。1.x 会将该 block 连同两者一起序列化进内容，因此模型能看到它们。从 `mcp_structured_content` 和 `mcp_meta` artifact 条目读取它们。
+- **工具 schema**：工具输入 schema 按照服务器声明的形式到达模型。1.x 内联了 `$ref` 定义并简化了复合 schema：它合并 `allOf`，展平 `anyOf` 和 `oneOf`，并移除 `if`/`then`/`else`、`not`、`$schema` 和 `unevaluatedProperties`。对照你的模型提供商检查来自具有复杂 schema 的服务器的工具。
+
+## 生命周期
+
+- **分组发现**：`listToolsets()` 返回从服务器名称到工具的映射，`listTools()` 将其展平。
+- **可复用的 close**：在使用其工具期间保持 adapter 打开，然后 await `close()`。关闭会停止进行中的发现和待处理的重连，并清除连接和缓存。之后发现新工具即可复用 adapter。
+- **发现缓存**：`listTools([], { cacheMode: "refresh" })` 刷新发现；`cacheMode: "bypass"` 跳过缓存。失败的刷新会使之前返回的工具保持可用。
+- **资源列出**：`listResources()` 和 `listResourceTemplates()` 现在会抛出服务器的错误，而 1.x 对失败的服务器返回 `[]`，并且只在 `DEBUG` 下记录错误。没有资源模板的服务器仍然将它们列为 `[]`。
+- **重连失败**：耗尽的后台 stdio 重启尝试现在通过 `onConnectionError` 回调报告。
+
+## 另请参阅
+
+- [Model Context Protocol (MCP)](/oss/langchain/mcp)
+- [Connections](/oss/langchain/mcp/connections)
+- [Authentication](/oss/langchain/mcp/auth)
+- [Tools](/oss/langchain/mcp/tools)

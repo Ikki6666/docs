@@ -1,0 +1,110 @@
+---
+title: 模型 fallback
+description: 当主模型被限流、报错或返回其他已配置的状态码时，自动针对备用模型重试请求。
+---
+
+import LLMGatewayBetaNote from '/snippets/langsmith/llm-gateway-beta-note.mdx';
+
+<LLMGatewayBetaNote />
+
+模型 fallback 会在主模型返回已配置的错误（例如速率限制或 provider 宕机）时，针对一个或多个备用模型重试请求。在 LangSmith 中定义一次 fallback 顺序，然后在你的应用中继续使用标准 LLM Gateway endpoint 和 model ID。
+
+## 工作原理
+
+一条 fallback 链包含：
+
+- **一个主模型**：当请求失败时触发该链的 provider 和模型。
+- **一到五个 fallback**：direct provider 模型或已保存的[模型配置](/langsmith/model-configurations)的有序列表。
+- **触发条件（triggers）**：把请求移到下一个模型的上游 HTTP 状态码。例如，用 `429` 表示速率限制，用 `500`、`502`、`503` 和 `504` 表示 provider 错误。
+
+对于每个请求，gateway 会：
+
+1. 调用由请求的带 provider 前缀 model ID 选定的主模型。
+1. 如果请求以已配置的触发状态码或传输错误失败，加载匹配的 fallback 链。
+1. 按顺序调用每个 fallback，直到某个调用成功、返回不会触发另一个 fallback 的状态码，或链条耗尽。
+1. 以 client 使用的 API 格式返回最终响应。
+
+fallback 可以使用与主模型不同的 provider 和 API 格式。gateway 会在[受支持的 API 格式](/langsmith/llm-gateway-api-formats)之间转换请求和响应，因此 Anthropic 主模型可以回退到 OpenAI 模型，而 client 无需任何改动。
+
+每次尝试都会被追踪，并单独计入 [spend policies](/langsmith/llm-gateway-spend-policies)。一个使用了两个 fallback 的请求会记录三次模型调用：一次主模型尝试和两次 fallback 尝试。
+
+## 创建 fallback 链
+
+<Warning>
+创建和管理 fallback 链需要 `organization:manage` 权限。完整的权限说明请参见 [Access control](/langsmith/llm-gateway-access)。
+</Warning>
+
+创建 fallback 链的步骤：
+
+1. 前往 **LLM Gateway** 并选择 **Model Fallbacks** 标签页。
+1. 点击 **Create fallback chain**。
+1. 选择该链适用的 **Workspace**。
+1. 选择主 provider 和模型。发往这个带 provider 前缀 model ID 的请求，会在主模型尝试失败时使用该链。
+1. 在 **Fallbacks** 下，按 gateway 应尝试的顺序添加一到五个备用模型。可以直接选择 provider 和模型、选择已有的模型配置，或创建自定义模型配置。
+1. 在 **Configure fallback triggers (advanced)** 下，检查应触发下一个 fallback 的 HTTP 状态码。按需添加或移除状态码。
+1. 点击 **Create chain**。
+
+一个 provider 和模型在每个工作区中只能有一条 fallback 链。要更改其行为，请编辑已有的链。
+
+## 发起调用
+
+使用主模型的带 provider 前缀 model ID 调用标准 LLM Gateway endpoint。你不需要 route 专属的 URL 或额外的请求字段：
+
+<CodeGroup>
+
+```bash Cloud
+curl https://gateway.smith.langchain.com/v1/chat/completions \
+    -H "Authorization: Bearer $LANGSMITH_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"anthropic/claude-opus-5","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+```bash BYOC
+curl https://<data_plane_host>/gateway/v1/chat/completions \
+    -H "Authorization: Bearer $LANGSMITH_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"anthropic/claude-opus-5","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+</CodeGroup>
+
+gateway 会应用为该 API key 所属工作区中的 `anthropic/claude-opus-5` 配置的 fallback 链。如果没有匹配的链，gateway 会直接返回主模型的响应，不尝试 fallback。
+
+## 为 prompt 设置 fallback
+
+要让一个 prompt 拥有自己的 fallback 链，把它路由到一个已保存的模型配置。prompt 按名称引用该配置，而 gateway 管理它的 fallback 链。
+
+创建配置需要 workspace 管理员权限。创建 fallback 链需要 `organization:manage` 权限。
+
+为 prompt 配置 fallback 的步骤：
+
+1. [创建一个模型配置](/langsmith/model-configurations#create-a-configuration)，指向你希望 prompt 使用的 provider 和模型。
+1. 在同一个工作区[创建一条 fallback 链](#create-a-fallback-chain)。选择你保存的配置作为主模型，而不是直接选择其底层 provider 和模型。添加备用模型，配置触发条件，然后保存链条。
+1. 在 Playground 中[创建一个 prompt](/langsmith/create-a-prompt)。打开 **Model Configuration**，将 **Provider** 选择为 **LangSmith Gateway**，并在 **Model** 字段中输入 `custom/<my_config_name>`。把 `<my_config_name>` 替换为已保存配置的名称，不要带尖括号。即使该值未在列表中列出，你也可以直接输入。点击 **Apply**。
+
+    <img
+      src="/images/llm-gateway-prompt-model-configuration.png"
+      alt="Model Configuration dialog with LangSmith Gateway selected as the provider and custom/<my_config_name> entered in the Model field."
+    />
+
+1. **保存** prompt，然后[连同其模型一起拉取](/langsmith/manage-prompts-programmatically#pull-a-prompt)。在 Python 中，调用 `client.pull_prompt` 时设置 `include_model=True`，这样保存的 Gateway 模型配置会被一并包含。
+
+使用拉取到的 prompt 及其保存的模型进行调用，即可通过 gateway 发送请求并应用该配置的 fallback 链。仅拉取 prompt 模板不会包含模型配置。
+
+fallback 链属于模型配置，而不是 prompt 本身。引用同一配置的 prompt 会共享它的 fallback。为每个需要不同 fallback 行为的 prompt 使用单独的配置。
+
+## 选择 fallback candidates
+
+你可以添加两类 fallback candidates：
+
+- **Direct provider model**：选择受支持的 gateway provider 和模型。该选项使用工作区中该 provider 的 secret，或对符合条件的托管模型使用 Gateway Credits。
+- **Model configuration**：选择一个已保存的[模型配置](/langsmith/model-configurations)。该选项适用于自定义 OpenAI 兼容或 Anthropic endpoint、自定义模型名称，或配置专属参数。
+
+一条 fallback 链可以使用其所选工作区或组织中的模型配置。如果两个范围中存在同名配置，LLM Gateway 会使用工作区范围的配置，主模型也一样。
+
+例如，把 `anthropic/claude-opus-5` 配置为主模型，`openai/gpt-5.4-mini` 作为第一个 fallback，一个已保存的 OpenAI 兼容模型配置作为第二个 fallback。应用继续请求 `anthropic/claude-opus-5`；gateway 会在需要时选择并转换 fallback 调用。
+
+## 另请参阅
+
+- [API 格式](/langsmith/llm-gateway-api-formats)：查看受支持的请求格式和转换行为。
+- [Spend policies](/langsmith/llm-gateway-spend-policies)：在 fallback 路由的同时应用成本限制。

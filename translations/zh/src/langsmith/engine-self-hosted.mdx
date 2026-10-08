@@ -1,69 +1,482 @@
 ---
 title: 自托管环境中的 LangSmith Engine
 sidebarTitle: 自托管
-description: 在自托管 LangSmith 实例上安装 LangSmith Engine，并了解它在你的环境之外依赖什么，以及它如何处理你的数据。
+description: 在自托管 LangSmith 实例上设置 LangSmith Engine，包括模型提供商选项和外部网络要求。
 ---
 
 <Info>
 自托管版 Engine 需要 LangSmith Helm chart `0.16.0` 或更高版本，并且需要包含 Engine 授权的 license。在更早的 chart 版本上不可用。[联系销售团队](https://www.langchain.com/contact-sales)，将该授权添加到你的订单中。
+
+在[自己的 model providers](#your-own-model-providers) 上运行 Engine 以及[离线（air-gapped）安装](#air-gapped-installations)需要 LangSmith Helm chart `0.17.0` 或更高版本。更早的 chart 版本只能在 [LangSmith Intelligence](#langsmith-intelligence) 上运行 Engine。
 </Info>
 
 LangSmith Engine 是 LangSmith 内的一个 agent，它会监控你的生产 traces，将它们聚类成 issues，结合你的源代码诊断每个问题，提出一个修复 PR，并识别应添加到 datasets 中的 ground truth evals。关于产品概览，请参阅 [Engine](/langsmith/engine-overview)。
 
-在自托管 LangSmith 中，Engine 的编排逻辑（包括其 detect、fix 和 verify 循环）作为 LangSmith 的一部分运行在你的 VPC 内。模型工作无法完全运行在你的 VPC 中：Engine 会将其所需的内容发送到 LangSmith Intelligence（LSI），一个由 LangChain 托管的零数据保留（ZDR）服务。
+在自托管 LangSmith 中，Engine 的分析和修复工作流运行在你的环境中。由 Organization Admin 选择 Engine 的模型调用在哪里运行：
 
-本页涵盖两部分内容：Engine 在你的环境之外依赖什么，以及如何在你的实例上[安装 Engine](#install-engine)。若要将其连接到你的源代码，请按[将 Engine 连接到 GitHub](/langsmith/engine-github) 中的说明创建并配置你自己的 GitHub App。
+- **LangSmith Intelligence (LSI)：**由 LangChain 托管的零数据保留（ZDR）服务，为你运行 Engine 的模型。
+- **自己的 model providers：**Anthropic、OpenAI、Amazon Bedrock、Google Vertex AI 或 Azure AI Foundry，使用你控制的凭据或云身份。
 
-Engine 会处理三类数据：
+Engine 会向 LangSmith Intelligence 报告用于计费的使用量元数据，除非你的安装是[离线（air-gapped）的](#air-gapped-installations)。
+
+本页涵盖模型提供商、数据处理和安装。若要让 Engine 访问源代码，还需要[配置一个 GitHub App](/langsmith/engine-github#self-hosted-configuration)。GitHub 对于 trace 分析是可选的。
+
+<Note>
+自托管 LangSmith 上不支持 Red teaming 和自动 issue 验证。没有这些功能，你仍然可以调查 issues、生成修复方案并创建 PR。
+</Note>
+
+Engine 会处理两类数据：
 
 - **Code**（可选）**：**你的 agent 源代码，Engine 会读取它来诊断问题并提出修复方案。
 - **Traces：**来自 agents 的运行时数据，其中可能包含用户消息、工具输出和 PII。
-- **Model：**Engine 为执行诊断、生成修复方案和编写 evaluators 而发起的 LLM 调用。
 
-## 按云和区域的可用性
+为了诊断问题、生成修复方案和编写 evaluators，Engine 会把这些数据中它需要的部分发送给它的模型，运行在 [LangSmith Intelligence 或你自己的 model providers](#choose-how-engine-runs-its-models) 上。
 
-Engine 在 LSI 可用的地方提供：
+## 选择 Engine 运行模型的方式
 
-| 云 | 区域 | 状态 |
+每个组织都可以在 **Settings > Engine > Model providers** 下选择 Engine 运行模型的方式。
+
+| | **LangSmith Intelligence** | **自己的 model providers** |
 | --- | --- | --- |
-| AWS | US | 可用 |
-| GCP | US | 可用 |
+| **谁运行模型** | LangChain，及其选择的 providers | 你的 provider 账户 |
+| **凭据** | 无。Engine 使用你的 LangSmith license 进行认证。 | 你提供的 API key 或云身份 |
+| **模型选择** | 由 LangChain 管理和调优 | 由 LangChain 管理，限于你的 providers 提供的模型系列 |
+| **数据处理协议** | LangChain 的协议，每家 provider 都有 ZDR | 你的协议，与你使用的每家 provider 签订 |
+| **计费** | LangChain 以 LSU 为单位对 Engine 用量计费。 | 你的 provider 对模型调用向你收费。LangChain 以 LSU 为单位对 Engine 用量计费，费率低于 LangSmith Intelligence。 |
+| **可用性** | AWS US | 任意云，只要集群可以访问受支持的模型和 endpoint |
 
-关于其他区域的可用性，请[联系销售团队](https://www.langchain.com/contact-sales)。
+关于其他云或区域的 LangSmith Intelligence，请[联系销售团队](https://www.langchain.com/contact-sales)。
 
-## 工作原理
+<Columns cols={2}>
+  <Frame caption="LangSmith Intelligence：Engine 运行在你的 VPC 中；LSI 和 Bedrock 运行在 LangChain 的 AWS 环境中。">
+    <img
+      src="/langsmith/images/engine-self-hosted-aws.png"
+      alt="自托管 LangSmith 在你的 VPC 中连接到 LangChain AWS 环境中的 LangSmith Intelligence 和 Bedrock 的架构图。"
+    />
+  </Frame>
+  <Frame caption="自己的 model providers：Engine 运行在你的 VPC 中并直接调用你的 providers；只有使用量元数据会发送给 LangChain。">
+    <img
+      src="/langsmith/images/engine-self-hosted-byok.png"
+      alt="自托管 LangSmith 在你的 VPC 中向你的 model providers 发送模型推理并向 LangChain 的云发送使用量元数据的架构图。"
+    />
+  </Frame>
+</Columns>
 
-LSI 是为 Engine 提供支持的 LangChain 托管服务。
+### LangSmith Intelligence
 
-流程如下：
+LSI 是一个运行 Engine 模型的 LangChain 托管服务。Engine 将其模型请求发送到 `https://beacon.aws.langchain.com/intelligence`，并使用你的 LangSmith license 进行认证，因此你无需提供模型提供商凭据。每次请求都会携带 Engine 工作所需的 trace 内容、代码和中间输出。
 
-- 你的自托管 Engine 向其所在云的 LSI gateway 发送 HTTPS 请求，本页后续的各云小节中列出了这些 gateway。
-- Engine 使用在 LangSmith license 校验期间获得的短期 license JWT 进行认证。你无需提供单独的模型提供商凭据。
-- LSI 校验该 JWT，并通过 LangChain 环境内部的私有网络将请求路由到模型提供商。
-- LSI 将响应返回给你的自托管 Engine。
+Engine 会为不同角色使用不同模型，分别用于聚类 issues、结合代码诊断根因、生成修复方案，以及编写用于验证修复的 evaluator。LangChain 会针对质量和 token 效率调优这些模型，并随着更优秀模型的推出进行更新。
 
-每次请求都会携带 Engine 工作所需的 trace 内容、代码和中间输出。LSI 和模型提供商会处理这些内容以服务该请求。
+你的集群必须允许到该 gateway 的出站 HTTPS。该连接可以使用公共 egress 或私有连接。要让 Engine 流量保持在私有网络上，请按照[通过 AWS PrivateLink 连接](#connect-with-aws-privatelink)操作。
 
-你的集群必须允许到该 gateway 的出站 HTTPS。该连接可以使用公共 egress 或私有连接。在 AWS 上，请按照[通过 AWS PrivateLink 连接](#connect-with-aws-privatelink)将 Engine 流量保持在私有网络上。
+如果到 LSI 的连接不可用，Engine 会停止并返回错误。你的 LangSmith 部署的其余部分不受影响，Engine 会在下一次计划扫描时重试。
 
-如果到 LSI 的连接不可用，Engine 会停止并返回错误，而不是降级到较低质量的输出。集群内没有模型，也没有备用提供商可以回退。你的 LangSmith 部署的其余部分不受影响，Engine 会在下一次计划扫描时重试。
+### 自己的 model providers
 
-## LangSmith Intelligence 保留了什么
+Engine 会直接从你的集群调用你的 providers。Prompts 和响应只会发送到你的 provider，受你与该 provider 之间的协议约束。LangChain 不会收到它们。
+
+Engine 的 sandbox 用量包含在 Engine 的 LSU 计费中。Engine 用于诊断问题、生成修复方案和编写 evaluators 的 sandboxes 不会产生额外的 Sandboxes 产品费用。
+
+Engine 支持 Anthropic、OpenAI、Amazon Bedrock、Google Vertex AI 和 Azure AI Foundry。它会使用你选择的 providers 的模型组合，因此为了获得最佳结果，请为你有权限访问的每家 provider 添加凭据。
+
+在你的 provider 账户中，为你的 provider 提供的 Anthropic Claude 模型和 OpenAI GPT 模型启用访问。在 Azure 上，请使用 Azure AI Foundry 资源。要确认 Engine 可以访问它使用的模型，请运行 [**Test connection**](#test-a-provider)。
+
+## Engine 在哪里处理和存储数据
+
+在自托管部署中，Engine 将数据处理分为你的环境和 LangChain 的环境两部分：
+
+- **你的环境：**Engine 编排逻辑和 LangSmith 存储的 traces 保留在你的自托管环境中。
+- **LangChain 的环境（使用 LangSmith Intelligence）：**Engine 发送的内容由 LSI 和模型提供商处理。LSI 只保留[使用量元数据](#what-langsmith-intelligence-retains)。
+- **你的 model providers（使用你自己的 providers）：**Engine 发送的内容由你的 providers 处理，受你与它们之间的协议约束。LangChain 只收到[使用量元数据](#what-langsmith-intelligence-retains)。
+
+如果你启用外部通知，Engine 还会将通知内容发送到你配置的 Slack channels 或 webhook endpoints。关于 Slack app 的设置以及发送到 Slack 的内容，请参阅[将自托管 LangSmith 连接到 Slack](/langsmith/self-host-slack)。
+
+### LangSmith Intelligence 保留了什么
 
 LSI 不会持久化 prompt 或模型响应的内容。它会保留以下用于使用量归因和计费的元数据：
 
 - 用于归因使用量的 Account、workspace 和 project 标识符。
 - 用于计费的模型和 token 使用量元数据。
 
-关于模型提供商的保留和训练承诺，请参阅 [Engine security](/langsmith/engine-security)。
+当 Engine 运行在你自己的 model providers 上时，这些元数据就是 LSI 收到的全部内容。你的自托管 LangSmith 会记录 Engine 的使用量，并每小时使用你的 license 认证后将其上报给 [`engine.intelligenceBaseUrl`](#allow-egress-to-langsmith-intelligence) 中的 endpoint。
 
-## 按云连接
+对于 LangChain-managed inference，模型提供商的保留和训练承诺已在 [Engine security](/langsmith/engine-security#model-subprocessors) 中说明。当你使用自己的 providers 时，它们的保留和训练政策取决于你与它们之间的协议。
 
-### AWS（美国可用）
+## 安装 Engine
 
-gateway 主机为 [`beacon.aws.langchain.com`](#allow-egress-to-langsmith-intelligence)。LSI 会将请求路由到 LangChain AWS 环境中的 AWS Bedrock。
+Engine 默认处于禁用状态。它需要 [Sandboxes](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes)、与 [LangSmith Intelligence](#allow-egress-to-langsmith-intelligence) 的连接（除非你的安装是[离线（air-gapped）的](#air-gapped-installations)）、一个可从外部访问的 [`config.hostname`](#verify-your-hostname-is-externally-reachable)，以及 [Engine 的 keys](#generate-engines-keys)。在启用 Engine 之前，请先完成这些前置条件。
 
-#### 通过 AWS PrivateLink 连接
+Engine 和 [Insights](/langsmith/deploy-self-hosted-full-platform#enable-fleet-insights-and-chat) 使用同一镜像并共享同一个 deployment。Engine 不需要 Insights。如果你的安装已经在运行 Insights，启用 Engine 只是增加配置，不会新增 pods。
+
+### 组件
+
+启用 Engine 会创建或复用：
+
+- `standalone-insights-api-server`：同时服务 `engine` 和 `insights` 两个 graph。
+- `standalone-insights-queue`：Engine 和 Insights 的后台 run 处理。
+- 一个专用于该共享 deployment 的 PostgreSQL 和 Redis 实例，两者都可以替换为外部实例。
+- [启用 Sandboxes](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes) 中描述的 sandbox 组件。
+
+Engine 还会在 `platform-backend` 和 `ingest-queue` 中添加配置，由它们负责调度 Engine 的 runs。
+
+### 前置条件
+
+<Steps>
+  <Step title="启用 Sandboxes">
+    首先完成[启用 Sandboxes](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes)，包括支持 KVM 的 node pool 和 JuiceFS 存储。
+
+    Engine 的 sandboxes 关联到单个 workspace。带 Engine 的安装必须有一个[共享组织](/langsmith/administration-overview#organizations)。如果共享组织只有一个 workspace，LangSmith 会使用该 workspace。如果共享组织有多个 workspace，LangSmith 不会自动选择，你必须将 `engine.sandboxTenantId` 设置为对应的 workspace ID。
+
+    <Warning>
+    请使用一个专供 Engine 使用的 workspace：
+
+    - Engine 的 sandboxes 不在 Sandboxes 产品上计费，因为 Engine 以 LSU 为单位计量自己的用量。
+    - Engine 的 sandboxes 与该 workspace 中的其他 sandboxes 共用相同的并发 sandbox、CPU 和内存配额。如果 workspace 接近上限，Engine 运行可能失败，或减少交互式 sandboxes 可用的容量。
+    - Engine 的 sandboxes 会列在该 workspace 中，任何有访问权限的人都可以停止它们。
+    - 每个 sandbox 都会运行 agent 生成的代码。
+    - 仓库凭据保存在 sandbox auth proxy 中，sandbox 内部运行的代码无法访问。
+    </Warning>
+  </Step>
+
+  <Step title="确认 license 授权">
+    Engine 与 Sandboxes 一样单独授权。你的 license 必须包含 Engine 授权。LangSmith 会在启动时和之后定期向 `https://beacon.langchain.com` 校验你的 license key，因此只要该授权被加入你的订单，无需更改任何配置即可生效。
+  </Step>
+
+  <Step title="允许到 LangSmith Intelligence 和你的 model providers 的 egress" id="allow-egress-to-langsmith-intelligence">
+    根据 Engine 运行模型的方式设置 `engine.intelligenceBaseUrl`，并允许集群到该 URL 的出站 HTTPS 连接：
+
+    | **Engine 运行模型的位置** | **`engine.intelligenceBaseUrl`** |
+    | --- | --- |
+    | LangSmith Intelligence | `https://beacon.aws.langchain.com/intelligence` |
+    | 自己的 model providers | `https://beacon.langchain.com/intelligence`（默认值） |
+    | 自己的 model providers，离线（air-gapped） | `""`（参见[离线安装](#air-gapped-installations)） |
+
+    AWS URL 同时记录使用量，因此对采用任一选项的组织都适用。默认 URL 只记录使用量，并且使用与自托管 LangSmith 已经用于 license 校验和计费遥测相同的同一主机，因此只是新增一条路径，而不是一个新的 egress 目标。
+
+    如果 Engine 将运行在你自己的 model providers 上，还需要允许 `standalone-insights` pods 到每家 provider 的 API endpoint 的出站 HTTPS。要让该流量保持在私有网络上，请参阅[私有连接到你的 providers](#connect-to-your-providers-privately)。
+
+    请把每个目标作为单独的 allowlist 条目添加，而不要开放一般性 egress。要让到 LangSmith Intelligence 的流量走私有网络，请参阅[通过 AWS PrivateLink 连接](#connect-with-aws-privatelink)。对 LangSmith Intelligence 的请求使用在 LangSmith license 校验期间获得的短期 license JWT。即使共享主机，Engine 的流量也与[配置 egress](/langsmith/self-host-egress) 中描述的计费与运维遥测相互独立。
+  </Step>
+
+  <Step title="确认主机名可从外部访问" id="verify-your-hostname-is-externally-reachable">
+    Engine 的 sandboxes 会使用 `langsmith` CLI 调用你的 LangSmith 安装，因此 `config.hostname` 必须能从 sandbox 网络访问。Helm 校验会拒绝 `localhost` 和集群内的 `*.svc` 地址。
+
+    如[设置 ingress](/langsmith/self-host-ingress) 中所述，通过 ingress 以 TLS 方式提供该主机名。Engine 的 sandbox 网络策略允许访问你的 LangSmith 主机名、所配置的 GitHub 主机和 Python 包仓库。每次运行的凭据由 sandbox 之外的 proxy 注入，而不是在 sandbox 内部可读。
+
+    对于 GitHub 连接，还需要允许你的 GitHub 环境所需的[出站请求和入站 webhooks](/langsmith/engine-github#allow-network-access)。仅靠浏览器访问 LangSmith 无法建立从 GitHub 到 webhooks 的连通性。
+  </Step>
+
+  <Step title="生成 Engine 的 keys" id="generate-engines-keys">
+    Engine 需要两个自己的 keys：
+
+    - **加密 key** (`engine_encryption_key`)：一个 Fernet key，用于加密 LangSmith 传给 Engine 的 run 载荷，这些载荷携带短期凭据。
+
+      ```bash
+      python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      ```
+
+    - **使用量签名 secret** (`engine_usage_signing_secret`)：为 Engine 发送给 LangSmith 的使用量报告签名。至少使用 32 个随机字符。
+
+      ```bash
+      openssl rand -hex 32
+      ```
+
+    在安装或升级 chart 之前，请把两者都存入你预定义的 Kubernetes Secret。参见[使用已有 secret](/langsmith/self-host-using-an-existing-secret#parameters)。当 Helm 可以从集群中读取已有 Secret 时，chart 会检查两个 keys 并指出缺失的项。`helm template` 和 GitOps 渲染会跳过该查找，因此请单独验证这些 keys 是否存在。
+
+    日后轮换加密 key 时，请把当前值复制到 `engine_encryption_key_previous`，并把新 key 设为 `engine_encryption_key`。旧 key 只用于解密，因此在切换前一刻加密的 runs 仍能正常完成。
+
+    在引入或轮换使用量签名 secret 时，请暂停新的 Engine 工作并等待正在运行的扫描完成。更新 `platform-backend`、`ingest-queue` 以及共享的 Engine 和 Insights API server 与 queue，让它们使用相同的签名 secret。在这四个组件都健康之后，恢复 Engine 并[验证一次分析和 Engine 用量](#verify-the-installation)。旧的加密 key 不能为使用量签名提供回退。
+  </Step>
+</Steps>
+
+### 通过 Helm 启用
+
+将以下内容添加到你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中，与[启用 Sandboxes](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes) 给出的完整 Sandboxes 值放在一起。以下示例只展示 Engine 相关的值和 `sandboxes.enabled` 开关。
+
+<Tabs>
+  <Tab title="使用 Kubernetes secrets（推荐）">
+    按名称引用你已有的 Secret，chart 会从中读取 `engine_encryption_key` 和 `engine_usage_signing_secret`。
+
+    ```yaml
+    config:
+      existingSecretName: "<your-secret-name>"
+      # 必须能从 sandbox 网络访问。
+      hostname: "https://langsmith.example.com"
+
+    engine:
+      enabled: true
+      intelligenceBaseUrl: "https://beacon.aws.langchain.com/intelligence"
+
+    sandboxes:
+      enabled: true
+    ```
+  </Tab>
+  <Tab title="使用内联值">
+    直接在配置文件中设置 Engine 的 keys。
+
+    <Warning>
+    这会把有效凭据写进配置文件。不要将它提交到版本控制，优先使用 Kubernetes Secret。
+    </Warning>
+
+    ```yaml
+    config:
+      hostname: "https://langsmith.example.com"
+
+    engine:
+      enabled: true
+      intelligenceBaseUrl: "https://beacon.aws.langchain.com/intelligence"
+      encryptionKey: "<engine-encryption-key>"
+      usageSigningSecret: "<engine-usage-signing-secret>"
+
+    sandboxes:
+      enabled: true
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+如果你的安装具有含多个 workspace 的共享组织，请设置掌管 Engine sandboxes 的 workspace：
+</Note>
+
+```yaml
+engine:
+  sandboxTenantId: "<workspace-id>"
+```
+
+#### 为你的 model providers 使用云身份
+
+Amazon Bedrock、Google Vertex AI 和 Azure AI Foundry 可以使用 Engine pods 的云身份进行认证，而不是使用保存在 LangSmith 中的凭据。在 `engine.workloadIdentityProviders` 中列出这些 providers。为共享的 Engine 和 Insights deployment 的 API server 和 queue 都配置身份：
+
+<Tabs>
+  <Tab title="Amazon EKS">
+    配置 IAM roles for service accounts (IRSA)。信任两个 Engine 工作负载的 namespace 和 service account，并授予该角色访问 Engine 所用 Bedrock 模型的权限。
+
+    ```yaml
+    engine:
+      workloadIdentityProviders:
+        - bedrock
+
+    engineInsightsAgent:
+      apiServer:
+        serviceAccount:
+          annotations:
+            eks.amazonaws.com/role-arn: "arn:aws:iam::<account-id>:role/<engine-model-access-role>"
+      queue:
+        serviceAccount:
+          annotations:
+            eks.amazonaws.com/role-arn: "arn:aws:iam::<account-id>:role/<engine-model-access-role>"
+    ```
+  </Tab>
+  <Tab title="Google GKE">
+    在集群和运行 Engine 的 node pools 上启用 Workload Identity Federation for GKE。在每个 Engine Kubernetes service account 上，向该 Google service account 授予 `roles/iam.workloadIdentityUser`。将每个成员绑定为 `serviceAccount:<cluster-project-id>.svc.id.goog[<namespace>/<kubernetes-service-account>]`。
+
+    在托管模型的项目中，向该 Google service account 授予 Vertex AI 推理权限，例如 `roles/aiplatform.user`。在该项目中启用所需的模型。
+
+    ```yaml
+    engine:
+      workloadIdentityProviders:
+        - vertex
+
+    engineInsightsAgent:
+      apiServer:
+        serviceAccount:
+          annotations:
+            iam.gke.io/gcp-service-account: "<service-account>@<project-id>.iam.gserviceaccount.com"
+        deployment:
+          extraEnv:
+            - name: GOOGLE_CLOUD_PROJECT
+              value: "<vertex-project-id>"
+      queue:
+        serviceAccount:
+          annotations:
+            iam.gke.io/gcp-service-account: "<service-account>@<project-id>.iam.gserviceaccount.com"
+        deployment:
+          extraEnv:
+            - name: GOOGLE_CLOUD_PROJECT
+              value: "<vertex-project-id>"
+    ```
+
+    Engine 使用 Application Default Credentials (ADC) 来解析身份和项目。将两个工作负载上的 `GOOGLE_CLOUD_PROJECT` 都设置为目标 Vertex AI 项目。Engine 当前使用 `global` Vertex AI 位置；所需的模型必须在该位置可用。
+  </Tab>
+  <Tab title="Azure AKS">
+    启用 AKS OIDC issuer 和 Microsoft Entra Workload ID。在你的 managed identity 上为每个 Engine Kubernetes service account 创建一个联合身份凭据。每一项都使用集群的 OIDC issuer、audience `api://AzureADTokenExchange`，以及 subject `system:serviceaccount:<namespace>:<kubernetes-service-account>`。
+
+    向该 identity 授予 Cognitive Services User 角色，范围限定为托管 Engine 模型的 Azure AI Foundry 资源。仅凭 Azure OpenAI 角色无法建立对 Claude 模型的访问。
+
+    ```yaml
+    engine:
+      workloadIdentityProviders:
+        - azure
+
+    engineInsightsAgent:
+      apiServer:
+        serviceAccount:
+          annotations:
+            azure.workload.identity/client-id: "<managed-identity-client-id>"
+        deployment:
+          labels:
+            azure.workload.identity/use: "true"
+      queue:
+        serviceAccount:
+          annotations:
+            azure.workload.identity/client-id: "<managed-identity-client-id>"
+        deployment:
+          labels:
+            azure.workload.identity/use: "true"
+    ```
+
+    两个工作负载都需要 service account 注解和 pod label。在 **Settings > Engine > Model providers** 下保存 Foundry 资源名称。
+  </Tab>
+</Tabs>
+
+<Warning>
+`engine.workloadIdentityProviders` 中列出的 provider 在没有保存凭据的情况下也算作已配置，因此任何 Organization Admin 都可以选择它。请将身份范围限定为 Engine 使用的模型。
+</Warning>
+
+保存的凭据优先于云身份。在切换 provider 时，请先应用云身份配置，再移除其保存的凭据。然后只在 **Settings > Engine > Model providers** 下移除该 provider 保存的 API key 或 service account JSON。对于 Bedrock，还要移除所有保存的 access key、secret access key 和 session token。保留 Azure AI Foundry 资源名称和任何 Bedrock 区域设置，然后再次[测试该 provider](#test-a-provider)。
+
+<Warning>
+从较旧的 Insights 镜像固定版本升级时需要额外检查一项：如果你的配置把 `images.engineInsightsAgentImage.repository` 固定到了已弃用的 `langsmith-clio` 镜像，请移除或更新该固定项。Engine 和 Insights 现在运行在 `langsmith-insights-engine` 上，chart 会拒绝 `langsmith-clio`。更多信息见[为你的 LangSmith 安装做镜像](/langsmith/self-host-mirroring-images#additional-images-for-engine)。
+</Warning>
+
+应用之前，先校验更新后的 chart：
+
+```bash
+helm template langsmith langchain/langsmith \
+  --values langsmith_config.yaml \
+  --version <version> \
+  --namespace <namespace>
+```
+
+chart 会在渲染时校验 Engine 值并指出缺失的值。这条命令不会检查已有 Kubernetes Secret 中的 keys；请在应用 chart 之前单独验证它们。
+
+应用更新后的 chart：
+
+```bash
+helm upgrade -i langsmith langchain/langsmith \
+  --values langsmith_config.yaml \
+  --version <version> \
+  --namespace <namespace> \
+  --wait
+```
+
+### 验证安装
+
+确认共享的 Engine 和 Insights deployment 正在运行：
+
+```bash
+kubectl get pods -n <namespace> | grep standalone-insights
+```
+
+API server 和 queue pods 都应处于 `Running` 状态。然后确认 `platform-backend` 是健康的，因为它负责调度 Engine 的 runs：
+
+```bash
+kubectl rollout status deployment/langsmith-platform-backend -n <namespace>
+```
+
+如果在这之后 Engine 没有出现在 LangSmith UI 中，最常见的原因是 license 中没有 Engine 授权，以及[在 LangSmith 中开启 Engine](#turn-on-engine-in-langsmith) 中描述的组织级开关。
+
+在 LangSmith UI 中[启用并配置 Engine](#turn-on-engine-in-langsmith) 之后，请[测试每个选定的 provider](#test-a-provider)，然后启动一次 Engine 分析，并确认该 tracing project 出现了结果。这样才能验证经过 Engine、Sandboxes 以及你的 model providers 或 LangSmith Intelligence 的完整链路。仅有处于运行状态的 pods 并不能验证这条链路。
+
+在 **Settings > Engine** 下查看 Engine 用量，可以看到按 workspace 和 project 汇总的支出。使用量上报和计费更新是异步的，因此支出可能比分析结果出现得更晚。对于离线（air-gapped）安装，请通过[用量导出](#air-gapped-installations)验证记录的使用量。
+
+如果分析未能完成，请检查 Engine pods 是否在运行、sandbox workspace 是否还有可用配额，以及集群能否访问你的 model providers 或配置在 `engine.intelligenceBaseUrl` 中的 LangSmith Intelligence gateway URL。
+
+### 在 LangSmith 中开启 Engine
+
+在 Helm 中启用 Engine 只是让该功能可用，并不会开始任何扫描。启用 chart 值之后，请在 LangSmith 中完成设置：
+
+1. 由[组织管理员](/langsmith/rbac#organization-admin)在 **Settings > Engine** 下为该组织开启 Engine。更多信息见[查找并修复 issues](/langsmith/engine#enable-engine-for-your-organization)。
+1. 由 Organization Admin 在 **Settings > Engine > Model providers** 下[选择 Engine 运行模型的方式](#choose-model-providers)。在这一步保存之前，Engine 不会开始任何运行。
+1. 由[角色](/langsmith/rbac)可以更新 tracing projects 的用户，从该 project 的 **Engine** 标签页为 tracing project 打开 Engine。更多信息见[设置 Engine](/langsmith/engine#set-up-engine)。
+
+为了读取源代码和创建 pull request，Engine 还需要一个 GitHub 连接。由运维人员[配置 GitHub App](/langsmith/engine-github#self-hosted-configuration)，然后由 workspace 用户[连接仓库](/langsmith/engine-github#connect-repositories)。
+
+### 选择 model providers
+
+在 **Settings > Engine > Model providers** 下，由 Organization Admin 选择 LangSmith Intelligence、你自己的 providers 中的一家或多家，或两者都选。凭据会保存为 organization secrets，并应用于该组织中的每个 workspace。
+
+只有当你的安装的 `engine.intelligenceBaseUrl` 服务 Engine 的模型时，LangSmith Intelligence 才会出现。
+
+当 LangSmith Intelligence 可用且被选中时，它优先于你选定的 providers。不选中它即可让推理保留在你自己的 providers 上。
+
+Engine 会从你启用的 providers 中选择模型。根据每家 provider 提供的模型，在你的 provider 账户中启用对 Claude 5.5 系列模型或 GPT 5.6 系列模型的访问。模型要求跟随 `images.engineInsightsAgentImage.tag` 中的 Engine 镜像标签，而不是 Helm chart 版本。运行 [**Test connection**](#test-a-provider) 可以识别所需的模型，并为已安装的 Engine 镜像确认访问权限。
+
+要使用你自己的 providers：
+
+<Steps>
+  <Step title="添加凭据">
+    点击 provider 旁边的 **Add credentials** 并输入：
+
+    <Tabs>
+      <Tab title="Anthropic">
+        一个 Anthropic API key。
+      </Tab>
+      <Tab title="Amazon Bedrock">
+        一个 AWS access key ID 和 secret access key（可选附带 session token），或一个 Bedrock API key（bearer token）。可选填写一个 AWS 区域。
+
+        Engine 使用 Bedrock Mantle API。请在所选 AWS 账户和区域中启用所需模型的访问。为调用身份授予 Mantle 推理和 model-subscription 权限；所需操作请参见 [AmazonBedrockMantleInferenceAccess](https://docs.aws.amazon.com/aws-managed-policy/latest/reference/AmazonBedrockMantleInferenceAccess.html)。
+
+        如果没有保存区域，Engine 会使用 `us-east-1`，包括在使用 workload identity 时。它不会继承 EKS 集群的区域。
+
+        若要改为使用 Engine pods 的云身份，请参见[为你的 model providers 使用云身份](#use-cloud-identity-for-your-model-providers)。
+      </Tab>
+      <Tab title="Google Vertex AI">
+        一个 JSON 格式的 service account key。Engine 使用该 JSON 的 `project_id` 作为推理项目，并调用 `global` 位置。
+
+        请在该项目中通过 [Model Garden](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/use-partner-models) 启用所需的模型。在同一项目中向该 service account 授予 `roles/aiplatform.user`。
+
+        若要改为使用 Engine pods 的云身份，请参见[为你的 model providers 使用云身份](#use-cloud-identity-for-your-model-providers)。
+      </Tab>
+      <Tab title="Azure AI Foundry">
+        确认你的资源区域对已安装 Engine 镜像所需的模型具有访问权限和配额。Azure 的配置步骤：
+
+        1. 在同一个 Azure AI Foundry 资源中创建所需的模型 deployments。Deployment 名称必须与模型名称（model ID）完全一致。Engine 使用 Claude 作为主模型，使用 GPT 作为备用。两个模型系列都不支持自定义 deployment 别名。
+
+           请按照 [Claude deployment instructions](https://platform.claude.com/docs/en/build-with-claude/claude-in-microsoft-foundry) 操作，并查看 [Azure OpenAI model availability](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/responses)。创建第一个 Claude deployment 时需要接受 Azure Marketplace 条款。
+        1. 输入一个 API key 和资源名称（而不是其完整 URL）。若要改为使用 Engine pods 的云身份而不是 API key，请参见[为你的 model providers 使用云身份](#use-cloud-identity-for-your-model-providers)。
+        1. 运行 [**Test connection**](#test-a-provider)，并确认 Claude 和 GPT 请求都成功，包括在选择其他 providers 时。保存之后，[启动一次 Engine 分析](#verify-the-installation)以验证完整设置。
+      </Tab>
+      <Tab title="OpenAI">
+        一个 OpenAI API key，可选填写你的 OpenAI organization ID。
+      </Tab>
+    </Tabs>
+
+    凭据完整的 provider 会显示为已配置。日后要更改它们，请点击 provider 旁边的钥匙图标。
+  </Step>
+  <Step title="测试 provider" id="test-a-provider">
+    点击 **Test connection**。Engine 会使用保存的凭据或配置的云身份，向该 provider 上它使用的每个模型发送一个小请求。它会显示每个请求是否成功，如果不成功，原因是什么。
+  </Step>
+  <Step title="选择 providers 并保存">
+    选择 Engine 可以使用的 providers，然后保存。
+  </Step>
+</Steps>
+
+如果保存之后 Engine 运行失败：
+
+- **未选择 provider：**在至少选择并保存一个 provider 之前，Engine 不会开始运行。
+- **凭据被拒绝：****Test connection** 会报告哪家 provider 拒绝了凭据。更新凭据并再次测试。
+- **模型不可用：**在你的 provider 账户中启用该模型，然后再次测试。
+
+### 禁用 Engine
+
+将 `engine.enabled` 设为 `false` 并重新应用：
+
+```yaml
+engine:
+  enabled: false
+```
+
+Engine 会停止调度 runs。Insights 与 Engine 共享同一 deployment，因此在 `insights.enabled` 为 `true` 时，`standalone-insights` pods 会继续运行。
+
+## 私有连接
+
+Engine 可以通过公共 egress 工作。要让它的流量保持在私有网络上，请通过 AWS PrivateLink 连接到 LangSmith Intelligence，或通过你所在云的私有 endpoint 连接到你自己的 model providers。
+
+### 通过 AWS PrivateLink 连接
+
+LangSmith Intelligence gateway（`beacon.aws.langchain.com`）会将请求路由到 LangChain AWS 环境中的 Amazon Bedrock。
 
 在配置 PrivateLink 之前，请先完成[安装 Engine](#install-engine)，包括其 Helm 和 egress 配置。
 
@@ -141,240 +554,36 @@ gateway 主机为 [`beacon.aws.langchain.com`](#allow-egress-to-langsmith-intell
   </Step>
 </Steps>
 
-<Frame caption="AWS：LangSmith 和 Engine 运行在你的 VPC 中；LSI 和 Bedrock 运行在 LangChain 的 AWS 环境中。">
-  <img
-    src="/langsmith/images/engine-self-hosted-aws.png"
-    alt="自托管 LangSmith 在你的 VPC 中通过 AWS PrivateLink 连接到 LangChain AWS 环境中的 LangSmith Intelligence 和 Bedrock 的架构图。"
-  />
-</Frame>
+### 私有连接到你的 providers
 
-### GCP（美国可用）
+Engine 会从 `standalone-insights` pods 调用每家 provider 的标准 API 主机名。要让该流量不经过公共互联网，请为你所在云设置到该 provider 的私有连接，使同一主机名在你的网络内部解析到私有地址：
 
-gateway 主机为 [`beacon.langchain.com`](#allow-egress-to-langsmith-intelligence)。LSI 会将请求路由到 LangChain GCP 环境中的 Vertex。
+| **Provider** | **Engine 调用的主机名** | **私有连接** |
+| --- | --- | --- |
+| Amazon Bedrock | `bedrock-mantle.<region>.api.aws` | 针对 `com.amazonaws.<region>.bedrock-mantle` 的 interface VPC endpoint，启用 private DNS，或为该主机名创建 Route 53 私有托管区 |
+| Google Vertex AI | `<region>-aiplatform.googleapis.com`，对于 global 区域为 `aiplatform.googleapis.com` | 用于 Google API 的 Private Service Connect，并为 `googleapis.com` 配置私有 DNS |
+| Azure AI Foundry | `<resource>.openai.azure.com` 和 `<resource>.services.ai.azure.com` | 针对 Foundry 资源的私有 endpoint，及其私有 DNS 区域 |
+| Anthropic、OpenAI | `api.anthropic.com`、`api.openai.com` | 不可用。这些 provider 需要公共 egress。 |
 
-<Note>
-该主机与自托管 LangSmith 用于 license 校验和计费遥测的主机相同，因此 GCP 部署只是新增了一条路径，而不是一个新的 egress 目标。参见[配置 egress](/langsmith/self-host-egress)。
-</Note>
+Engine 不接受自定义 endpoint URL，因此私有连接通过 DNS 实现：标准主机名必须能从 Engine pods 解析到你的私有 endpoint。
 
-<Frame caption="GCP：LangSmith 和 Engine 运行在你的 project 中；LSI 和 Vertex 运行在 LangChain 的 GCP 环境中。">
-  <img
-    src="/langsmith/images/engine-self-hosted-gcp.png"
-    alt="自托管 LangSmith 在你的 GCP project 中连接到 LangChain GCP 环境中的 LangSmith Intelligence 和 Vertex 的架构图。"
-  />
-</Frame>
+如果 Engine 使用[云身份](#use-cloud-identity-for-your-model-providers)进行认证，pods 还需要访问你所在云的 token 服务，例如在 AWS 上为 AWS STS 的 interface VPC endpoint。
 
-## 模型选择与质量
+使用保存的 Vertex AI service account JSON 时，除了用于推理的 `aiplatform.googleapis.com`，还要允许到 `oauth2.googleapis.com` 的 HTTPS 以进行 token 交换。
 
-Engine 会为不同角色使用不同模型，分别用于聚类 issues、结合代码诊断根因、生成修复方案，以及编写用于验证修复的 evaluator。LangChain 会针对质量和 token 效率调优这些模型，并随着更优秀模型的推出进行更新。
+向 LangSmith Intelligence 上报使用量是一条独立的连接。在 AWS 上，`https://beacon.aws.langchain.com/intelligence` 记录使用量并支持 [AWS PrivateLink](#connect-with-aws-privatelink)，因此安装可以在 Bedrock 上运行 Engine 并在没有公共 egress 的情况下上报使用量。默认的 `https://beacon.langchain.com/intelligence` 需要公共 egress。
 
-Engine 使用托管推理，而不是自带 key（bring-your-own-key）的方式。这使 Engine 的行为保持一致，并随着 LangChain 更新模型而持续改进。如果采用自带 key 的方式，模型选择、调优和 token 效率可能会因请求不同而波动。
+## 离线（air-gapped）安装
 
-## Engine 在哪里处理数据
+具有离线 license 且没有连接到 LangSmith Intelligence 的安装，可以在自己的 model providers 上运行 Engine：
 
-在自托管部署中，Engine 将数据处理分为你的环境和 LangChain 的环境两部分：
+- 将 `engine.intelligenceBaseUrl` 设置为 `""`。
+- 在 **Settings > Engine > Model providers** 下选择你自己的 model providers。LangSmith Intelligence 不可用。
+- 允许 `standalone-insights` pods 到你的 model providers 的出站 HTTPS，或通过你自己的网络路径路由到它们。
 
-- **你的环境：**Engine 编排逻辑和 LangSmith 存储的 traces 保留在你的自托管环境中。
-- **LangChain 的环境：**Engine 发送的内容由 LSI 和模型提供商处理。LSI 会保留上文所述的计费元数据。
+Engine 会在你的安装中记录其使用量。由 Organization Admin 在 **Settings > Usage export** 中将其与你其余的用量一起下载，并按协议中的时间表发送给你的 LangChain 客户团队。
 
-Engine 与部署无关的数据处理方式——包括与每家模型服务商之间的零数据保留，以及不会使用客户数据来训练或微调模型——已在 [Engine security](/langsmith/engine-security) 中说明。
-
-## 安装 Engine
-
-Engine 默认处于禁用状态。它需要 [Sandboxes](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes)、与 [LangSmith Intelligence](#allow-egress-to-langsmith-intelligence) 的连接、一个可从外部访问的 [`config.hostname`](#verify-your-hostname-is-externally-reachable)，以及一个 [Engine 加密 key](#generate-the-engine-encryption-key)。在启用 Engine 之前，请先完成这些前置条件。
-
-Engine 和 [Insights](/langsmith/deploy-self-hosted-full-platform#enable-fleet-insights-and-chat) 使用同一镜像并共享同一个 deployment。Engine 不需要 Insights。如果你的安装已经在运行 Insights，启用 Engine 只是增加配置，不会新增 pods。
-
-### 组件
-
-启用 Engine 会创建或复用：
-
-- `standalone-insights-api-server`：同时服务 `engine` 和 `insights` 两个 graph。
-- `standalone-insights-queue`：Engine 和 Insights 的后台 run 处理。
-- 一个专用于该共享 deployment 的 PostgreSQL 和 Redis 实例，两者都可以替换为外部实例。
-- [启用 Sandboxes](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes) 中描述的 sandbox 组件。
-
-Engine 还会在 `platform-backend` 和 `ingest-queue` 中添加配置，由它们负责调度 Engine 的 runs。
-
-### 前置条件
-
-<Steps>
-  <Step title="启用 Sandboxes">
-    首先完成[启用 Sandboxes](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes)，包括支持 KVM 的 node pool 和 JuiceFS 存储。
-
-    Engine 的 sandboxes 关联到单个 workspace。带 Engine 的安装必须有一个[共享组织](/langsmith/administration-overview#organizations)。如果共享组织只有一个 workspace，LangSmith 会使用该 workspace。如果共享组织有多个 workspace，LangSmith 不会自动选择，你必须将 `engine.sandboxTenantId` 设置为对应的 workspace ID。
-
-    <Warning>
-    请使用一个专供 Engine 使用的 workspace：
-
-    - Engine 的 sandboxes 不在 Sandboxes 产品上计费，因为 Engine 以 LCU 为单位计量自己的用量。
-    - Engine 的 sandboxes 与该 workspace 中的其他 sandboxes 共用相同的并发 sandbox、CPU 和内存配额。如果 workspace 接近上限，Engine 运行可能失败，或减少交互式 sandboxes 可用的容量。
-    - Engine 的 sandboxes 会列在该 workspace 中，任何有访问权限的人都可以停止它们。
-    - 每个 sandbox 都会运行 agent 生成的代码。
-    - 仓库凭据保存在 sandbox auth proxy 中，sandbox 内部运行的代码无法访问。
-    </Warning>
-  </Step>
-
-  <Step title="确认 license 授权">
-    Engine 与 Sandboxes 一样单独授权。你的 license 必须包含 Engine 授权。LangSmith 会在启动时和之后定期向 `https://beacon.langchain.com` 校验你的 license key，因此只要该授权被加入你的订单，无需更改任何配置即可生效。
-  </Step>
-
-  <Step title="允许到 LangSmith Intelligence 的 egress" id="allow-egress-to-langsmith-intelligence">
-    允许集群向你所在云对应的 LangSmith Intelligence gateway URL 发起出站 HTTPS 连接，并把这个 URL 作为 `engine.intelligenceBaseUrl` 的值。
-
-    | 云 | `engine.intelligenceBaseUrl` |
-    | --- | --- |
-    | AWS | `https://beacon.aws.langchain.com/intelligence` |
-    | GCP | `https://beacon.langchain.com/intelligence` |
-
-    在 GCP 上，这里使用的是 LangSmith 已经用于 license 校验和计费遥测的同一主机，因此 Engine 只是新增一条路径，而不是一个新的 egress 目标。
-
-    <Note>
-    自托管部署仅支持 **AWS US** 和 **GCP US** 区域。在规划上线前，请查看[云和区域的可用性](#availability-by-cloud-and-region)，并与[我们的销售团队](https://www.langchain.com/contact-sales)确认覆盖情况。
-    </Note>
-
-    请把 gateway 作为单独的 allowlist 条目添加，而不要开放一般性 egress。要让 AWS 流量走私有网络，请参阅[通过 AWS PrivateLink 连接 LangSmith Intelligence](#connect-with-aws-privatelink)。请求使用在 LangSmith license 校验期间获得的短期 license JWT。即使共享主机，Engine 的流量也与[配置 egress](/langsmith/self-host-egress) 中描述的计费与运维遥测相互独立。
-
-    <Note>
-    离线（air-gapped）安装无法运行 Engine。集群内没有任何可以回退的模型。
-    </Note>
-  </Step>
-
-  <Step title="确认主机名可从外部访问" id="verify-your-hostname-is-externally-reachable">
-    Engine 的 sandboxes 会使用 `langsmith` CLI 调用你的 LangSmith 安装，因此 `config.hostname` 必须能从 sandbox 网络访问。Helm 校验会拒绝 `localhost` 和集群内的 `*.svc` 地址。
-
-    如[设置 ingress](/langsmith/self-host-ingress) 中所述，通过 ingress 以 TLS 方式提供该主机名。Engine 不要求你暴露超出自己用户已可访问地址之外的任何内容。Sandbox egress 只允许访问你的 LangSmith 主机名、`github.com`、`api.github.com` 和 Python 包仓库。每次运行的凭据由 sandbox 之外的 proxy 注入，而不是在 sandbox 内部可读。
-  </Step>
-
-  <Step title="生成 Engine 加密 key" id="generate-the-engine-encryption-key">
-    Engine 使用自己的 Fernet key 加密 LangSmith 传给它的 run 载荷，这些载荷携带短期凭据。生成方式：
-
-    ```bash
-    python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-    ```
-
-    请把它以 `engine_encryption_key` 的形式存入你预定义的 Kubernetes Secret，而不是写在配置文件里。参见[使用已有 secret](/langsmith/self-host-using-an-existing-secret#parameters)。
-
-    日后轮换 key 时，请把当前值复制到 `engine_encryption_key_previous`，并把新 key 设为 `engine_encryption_key`。旧 key 只用于解密，因此在切换前一刻加密的 runs 仍能正常完成。
-  </Step>
-</Steps>
-
-### 通过 Helm 启用
-
-将以下内容添加到你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中，与[启用 Sandboxes](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes) 给出的完整 Sandboxes 值放在一起。以下示例只展示 Engine 相关的值和 `sandboxes.enabled` 开关。
-
-<Tabs>
-  <Tab title="使用 Kubernetes secrets（推荐）">
-    按名称引用你已有的 Secret，chart 会自动从中读取 `engine_encryption_key`。
-
-    ```yaml
-    config:
-      existingSecretName: "<your-secret-name>"
-      # 必须能从 sandbox 网络访问。
-      hostname: "https://langsmith.example.com"
-
-    engine:
-      enabled: true
-      intelligenceBaseUrl: "https://beacon.aws.langchain.com/intelligence"
-
-    sandboxes:
-      enabled: true
-    ```
-  </Tab>
-  <Tab title="使用内联值">
-    直接在配置文件中设置加密 key。
-
-    <Warning>
-    这会把一份有效凭据写进配置文件。不要将它提交到版本控制，优先使用 Kubernetes Secret。
-    </Warning>
-
-    ```yaml
-    config:
-      hostname: "https://langsmith.example.com"
-
-    engine:
-      enabled: true
-      intelligenceBaseUrl: "https://beacon.aws.langchain.com/intelligence"
-      encryptionKey: "<engine-encryption-key>"
-
-    sandboxes:
-      enabled: true
-    ```
-  </Tab>
-</Tabs>
-
-<Note>
-如果你的安装具有含多个 workspace 的共享组织，请设置掌管 Engine sandboxes 的 workspace：
-</Note>
-
-```yaml
-engine:
-  sandboxTenantId: "<workspace-id>"
-```
-
-<Warning>
-从较旧的 Insights 镜像固定版本升级时需要额外检查一项：如果你的配置把 `images.engineInsightsAgentImage.repository` 固定到了已弃用的 `langsmith-clio` 镜像，请移除或更新该固定项。Engine 和 Insights 现在运行在 `langsmith-insights-engine` 上，chart 会拒绝 `langsmith-clio`。更多信息见[为你的 LangSmith 安装做镜像](/langsmith/self-host-mirroring-images#additional-images-for-engine)。
-</Warning>
-
-应用之前，先校验更新后的 chart：
-
-```bash
-helm template langsmith langchain/langsmith \
-  --values langsmith_config.yaml \
-  --version <version> \
-  --namespace <namespace>
-```
-
-chart 会在渲染时校验 Engine 配置，缺失某个值时会报错并指明该值，因此这条命令能在配置进入集群之前发现配置错误。
-
-应用更新后的 chart：
-
-```bash
-helm upgrade -i langsmith langchain/langsmith \
-  --values langsmith_config.yaml \
-  --version <version> \
-  --namespace <namespace> \
-  --wait
-```
-
-### 验证安装
-
-确认共享的 Engine 和 Insights deployment 正在运行：
-
-```bash
-kubectl get pods -n <namespace> | grep standalone-insights
-```
-
-API server 和 queue pods 都应处于 `Running` 状态。然后确认 `platform-backend` 是健康的，因为它负责调度 Engine 的 runs：
-
-```bash
-kubectl rollout status deployment/langsmith-platform-backend -n <namespace>
-```
-
-如果在这之后 Engine 没有出现在 LangSmith UI 中，最常见的原因是 license 中没有 Engine 授权，以及[在 LangSmith 中开启 Engine](#turn-on-engine-in-langsmith) 中描述的组织级开关。
-
-在 LangSmith UI 中[启用并配置 Engine](#turn-on-engine-in-langsmith) 之后，请启动一次 Engine 分析，并确认该 tracing project 出现了结果。这样才能验证经过 Engine、Sandboxes 和 LangSmith Intelligence 的完整链路。仅有处于运行状态的 pods 并不能验证这条链路。
-
-如果分析未能完成，请检查 Engine pods 是否在运行、sandbox workspace 是否还有可用配额，以及集群能否访问配置在 `engine.intelligenceBaseUrl` 中的 LangSmith Intelligence gateway URL。
-
-### 在 LangSmith 中开启 Engine
-
-在 Helm 中启用 Engine 只是让该功能可用，并不会开始任何扫描。启用 chart 值之后，请在 LangSmith 中完成设置：
-
-1. 由[组织管理员](/langsmith/rbac#organization-admin)在 **Settings > Engine enablement** 下为该组织开启 Engine。更多信息见[查找并修复 issues](/langsmith/engine#enable-engine-for-your-organization)。
-1. 任何用户都可以从 tracing project 的 **Engine** 标签页为该 project 设置 Engine。更多信息见[为 tracing project 设置 Engine](/langsmith/engine#set-up-engine-for-a-tracing-project)。
-
-连接 GitHub 仓库是可选的，但可以改进 Engine 的诊断和修复质量。没有连接时，Engine 无法读取你的源代码，也无法发起 pull request。要创建 GitHub App 并配置 `host-backend`，参见[将 Engine 连接到 GitHub](/langsmith/engine-github#self-hosted)。
-
-### 禁用 Engine
-
-将 `engine.enabled` 设为 `false` 并重新应用：
-
-```yaml
-engine:
-  enabled: false
-```
-
-Engine 会停止调度 runs。Insights 与 Engine 共享同一 deployment，因此在 `insights.enabled` 为 `true` 时，`standalone-insights` pods 会继续运行。
+离线安装不显示 Engine 支出，除 `0` 以外的支出限额不会被强制执行。将限额设为 `0` 可以为某个组织或 project 暂停 Engine。
 
 ## 另请参阅
 
@@ -382,5 +591,6 @@ Engine 会停止调度 runs。Insights 与 Engine 共享同一 deployment，因�
 - [配置 Engine](/langsmith/engine)
 - [将 Engine 连接到 GitHub](/langsmith/engine-github)
 - [Engine security](/langsmith/engine-security)
-- [Engine webhooks](/langsmith/engine-webhooks)
+- [Engine notifications](/langsmith/engine-notifications)
+- [将自托管 LangSmith 连接到 Slack](/langsmith/self-host-slack)
 - [启用其他 LangSmith 功能](/langsmith/deploy-self-hosted-full-platform)

@@ -1,0 +1,293 @@
+---
+title: Managed Deep Agents 运行时
+sidebarTitle: Runtime
+description: 从 agent factory、tool 和 middleware 接收的原生运行时类型中读取 run context、verified caller、channel 投递和 sandbox。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/langsmith/managed-deep-agents-public-beta-note.mdx';
+
+Agent factory、tool 和 middleware hook 各自接收一个运行时。它是原生的 LangChain 或 LangGraph 运行时，额外增加了三个托管字段。Context、state 和 store 的工作方式与 [LangChain](/oss/langchain/runtime) 中相同，并且你的类型检查器看到的是你自己的 context 类型。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+## 理解运行时类型
+
+针对你的代码运行的每个位置，Managed Deep Agents 扩展一个原生类型：
+
+:::python
+| 代码 | 类型 | 扩展自 |
+|---|---|---|
+| Agent factory | `ManagedServerRuntime[Context]` | `ServerRuntime`，来自 `langgraph_sdk.runtime` |
+| Tool | `ManagedToolRuntime[Context, State]` | `ToolRuntime`，来自 `langchain.tools` |
+| Middleware hook | `ManagedRuntime[Context]` | `Runtime`，来自 `langgraph.runtime` |
+
+类型参数遵循原生顺序，因此 `ManagedToolRuntime` 先取 context，再取 state。两个参数都是可选的。`ManagedDeepAgentRuntime` 是 `ManagedToolRuntime` 的别名。
+
+每个类型保留所有原生字段和方法，例如 `context`、`state`、`store`、`stream_writer` 和 `tool_call_id`。Managed Deep Agents 增加三个字段：
+
+- **`server_info`**：原生服务器元数据，外加 verified caller。Tool 和 middleware 会接收到它。
+- **`channel`**：启动该 run 的 verified channel 投递。Direct API 和 schedule run 上为 `None`。
+- **`backend`**：该 thread 的 [sandbox](/langsmith/managed-deep-agents-sandboxes) 文件系统。项目未声明 sandbox 时为 `None`。
+:::
+
+:::js
+| 代码 | 类型 | 扩展自 |
+|---|---|---|
+| Agent factory | `ManagedServerRuntime<Context>` | `ServerRuntime`，来自 `@langchain/langgraph-sdk` |
+| Tool | `ManagedToolRuntime<State, Context>` | `ToolRuntime`，来自 `@langchain/core/tools` |
+| Middleware hook | `ManagedRuntime<Context>` | `Runtime`，来自 `langchain` |
+
+类型参数遵循原生顺序，因此 `ManagedToolRuntime` 先取 state，再取 context。两个参数都是可选的。`ManagedDeepAgentRuntime` 是 `ManagedToolRuntime` 的别名。
+
+每个类型保留所有原生字段和方法，例如 `context`、`state`、`store`、`writer` 和 `toolCallId`。Managed Deep Agents 增加三个字段：
+
+- **`serverInfo`**：原生服务器元数据，外加 verified caller。Tool 和 middleware 会接收到它。
+- **`channel`**：启动该 run 的 verified channel 投递。Direct API 和 schedule run 上为 `undefined`。
+- **`backend`**：该 thread 的 [sandbox](/langsmith/managed-deep-agents-sandboxes) 文件系统。项目未声明 sandbox 时为 `undefined`。
+:::
+
+## 区分 context、caller 和投递
+
+Context、caller 和 channel 投递来自不同的来源，具有不同的信任级别。运行时将它们保存在不同的字段中：
+
+- **Context** 来自 API 调用的 `context` 参数。LangGraph 会针对你的 context schema 校验它。用它来选择行为，而不是授予访问权限。
+- **Server info** 来自 [identity](/langsmith/managed-deep-agents-identity)，它从已验证的 token 解析出 caller。Managed Deep Agents 会剥离 client 通过 `configurable` 发送的 identity key，因此请用该字段进行授权。
+- **Channel** 来自托管的 [channel](/langsmith/managed-deep-agents-channels) ingress，它会在 run 开始之前验证投递。Direct API 调用的 context 中的 `channel` key 不会创建 `runtime.channel`。
+
+API 调用者在 input 旁边传入 context：
+
+:::python
+```python
+await client.runs.create(
+    thread_id,
+    "support",
+    input={"messages": [{"role": "user", "content": "Where is my order?"}]},
+    context={"tier": "fast"},
+)
+```
+:::
+
+:::js
+```ts
+await client.runs.create(threadId, "support", {
+  input: { messages: [{ role: "user", content: "Where is my order?" }] },
+  context: { tier: "fast" },
+});
+```
+:::
+
+### 处理不带 context 的 channel run
+
+Channel 投递不携带应用 context。Managed Deep Agents 会在 LangGraph 校验 context 之前移除投递数据，因此必填的 context 字段不会拒绝 channel run。Direct API run 保持原生校验。
+
+:::python
+在 channel run 上，agent factory、tool 和 middleware 中的 context 为 `None`。
+:::
+
+:::js
+在 channel run 上，agent factory 和 tool 中的 context 为 `undefined`，原生 middleware 中为空对象。
+:::
+
+要区分 channel run 和 direct run，请检查 `runtime.channel`。
+
+## 在 agent factory 中读取运行时
+
+Agent factory 接收一个 `ManagedServerRuntime`：原生的 [`ServerRuntime`](/langsmith/graph-rebuild) 加上 `channel` 和 `backend`。要编写 factory，请参见 [Select configuration per run](/langsmith/managed-deep-agents-agent-definition#select-configuration-per-run)。
+
+:::python
+Agent Server 还会调用 factory 来读取 schema 和 state。`access_context` 指明该操作。[`execution_runtime`](/langsmith/graph-rebuild#access-contexts) 在 `threads.create_run` 之外为 `None`，因此请从 `execution_runtime.context` 读取 run context。每次调用都返回相同的 graph 结构和 schema。
+
+`channel` 可用，因此 factory 可以按 channel 选择配置。`backend` 始终为 `None`，因为 sandbox 由 factory 选择。原生的 `user`、`store` 和 `ensure_user()` 仍然可用。
+:::
+
+:::js
+Agent Server 还会调用 factory 来读取 schema 和 state。`accessContext` 指明该操作。[`executionRuntime`](/langsmith/graph-rebuild#access-contexts) 在 `threads.create_run` 之外为 `null`，因此请从 `executionRuntime.context` 读取 run context。每次调用都返回相同的 graph 结构和 schema。
+
+`channel` 可用，因此 factory 可以按 channel 选择配置。`backend` 始终为 `undefined`，因为 sandbox 由 factory 选择。
+:::
+
+## 在 tool 中读取运行时
+
+:::python
+用 `ManagedToolRuntime` 标注 runtime 参数。Managed Deep Agents 会为该参数注入托管运行时，无论它叫什么名字：
+
+```python tools/check_order.py
+from dataclasses import dataclass
+
+from langchain.tools import tool
+from managed_deepagents import ManagedToolRuntime
+
+
+@dataclass
+class AppContext:
+    region: str = "us"
+
+
+@tool
+async def check_order(order_id: str, runtime: ManagedToolRuntime[AppContext]) -> str:
+    """Check the status of an order."""
+    principal = runtime.server_info.principal if runtime.server_info else None
+    if principal is None:
+        return "Sign in to check orders."
+    if runtime.channel is not None and runtime.channel.post is not None:
+        await runtime.channel.post({"type": "content", "content": "Checking that order now."})
+    region = runtime.context.region if runtime.context else "us"
+    return f"Order {order_id} for {principal.id} ships from {region}."
+```
+:::
+
+:::js
+用 `ManagedToolRuntime` 标注 runtime 参数：
+
+```ts tools/check-order.ts
+import { tool } from "langchain";
+import type { ManagedToolRuntime } from "managed-deepagents";
+import { z } from "zod";
+
+type AppContext = { region?: string };
+
+export const checkOrder = tool(
+  async ({ orderId }, runtime: ManagedToolRuntime<unknown, AppContext>) => {
+    const principal = runtime.serverInfo?.principal;
+    if (!principal) return "Sign in to check orders.";
+    await runtime.channel?.post?.({
+      type: "content",
+      content: "Checking that order now.",
+    });
+    const region = runtime.context?.region ?? "us";
+    return `Order ${orderId} for ${principal.id} ships from ${region}.`;
+  },
+  {
+    name: "check_order",
+    description: "Check the status of an order.",
+    schema: z.object({ orderId: z.string() }),
+  }
+);
+```
+:::
+
+当没有 caller 解析时，`principal` 不存在，因为 identity 是可选的。`post` 发送一条附加消息，agent 的最终回复仍会自动投递。编写 tool 的更多内容请参见 [Custom tools](/langsmith/managed-deep-agents-tools)。
+
+## 在 middleware 中读取运行时
+
+:::python
+Lifecycle 和 model hook 保持原生 `Runtime[Context]` 签名。使用 `isinstance` 收窄类型以读取托管字段：
+
+```python middleware/log_caller.py
+from dataclasses import dataclass
+
+from langchain.agents.middleware import AgentState, before_model
+from langgraph.runtime import Runtime
+from managed_deepagents import ManagedRuntime
+
+
+@dataclass
+class AppContext:
+    region: str = "us"
+
+
+@before_model
+def log_caller(state: AgentState, runtime: Runtime[AppContext]) -> None:
+    if not isinstance(runtime, ManagedRuntime):
+        return None
+    principal = runtime.server_info.principal if runtime.server_info else None
+    source = runtime.channel.provider if runtime.channel else "api"
+    print(f"{principal.id if principal else 'anonymous'} via {source}")
+    return None
+```
+
+:::
+
+:::js
+将 hook 的 runtime 断言为 `ManagedRuntime` 以读取托管字段：
+
+```ts middleware/log-caller.ts
+import { createMiddleware } from "langchain";
+import type { ManagedRuntime } from "managed-deepagents";
+
+type AppContext = { region?: string };
+
+export const logCaller = createMiddleware({
+  name: "LogCaller",
+  beforeModel: (_state, runtime) => {
+    const { serverInfo, channel } = runtime as ManagedRuntime<AppContext>;
+    const caller = serverInfo?.principal?.id ?? "anonymous";
+    console.log(`${caller} via ${channel?.provider ?? "api"}`);
+    return undefined;
+  },
+});
+```
+
+:::
+
+Tool-call hook 接收一个 `ManagedToolRuntime`。声明式 subagent 接收相同的托管字段。两者都不需要 identity 或 sandbox 声明。编写 middleware 的更多内容请参见 [Custom middleware](/langsmith/managed-deep-agents-middleware)。
+
+## 参考托管字段
+
+### Server info
+
+:::python
+`runtime.server_info` 是一个 `ManagedServerInfo`。它保留原生的 `assistant_id`、`graph_id` 和 `user` 字段，并增加 caller：
+
+- **`principal`**：verified caller。`id` 是调用者 ID，`kind` 为 `"person"`、`"service"` 或 `"channel"`，`claims` 保存 token claims。`claims["groups"]` 始终是字符串元组，`claims["email"]` 始终是字符串。
+- **`subject`**：该 run 以什么权限执行。`authority` 为 `"agent"` 或 `"user"`，附带 `agent_id` 和 `user_id`。
+- **`link`**：账号关联。`status` 目前报告 `"not_required"`。
+- **`source`**：run 的进入方式。`provider` 是 `"http"`、`"schedule"`、`"studio"` 或 `"slack"` 之类的值，附带可选的 `thread_id`。
+
+:::
+
+:::js
+`runtime.serverInfo` 是一个 `ManagedServerInfo`。它保留原生的 `assistantId`、`graphId` 和 `user` 字段，并增加 caller：
+
+- **`principal`**：verified caller。`id` 是调用者 ID，`kind` 为 `"person"`、`"service"` 或 `"channel"`，`claims` 保存 token claims。`claims.groups` 始终是字符串数组，`claims.email` 始终是字符串。
+- **`subject`**：该 run 以什么权限执行。`authority` 为 `"agent"` 或 `"user"`，附带 `agent_id` 和 `user_id`。
+- **`link`**：账号关联。`status` 目前报告 `"not_required"`。
+- **`source`**：run 的进入方式。`provider` 是 `"http"`、`"schedule"`、`"studio"` 或 `"slack"` 之类的值，附带可选的 `threadId`。
+
+:::
+
+请从 `principal` 读取 caller，而不是从原生的 `user`。Identity provider 和 claim 映射请参见 [Identity](/langsmith/managed-deep-agents-identity)。
+
+### Channel
+
+:::python
+`runtime.channel` 是一个 `RuntimeChannel`：
+
+- **`name`**：配置的 channel 名称。
+- **`provider`**：provider 标签，例如 `"slack"`。
+- **`event`**：类型化的投递。请参见下文的 event 类型。
+- **`raw_event`**：原始 provider payload（当 channel 提供时）。对 Slack 而言，是不含 HTTP headers 和 Trigger envelope 的内部 Slack event。Resume 可以省略它。
+- **`post`**：一个异步函数，向启动该 run 的对话发送消息。当 channel 无法发送时为 `None`。
+:::
+
+:::js
+`runtime.channel` 是一个 `RuntimeChannel`：
+
+- **`name`**：配置的 channel 名称。
+- **`provider`**：provider 标签，例如 `"slack"`。
+- **`event`**：类型化的投递。请参见下文的 event 类型。
+- **`rawEvent`**：原始 provider payload（当 channel 提供时）。对 Slack 而言，是不含 HTTP headers 和 Trigger envelope 的内部 Slack event。Resume 可以省略它。
+- **`post`**：一个异步函数，向启动该 run 的对话发送消息。当 channel 无法发送时为 `undefined`。
+:::
+
+`event.type` 是以下之一：
+
+- **`message`**：一条新消息。`messages` 保存传入的消息。
+- **`user_prompt_response`**：对交互式 prompt 的回复。携带 `action`、可选的 `value` 和可选的 `correlation_id`。请参见 [Agent-owned interrupts](/langsmith/managed-deep-agents-agent-owned-interrupts)。
+- **`interrupt_resume`**：针对待处理 interrupt 的 resume。`resume` 保存 resume 值。
+
+`post` 接受 content 消息 `{"type": "content", "content": ...}` 或原生消息 `{"type": "native", "native": ...}`。内置 Slack channel 只发送文本 content。回复目标保持私密：`post` 没有地址或目的地覆盖，代码无法读取或替换该目标。
+
+### Backend
+
+`runtime.backend` 读写该 thread 的 sandbox 中的文件。请参见 [Read and write sandbox files from code](/langsmith/managed-deep-agents-sandboxes#read-and-write-sandbox-files-from-code)。
+
+## 另请参阅
+
+- [Runtime](/oss/langchain/runtime)
+- [Rebuild graph at runtime](/langsmith/graph-rebuild)
+- [Agent definition](/langsmith/managed-deep-agents-agent-definition)
+- [Custom tools](/langsmith/managed-deep-agents-tools)
+- [Custom middleware](/langsmith/managed-deep-agents-middleware)
+- [Channels](/langsmith/managed-deep-agents-channels)
+- [Identity](/langsmith/managed-deep-agents-identity)

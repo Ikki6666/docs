@@ -1,0 +1,255 @@
+---
+title: 为 Managed Deep Agents 添加 Identity
+sidebarTitle: Identity
+description: 使用 LangSmith API key、Supabase 或你自己的后端，对 Managed Deep Agents deployment 的调用方进行认证。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/langsmith/managed-deep-agents-public-beta-note.mdx';
+import ManagedDeepAgentsTestAndDeploy from '/snippets/langsmith/managed-deep-agents-test-and-deploy.mdx';
+
+Identity 控制谁可以调用你的 managed deep agent，例如启动 runs 或发送消息的应用和 SDK client。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+将 identity 声明放在项目根目录：
+
+:::python
+```text
+my-agent/
+  agent.py
+  identity.py
+```
+:::
+
+:::js
+```text
+my-agent/
+  agent.ts
+  identity.ts
+```
+:::
+
+完整的项目布局请参见 [Project structure](/langsmith/managed-deep-agents-project-structure)。
+
+## 选择 identity provider
+
+默认情况下，`mda init` 要求调用方出示 LangSmith API key。拥有该 key 的任何人都可以使用同一个 deployment，并可能看到相同的 threads。要让每个登录的最终用户拥有私密的会话，请改用 Supabase：
+
+| 目标 | 使用 |
+| --- | --- |
+| 为 SDK client、脚本和服务锁定 deployment | [LangSmith API key (default)](#configure-identity-with-a-langsmith-api-key) |
+| 拥有私聊的登录最终用户，由 Managed Deep Agents 验证 | [Supabase](#configure-identity-with-supabase) |
+| 拥有私聊的登录最终用户，已由你自己的 API 认证 | [Your own backend](#configure-identity-with-your-own-backend) |
+
+Supabase 和 backend identity 都给每个最终用户私密的 threads。区别在于谁来验证用户。使用 Supabase 时，浏览器发送它的 access token，Managed Deep Agents 验证它。使用 backend identity 时，你的 API 验证用户并断言得到的用户 ID。
+
+更多信息请参见 [Project structure](/langsmith/managed-deep-agents-project-structure)。
+
+<Note>
+在托管 deployment 上，LangSmith Studio 通过一条单独的、经 workspace 认证的路径访问 deployment。对 LangSmith workspace 拥有 API 访问权限的调用方可以读取和搜索 deployment 中的每个 thread，无论你选择哪种 identity provider。该调用方无法修改你的最终用户拥有的 threads。因此针对你的最终用户的隐私保护成立，而针对你的 LangSmith workspace 成员不成立。
+</Note>
+
+## 使用 LangSmith API key 配置 identity
+
+`mda init` 将这种 identity provider 作为安全默认值搭建。调用方必须出示有效的 LangSmith workspace API key。Managed Deep Agents 向 LangSmith Cloud 验证该 key。
+
+:::python
+```python identity.py
+from managed_deepagents import auth, define_identity
+
+identity = define_identity(auth=auth.langsmith_api_key())
+```
+:::
+
+:::js
+```ts identity.ts
+import { auth, defineIdentity } from "managed-deepagents";
+
+export const identity = defineIdentity({
+  auth: auth.langsmithApiKey(),
+});
+```
+:::
+
+Client 以 `x-api-key` 发送该 key。你不需要在项目 `.env` 中添加验证 endpoint 或 tenant 设置。LangSmith Cloud 会提供这些。
+
+<Warning>
+拥有该 key 的任何人都能访问 deployment，因此请把 key 当作 secret 对待。这种默认方式不会给每个最终用户私密的 threads。如果 Alice 不能看到 Bob 的 threads，请使用 [Supabase](#configure-identity-with-supabase) 或 [你自己的后端](#configure-identity-with-your-own-backend)。
+</Warning>
+
+## 使用 Supabase 配置 identity
+
+当浏览器或其他 client 以已登录实体的身份调用 deployment 时，使用 Supabase。每个用户获得私密的 threads。Managed Deep Agents 会为你配置这种所有权。关于底层 LangSmith Deployment 模式的更多信息，请参见 [Make conversations private](/langsmith/resource-auth)。
+
+<Steps>
+  <Step title="在 Supabase 中启用 auth" id="enable-auth-in-supabase">
+
+在 Supabase 控制台中，启用你要使用的 auth provider（例如 email/password）。
+
+  </Step>
+  <Step title="复制项目引用" id="copy-the-project-reference">
+
+复制项目引用：项目 URL 中 `.supabase.co` 之前的子域名。
+
+  </Step>
+  <Step title="声明 identity" id="declare-supabase-identity">
+
+使用该项目引用声明 identity：
+
+:::python
+```python identity.py
+from managed_deepagents import auth, define_identity
+
+identity = define_identity(
+    auth=auth.supabase(project_ref="your-project-ref"),
+)
+```
+:::
+
+:::js
+```ts identity.ts
+import { auth, defineIdentity } from "managed-deepagents";
+
+export const identity = defineIdentity({
+  auth: auth.supabase({ projectRef: "your-project-ref" }),
+});
+```
+:::
+
+使用自定义 auth 域名时，传 `url` 而不是项目引用。
+
+  </Step>
+  <Step title="从 client 发送 access token" id="send-the-access-token">
+
+在 client 应用中，设置 Supabase 项目 URL 和 publishable key（在 Supabase 控制台中标记为 `anon`）。让用户登录，然后在每个 deployment 请求上发送 access token：
+
+:::python
+```python
+import httpx
+
+response = httpx.post(
+    f"{deployment_url}/threads/{thread_id}/runs",
+    headers={
+        "Authorization": f"Bearer {supabase_access_token}",
+        "Content-Type": "application/json",
+    },
+    json=run_body,
+)
+```
+:::
+
+:::js
+```ts
+await fetch(`${deploymentUrl}/threads/${threadId}/runs`, {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${supabaseAccessToken}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify(runBody),
+});
+```
+:::
+
+Publishable key（在 Supabase 控制台中标记为 `anon`）只用于 client 登录 Supabase。在这种模式下不要发送 LangSmith API key。Bearer token 就是调用方身份。
+
+Managed Deep Agents 会根据从你的项目引用推导出的项目 JWKS URL（`https://<project-ref>.supabase.co/auth/v1/.well-known/jwks.json`）验证 JWT。
+
+<Note>
+向已有的 deployment 添加 Supabase identity 不会为已有的 threads 添加 owner 元数据。在依赖基于 identity 的访问之前，请先规划并测试一次迁移。
+</Note>
+
+  </Step>
+</Steps>
+
+## 使用你自己的后端配置 identity
+
+当你自己的 API 已经对用户认证，并代表他们调用 deployment 时，使用 backend identity。你的后端用共享 secret 证明自己，并指明调用者。只有在 secret 匹配后，Managed Deep Agents 才信任该名称，然后为每个指名的用户私密的 threads。
+
+在这种模式下，浏览器永远不会直接访问 deployment。请求从浏览器到你的 API，再从你的 API 到 deployment。
+
+<Steps>
+  <Step title="声明 identity" id="declare-backend-identity">
+
+:::python
+```python identity.py
+from managed_deepagents import define_identity
+
+identity = define_identity(auth="backend")
+```
+:::
+
+:::js
+```ts identity.ts
+import { defineIdentity } from "managed-deepagents";
+
+export const identity = defineIdentity({
+  auth: "backend",
+});
+```
+:::
+
+  </Step>
+  <Step title="生成 ingress secret" id="generate-the-ingress-secret">
+
+生成一个随机值，并作为 `MDA_INGRESS_SECRET` 添加到项目 `.env` 中：
+
+```bash
+openssl rand -hex 32
+```
+
+```text .env
+MDA_INGRESS_SECRET=<MDA_INGRESS_SECRET>
+```
+
+`mda deploy` 会将该值作为托管 deployment secret 转发。声明 backend identity 却没有这个值的项目会在任何构建工作之前未通过部署预检，因为 deployment 会以 401 拒绝每个请求。关于 `.env` 值如何到达 deployment，请参见 [Deploy](/langsmith/managed-deep-agents-deploy#secrets-and-environment-files)。
+
+  </Step>
+  <Step title="从你的后端发送两个请求头" id="send-both-headers">
+
+在你自己的 API 中认证用户，然后在每个 deployment 请求上发送 secret 和解析出的用户 ID：
+
+:::python
+```python
+import httpx
+
+response = httpx.post(
+    f"{deployment_url}/threads/{thread_id}/runs",
+    headers={
+        "x-mda-ingress-secret": mda_ingress_secret,
+        "x-mda-user-id": user_id,
+        "Content-Type": "application/json",
+    },
+    json=run_body,
+)
+```
+:::
+
+:::js
+```ts
+await fetch(`${deploymentUrl}/threads/${threadId}/runs`, {
+  method: "POST",
+  headers: {
+    "x-mda-ingress-secret": mdaIngressSecret,
+    "x-mda-user-id": userId,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify(runBody),
+});
+```
+:::
+
+`x-mda-user-id` 使用与你自己系统中该用户相同的标识符，并跨会话保持稳定。Threads 和存储的凭据以这个值为 key，因此以新标识符出现的用户会到达另一组 threads。
+
+  </Step>
+</Steps>
+
+<Warning>
+`MDA_INGRESS_SECRET` 是服务端 secret。Managed Deep Agents 接受伴随有效 secret 的任何 `x-mda-user-id`，因此任何持有该 secret 的人都可以以任何用户的身份行动。请把它保存在你的后端，绝不要放在浏览器代码、移动应用或 client bundle 中。
+</Warning>
+
+## 测试和部署
+
+<ManagedDeepAgentsTestAndDeploy />
+
+认证失败返回 401。对于 LangSmith API-key 默认方式，确认 client 发送了 `x-api-key`。对于 Supabase，确认 client 发送了 `Authorization: Bearer <access_token>`，`project_ref` / `projectRef` 与你的 Supabase 项目匹配，并且调用方无法访问其他用户的 threads（403）。对于 backend identity，确认你的 API 同时发送了 `x-mda-ingress-secret` 和 `x-mda-user-id`，secret 与 deployment 上的 `MDA_INGRESS_SECRET` 匹配，并且一个用户的标识符无法访问另一个用户的 threads（403）。

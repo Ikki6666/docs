@@ -1,0 +1,164 @@
+---
+title: Data policy
+description: 在 LLM Gateway 中创建数据策略，对敏感数据脱敏并控制 trace 内容。
+---
+
+import LLMGatewayBetaNote from '/snippets/langsmith/llm-gateway-beta-note.mdx';
+
+<LLMGatewayBetaNote />
+
+LLM Gateway 中的 **Data Policy** 标签页存放 data policies。一条 data policy 覆盖两个领域，与创建表单的两个部分对应：
+
+- **Data retention**：gateway 是否把请求和响应体写入 LangSmith trace。
+- **Data protection**：在请求到达 LLM provider 之前，gateway 会扫描并脱敏哪些敏感数据、这次扫描最长可以运行多久，以及超出限制时请求是否继续。
+
+## 可用性
+
+拥有 LLM Gateway 访问权限的每个组织都可以使用 data policies。两项 entitlement 决定了 **Data Policy** 标签页提供什么：
+
+- **Data protection** 默认开启。如果该 entitlement 被关闭，cloud Enterprise 组织会看到标签页呈灰色并带有 **Request access** 链接，其他所有组织则完全看不到该标签页。
+- **PII redaction** 默认关闭，仅对选定的组织启用。没有该 entitlement 时，创建和编辑表单中的 PII 选项不可用，并且 API 会拒绝任何配置为检测 PII 的策略。
+
+请联系你的 account team 更改任一 entitlement。
+
+## Data retention
+
+每次经过 LLM Gateway 的调用都会被追踪到 LangSmith。**Trace content** 开关控制请求和响应体是否存储在这些 traces 中。它对所有组织默认关闭，由 data policy 针对该策略匹配的请求开启。当 trace content 被禁用时，gateway 仍然会记录 token 用量、延迟、状态、模型信息和策略评估结果等 metadata。当它开启时，会记录相同的 metadata，外加这次调用的内容。
+
+Gateway traces 会写入与调用者 API key 关联的[工作区](/langsmith/administration-overview#workspaces)中名为 `gateway` 的 project。关于 traces 携带的 metadata 以及如何限制 trace 可见性，请参见 [Traces and access control](/langsmith/llm-gateway-access)。
+
+## Data protection
+
+当 data policy 启用检测时，gateway 会在出站请求到达 LLM provider 之前对它们进行扫描。检测到的值会在请求被转发上游之前替换为占位符，因此 provider 只会看到脱敏后的 payload。对于成功的响应，gateway 会在把响应返回给调用者之前，把占位符恢复为原始值。
+
+内容只会在发送给 LLM 时被脱敏。响应返回后，该内容会在返回给调用者之前被还原。如果 trace content 捕获已开启，gateway trace 反映的是 provider 所看到的内容，包括脱敏占位符。gateway 之外的应用 traces 仍然可以捕获它们从该响应中收到的还原值。
+
+**PII** 和 **Secrets** 开关相互独立。在新策略上，PII 检测默认开启并选中每条规则（对拥有该 entitlement 的组织），secrets 检测默认关闭。
+
+### PII 检测
+
+**Personally Identifiable Information (PII)** 开关覆盖姓名、电子邮件、美国电话号码、地址和美国 SSN。它下面有六条规则，每条都可以单独选择，按 gateway 的检测方式分组。
+
+基于规则的类别使用正则表达式匹配，检测更快：
+
+| 类别 | 检测到的模式 |
+| --- | --- |
+| **Emails** | 电子邮件地址模式 |
+| **US phone numbers** | 常见美国格式，例如 `415-555-1234` 和 `+1 (415) 555-1234`。不带格式的 10 位数字不会被匹配 |
+| **US Social Security numbers** | 美国 SSN 模式，例如 `123-45-6789` |
+
+基于模型的类别由 Presidio 匹配，检测较慢：
+
+| 类别 | 示例 |
+| --- | --- |
+| **Names** | 自然语言中的人名 |
+| **Locations** | 地址、城市、国家 |
+| **Nationality, religious, and political groups** | 国籍、宗教信仰、政治立场 |
+
+### Secrets 检测
+
+**Secrets** 开关检测常见的 API keys、tokens 和凭证，并把它们从请求中脱敏：
+
+| 类别 | 检测到的模式 |
+| --- | --- |
+| **LangSmith** | Personal access tokens、service keys、旧版 API keys |
+| **AWS** | Access tokens |
+| **GitHub** | Personal access tokens、fine-grained PATs、OAuth tokens、app tokens |
+| **GitLab** | Personal access tokens |
+| **AI providers** | OpenAI API keys、Anthropic API keys |
+| **Cloud platforms** | GCP API keys、Azure AD client secrets、Google OAuth access tokens |
+| **Collaboration tools** | Slack bot、user 和 app tokens，Slack webhook URLs，Datadog access tokens |
+| **Package registries** | PyPI upload tokens、npm access tokens |
+| **Cryptographic** | 私钥、JWTs |
+| **Other** | Stripe access tokens、SendGrid API tokens |
+
+检测刻意保持狭窄：只应用锚定到可识别 token 形状的规则，因此 prompt 中的高熵文本不会触发脱敏。
+
+### 扫描时间与超时行为
+
+每条 data policy 都会限制扫描管道可以运行的最长时间，并决定达到该上限时会发生什么：
+
+- **Max processing time (seconds)**：默认 2，可在 0.1 到 30 之间配置。
+- **On timeout**：默认为 **Allow request**。把它设置为 **Block request** 可以拒绝扫描未及时完成的请求。
+
+这两个字段只对拥有 PII 检测 entitlement 的组织显示。其他组织使用默认值。
+
+## 创建 data policy
+
+<Warning>
+创建和管理策略需要 `organization:manage` 权限。
+</Warning>
+
+1. 在 LangSmith 侧边栏中，点击 **LLM Gateway**。
+1. 打开 **Data Policy** 标签页。
+1. 点击 **Create data policy**。
+1. 选择范围：**Organization**、**Workspace**、**User** 或 **API Key**。
+1. 输入 **Policy name**，或保留自动生成的名称。
+1. 对于 workspace、user 或 API key 范围，选择策略适用的具体 subject。
+1. （可选）在 **Data retention** 下，启用 **Trace content** 以在 traces 中存储请求和响应体。
+1. 在 **Data protection** 下，启用 **Secrets**、**PII** 或两者。对于 PII，选择要应用的规则。
+1. （可选）设置 **Max processing time (seconds)** 和 **On timeout**。
+1. 点击 **Create data policy**。
+
+Data policies 应用于在其配置范围内穿过 gateway 的所有请求。它们会立即生效。
+
+## 脱敏后的内容如何呈现
+
+当检测到 PII 或 secret 时，内容会在发送给 provider 的请求和 LangSmith trace 中都被替换为占位符。例如：
+
+**原始请求：**
+
+```text
+Please process the refund for John Smith, SSN 123-45-6789.
+```
+
+**上游脱敏结果：**
+
+```text
+## disclaimer: Some values have been redacted by a reverse proxy and replaced with placeholders containing unique identifiers.
+
+Please process the refund for [SAFE_TO_USE:PERSON_kbqdjxyz], SSN [SAFE_TO_USE:US_SSN_abqxlmwp].
+```
+
+gateway 会前置这条 disclaimer，让模型把这些占位符当作可以原样复用的值。
+
+占位符遵循格式 `[SAFE_TO_USE:<CATEGORY>_<suffix>]`：
+
+- **SAFE_TO_USE：** 固定前缀，标记该值是一个脱敏占位符。
+- **\<CATEGORY\>：** 检测到的类型。示例：`PERSON`、`LOCATION`、`US_SSN`、`US_PHONE_NUMBER`、`OPENAI_API_KEY`、`GITHUB_PAT`、`LANGSMITH_PERSONAL_TOKEN`。
+- **\<suffix\>：** 一个 8 字符的标记。同一请求中出现两次的值两次都会得到相同的占位符，并且这些标记无法跨请求关联。
+
+LangSmith 中的 trace 会显示脱敏后的版本，并附带表明发生了脱敏以及检测到哪些类别的 metadata。
+
+**下游还原后的响应：**
+
+当上游 provider 返回成功响应时，gateway 会把占位符替换为调用者的原始值。流式响应会逐事件重写，因此还原不会延迟流。例如，你的 agent 可能会看到这样的响应：
+
+```text
+Confirming John Smith's SSN as 123-45-6789. I will process the full refund.
+```
+
+## 脱敏覆盖范围
+
+**覆盖的内容：**
+
+- 出站请求内容（发送给 LLM provider 的消息）会在离开 gateway 之前被扫描和脱敏。
+- 脱敏后的版本就是出现在 LangSmith traces 中的版本。
+- 成功 provider 响应（无论是否流式）中的占位符，会在响应到达调用者之前恢复为原始值。
+
+**不覆盖的内容：**
+
+- **来自 LLM provider 的响应：** 如果模型在其响应中生成了敏感数据，这些内容不会被扫描或脱敏。只有请求会被扫描。
+- **Provider 错误：** 当 provider 返回 400 或更高的状态码时，gateway 会原样透传响应体，因此调用者看到的是占位符而不是原始值。
+- **你 traces 中已有的数据：** 脱敏只适用于穿过 gateway 的请求。直接写入 LangSmith API（绕过 gateway）的 traces 不会被扫描。
+- **Platform 级别的摄取：** 如果你的要求是不管数据以何种方式进入都阻止 PII 进入 LangSmith（例如数据驻留合规），仅靠 gateway 脱敏是不够的。这需要摄取级别的脱敏，那是一项独立的能力。
+- **System 和 developer prompts：** 这些会被跳过，同时跳过的还有 assistant tool-call metadata 以及以单个 JSON 字符串形式到达的 tool-call arguments。User messages、tool results 和结构化 tool-call arguments 会被扫描。
+
+**扫描器失败时 fail open：** 如果某个扫描器不可达或出错，请求会带着该阶段产出的内容继续发往 provider。只有扫描超时才能拦截请求，且仅当策略的 timeout action 设置为 **Block request** 时。
+
+覆盖边界很重要。如果你的安全模型要求敏感数据永远不进入任何系统（不只是 LLM provider），请确保你理解 gateway 覆盖哪些层面，哪些层面需要额外的控制。
+
+## 下一步
+
+- [Traces and access control](/langsmith/llm-gateway-access)：了解 gateway traces 落在哪里，以及谁可以读取它们。
+- [Spend policies](/langsmith/llm-gateway-spend-policies)：在 data protection 之外添加成本控制。

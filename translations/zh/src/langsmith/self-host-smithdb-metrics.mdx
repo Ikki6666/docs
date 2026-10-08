@@ -1,0 +1,101 @@
+---
+title: SmithDB 指标参考
+sidebarTitle: 指标参考
+description: 每个 SmithDB 组件需要关注的指标、它们测量什么，以及如何解读。
+---
+
+SmithDB 组件会在每个 pod 的 HTTP 端口上的 `/metrics` 暴露 Prometheus 指标。本页列出每个组件值得关注的指标以及如何解读它们。抓取和导出配置请参见[配置 SmithDB observability](/langsmith/self-host-smithdb-observability)。
+
+名称与 `/metrics` 上显示的一致。如果你的 collector 添加了 namespace 或前缀，请相应调整。
+
+关于基于这些指标构建、并带有各自所需抓取注解的 Datadog 和 Grafana 仪表板，请参见 LangSmith Helm chart 仓库中的 [SmithDB observability 示例](https://github.com/langchain-ai/helm/tree/main/charts/langsmith/examples/smithdb-observability)。
+
+<Note>
+本页涵盖 SmithDB 发出的指标。Kubernetes 信号（例如 OOM kills、容器重启、针对 limits 的 CPU 和内存、缓存磁盘用量）值得告警，但来自你的基础设施监控，而不是来自 SmithDB。
+</Note>
+
+## 基线指标
+
+如果完整参考超出你的需要，以下指标可以回答 SmithDB 是否健康。其他所有指标提供更多细节。
+
+| 问题 | 指标 | 组件 |
+| --- | --- | --- |
+| 查询是否成功且快速？ | `server_requests_duration` | Query |
+| 写入是否落地且快速？ | `ingest_batch_latency` | Ingestion |
+| 摄取是否跟得上到达量？ | `ingest_pending_segment_entry_count` | Ingestion |
+| Compaction 是否跟得上？ | `compaction_queue_job_count` | Compaction |
+| Compaction 是否成功？ | `compaction_job_completion` | Compaction |
+
+Compaction 有两个条目，因为故障模式是分开的：job 可能反复失败而队列长度保持持平，队列也可能增长而每个运行的 job 都成功。
+
+## Ingestion
+
+| 指标 | 类型 | 描述 |
+| --- | --- | --- |
+| `ingest_batch_latency` | Histogram | 从收到 batch 到 flush 完成的端到端延迟。 |
+| `ingest_flush_count` | Counter | 到 object storage 的 flush。流量到达时速率持平意味着写入没有落地。 |
+| `ingest_flush_rows` | Histogram | 每次 flush 的行数，按 level。flush 速率稳定而行数下降，提示过早 flush。 |
+| `ingest_flush_duration` | Histogram | flush 耗时多长。持续时间上升指向 object store 延迟或摄取规格不足。 |
+| `ingest_flush_reason` | Counter | 触发每次 flush 的原因，标签为 `reason`（`size`、`time` 或 `shutdown`）和 `level`（`L0` 或 `L1`）。L1 按 accumulate 的 run 数量或超时 flush。 |
+| `ingest_pending_segment_entry_count` | Gauge | 尚未 flush 的条目。持续增长意味着 flush 出现积压。 |
+| `semaphore_permits_in_use` | Gauge | 已持有的并发 permits，对应 `semaphore_max_permits`。持续饱和意味着写入在排队。 |
+| `server_requests_duration` | Histogram | 摄取请求延迟。按 `status` 拆分可得到成功和失败计数。 |
+
+## Query
+
+| 指标 | 类型 | 描述 |
+| --- | --- | --- |
+| `server_requests_duration` | Histogram | 查询延迟。按 `status` 拆分可得到成功和失败计数，其中 `status` 是 gRPC code（`0` 为成功）或 HTTP code；按 `path` 拆分可找到慢的 endpoint。 |
+| `query_fanout_partitions` | Histogram | 每个查询的活跃扫描分区。fanout 上升会同时推高延迟和内存。 |
+| `query_fanout_limit_exceeded_total` | Counter | 因 fanout 过大而被拒绝的查询。任何持续出现的速率意味着查询在直接失败。 |
+| `query_execution_max_mem_used_bytes` | Histogram | 查询计划中最大 operator 的峰值内存。接近配置限制预示着即将被终止。 |
+
+## Compaction
+
+| 指标 | 类型 | 描述 |
+| --- | --- | --- |
+| `compaction_queue_job_count` | Gauge | 在 compaction 队列中等待的 job。持续增长意味着 compaction 落后了。 |
+| `compaction_jobs_scheduled` | Counter | 管道创建的工作。与已执行的 job 对比。 |
+| `compaction_jobs_executed` | Counter | 已消耗的工作。持续低于 scheduled 意味着 workers 预配不足。 |
+| `compaction_job_completion` | Counter | job 结果，标签为 `status`（`success` 或 `failure`）和 `job_kind`。某个 `job_kind` 降到零意味着该 job 类型已停止运行。 |
+| `compaction_queue_jobs_skipped_capacity` | Counter | 因超出 worker 剩余容量而被跳过的 job。持续出现的速率意味着 worker 容量对所产生的 job 来说太小。 |
+| `compaction_queue_oldest_pending_created_at_seconds` | Gauge | 最老的 pending job 入队时的 Unix 时间戳，队列为空时为零。把年龄计算为 `time() - metric`，并排除零的情况。 |
+| `compaction_job_latency_seconds` | Histogram | 从 job 创建到完成。包含队列等待，因此 workers 饱和以及 job 缓慢时都会上升。 |
+| `compaction_worker_capacity_used` | Gauge | 按 `job_kind` 计算的进行中容量成本，对应 `compaction_worker_capacity_limit`。接近 limit 的持续占用可以解释被跳过的 job 和不断增长的队列。 |
+| `compaction_worker_running_tasks` | Gauge | 按 `job_kind` 计算的正在运行的任务。队列为非空时为零意味着 workers 停滞了，而不是繁忙。 |
+
+## Migration
+
+Migration Job pods 会在[历史迁移](/langsmith/self-host-smithdb-migrate)期间发出指标。如何跨 pods 聚合某个指标取决于它的类型：
+
+- **Gauges**：报告整个迁移的总量。值来自 TaskDB，每两分钟刷新一次。每个 pod 报告相同的值，因此用 `max` 聚合，而不是 `sum`。
+- **Counters**：跟踪每个 pod 完成的工作。跨 pods 求它们的速率之和。
+
+Migration Job pods 会发出以下指标：
+
+| 指标 | 类型 | 描述 |
+| --- | --- | --- |
+| `migration_tasks` | Gauge | 迁移任务，标签为 `kind`（`run` 或 `feedback`）和 `status`（`pending`、`running`、`completed` 或 `failed`）。进度是 `completed` 计数相对于所有状态的总数。 |
+| `migration_jobs` | Gauge | 迁移 job，标签为 `kind` 和 `status`。Run job 以 `promoted` 结束，feedback job 以 `validated` 结束。`failed` 和 `validation_failed` 是失败，其他所有状态意味着 job 仍在进行中。 |
+| `migration_run_tasks_completed_total` | Counter | 该 pod 完成的 run 任务。其速率就是以任务数计的迁移吞吐量。 |
+| `migration_run_task_planned_rows_migrated_total` | Counter | 该 pod 完成的 run 任务中的行数，按任务计划时在 ClickHouse 中统计。其速率就是以行数计的迁移吞吐量。 |
+
+Migration 不会自行重试失败的任务或 job。任何 `failed` 任务，或 `failed` 或 `validation_failed` 的 job 计数，都会让 migration Job 无法到达 `Complete`。该 Job 会一直运行，直到你解决故障。请参见 [Migration Job 失败](/langsmith/self-host-smithdb-troubleshooting#migration-job-failures)。
+
+## 所有组件
+
+| 指标 | 类型 | 描述 |
+| --- | --- | --- |
+| `object_store_op_duration` | Histogram | Object store 操作延迟。 |
+| `sys_jemalloc_resident_bytes` | Gauge | 进程驻留内存。对照 pod 内存 limit 进行跟踪。 |
+
+## LangSmith 摄取路径
+
+由 LangSmith 而不是 SmithDB 发出，标签为 `store="clickhouse|smithdb"`，因此可以在[双路径摄取](/langsmith/self-host-smithdb-install#step-4-enable-dual-ingestion)期间直接比较两个 store。
+
+| 指标 | 类型 | 描述 |
+| --- | --- | --- |
+| `langsmith_ingestion_e2e_latency_seconds` | Histogram | 从 API 接收到 store 写入确认的每个 run 的延迟。这是面向用户的数字；对比 `store="smithdb"` 与 `store="clickhouse"`。 |
+| `langsmith_ingestion_api_to_worker_latency_seconds` | Histogram | worker 开始之前的队列等待。这里上升是队列问题，而不是 SmithDB 问题。 |
+| `langsmith_ingestion_worker_to_store_latency_seconds` | Histogram | 仅 store 写入时间。把 SmithDB 与队列延迟隔离开。 |
+| `langsmith_asynq_ingestion_queue_pending` | Gauge | 在 LangSmith 摄取队列中等待 worker 领取的任务。持续增长意味着队列跟不上到达量，位于 SmithDB 上游。 |

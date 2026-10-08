@@ -1,0 +1,137 @@
+---
+title: BYOC 使用
+sidebarTitle: 使用
+description: 将 tracing 和 API 流量路由到 LangSmith BYOC data plane，包括向多个 endpoint 发送 traces，以及每个服务的路径前缀。
+icon: "plug"
+---
+
+你的 data plane 激活后，其 workspace 的所有 API 流量都会发送到 data plane endpoint，而不是 LangSmith Cloud backend。本页说明如何将请求路由到正确的服务。
+
+LangSmith UI 会自动处理这件事：它会根据你选择的 workspace 路由到正确的 data plane。以下指南适用于你自己的客户端应用和直接 API 调用。
+
+## 组织、data plane 与 workspace
+
+BYOC 部署在标准的 LangSmith [资源层级](/langsmith/administration-overview#resource-hierarchy)上增加了一级：data plane，它位于组织与 workspace 之间。
+
+- **组织**：最高层级。用户、角色、计费、SSO 配置和 API keys 属于组织，存放在 control plane 中。
+- **Data plane**：属于一个组织，代表数据的物理隔离。一个组织可以有多个 data plane，每个位于自己的 AWS 账户和 region 中。
+- **Workspace**：恰好属于一个 data plane，你在创建 workspace 时选择该 data plane。traces、datasets、experiments 和其他应用数据存放在 workspace 中。
+
+<img
+  src="/langsmith/images/byoc-org-structure.png"
+  alt="Nesting diagram of a BYOC deployment. An organization contains two data planes, each labeled as physical separation. The first is in us-east-1 and the second is in eu-west-1. Each data plane holds one workspace per team, and every workspace is labeled as logical separation within its data plane."
+/>
+
+用 data plane 实现数据的物理隔离，用 workspace 实现 data plane 内部的逻辑隔离。划分 data plane 的常见方式有：
+
+- **按 region 划分**，例如 `us-east-1` 和 `us-west-2`，将敏感应用数据保留在特定 region 内。
+- **按环境和 region 划分**，例如生产 `us-east-1` 和开发 `us-east-1`，将生产和开发数据保存在不同的 AWS 账户中。
+- **按业务单元划分**，适用于每个业务单元拥有自己 AWS 账户的情况。
+
+在 data plane 之下，workspace 和应用的行为与 Cloud 或自托管时相同。更多信息请参阅 [Administration 概览](/langsmith/administration-overview)和[工作负载隔离](/langsmith/workload-isolation)。
+
+## 查找你的 data plane endpoint
+
+每个 data plane 都有一个 base URL。导航到 **Settings > Data Planes** 即可查看你的每个 data plane、其状态及其 API URL。
+
+<Warning>
+data plane 默认配置为私有 endpoint，因此你需要私有网络连接（例如 Tailscale、AWS PrivateLink 或 VPC peering）才能访问 base URL。
+</Warning>
+
+## 向 data plane 发送 traces
+
+要将 traces 发送到位于你的 data plane 中的 workspace，请将 LangSmith SDK 指向 data plane endpoint，并使用限定于该 data plane 中某个 workspace 的 API key 进行身份验证：
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY="<your-api-key>"
+export LANGSMITH_ENDPOINT="https://<data_plane_host>"
+```
+
+<Warning>
+请从目标 data plane 内的 workspace 创建 `LANGSMITH_API_KEY`。traces 按 tenant 隔离，因此来自其他 data plane 上 workspace 的 API key（包括 Cloud workspace）会被拒绝。
+</Warning>
+
+要查看完整可运行的示例，请按照[可观测性快速开始](/langsmith/observability-quickstart)操作，并替换为上面的环境变量。
+
+## 路由 API 请求
+
+base URL 会根据路径前缀路由到不同的服务：
+
+| 服务 | 路径前缀 | 示例 |
+|---------|-------------|---------|
+| LangSmith | `/api` | `https://<data_plane_host>/api/v1/sessions` |
+| LangSmith Deployment | `/api-host` | `https://<data_plane_host>/api-host/v2/deployments` |
+| LLM Gateway | `/gateway` | `https://<data_plane_host>/gateway/v1/chat/completions` |
+
+## 向多个 endpoint 发送 traces
+
+使用以下模式同时向 Cloud 和某个 data plane 发送 traces，或向多个 data plane 发送 traces。
+
+### 双写两个 endpoint
+
+设置 `LANGSMITH_RUNS_ENDPOINTS` 以写入多个 endpoint：
+
+```bash
+export LANGSMITH_RUNS_ENDPOINTS='[
+  {"api_url": "https://aws.api.smith.langchain.com", "api_key": "ls__key1", "project_name": "project-cloud"},
+  {"api_url": "https://<data_plane_host>", "api_key": "ls__key2", "project_name": "project-byoc"}
+]'
+```
+
+### 在应用逻辑中选择目的地
+
+要在运行时决定 tracing 的目的地，为每个 endpoint 创建一个 client，并在它们之间进行选择：
+
+```python
+import os
+
+from langsmith import Client, traceable, tracing_context
+
+CLOUD_ENDPOINT = "https://aws.api.smith.langchain.com"
+BYOC_ENDPOINT = "https://<data_plane_host>"
+
+
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+cloud_client = Client(
+    api_key=require_env("LANGSMITH_CLOUD_API_KEY"),
+    api_url=CLOUD_ENDPOINT,
+    workspace_id=os.getenv("LANGSMITH_CLOUD_WORKSPACE_ID"),
+)
+
+byoc_client = Client(
+    api_key=require_env("LANGSMITH_BYOC_API_KEY"),
+    api_url=BYOC_ENDPOINT,
+    workspace_id=os.getenv("LANGSMITH_BYOC_WORKSPACE_ID"),
+)
+
+
+def get_workspace_routing(tenant_id: str):
+    """Determine the tracing destination based on application routing logic."""
+    if tenant_id.startswith("byoc_"):
+        return byoc_client, os.getenv("LANGSMITH_BYOC_PROJECT", "byoc-customer-project")
+    return cloud_client, os.getenv("LANGSMITH_CLOUD_PROJECT", "cloud-customer-project")
+
+
+@traceable
+def run_agent_workflow(query: str):
+    return f"Processed: {query}"
+
+
+def handle_request(tenant_id: str, query: str):
+    client, project_name = get_workspace_routing(tenant_id)
+
+    with tracing_context(enabled=True, client=client, project_name=project_name):
+        return run_agent_workflow(query)
+```
+
+## 另请参阅
+
+- [BYOC 入门指南](/langsmith/byoc-onboarding)
+- [BYOC 架构](/langsmith/byoc-architecture)

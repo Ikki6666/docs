@@ -1,0 +1,120 @@
+---
+title: Code mode
+sidebarTitle: Code mode
+description: 使用 OpenWiki 为 coding agent 生成并维护仓库文档
+---
+
+Code mode 会在 `openwiki/` 中构建一个仓库 wiki，包含架构、集成和工作流等持久细节。Coding agent 把该 wiki 用作上下文，因此可以更高效地在包中工作，减少重新探索和 token 消耗。人类可以阅读相同的 Markdown，但 agent 是主要受众。Agent 通过 OpenWiki 添加到 `AGENTS.md` 和 `CLAUDE.md` 中的指针发现该 wiki。
+
+`openwiki`、`openwiki --init` 和 `openwiki --update` 以 code 模式运行。你也可以显式传入模式：
+
+```bash
+openwiki code --init
+openwiki code --update
+openwiki code --update --print
+```
+
+再次运行 `openwiki --init` 会用新生成的内容替换现有的生成仓库 wiki 和 Claims，同时保留用户编写的 `openwiki/INSTRUCTIONS.md` brief。在持久 checkout 上，OpenWiki 会把进行中的生成记录到 `openwiki/.run.json`，因此在中断之后重新运行相同命令会恢复持久化页面队列。临时 CI runner 在失败后会重新开始，除非它们的 workspace 被保留。在新运行状态持久化之前的设置失败会恢复之前的 wiki。
+
+要用另一种语言生成 wiki 页面，请传入 BCP-47 locale，例如 `ko`、`zh-CN` 或 `pt-BR`：
+
+```bash
+openwiki --init --language ko
+```
+
+你也可以在 Codex、Claude Code、OpenCode 或 Cursor 中运行 OpenWiki。请参见 [Coding-agent integrations](/oss/openwiki/integrations)。
+
+## Code mode 会产出什么
+
+成功 init 或 update 之后，仓库通常包括：
+
+- **`openwiki/`**：生成的 Markdown wiki（quickstart、架构、操作和相关主题）
+- **`openwiki/INSTRUCTIONS.md`**：用户编写的范围和优先级 brief。OpenWiki 在 init 和 update 时会读取它。你可以自己编辑它，或在聊天中让 OpenWiki 更改它；正常的 `--init` 和 `--update` 运行不会重写它
+- **`openwiki/.claims/`**：结构化的 Claim sidecar，让事实性页面与带版本的仓库证据保持一致
+- **`openwiki/.page-manifest.json`**：用于可恢复生成的每页进度和源 checkpoint
+- **`openwiki/.last-update.json`**：上次成功文档检查的元数据（包括 no-op 更新）
+- **`AGENTS.md` / `CLAUDE.md`**：OpenWiki 会插入或刷新一个 `<!-- OPENWIKI:START -->` … `<!-- OPENWIKI:END -->` block，告诉 coding agent 何时查阅 wiki。block 之外的现有内容不会被改动
+
+在活动运行期间，`openwiki/.run.json` 会 checkpoint 有序的页面队列。OpenWiki 会在成功完成后删除该文件。
+
+## Grounded Claims
+
+OpenWiki 通过跟踪事实性页面背后的重要命题，而不仅仅是 Markdown 文件上次生成的时间，让 code wiki 具备自我纠正能力。Claims 涵盖未来 agent 依赖的事实：行为、职责、架构、数据流、不变量、失败语义、配置和安全边界。每个 Claim 都指向确切的仓库证据，例如 `repo://src/server.ts#L40-L82`，并带有 OpenWiki 建立 Claim 时观察到的证据版本。
+
+Markdown 保持整洁。结构化的 Claim state 位于 `openwiki/.claims/` 下。页面完成会持久化调和后的 Claims，将验证投影到 OKF front matter，并在将页面 job 标记为完成之前证明完整结果。Grounded Claims 适用于仓库 code wiki 和仓库证据。来自 connector 的事实（包括仅来自 LangSmith 的观察）不会作为 Claims 包含在内。
+
+## Markdown 输出
+
+OpenWiki 的持久化输出是 Markdown（OKF），而不是静态 HTML 站点。要在浏览器中浏览 wiki，请运行 [`openwiki visualize`](/oss/openwiki/visualize)。该命令只在你的本地机器（`127.0.0.1`）上提供 viewer，或者你可以[导出一个静态 visualizer](/oss/openwiki/visualize#export-a-static-site) 用于托管。
+
+## Open Knowledge Format
+
+OpenWiki 在 code 和 personal 两种模式下都会输出 [Google Open Knowledge Format (OKF)](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md) v0.2 包：
+
+- **Concept** 是一个普通的 wiki Markdown 页面（一个主题文件）。每个 concept 都有带非空 `type` 的 YAML front matter；其他标准字段是可选的
+- 新页面和刚初始化的页面会收到 `generated: {by, at}`。在更新期间，任何正文变化（包括空白）都会推进该 stamp；未变化的正文保留其先前的事件，仅 front matter 的变化不会推进它。Producer 会被标记为 `openwiki/<version>`（或 coding-agent 宿主）
+- 仓库页面将 grounded Claims 证据投影到 `sources`。OpenWiki 会在保留独立编写的 sources 的同时，调和它确定性识别的条目
+- 仓库页面只有在成功的页面提交调和了非空的完整 Claims 集合、通过了最终证据复核并持久化了 Claims sidecar 之后，才会收到 `verified: {by: openwiki/<version>, at: ...}`
+- `index.md` 和 `log.md` 是**保留的**脚手架文件，不是 concepts。根索引声明 `okf_version: "0.2"`
+- 可选的 v0.2 provenance、trust 和 lifecycle 系列（`sources`、`verified`、`status`、`stale_after`）在存在时会被验证。Producer 定义的扩展字段会在更新和迁移中保留
+- Concept 文档之间的标准 Markdown 链接表达关系
+
+## LangSmith connector
+
+**LangSmith** connector 可以丰富 code wiki：它会为你选择的项目拉取最近的 LangSmith traces（tool calls、结果和延迟），因此仓库文档反映代码在运行时的表现，而不仅仅是源码说了什么。
+
+在 code 模式下的 `openwiki --init` 期间配置它。从来源菜单中添加 LangSmith，选择你的 workspace 区域（US、EU 或 APAC），并列出要记录的项目。OpenWiki 会写入一个已提交的 `openwiki/.langsmith.json`，命名 workspace 和项目（永远不会写入 key 本身）。API key 从环境中读取：
+
+```bash
+OPENWIKI_LANGSMITH_API_KEY="<your-langsmith-key>"
+```
+
+本地 setup 向导可以将它保存到 `~/.openwiki/.env`。在 CI 中，将其设置为仓库 secret，并为运行导出。
+
+LangSmith key 与 workspace 和区域绑定。要记录多个 workspace 的项目，请为每个 workspace 添加一个条目，每个条目都有自己的 key，命名为 `OPENWIKI_LANGSMITH_API_KEY_2`、`OPENWIKI_LANGSMITH_API_KEY_3`，依此类推。Connector 连接官方的 US（`api.smith.langchain.com`）、EU（`eu.api.smith.langchain.com`）和 APAC（`apac.api.smith.langchain.com`）主机。
+
+## 忽略路径
+
+在仓库根目录创建一个 `.openwikiignore` 文件，防止生成的文档读取或描述私有的、生成的或无关的路径。语法支持注释、空行、`*` 和 `**` glob、目录规则，以及 `!` 取反：
+
+```txt
+secrets/
+*.log
+!logs/keep.log
+```
+
+当 `.openwikiignore` 有生效的规则时，OpenWiki 会过滤文件系统发现并限制 shell 执行，让被忽略的路径远离本次运行。
+
+<Note>
+    这是一条读取边界：被忽略的路径永远不会被读取、扫描或在生成的文档中复现。它不保证某个主题永远不会被提及，因为 agent 仍可能从其他允许的证据（例如测试、README、commit message 或现有 wiki）推断出被忽略的区域。
+</Note>
+
+## Diagrams
+
+OpenWiki 会在 Mermaid 图比散文更能澄清 concept 的地方嵌入 Mermaid 图。每次运行之后，它会验证 Mermaid fence。验证失败的图会被就地转换为带有简短注释的普通 `text` fence，然后在后续的 `--update` 运行中尽可能修复。
+
+要让验证更接近 GitHub 的渲染方式，请在运行 OpenWiki 的地方安装 Mermaid parser：
+
+```bash
+npm install mermaid jsdom
+```
+
+当 parser 存在时，OpenWiki 会使用它。当它不存在时，OpenWiki 会回退到一个轻量级检查。无论哪种方式，图生成都能工作。
+
+## 自定义 wiki brief
+
+编辑 `openwiki/INSTRUCTIONS.md` 可以调整仓库文档的范围、优先级和偏好的写作规范（例如语气、术语，以及强调或跳过什么）。OpenWiki 在 init 和 update 运行时会读取该文件。你也可以在聊天中让 OpenWiki 修订该 brief：
+
+```bash
+openwiki "Update openwiki/INSTRUCTIONS.md to prioritize the public API and skip internal tooling"
+```
+
+正常的 `--init` 和 `--update` 运行不会重写该文件。
+
+## See also
+
+- [Coding-agent integrations](/oss/openwiki/integrations)
+- [Visualize your wiki](/oss/openwiki/visualize)
+- [Automate updates](/oss/openwiki/automate-updates)
+- [Customize OpenWiki](/oss/openwiki/customize)
+- [Personal mode](/oss/openwiki/personal-mode)

@@ -1,0 +1,175 @@
+---
+title: MongoDB Atlas
+sidebarTitle: MongoDB Atlas
+description: 使用 LangChain Python 集成 MongoDBAtlasHybridSearchRetriever。
+integration:
+  name: MongoDBAtlas
+  pypi: langchain-mongodb
+---
+
+>[MongoDB Atlas](https://www.mongodb.com/docs/atlas/) 是一个在 AWS、Azure 和 GCP 上可用的全托管云数据库。它支持在你的 MongoDB 文档数据上进行原生向量搜索、全文搜索（BM25）和混合搜索。
+
+`MongoDBAtlasHybridSearchRetriever` 使用 Reciprocal Rank Fusion（RRF）组合向量搜索和全文搜索，从 Atlas collection 中返回最相关的文档。对于没有向量索引的关键词检索，`MongoDBAtlasFullTextSearchRetriever` 使用 Atlas Search 的 Lucene（BM25）分析器。
+
+这两个 retriever 都是 `BaseRetriever` 的子类，随 `langchain-mongodb` 包一同发布。你也可以通过 `.as_retriever()` 把 [MongoDB Atlas 向量存储](/oss/integrations/vectorstores/mongodb_atlas)转换为 retriever。当需要混合搜索或仅全文搜索时，请使用专用的 retriever 类。
+
+本指南帮助你开始使用 MongoDB Atlas [retriever](/oss/deepagents/retrieval)。有关 `MongoDBAtlasHybridSearchRetriever` 全部特性与配置的详细文档，请参见 [API reference](https://reference.langchain.com/python/langchain-mongodb/retrievers/MongoDBAtlasHybridSearchRetriever)。
+
+### 集成详情
+
+<ItemTable category="document_retrievers" item="MongoDBAtlasHybridSearchRetriever" />
+
+## 设置
+
+你需要一个启用了 Atlas Search 的 MongoDB Atlas 运行中的 cluster。如果还没有，请在 [Atlas UI](https://www.mongodb.com/cloud/atlas/register) 中创建一个。
+
+`MongoDBAtlasHybridSearchRetriever` 需要目标 collection 上有两个搜索 index：
+
+- 一个用于语义召回的 **向量搜索 index**
+- 一个用于关键词召回的 **全文搜索 index**
+
+请参见下方的[创建 index](#create-indexes)，或在 Atlas UI 中手动创建。
+
+如果你希望对单个查询启用自动 tracing，请设置你的 [LangSmith](/langsmith/home) API key：
+
+```python
+import getpass
+import os
+
+os.environ["LANGSMITH_API_KEY"] = getpass.getpass("Enter your LangSmith API key: ")
+os.environ["LANGSMITH_TRACING"] = "true"
+```
+
+### 安装
+
+安装 `langchain-mongodb`。下面的示例还使用 Voyage AI embeddings：
+
+<CodeGroup>
+```bash pip
+pip install -qU langchain-mongodb langchain-voyageai
+```
+
+```bash uv
+uv add langchain-mongodb langchain-voyageai
+```
+</CodeGroup>
+
+### 配置
+
+设置你的 Atlas 连接字符串并打开一个 collection 句柄：
+
+```python
+import getpass
+import os
+
+from pymongo import MongoClient
+
+if not os.environ.get("MONGODB_ATLAS_URI"):
+    os.environ["MONGODB_ATLAS_URI"] = getpass.getpass("Enter your MongoDB Atlas URI: ")
+
+client = MongoClient(os.environ["MONGODB_ATLAS_URI"])
+collection = client["<db_name>"]["<collection_name>"]
+```
+
+### 创建 index
+
+在使用混合搜索之前，先在 collection 上创建一个向量搜索 index 和一个全文搜索 index。`dimensions` 需要与你的 embeddings 模型匹配（`voyage-4-lite` 使用 1024）：
+
+```python
+from langchain_mongodb import MongoDBAtlasVectorSearch
+from langchain_mongodb.index import create_fulltext_search_index
+from langchain_voyageai import VoyageAIEmbeddings  # swap in any embeddings class
+
+embeddings = VoyageAIEmbeddings(model="voyage-4-lite")
+
+vector_store = MongoDBAtlasVectorSearch(
+    collection=collection,
+    embedding=embeddings,
+    index_name="vector_index",
+)
+
+# Create the vector search index (runs asynchronously on Atlas)
+vector_store.create_vector_search_index(
+    dimensions=1024,
+    wait_until_complete=60,
+)
+
+# Create the full-text search index on the text field
+create_fulltext_search_index(
+    collection=collection,
+    field="text",
+    index_name="search_index",
+    wait_until_complete=60,
+)
+```
+
+更多 index 选项，请参见 [MongoDB Atlas 向量存储](/oss/integrations/vectorstores/mongodb_atlas)指南。
+
+## 实例化
+
+### 混合搜索
+
+`MongoDBAtlasHybridSearchRetriever` 使用 RRF 融合向量和关键词结果。增大 `vector_penalty` 或 `fulltext_penalty` 会降低对应通道的权重：
+
+```python
+from langchain_mongodb.retrievers import MongoDBAtlasHybridSearchRetriever
+
+retriever = MongoDBAtlasHybridSearchRetriever(
+    vectorstore=vector_store,
+    search_index_name="search_index",
+    k=5,
+    vector_penalty=60.0,
+    fulltext_penalty=60.0,
+)
+```
+
+### 全文搜索
+
+`MongoDBAtlasFullTextSearchRetriever` 运行 BM25 关键词搜索，并且不需要向量 index：
+
+```python
+from langchain_mongodb.retrievers import MongoDBAtlasFullTextSearchRetriever
+
+ft_retriever = MongoDBAtlasFullTextSearchRetriever(
+    collection=collection,
+    search_index_name="search_index",
+    search_field="text",
+    k=5,
+)
+```
+
+## 用法
+
+```python
+docs = retriever.invoke("What is MongoDB Atlas?")
+```
+
+## 在 chain 中使用
+
+```python
+from langchain_anthropic import ChatAnthropic
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+prompt = ChatPromptTemplate.from_template(
+    "Answer the question based only on the following context:\n\n{context}\n\nQuestion: {question}"
+)
+
+llm = ChatAnthropic(model="claude-sonnet-4-6")
+
+chain = (
+    {"context": retriever, "question": RunnablePassthrough()}
+    | prompt
+    | llm
+    | StrOutputParser()
+)
+
+chain.invoke("What is MongoDB Atlas?")
+```
+
+## API reference
+
+有关 `MongoDBAtlasHybridSearchRetriever` 全部特性与配置的详细文档，请参见 [API reference](https://reference.langchain.com/python/langchain-mongodb/retrievers/MongoDBAtlasHybridSearchRetriever)。
+
+全文搜索请参见 [`MongoDBAtlasFullTextSearchRetriever`](https://reference.langchain.com/python/langchain-mongodb/retrievers/MongoDBAtlasFullTextSearchRetriever)。

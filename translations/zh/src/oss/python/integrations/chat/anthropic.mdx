@@ -60,7 +60,7 @@ if "ANTHROPIC_API_KEY" not in os.environ:
     os.environ["ANTHROPIC_API_KEY"] = getpass.getpass("Enter your Anthropic API key: ")
 ```
 
-要启用模型调用的自动 tracing，请设置 [LangSmith](/langsmith/observability) API key：
+（可选）通过设置以下环境变量，使用 [LangSmith](/langsmith/observability) 对模型调用启用 tracing：
 
 ```python
 os.environ["LANGSMITH_API_KEY"] = getpass.getpass("Enter your LangSmith API key: ")
@@ -460,7 +460,7 @@ response = model_with_tools.invoke(
 ```
 
 `extras` 参数还支持：
-- `defer_loading`（bool）：为 [tool search](#tool-search) 按需加载工具
+- `defer_loading`（bool）：为 [tool search](#tool-search) 或[对话中途的工具更改](#change-tools-mid-conversation)按需加载工具
 - `cache_control`（dict）：为工具启用 [prompt caching](#caching-tools)
 - `eager_input_streaming`（bool）：为该工具启用 [fine-grained tool streaming](#fine-grained-tool-streaming)
 
@@ -1548,6 +1548,141 @@ Prompt caching 可以用于[多轮对话](https://platform.claude.com/docs/en/bu
         ```
     </Accordion>
 </AccordionGroup>
+
+## 对话中途的 system message
+
+<Note>
+    对话中途的 system message 需要 `langchain-anthropic>=1.7.3`。
+</Note>
+
+受支持的 Claude 模型接受[在对话进行到一半时插入的 system message](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages)。其中的指令从该位置开始生效。插入这样一条消息不会改变更早的轮次，因此也不会使其 [prompt cache](#prompt-caching) 失效。
+
+位于开头的 @[`SystemMessage`] 始终放在顶层的 `system` 字段中。当以下两个条件同时成立时，`ChatAnthropic` 会把稍后出现的 `SystemMessage` 按其在对话中的原位置发送：
+
+- 模型支持对话中途的 system message。[Claude 文档](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages)列出了支持的模型。
+- 该消息跟在 human 或 tool 消息之后，并且要么是最后一条消息，要么后面跟着一条 AI 消息。
+
+否则，`ChatAnthropic` 会将该消息移入顶层的 `system` 字段并给出警告，此时它作用于整个对话。如果该字段已被开头的 system message 占用，`ChatAnthropic` 会抛出 `ValueError`。
+
+```python
+from langchain.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_anthropic import ChatAnthropic
+
+model = ChatAnthropic(model="claude-opus-5-5")
+
+response = model.invoke(
+    [
+        SystemMessage("You are a travel assistant."),
+        HumanMessage("Suggest a day trip from Lisbon."),
+        AIMessage("Sintra is a good choice: palaces, gardens, and a short train ride."),
+        HumanMessage("How do I get there?"),
+        SystemMessage("The user has switched to the mobile app. Keep answers under 50 words."),  # [!code highlight]
+    ]
+)
+```
+
+如需措辞建议和完整的放置规则，请参阅 [Claude 文档](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages)。
+
+### 对话中途更改工具
+
+<Note>
+    对话中途的工具更改需要 `langchain-anthropic>=1.7.4`。
+</Note>
+
+对话中途的 `SystemMessage` 也可以通过 Anthropic 的 [`tool_addition` 和 `tool_removal`](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages#mid-conversation-tool-changes) 内容块来添加或移除工具。直接修改请求上的 `tools` 会使整个对话的 prompt cache 失效，而这些块不会改动 `tools`，因此缓存前缀仍然匹配。
+
+上面的[放置与模型规则](#mid-conversation-system-messages)同样适用。当 `ChatAnthropic` 无法原位发送该消息时，它会丢弃其中的工具更改块并给出警告。
+
+`ChatAnthropic` 会自动加上所需的 beta header，因此你无需设置 `betas`。
+
+要在对话中途添加工具，先用 `extras={"defer_loading": True}` 绑定它，这样 Claude 一开始看不到它。然后在 `tool_addition` 块中按名称引用它：
+
+```python
+from langchain.messages import HumanMessage, SystemMessage
+from langchain.tools import tool
+from langchain_anthropic import ChatAnthropic
+
+
+@tool
+def get_time() -> str:
+    """Get the current time."""
+    return "12:00"
+
+
+@tool(extras={"defer_loading": True})  # [!code highlight]
+def get_weather(location: str) -> str:
+    """Get the current weather for a location."""
+    return f"It's sunny in {location}."
+
+
+model = ChatAnthropic(model="claude-opus-5-5")
+model_with_tools = model.bind_tools([get_time, get_weather])
+
+response = model_with_tools.invoke(
+    [
+        HumanMessage("What's the weather in San Francisco?"),
+        SystemMessage(
+            [
+                {  # [!code highlight]
+                    "type": "tool_addition",  # [!code highlight]
+                    "tool": {"type": "tool_reference", "name": "get_weather"},  # [!code highlight]
+                },  # [!code highlight]
+            ]
+        ),
+    ]
+)
+```
+
+API 会拒绝所有工具都被延迟加载的请求，因此至少要绑定一个不带 `defer_loading` 的工具。
+
+要撤下某个工具，在 `tool_removal` 块中引用它。之后的 `tool_addition` 可以再次提供它。
+
+```python
+SystemMessage(
+    [
+        {
+            "type": "tool_removal",
+            "tool": {"type": "tool_reference", "name": "get_weather"},
+        },
+    ]
+)
+```
+
+要添加没有预先绑定的工具，可以[内联定义它](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages#define-tools-in-a-message-beta)，使用 `tool_definition`。内联定义为 beta 阶段功能，仅在 Claude API 上可用。
+
+```python
+from langchain.messages import HumanMessage, SystemMessage
+from langchain_anthropic import ChatAnthropic
+
+model = ChatAnthropic(model="claude-opus-5-5")
+
+response = model.invoke(
+    [
+        HumanMessage("How many orders did we get yesterday?"),
+        SystemMessage(
+            [
+                {
+                    "type": "tool_addition",
+                    "tool": {
+                        "type": "tool_definition",  # [!code highlight]
+                        "definition": {  # [!code highlight]
+                            "name": "db_query",
+                            "description": "Run a read-only SQL query against the analytics database.",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"sql": {"type": "string"}},
+                                "required": ["sql"],
+                            },
+                        },
+                    },
+                },
+            ]
+        ),
+    ]
+)
+```
+
+你也可以把这些块包在 `non_standard` 块中，这也是 `content_blocks` 返回它们的方式。无论哪种形式，`ChatAnthropic` 发送的请求都是相同的。
 
 ## 上下文管理
 
@@ -2984,6 +3119,7 @@ sequenceDiagram
 
 关于 tool search 的更多细节，包括如何与 MCP server 和客户端实现结合使用，请参见 [Claude documentation](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)。
 
+如果你想不走搜索、自行提供延迟加载的工具，请[在对话中途更改工具](#change-tools-mid-conversation)。
 
 ## 响应元数据
 

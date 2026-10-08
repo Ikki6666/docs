@@ -3,6 +3,8 @@ title: 跟踪 Claude Code 应用
 sidebarTitle: Claude Code
 ---
 
+import CodingAgentSecretRedaction from '/snippets/langsmith/coding-agent-secret-redaction.mdx';
+
 本指南介绍如何将来自 [Claude Code CLI](https://code.claude.com/docs/en/overview) 的对话自动发送到 LangSmith。
 
 配置完成后，每个 Claude Code 项目都可以选择开启将 traces 发送到 LangSmith。每条 trace 都会包含用户消息、工具调用、compaction、subagent runs，以及 assistant 响应。系统 prompts 不会被包含，因为 Claude Code 不会在对话转录中返回它们。
@@ -25,12 +27,19 @@ sidebarTitle: Claude Code
 /reload-plugins
 ```
 
-如需更新插件，请运行：
+如需更新插件，请在 Claude Code 中刷新 marketplace：
 
 ```bash
 /plugin marketplace update langsmith-claude-code-plugins
-/reload-plugins
 ```
+
+然后在你的 shell 中把安装移到新版本，并重启 Claude Code：
+
+```bash
+claude plugin update langsmith-tracing@langsmith-claude-code-plugins
+```
+
+<Note> 仅刷新 marketplace 只会更新目录克隆。你的安装仍然固定在安装时所在的版本目录上，因此在 `claude plugin update` 移动它之前，hooks 会继续运行旧的 bundle。下次想跳过这两个步骤，请运行 `/plugin`，打开 **Marketplaces** → `langsmith-claude-code-plugins` 并选择 **Enable auto-update**：第三方 marketplace 默认关闭该选项，启用后会把 marketplace 及其已安装的插件一起更新。 </Note>
 
 <Note> 如果你正在从此前推荐的、通过手动创建 stop hook 来跟踪 Claude Code 的旧方式迁移，请参阅[从手动 stop hook 迁移](#从手动-stop-hook-迁移)。 </Note>
 
@@ -111,6 +120,99 @@ export CC_LANGSMITH_METADATA='{"author":"jane","environment":"development"}'
 </Tabs>
 
 这些 metadata 的 keys 和 values 会出现在 LangSmith 中的所有 runs 上，你可以据此过滤和搜索 traces。
+
+## 静音一个 thread
+
+静音（mute）会在不关闭 tracing 的情况下，抑制一个 thread 在 traces 中的输入和输出内容。静音默认关闭，除非你[设置了默认值](#set-a-default-mute-configuration)。
+
+在 tracing 开启的情况下，在 Claude Code 中运行这些插件命令。两个命令都不接受参数：
+
+- `/langsmith-tracing:mute`：在此后的 traces 中省略该 thread 的输入和输出内容。
+- `/langsmith-tracing:unmute`：为该 thread 中后续的 turn 恢复完整 tracing。
+
+两个命令都从下一回合开始生效，因此当前回合保持不变。一个回合的模式在该回合开始时就固定了，其 subagents 会继承该模式。
+
+静音的 run 保留其正常的嵌套、名称、计时、状态、模型和工具身份，以及 token 用量。输入和输出会被替换为一条系统提示。静音模式还会省略原始错误、身份和仓库归因、自定义 metadata、SDK 运行时 metadata，以及 replica metadata 覆盖。静音与 secret 脱敏相互独立。
+
+### 设置默认静音配置
+
+要让新 thread 直接以 metadata-only 模式启动，而不必在每个 thread 中运行命令，请将 `CC_LANGSMITH_DEFAULT_MUTED` 设置为 `"true"`：
+
+<Tabs>
+
+<Tab title="Settings file (recommended)">
+
+```json
+{
+  "env": {
+    "TRACE_TO_LANGSMITH": "true",
+    "CC_LANGSMITH_API_KEY": "<LangSmith API key>",
+    "CC_LANGSMITH_PROJECT": "my-project",
+    "CC_LANGSMITH_DEFAULT_MUTED": "true"
+  }
+}
+```
+
+</Tab>
+
+<Tab title="Shell environment variable">
+
+```bash
+export CC_LANGSMITH_DEFAULT_MUTED="true"
+```
+
+</Tab>
+
+</Tabs>
+
+把该变量设为 `"false"` 即可回到未静音的默认值。比较不区分大小写，任何其他值都会静音，包括空字符串。
+
+插件还会从它自己的配置文件中读取一个 `defaultMuted` 布尔值，顺序为：项目目录下的 `.claude/langsmith.json` 和 `langsmith-plugins.json`，然后是 `~/.claude/langsmith.json` 和 `~/.langsmith-plugins.json`。环境变量的优先级高于这四个文件。
+
+Thread 偏好是持久的。插件会把每次显式的静音或取消静音保存到一个 privacy 文件中，默认为 `~/.claude/state/langsmith_state.privacy.json`，并且已保存的 thread 偏好在两个方向上都优先于配置的默认值。删除该 privacy 文件会移除所有 thread 覆盖，并让每个 thread 回到配置的默认值。
+
+## Secret 脱敏
+
+插件会在把 run inputs、outputs、errors 和 metadata 上传到 LangSmith 之前，对其中检测到的 secrets 做脱敏。脱敏默认开启。
+
+<CodingAgentSecretRedaction />
+
+脱敏针对的是凭据值，而不是身份。插件附加的 `anthropic_user_id` 和 `local_username` metadata 不受影响。如果想省略内容和归因，而不是把凭据从中擦除，请[静音该 thread](#静音一个-thread)。
+
+### 关闭脱敏
+
+将 `CC_LANGSMITH_REDACT` 设置为 `false`、`0`、`no` 或 `off`。比较不区分大小写，任何其他值都会保持脱敏开启。
+
+```bash
+export CC_LANGSMITH_REDACT="false"
+```
+
+### 脱敏更多 pattern
+
+将 `CC_LANGSMITH_REDACT_EXTRA` 设置为一个由 `{ "pattern": ..., "replace": ... }` 规则组成的 JSON 数组。每个 `pattern` 是一个正则表达式字符串，全局应用且区分大小写。`replace` 是可选的，缺省回退到 `[redacted]`。
+
+```json
+{
+  "env": {
+    "CC_LANGSMITH_REDACT_EXTRA": "[{\"pattern\":\"ACME-[A-Z0-9]{16}\",\"replace\":\"[REDACTED_ACME_KEY]\"}]"
+  }
+}
+```
+
+Extra rules 在内置规则之后运行。插件会跳过包含无效正则表达式的规则，记录一个错误，并在应用其余规则的情况下上传该回合。
+
+这两项设置也会从[设置默认静音配置](#set-a-default-mute-configuration)中描述的插件配置文件中读取，对应的 keys 是 `redact` 和 `redact_extra_rules`：
+
+```json
+{
+  "redact": true,
+  "redact_extra_rules": [{ "pattern": "ACME-[A-Z0-9]{16}", "replace": "[REDACTED_ACME_KEY]" }]
+}
+```
+
+环境变量的优先级高于全部四个文件。文件的行为比环境变量更严格。一个包含无效正则表达式的规则会丢弃该文件中的所有设置，而不仅仅是那条规则。
+
+由于项目级的 `.claude/langsmith.json` 可以把 `redact` 设为 `false`，在你不受控的仓库中启用 tracing 之前，请先检查该文件。
 
 ## 与 GitHub Actions 一起使用
 
