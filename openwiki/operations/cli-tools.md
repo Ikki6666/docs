@@ -1,11 +1,10 @@
 ---
-type: reference
-title: CLI Tools Reference
-description: Complete documentation of the `docs` Python CLI and supporting commands for building, developing, migrating, and maintaining documentation.
-tags: [cli, build, development, migration]
+type: "Reference"
+title: "CLI Tools and Make Targets"
+openwiki_generated: true
 verified:
-  - by: openwiki/0.5.0
-    at: 2026-09-03T15:00:58.567Z
+  - by: openwiki/0.4.3
+    at: 2026-10-07T08:23:22.147Z
 sources:
   - id: openwiki-source-012f2c78e3b1446dfc35803f
     resource: repo://Makefile
@@ -15,393 +14,158 @@ sources:
     resource: repo://pipeline/commands/build.py
   - id: openwiki-source-b481a230af378c0c50ed9994
     resource: repo://pipeline/commands/dev.py
-  - id: openwiki-source-636af982f42ea94123d2d7e9
-    resource: repo://pipeline/core/watcher.py
-  - id: openwiki-source-0267a6f0fe0840056f8e4f6b
-    resource: repo://pipeline/tools/docusaurus_parser.py
+  - id: openwiki-source-d0cdf44431684bdedf34705a
+    resource: repo://pipeline/core/builder.py
   - id: openwiki-source-8d071ef0669cd8d2d79c6c15
     resource: repo://pipeline/tools/links.py
-  - id: openwiki-source-a210b0c642944a7ad93f3b40
-    resource: repo://pipeline/tools/parser.py
   - id: openwiki-source-05ccef8d4cf1698187f20464
     resource: repo://pyproject.toml
-  - id: openwiki-source-23775c3de52f3ab95a13cb8b
-    resource: repo://README.md
-generated: { by: "openwiki/0.5.0", at: "2026-09-03T15:00:58.567Z" }
+  - id: openwiki-source-7c3064080adf2cb0048e51fc
+    resource: repo://scripts/check_llms_urls.py
+  - id: openwiki-source-fd0cb9d6fca56bf4963559e9
+    resource: repo://scripts/extract_code_snippets.py
+  - id: openwiki-source-560bf24db9566b97ee19e383
+    resource: repo://scripts/generate_code_snippet_mdx.py
+  - id: openwiki-source-2b15ecffacad911ef9db112f
+    resource: repo://scripts/test_code_samples.py
+generated: { by: "openwiki/0.4.3", at: "2026-10-07T08:23:22.147Z" }
 ---
 
-## Overview
 
-The LangChain documentation pipeline provides a Python CLI (`docs`) that wraps and automates the core documentation operations. These commands handle building documentation, starting development servers with file watching, migrating legacy formats to Mintlify, and refactoring documentation structure while maintaining cross-references.
+# CLI Tools and Make Targets
 
-The `docs` CLI is the entry point defined in `pyproject.toml` at `pipeline.cli:main`. Make targets in the `Makefile` wrap these commands for convenience.
+The Python `docs` CLI owns documentation transformation and local preview. The `Makefile` supplies checkout-oriented setup, validation, export, sample, and generated-content workflows. Author in `src/`; `build/` is disposable Mintlify input, not an authoring surface. A full build deletes and recreates it, so never hand-edit build artifacts.
 
-## Quick Reference
+## Entry points and setup
 
-| Command | Purpose | Key Options |
-|---------|---------|------------|
-| `docs dev` | Start development mode with file watching and hot reload | `--skip-build`, `--watch` |
-| `docs build` | Build all documentation to `/build` | `--watch` |
-| `docs migrate <path>` | Convert MkDocs markdown to Mintlify format | `--dry-run`, `--output` |
-| `docs migrate-docusaurus <path>` | Convert Docusaurus markdown to Mintlify format | `--dry-run`, `--output` |
-| `docs mv <old> <new>` | Move a file and update all cross-references | `--dry-run` |
-
-## Command Invocation
-
-### Via Make
+The project script is `docs = "pipeline.cli:main"`. From a checkout, use `uv run pipeline <command>`; after installation, `docs <command>` reaches the same entry point. `make build` and `make dev` install local npm dependencies and invoke the corresponding pipeline command with the checkout on `PYTHONPATH`.
 
 ```bash
-make dev          # uv run pipeline dev
-make build        # uv run pipeline build
-```
-
-### Via Python CLI
-
-```bash
-uv run pipeline dev
-uv run pipeline build
-uv run pipeline migrate <path>
-```
-
-After `make install`, the `docs` command may be available directly:
-
-```bash
-docs dev
-docs build
-docs migrate <path>
-```
-
-## Commands
-
-### `docs dev` — Development Mode
-
-Starts the development server with automatic file watching and live reload.
-
-**Behavior:**
-1. Performs an initial build of all documentation (unless `--skip-build` is set)
-2. Starts a file watcher on the `src/` directory that automatically rebuilds changed files
-3. Launches the Mintlify dev server at `http://localhost:3000` with hot reload
-4. Forwards logs from the Mint dev server to the console
-5. Continues watching for changes until interrupted (Ctrl+C)
-
-**Options:**
-
-- `--skip-build`: Skip the initial build step and use an existing `/build` directory. Useful for resuming development after an interruption. Warns if `/build` does not exist.
-- `--watch` (legacy): Documented but effectively superseded by default behavior; file watching is implicit in `dev`.
-
-**Flow:**
-- Invokes `build_command()` unless skipped
-- Creates a `FileWatcher` instance monitoring `src/` → `build/`
-- Spawns a subprocess running `mint dev --port 3000` in the `/build` directory
-- Uses `asyncio.wait()` with `FIRST_COMPLETED` to detect when either the watcher or Mint process exits abnormally
-- On Ctrl+C: cleanly shuts down the watcher, terminates Mint (with a 5-second timeout before forced kill), and cancels all tasks
-
-**Use:**
-```bash
+make install
+make build
 make dev
-# or
-uv run pipeline dev --skip-build
+uv run pipeline migrate legacy/guide.md --dry-run
+uv run pipeline mv old.mdx new.mdx --dry-run
 ```
 
-**Note:** `mint` is Mintlify's separate global npm binary. The `docs` CLI orchestrates it; it is not bundled with the Python package.
+`make install` synchronizes all uv dependency groups, installs local npm dependencies and the global Mint CLI, then links agent skills. `mint` is a separate npm global binary rather than part of the Python CLI. CLI logs use stderr at INFO level with `LEVELNAME - message` formatting. See [Local Development](/openwiki/workflows/local-development.md) for environment setup and recovery guidance.
 
----
+## Select the right boundary
 
-### `docs build` — Build Documentation
+| Need | Command | Inputs and outputs | Safety boundary |
+| --- | --- | --- | --- |
+| Reset generated site | `make build` or `docs build` | `src/` → regenerated `build/` | Destroys prior build output; do not rely on manual files there. |
+| Preview changes | `make dev` or `docs dev` | source changes → incremental build output → Mint preview | A preview tree can become stale; run a full build after broad changes. |
+| Check source references | `make check-cross-refs` | source `@[ref]` usages and map | Does not render or validate the Mint site. |
+| Check generated links | `make broken-links-with-anchors` | fresh `build/` → Mint report | Checks generated output; appropriate after route, redirect, heading, or link changes. |
+| Run examples | `make test-code-samples` | executable programs in `src/code-samples/` | Programs inherit credentials and can call live services. |
+| Regenerate snippets | `make code-snippets` | samples → intermediate extraction → MDX | Generated directories are outputs, not files to edit. |
 
-Builds all documentation from source to the `/build` directory for deployment or offline use.
+`build` is phony. Therefore `make broken-links`, `make broken-links-with-anchors`, `make check-openapi`, and `make export` rebuild before their Mint operation. `make htmltest` instead checks an already-existing export archive; source linters, `make test`, `make check-cross-refs`, and sample targets do not build the site.
 
-**Behavior:**
-1. Validates that the `src/` directory exists
-2. Creates the `/build` directory if it does not exist
-3. Initializes a `DocumentationBuilder` instance
-4. Processes all source files through the build pipeline
-5. Writes preprocessed `.mdx` files and assets to `/build`
-6. Returns exit code 0 on success, 1 on failure
+## Build and preview
 
-**Options:**
+### Full build: `make build` / `docs build`
 
-- `--watch` (legacy): Enables file watching after the initial build. Rarely used; `docs dev` is the preferred way to enable watching.
-
-**Implementation:**
-- Entry point: `pipeline.commands.build:build_command`
-- Orchestrated by `DocumentationBuilder` (`pipeline.core.builder`)
-- Runs once and exits (unless `--watch` is specified)
-- Each run performs a **full rebuild** — no incremental caching
-
-**Use:**
 ```bash
 make build
-# or
+# Direct CLI equivalent
 uv run pipeline build
 ```
 
-**Output:**
-- All preprocessed files written to `/build` (never edit this directory directly)
-- Build artifacts include navigation configuration and assets
+`docs build` requires `src/`, ensures `build/` exists, and delegates to `DocumentationBuilder`. `build_all()` clears the output directory, emits versioned and unversioned documentation trees, copies shared files, and copies npm snippet components. Treat a full build as the reset operation.
 
----
+Although argument parsing accepts `docs build --watch`, `build_command()` does not consume its arguments: it builds once and exits. Use `docs dev` for supported watch behavior.
 
-### `docs migrate <path>` — MkDocs to Mintlify Conversion
+### Local preview: `make dev` / `docs dev`
 
-Converts MkDocs-formatted markdown files to Mintlify format. Supports single files, directories, and batch processing.
+Development normally performs a full build, watches `src/` recursively, and starts `mint dev --port 3000` with `build/` as its working directory. `--skip-build` is only for resuming with an already suitable build tree; it merely warns if `build/` does not exist.
 
-**Supported file types:**
-- `.md`, `.markdown` (converted in place or to `--output` location)
-- `.ipynb` (Jupyter notebooks; converted to `.md`)
+```mermaid
+flowchart TD
+  Start["docs dev"] --> Decide{"Skip initial build"}
+  Decide -->|"No"| Full["Rebuild generated tree"]
+  Decide -->|"Yes"| Reuse["Reuse build tree"]
+  Full --> Services["Start watcher and Mint dev"]
+  Reuse --> Services
+  Services --> Change["Supported source event"]
+  Change --> Filter{"Temporary file or directory"}
+  Filter -->|"Yes"| Ignore["Ignore event"]
+  Filter -->|"No"| Queue["Queue source path"]
+  Queue --> Delay["Debounce 0.2 seconds"]
+  Delay --> Build["Build pending paths"]
+  Build --> Touch["Touch generated output"]
+  Touch --> Reload["Mint detects update"]
+```
 
-**Options:**
+This is the development control flow: an initial full build establishes the generated tree, then supported changes are rebuilt incrementally.
 
-- `--dry-run`: Print converted markdown to stdout without writing files. Useful for previewing changes.
-- `--output <path>`: Write converted files to a directory or single file. If not provided, updates files in place.
+The watcher ignores directories, backup files ending in `~`, `.bak`, or `.orig`, and hidden temporary files ending in `.tmp`, `.temp`, or `.swp`. It deduplicates queued paths, builds the pending batch asynchronously, then touches output for Mint. Deleting a source file removes its corresponding source-relative output path. This incremental loop does not replace a full build for whole-tree changes.
 
-**Behavior:**
-1. Validates that the input path exists
-2. Recursively finds all `.md`, `.markdown`, and `.ipynb` files in the directory (or uses a single file if provided)
-3. For each file:
-   - Reads the source content
-   - Parses the markdown using `pipeline.tools.parser:to_mint()`
-   - Removes `.md` / `.markdown` suffix from internal links
-   - In dry-run mode: prints to stdout with file headers
-   - Otherwise: writes to output location, creating directories as needed
-4. Cleans up original `.ipynb` files if converted in place (since they become `.md` files)
-5. Reports migration results (success/failure counts for batch operations)
+If the initial build fails, development returns 1 before starting services. After startup, Mint stdout and stderr are forwarded to logging; a nonzero Mint exit or unexpectedly stopped watcher fails the command. Ctrl+C shuts down the watcher and terminates Mint, killing it after five seconds if necessary. A missing `mint` executable returns 1 with installation guidance.
 
-**Processing:**
-- MkDocs custom syntax (admonitions `!!!`, tabs `===`, etc.) is converted to Mintlify equivalents
-- Admonitions map to Mintlify `<Note>`, `<Warning>`, `<Tip>`, `<Danger>`, `<Info>` callouts
-- Tabs (`===`) convert to Mintlify `<Tabs>` and `<Tab>` components
-- Blockquotes and lists are preserved
-- Parse errors are logged with file context (no full stack traces)
+## Migration and source refactoring
 
-**Use:**
+Migration and move commands operate on supplied source paths, never on `build/`. Prefer `--dry-run`, review the result, then perform the modifying command.
+
+### `docs migrate <path>` and `docs migrate-docusaurus <path>`
+
+`migrate` accepts `.md`, `.markdown`, and `.ipynb` files and searches a directory recursively. `migrate-docusaurus` also accepts `.mdx` and converts Docusaurus admonitions, tabs, imports, and frontmatter to Mintlify-oriented forms.
+
 ```bash
-# Preview changes without writing
-uv run pipeline migrate docs/ --dry-run
-
-# Convert in place
-uv run pipeline migrate docs/
-
-# Convert to a new directory
-uv run pipeline migrate docs/ --output ../converted-docs/
-
-# Convert a single file
-uv run pipeline migrate docs/index.md --output docs/index.new.md
+uv run pipeline migrate legacy/ --output converted/
+uv run pipeline migrate-docusaurus legacy/guide.mdx --dry-run
 ```
 
----
+For each file, the command reads content, converts it through the selected parser, removes `.md` and `.mdx` link suffixes, then prints to stdout for `--dry-run` or creates parent directories and writes output. Directory output preserves relative layout; ordinary migration produces `.md`, while Docusaurus `.mdx` remains `.mdx`. Without `--output`, Markdown retains its extension; a successful in-place notebook conversion writes `.md` and deletes the original notebook.
 
-### `docs migrate-docusaurus <path>` — Docusaurus to Mintlify Conversion
+A missing path exits 1. A `ParseError` is reported without a full traceback, marks only that file failed, and lets the remaining batch continue; batches report success and failure totals. Unexpected exceptions include traceback context.
 
-Converts Docusaurus-formatted markdown to Mintlify format. Extends `migrate` to handle Docusaurus-specific syntax.
+### `docs mv <old_path> <new_path>`
 
-**Supported file types:**
-- `.md`, `.markdown`, `.mdx` (MDX files are converted to `.md` unless `--output` specifies otherwise)
-- `.ipynb` (Jupyter notebooks)
+The mover finds the Git root and scans `<root>/src` Markdown, MDX, and notebook Markdown. It rewrites inbound relative cross-references while preserving anchors and recalculates internal relative links in the moved Markdown/MDX file or notebook. `--dry-run` previews without writes or a move.
 
-**Options:**
+A real move creates destination parents, records absolute old and new paths in root-level `link_changes.jsonl`, rewrites inbound links, moves the file, then updates links within it. It does not update navigation, redirects, or arbitrary prose references; reconcile those authored surfaces and run a generated-site link check afterward. See [Adding Pages](/openwiki/operations/adding-pages.md) for authoring considerations.
 
-- `--dry-run`: Print converted markdown to stdout without writing files
-- `--output <path>`: Write converted files to a directory or single file
+## Make targets for validation and export
 
-**Behavior:**
-1. Validates input path
-2. Recursively finds all `.md`, `.markdown`, `.mdx`, and `.ipynb` files
-3. For each file:
-   - Extracts Docusaurus frontmatter (YAML)
-   - Parses the body using `pipeline.tools.docusaurus_parser:convert_docusaurus_to_mintlify()`
-   - Converts Docusaurus-specific MDX components and syntax
-   - Generates Mintlify-compatible frontmatter
-   - Removes `.md` suffixes from internal links
-   - Writes or prints the result
+| Target | Behavior and requirements |
+| --- | --- |
+| `make broken-links` | Rebuilds, then runs `mint broken-links --check-redirects` from `build/`. Deployment-generated OpenAPI and standalone-snippet noise are filtered; remaining reported link entries fail the target. |
+| `make broken-links-with-anchors` | The same check with `--check-anchors`; use after heading or fragment-link changes. |
+| `make check-openapi` | Rebuilds, then validates `build/langsmith/agent-server-openapi.json` with Mint. |
+| `make export` | Rebuilds then runs `mint export` in `build/`. Requires a Mint CLI that supports `mint export`, Node 20 or 22 rather than Node 25+, and an Enterprise Mintlify plan. |
+| `make htmltest` | Requires a pre-existing `EXPORT_ZIP`, `htmltest`, and `unzip`; it unpacks and runs the configured external-URL check. `make export-htmltest` runs export then this check. |
+| `make test` | Runs pytest with network sockets disabled except Unix sockets. `TEST_FILE` narrows its default `tests/unit_tests` scope. |
+| `make lint`, `make format`, `make format-check` | Check, modify, or check Python format/lint/type/spelling state. `format` modifies files. |
+| `make lint_md`, `make lint_md_fix`, `make lint_prose` | Lint Markdown, apply Markdown fixes, or install and invoke Vale. `lint_prose` uses `FILES` when supplied, otherwise `src/`. |
+| `make skills` | Links `.agents/skills/` directories into `.claude/skills/`, retaining non-symlink entries and removing stale symlinks. |
 
-**Processing:**
-- **Admonitions:** Docusaurus admonitions (`::: note`, etc.) → Mintlify callouts
-- **Tabs:** Docusaurus tabbed content → Mintlify `<Tabs>` / `<Tab>`
-- **Imports:** Docusaurus `import` statements are processed or removed
-- **Code blocks:** Language-specific syntax is normalized
-- **Links:** Asset and documentation links are adjusted for Mintlify paths
-- **Frontmatter:** Maps Docusaurus YAML (title, description, etc.) to Mintlify equivalents
+For broader validation selection, see [Testing Overview](/openwiki/testing/test-overview.md) and [Mintlify Integration](/openwiki/integrations/mintlify.md).
 
-**Use:**
-```bash
-# Preview conversion
-uv run pipeline migrate-docusaurus docs/ --dry-run
+## Samples, snippets, and trace refreshes
 
-# Convert in place
-uv run pipeline migrate-docusaurus docs/
+`make code-snippets` is a two-stage generated-content refresh:
 
-# Convert to output directory
-uv run pipeline migrate-docusaurus docs/ --output ../mintlify-docs/
+```text
+src/code-samples/ -- extraction --> src/code-samples-generated/ -- MDX generation --> src/snippets/code-samples/
 ```
 
----
+Extraction processes marked Python, TypeScript, Java, Kotlin, Go, and shell samples. A full run removes prior generated supported intermediate outputs. `CODE_SNIPPET_SOURCES` can restrict extraction to space-separated eligible files beneath `src/code-samples/`, replacing only those files’ prior generated outputs; missing, out-of-root, or unsupported selections fail. Generation scans the intermediate files and writes importable MDX. Edit the sample source, never the intermediate or generated MDX as an authoring shortcut. See [Code Sample Lifecycle](/openwiki/workflows/code-sample-lifecycle.md) for marker and dependency rules.
 
-### `docs mv <old_path> <new_path>` — Move Files with Reference Updates
+`make test-code-samples` executes all eligible samples or a focused `FILES="path ..."` set. It preserves the caller environment, including service and credential variables, and dispatches each supported language through its toolchain. Ordinary failures fail the command. A persistent LangSmith rate limit is retried three times and then reported as skipped rather than failed, so successful completion with skips is not proof every sample ran.
 
-Moves a documentation file and automatically rewrites all cross-references pointing to it throughout the documentation tree.
+`make update-code-sample-traces` sets `CODE_SAMPLE_TRACING=1`, defaults `LANGSMITH_PROJECT` to `docs-code-samples`, executes the chosen samples, and regenerates snippet MDX. It requires `LANGSMITH_API_KEY`: tracing creates or reuses public LangSmith share URLs. For a successful single-snippet sample, collection selects an agent-like root run and records its public URL in `src/code-samples/trace-links.json`; no-marker and multi-marker sources receive no trace link. Trace collection errors fail the sample run. Use intentional credentials and review the manifest and generated-MDX diffs because this workflow publishes links.
 
-**Options:**
+## Served LLM-index validation
 
-- `--dry-run`: Preview the changes without moving files or rewriting links. Shows what would be updated.
+`python3 scripts/check_llms_urls.py` checks deployed output, not a local build. It crawls the served root `llms.txt` and reachable nested `/_llms/` indexes, compares normalized page URLs with the deployed sitemap, and exits 1 for sitemap pages missing from the index. `--base-url` chooses a served site. It retries dropped connections but not HTTP errors. Since the repository does not generate these index files, first check that no custom `llms.txt` entered the build; report a remaining served-index gap to Mintlify.
 
-**Behavior:**
-1. Validates that the old path exists
-2. Scans all `.md`, `.markdown`, `.mdx`, and `.ipynb` files in the documentation root
-3. For each file containing a link to the old path:
-   - Calculates the relative path from that file to the new location
-   - Updates all instances of the old link to the new link
-   - Adjusts internal links within the moved file itself to account for its new parent directory
-4. In dry-run mode: reports proposed changes
-5. Otherwise: moves the file and rewrites all references
+## Focused command sequence
 
-**Use:**
-```bash
-# Preview changes
-uv run pipeline mv old/path.md new/path.md --dry-run
-
-# Move and update references
-uv run pipeline mv docs/old-guide.md docs/tutorials/new-guide.md
-```
-
-**Mechanics:**
-<!-- openwiki: broken internal link [url] file "url" does not exist. Fix the href or restore the target, then delete this comment. -->
-- Uses regex-based link matching to identify Markdown link syntax `[label](url)` and anchors
-- Preserves link anchors (fragments like `#section-id`)
-- Skips external links, `mailto:` links, and absolute paths
-- Updates links in both `.md` and `.ipynb` notebook files
-- Reports all link changes made
-
----
-
-## Build Pipeline Architecture
-
-### File Watcher
-
-The `FileWatcher` (in `pipeline.core.watcher`) continuously monitors the `src/` directory:
-
-- **Trigger:** File modifications, additions, or deletions
-- **Action:** Queues the changed file for rebuild
-- **Debouncing:** Handles rapid successive changes gracefully
-- **Ignores:** Temporary files (`.swp`, `.tmp`), backup files (`.bak`, `~`), and hidden temporary files
-
-### Documentation Builder
-
-The `DocumentationBuilder` (in `pipeline.core.builder`) orchestrates the build process:
-
-1. **Traverses** the `src/` directory tree
-2. **Preprocesses** `.md` and `.mdx` files (frontmatter parsing, syntax normalization, snippet extraction)
-3. **Converts** `.ipynb` notebooks to markdown
-4. **Copies** processed files and assets to `/build`
-5. **Generates** navigation configuration (`docs.json` for Mintlify)
-
-### Output Structure
-
-```
-build/
-  ├── docs.json           # Mintlify site configuration
-  ├── langsmith/          # Preprocessed LangSmith docs
-  ├── oss/                # Preprocessed LangChain, LangGraph, integrations docs
-  ├── snippets/           # Reusable MDX content (language-prefixed subdirectories)
-  └── assets/             # Images and other static files
-```
-
-Never edit `/build` directly; it is regenerated on each build.
-
----
-
-## Error Handling
-
-### Parse Errors
-
-When `docs migrate` or `docs migrate-docusaurus` encounters a parsing error (e.g., malformed markdown):
-- The error is logged with file path and line number context
-- No full stack trace is printed (only the message)
-- The file is marked as failed but processing continues
-- Final summary reports success and failure counts
-
-**Example:**
-```
-ERROR - Parse error while processing file: 'docs/guide.md', at line 42, ...
-```
-
-### Build Failures
-
-If `docs dev` detects a build failure:
-- Logs the error and exits with code 1
-- The Mint dev server is not started
-- User is prompted to fix the issue and retry
-
-### Missing Dependencies
-
-If `mint` is not installed:
-- `docs dev` exits with code 1 and suggests running `make install` or installing Mintlify directly
-
----
-
-## Configuration
-
-### Logging
-
-All CLI commands emit structured logs to stderr:
-- **Level:** INFO by default
-- **Format:** `LEVELNAME - message`
-- Commands log informational progress, warnings for skipped files, and errors with context
-
-### Entry Point
-
-The `docs` command is registered in `pyproject.toml`:
-```toml
-[project.scripts]
-docs = "pipeline.cli:main"
-```
-
-This makes the command available after `pip install` or `uv sync`.
-
----
-
-## Related Pages
-
-- [Local Development Workflow](/openwiki/workflows/local-development.md) — Setup and development practices
-- [Adding Pages](/openwiki/operations/adding-pages.md) — Documentation content authoring
-
----
-
-## Troubleshooting
-
-### `docs dev` not working / running
-
-**Symptom:** `docs dev` fails or `mint` dev server doesn't start
-
-**Solutions:**
-- Run `make install` to ensure all dependencies are installed
-- Check that `mint` is globally installed: `npm install -g mint@latest`
-- Run `make clean` and then `make dev` to rebuild from scratch
-- Check for port conflicts: Mint expects port 3000 to be available
-
-### Build directory is stale
-
-**Symptom:** Changes to source files aren't reflected in the build
-
-**Solutions:**
-- Run `make clean && make dev` to rebuild from scratch
-- Use `docs dev --skip-build` only after a successful build has been completed
-
-### Migration producing empty or incorrect output
-
-**Symptom:** `docs migrate` produces truncated or malformed output
-
-**Solutions:**
-- Run `docs migrate <path> --dry-run` to preview the output first
-- Check for unsupported markdown syntax that the parser may not recognize
-- Verify the source file encoding is UTF-8
-- Review parse error messages for hints about problematic sections
-
-### Links still broken after `docs mv`
-
-**Symptom:** Cross-references weren't updated correctly
-
-**Solutions:**
-- Run `docs mv --dry-run` to verify the proposed changes before executing
-- Check that the old path is actually referenced in your docs (use grep)
-- For complex cases, manually verify a few key files in the build output
+1. For pipeline or watcher changes, run the closest focused unit test, for example `make test TEST_FILE=tests/unit_tests/test_watcher.py`.
+2. For `@[ref]` edits, run `make check-cross-refs`.
+3. For a prose-only page, use `make lint_prose FILES="src/path/page.mdx"`.
+4. For a runnable example, run `make test-code-samples FILES="src/code-samples/..."` and provide only the credentials and services it intentionally needs.
+5. After route, navigation, redirect, snippet, heading, or ordinary-reference changes, run `make broken-links-with-anchors`; it builds first.
+6. Use `make export-htmltest` for its separate exported-site external-link coverage.

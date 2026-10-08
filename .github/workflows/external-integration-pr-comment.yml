@@ -1,18 +1,20 @@
 # Apply the `integration` label to PRs from external contributors that add
 # integration docs (hosted MDX pages or external listing YAML rows).
 #
-# PR patience/nudge comments are temporarily disabled while listings move to
-# the issue-form automation (see the commented block in the script below).
+# Also posts a one-time nudge redirecting non-featured listing PRs to the
+# Integration listing issue form, then closes the PR. Featured hosted pages
+# (frontmatter `featured: true`) skip the comment and close; labeling still
+# applies.
 #
-# NOTE: Uses `pull_request_target` so it can label PRs from forks.
-# The script only reads changed files from the GitHub API and checks org
-# membership — no untrusted code is executed.
+# NOTE: Uses `pull_request_target` so it can label, comment, and close PRs
+# from forks. The script only reads changed files and PR head content from the
+# GitHub API and checks org membership — no untrusted code is executed.
 
 name: External Integration PR Comment
 
 on:
   pull_request_target:
-    types: [opened, ready_for_review, synchronize]
+    types: [opened, ready_for_review, reopened, synchronize]
 
 jobs:
   integration-comment:
@@ -130,9 +132,45 @@ jobs:
               console.log(`Added integration label to PR #${pr.number}`);
             }
 
-            // PR nudges disabled for now while integration listings move to the
-            // issue-form automation. Keep labeling above; restore commenting later.
-            /*
+            // Skip the listing-form nudge when any newly added MDX page is
+            // featured (maintainer path for hosted guides).
+            async function fileHasFeaturedFrontmatter(filename) {
+              if (!filename.endsWith('.mdx')) return false;
+              try {
+                const head = pr.head;
+                const { data } = await github.rest.repos.getContent({
+                  owner: head.repo.owner.login,
+                  repo: head.repo.name,
+                  path: filename,
+                  ref: head.sha,
+                });
+                if (Array.isArray(data) || !data.content) {
+                  console.log(`Could not read file content for ${filename}`);
+                  return false;
+                }
+                const content = Buffer.from(data.content, 'base64').toString('utf8');
+                const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+                if (!frontmatter) return false;
+                return /^[ \t]*featured:[ \t]*true[ \t]*$/m.test(frontmatter[1]);
+              } catch (error) {
+                console.log(`Failed to read ${filename} from PR head: ${error.message}`);
+                return false;
+              }
+            }
+
+            let hasFeaturedIntegration = false;
+            for (const file of newIntegrationFiles) {
+              if (await fileHasFeaturedFrontmatter(file.filename)) {
+                console.log(`${file.filename} has featured: true; skipping nudge comment`);
+                hasFeaturedIntegration = true;
+                break;
+              }
+            }
+
+            if (hasFeaturedIntegration) {
+              return;
+            }
+
             const marker = '<!-- external-integration-contribution -->';
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner,
@@ -143,26 +181,32 @@ jobs:
 
             if (comments.some((comment) => comment.body.includes(marker))) {
               console.log('Comment already posted; skipping comment');
-              return;
+            } else {
+              const body = [
+                marker,
+                `Thanks for contributing a new integration docs page, @${author}!`,
+                '',
+                'New integration listings should be filed as an [Integration listing issue](https://github.com/langchain-ai/docs/issues/new?template=06-integration-submission.yml) rather than a manual PR. This pull request is being closed.',
+              ].join('\n');
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pr.number,
+                body,
+              });
+
+              console.log(`Posted external integration comment on PR #${pr.number}`);
             }
 
-            const body = [
-              marker,
-              `Thanks for contributing a new integration docs page, @${author}!`,
-              '',
-              'New integration listings should be filed as an [Integration listing issue](https://github.com/langchain-ai/docs/issues/new?template=06-integration-submission.yml) rather than a manual PR. Automation opens a review PR from the form fields. See the [integration submission process](https://docs.langchain.com/oss/python/contributing/publish-langchain#make-your-integration-discoverable).',
-              '',
-              'We receive a large number of PRs and review them as quickly as we can. Please bear with us as we work through the queue.',
-              '',
-              'If you have already tagged a maintainer on this PR, do not tag them again.',
-            ].join('\n');
-
-            await github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number: pr.number,
-              body,
-            });
-
-            console.log(`Posted external integration comment on PR #${pr.number}`);
-            */
+            if (pr.state === 'open') {
+              await github.rest.pulls.update({
+                owner,
+                repo,
+                pull_number: pr.number,
+                state: 'closed',
+              });
+              console.log(`Closed PR #${pr.number}`);
+            } else {
+              console.log(`PR #${pr.number} is already ${pr.state}; skipping close`);
+            }

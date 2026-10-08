@@ -1,5 +1,5 @@
 # Files
 
-- [Builder Tests and File Handling](builder-tests.md) - Comprehensive test suite for DocumentationBuilder covering file categorization, versioning, preprocessing, and multi-language link rewriting.
-- [Testing Conditional Rendering](conditional-rendering.md) - How to test :::python and :::js conditional blocks to ensure correct content appears in each language variant during the build process.
-- [Testing Overview](test-overview.md) - Validation guidance for isolated pytest tests, built documentation and cross-reference checks, and executable multi-language code samples. Explains CI selection, service and secret requirements, timeouts, and rate-limit behavior.
+- [Builder Tests](builder-tests.md) - Focused, offline tests for DocumentationBuilder routing, Markdown preprocessing, shared inputs, snippets, source containment, and generated build-output invariants. Covers when an output assertion is sufficient and when to add a built-site check.
+- [Conditional Rendering Tests](conditional-rendering.md) - Test guidance for the build-time `:::python` and `:::js` renderer, including its regex fence semantics, scoped autolinks, code-fence boundary, and language-specific artifacts.
+- [Testing Overview](test-overview.md) - Change-oriented guidance for deterministic tests, generated documentation, credentialed code samples, rendering checks, and CI boundaries.

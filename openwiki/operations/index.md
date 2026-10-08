@@ -1,5 +1,6 @@
 # Files
 
-- [Adding and Modifying Documentation Pages](adding-pages.md) - Safely choose a documentation routing domain, add or move an MDX page and its navigation entry, preserve old URLs with redirects, and validate the generated site.
-- [CLI Tools Reference](cli-tools.md) - Complete documentation of the `docs` Python CLI and supporting commands for building, developing, migrating, and maintaining documentation.
-- [Cross-Reference Links (@\[ClassName\] Syntax)](cross-references.md) - Use the @[ClassName] syntax to create resilient API reference links that update automatically with changes to the link registry, without hardcoding URLs.
+- [Adding and Maintaining Documentation Pages](adding-pages.md) - Safely add, move, retire, or regenerate documentation pages by selecting the source owner, maintaining navigation and redirects, and validating emitted routes.
+- [Agent authoring skills](agent-skills.md) - Use the repository's task-specific skill catalog without duplicating global rules, distribute the canonical tree to supported agents, and validate skill and tooling changes.
+- [CLI Tools and Make Targets](cli-tools.md)
+- [Cross-References](cross-references.md) - Author, resolve, and validate scoped semantic @[ref] API-reference links. Covers Python and JavaScript lookup, MCP aliases, link-map ownership, and the separate source and rendered-link checks.

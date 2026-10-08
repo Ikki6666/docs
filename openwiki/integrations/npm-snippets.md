@@ -1,57 +1,58 @@
 ---
 type: integration
 title: NPM Snippet Components
-description: Reusable React/TypeScript components from @langchain/docs-sandbox that enable interactive features like pattern visualizations and code sandboxes in MDX documentation pages.
-tags: [npm-package, snippet-components, react-components, build-system, mdx-integration]
+description: Describes how @langchain/docs-sandbox supplies interactive documentation components to the generated build tree, including overlay precedence, output paths, degraded-install behavior, and test boundaries.
+tags: [npm, snippet-components, documentation-build, mintlify]
 verified:
-  - by: openwiki/0.5.0
-    at: 2026-09-03T15:00:58.567Z
+  - by: openwiki/0.4.3
+    at: 2026-09-29T08:22:38.059Z
 sources:
+  - id: openwiki-source-012f2c78e3b1446dfc35803f
+    resource: repo://Makefile
+  - id: openwiki-source-5093b074f16e0b77479219b2
+    resource: repo://package-lock.json
   - id: openwiki-source-5b54a58d1b51cd490b0e7162
     resource: repo://package.json
+  - id: openwiki-source-41f7c907e42a5efd3b3405cd
+    resource: repo://pipeline/commands/build.py
   - id: openwiki-source-d0cdf44431684bdedf34705a
     resource: repo://pipeline/core/builder.py
+  - id: openwiki-source-a9a8730b7e43a5ad2d0af4f1
+    resource: repo://src/docs.json
   - id: openwiki-source-13bb4a68b3327e33785edf79
     resource: repo://src/oss/langchain/frontend/branching-chat.mdx
   - id: openwiki-source-1d8e4cd1c107f61094b773fd
     resource: repo://src/oss/langchain/frontend/integrations/copilotkit.mdx
-generated: { by: "openwiki/0.5.0", at: "2026-09-03T15:00:58.567Z" }
+  - id: openwiki-source-24e5f74f0f40e9bfd381871f
+    resource: repo://tests/unit_tests/test_builder.py
+generated: { by: "openwiki/0.4.3", at: "2026-09-29T08:22:38.059Z" }
 ---
 
 # NPM Snippet Components
 
-Snippet components are reusable React/TypeScript UI components published in the `@langchain/docs-sandbox` npm package. They provide interactive visualizations and embedded experiences that enhance documentation pages with live demonstrations, pattern diagrams, and code sandboxes.
+`@langchain/docs-sandbox` owns a small set of interactive documentation assets. The documentation repository consumes those assets at build time rather than maintaining their implementation in `src/`: `package.json` declares `^0.0.24` and the lockfile resolves `0.0.24`. The package has peer dependencies on React and Zod, which are supplied by the documentation runtime rather than bundled by this integration.
 
-## Package and Components
+This is distinct from authored Markdown snippets under `src/snippets/`. The latter are normal source inputs; the npm package is an explicit, allowlisted overlay. Do not edit `node_modules/` or `build/`: a dependency install or full build replaces both relevant inputs and outputs.
 
-The `@langchain/docs-sandbox` package (version ^0.0.23 or later in `package.json`) contains compiled `.jsx` and `.js` files that expose React components for use in MDX documentation.
+## Entry point and artifact contract
 
-### Available Components
+`make build` runs `npm install` before `uv run pipeline build`. The build command constructs `DocumentationBuilder` with `src` and `build` and calls `build_all()`. During that full build, `_copy_npm_snippets()` reads `node_modules/@langchain/docs-sandbox/dist/` relative to the repository root (the parent of `src`) and copies only the following mappings:
 
-The build system copies two main component categories:
+| Package `dist/` artifact | Generated location | How it is consumed |
+| --- | --- | --- |
+| `PatternEmbed.jsx` | `build/snippets/pattern-embed.jsx` | MDX imports `/snippets/pattern-embed.jsx` |
+| `ExampleEmbed.jsx` | `build/snippets/example-embed.jsx` | MDX imports `/snippets/example-embed.jsx` |
+| `ChatLangChainEmbed.js` | `build/ChatLangChainEmbed.js` | `src/docs.json` loads `/ChatLangChainEmbed.js` with `defer` |
 
-**Snippet Components** — copied to `/build/snippets/`:
-- `PatternEmbed.jsx`: Renders interactive flow diagrams and pattern visualizations (e.g., branching chat, custom stream channels, tool calling patterns)
-- `ExampleEmbed.jsx`: Embeds interactive code examples and live sandboxes (e.g., CopilotKit, OpenUI, Assistant UI integration examples)
+The two class-level mapping dictionaries are the extension point and compatibility boundary. Publishing a new package file alone does not expose it to the site: add a deliberate source-to-destination mapping, decide whether it belongs under `build/snippets/` or at the site root, and add coverage for the output contract. Conversely, a package rename or removal must be reflected in the mapping and in consuming MDX/configuration.
 
-**Build-Root Components** — copied to `/build/`:
-- `ChatLangChainEmbed.js`: A specialized chat interface component served at the site root for use across multiple pages
-
-The exact set of components is defined in `DocumentationBuilder._NPM_SNIPPET_FILES` and `DocumentationBuilder._NPM_BUILD_FILES` class variables in `pipeline/core/builder.py`. This mapping ensures npm package files are renamed and placed correctly during the build process.
-
-## How Snippet Components Work in MDX
-
-### Import Pattern
-
-MDX pages import snippet components directly by path:
+Representative pages use the generated public paths, not package paths:
 
 ```jsx
 import { PatternEmbed } from "/snippets/pattern-embed.jsx"
 
 <PatternEmbed pattern="branching-chat" />
 ```
-
-Or for example embeds:
 
 ```jsx
 import { ExampleEmbed } from "/snippets/example-embed.jsx"
@@ -59,127 +60,44 @@ import { ExampleEmbed } from "/snippets/example-embed.jsx"
 <ExampleEmbed example="copilotkit" minHeight={700} />
 ```
 
-### Component Props
+The `pattern` and `example` values are component-package contracts. Confirm an identifier is supported by the installed package version when changing a page.
 
-Each component accepts configuration props:
+## Overlay lifecycle and precedence
 
-- `PatternEmbed`: accepts `pattern` (string identifier), and other rendering options
-- `ExampleEmbed`: accepts `example` (string identifier), `minHeight` (pixel height), and other sizing options
+A full build deletes and recreates `build/`, emits the versioned and unversioned documentation families, copies shared source files, and then applies the npm overlay. `shutil.copy2` preserves file metadata while overwriting its destination. Therefore, if `src/snippets/` contains a source-tree fallback at the same mapped destination, the installed package copy is authoritative in the finished build.
 
-The actual pattern and example definitions (HTML/CSS/data structures) are bundled within the npm package and resolved by component name at render time.
-
-### Usage Example
-
-A typical use case is documenting frontend patterns:
-
-```jsx
----
-title: Branching Chat
----
-
-Conversations with AI agents are rarely linear...
-
-import { PatternEmbed } from "/snippets/pattern-embed.jsx"
-
-<PatternEmbed pattern="branching-chat" />
-
-This pattern treats conversations as a checkpointed timeline...
+```mermaid
+flowchart TD
+    Install["npm install"] --> Dist["package dist artifacts"]
+    Source["src shared files"] --> Shared["Copy shared files"]
+    Shared --> Overlay["Copy allowlisted npm artifacts"]
+    Dist --> Overlay
+    Overlay --> Output["Generated build tree"]
+    Output --> Mint["Mintlify reads build"]
 ```
 
-The component renders in the Mintlify dev server during development and in the published documentation build.
+This flow shows the full-build ordering that gives the package overlay precedence over source-tree copies.
 
-## Build Process Integration
+The integration is deliberately best-effort rather than a build gate:
 
-### Installation and Copying
+- If the package `dist/` directory does not exist, `_copy_npm_snippets()` logs a warning instructing the user to run `npm install` and returns.
+- If an individual mapped artifact is absent, it logs a warning and continues copying the remaining mapped files.
+- Consequently, a successful pipeline build does not prove that interactive embeds exist. After dependency or mapping changes, inspect the expected `build/` files and render the consuming route.
 
-When the documentation build runs (`builder.build_all()`), the build process:
+## Language routing relationship
 
-1. **Installs npm dependencies** via `npm install`, which populates `node_modules/@langchain/docs-sandbox/`
-2. **Copies npm snippet components** in the `_copy_npm_snippets()` stage by reading from `node_modules/@langchain/docs-sandbox/dist/`
-3. **Maps dist filenames to build locations** using the `_NPM_SNIPPET_FILES` and `_NPM_BUILD_FILES` dicts
-4. **Overwrites source-tree versions** so the build always uses the latest published npm package versions
+The language-specific snippet rewriter operates only on `/snippets/` imports ending in `.md` or `.mdx`. For a Python or JavaScript documentation variant it rewrites an unscoped Markdown import to `/snippets/python/...` or `/snippets/javascript/...`; it leaves an already scoped Markdown path unchanged. Markdown snippets are emitted as a Python-default original path plus Python and JavaScript copies.
 
-### Fallback Behavior
+Npm component imports end in `.jsx`, so they do not match that rewrite. `PatternEmbed` and `ExampleEmbed` therefore remain single shared assets under `build/snippets/` for both language variants. This distinction is intentional: do not introduce language-scoped component imports unless the builder and artifact contract are changed together.
 
-The builder includes local fallback versions of components in `/src/snippets/`. If the npm package is not installed, these fallbacks are copied instead. However, npm package versions (when installed) always overwrite fallbacks, ensuring reproducible builds with published component versions.
+## Verification and test coverage
 
-### Build Stage Order
+For a package upgrade or mapping change, use a full build rather than relying on incremental preview behavior:
 
-NPM snippet copying occurs late in the build pipeline (after shared files are copied) to ensure npm versions take precedence:
-
-1. Clear build directory
-2. Build versioned OSS content (Python/JavaScript variants)
-3. Build language-agnostic OSS products
-4. Build unversioned LangSmith content
-5. Build Managed Deep Agents language routes
-6. Copy shared files (images, fonts, etc.) ← includes fallback snippets
-7. **Copy npm snippet components** ← overwrites fallbacks with npm versions
-8. Generate llms.txt and llms-full.txt
-
-## Language-Specific Variant Handling
-
-Snippet markdown files (`.mdx` files in `/src/snippets/`) are processed specially:
-
-- **Default copy** (Python-prefixed): `/build/snippets/[filename].mdx`
-- **Python variant**: `/build/snippets/python/[filename].mdx`
-- **JavaScript variant**: `/build/snippets/javascript/[filename].mdx`
-
-Versioned OSS pages that import snippets are automatically rewritten by `_rewrite_snippet_imports_for_language()` to point to language-specific copies:
-
-```jsx
-// Original import in source
-import { ComponentTab } from "/snippets/component-tabs.mdx"
-
-// Rewritten during JavaScript build
-import { ComponentTab } from "/snippets/javascript/component-tabs.mdx"
+```bash
+make build
 ```
 
-However, JSX/TSX component files (like `pattern-embed.jsx`) are **not** language-versioned; a single version serves all build variants.
+Then verify the expected generated artifact, the importing MDX route, and—in the root-script case—the deferred script entry in `build/docs.json`. See [Build System Architecture](/openwiki/architecture/build-system.md) for full-build and watcher boundaries, [Local Development Workflow](/openwiki/workflows/local-development.md) for preview operation, and [Builder Tests](/openwiki/testing/builder-tests.md) for fixture conventions.
 
-## Local Development and Testing
-
-### Testing Components Locally
-
-1. **Start the dev server**: Run Mintlify's dev server (typically `npm run dev` or similar)
-2. **Components render live**: MDX pages that import snippet components render them in the browser as the server runs
-3. **Hot reload**: Edit component props or MDX pages and observe changes in real-time
-
-### Using Local or NPM Versions
-
-- **During development**: If npm packages are not installed, local `/src/snippets/` components are used as fallbacks
-- **After running `npm install`**: The npm package version takes precedence and is copied during the build
-- **Publishing**: The build always copies npm versions, so component behavior is reproducible across environments
-
-## Maintenance and Coordination
-
-### Adding New Components
-
-To add new snippet components:
-
-1. **Develop in npm package**: Create and test the component in the `@langchain/docs-sandbox` repository
-2. **Publish npm package**: Release a new version of `@langchain/docs-sandbox` to npm
-3. **Update package.json**: Increment the `@langchain/docs-sandbox` version constraint in the docs `package.json`
-4. **Run `npm install`**: Pull the new version into node_modules
-5. **Update builder.py**: If the component is new, add an entry to `_NPM_SNIPPET_FILES` or `_NPM_BUILD_FILES` with the dist filename and destination name
-6. **Import in MDX**: Use the component in pages with `import { ComponentName } from '/snippets/component-name.jsx'`
-
-### Troubleshooting Missing Components
-
-If components don't appear during build:
-
-- **Check package.json**: Verify `@langchain/docs-sandbox` version is specified
-- **Run npm install**: Ensure dependencies are installed: `npm install`
-- **Verify dist files**: Check that files exist in `node_modules/@langchain/docs-sandbox/dist/`
-- **Check builder mappings**: Confirm `_NPM_SNIPPET_FILES` or `_NPM_BUILD_FILES` contains the filename
-- **Review build logs**: The build logs warnings if expected files are not found during `_copy_npm_snippets()`
-
-## Integration with Documentation Architecture
-
-Snippet components fit into the larger documentation pipeline:
-
-- **Shared assets**: Components copy to shared build locations (`/build/snippets/` or `/build/`) once, not duplicated per language version
-- **Preprocessing pipeline**: While component JSX is not preprocessed, MDX files that *import* components receive language-specific rewriting for correct import paths
-- **Mintlify integration**: Components render as live React elements in Mintlify documentation, enabling interactive examples
-- **Versioning strategy**: Components are language-agnostic but may be consumed by both Python and JavaScript documentation variants
-
-See the [Build System Architecture](/openwiki/architecture/build-system.md) page for details on the full preprocessing pipeline and shared file handling.
+The focused builder tests verify language rewriting of Markdown snippet imports, preservation of a `.jsx` import, preservation of an already language-scoped Markdown import, and copying of a local TSX snippet component. They contain no direct test of `_copy_npm_snippets()` itself. Changes to package copying should add isolated fixtures for mapped-file output, source-copy overwrite precedence, and warnings for a missing package directory or individual artifact.

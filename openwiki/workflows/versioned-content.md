@@ -1,455 +1,210 @@
 ---
-type: workflow guide
-title: Writing Versioned Content (Python/JavaScript)
-description: Best practices for authoring documentation that appears in both Python and JavaScript variants using conditional blocks and language-specific code examples.
-tags: [versioning, language-branching, conditional-rendering, code-examples, multi-language]
+type: authoring workflow
+title: Changing Versioned Content
+description: Safely change documentation that emits Python and JavaScript variants, including conditional content, links, snippets, Managed Deep Agents routes, navigation, redirects, and output verification.
+tags: [versioning, documentation, conditional-rendering, navigation, snippets]
 verified:
-  - by: openwiki/0.5.0
-    at: 2026-09-03T15:00:58.567Z
+  - by: openwiki/0.4.3
+    at: 2026-09-29T08:22:38.059Z
 sources:
+  - id: openwiki-source-8037e2358a2c4f9b2c722a11
+    resource: repo://AGENTS.md
+  - id: openwiki-source-012f2c78e3b1446dfc35803f
+    resource: repo://Makefile
   - id: openwiki-source-d0cdf44431684bdedf34705a
     resource: repo://pipeline/core/builder.py
-generated: { by: "openwiki/0.5.0", at: "2026-09-03T15:00:58.567Z" }
+  - id: openwiki-source-17f3856bce97f37118963062
+    resource: repo://pipeline/preprocessors/handle_auto_links.py
+  - id: openwiki-source-06a4c757b1153b7de4f47a0e
+    resource: repo://pipeline/preprocessors/markdown_preprocessor.py
+  - id: openwiki-source-a9a8730b7e43a5ad2d0af4f1
+    resource: repo://src/docs.json
+  - id: openwiki-source-43ff65f03831177d52580c83
+    resource: repo://src/langsmith/managed-deep-agents-overview.mdx
+  - id: openwiki-source-9c21f97e4a156024dc442cb7
+    resource: repo://src/oss/deepagents/models.mdx
+  - id: openwiki-source-6c281d3369cb652cb5d9135f
+    resource: repo://src/oss/deepagents/rag.mdx
+  - id: openwiki-source-24e5f74f0f40e9bfd381871f
+    resource: repo://tests/unit_tests/test_builder.py
+generated: { by: "openwiki/0.4.3", at: "2026-09-29T08:22:38.059Z" }
 ---
 
-# Writing Versioned Content (Python/JavaScript)
+# Changing Versioned Content
 
-This guide explains how to write documentation that automatically generates separate Python and JavaScript variants from a single source file. The build system processes conditional blocks, rewrites links, and manages language-specific imports to create language-specific output.
+Versioned documentation has four independent contracts: the authored source, emitted routes, navigation, and redirects. Choose and verify each one. Author under `src/`; `build/` is regenerated output and must never be edited.
 
-## Understanding the Build Model
-
-The documentation system builds versioned OSS content (LangChain, LangGraph, and most Deep Agents documentation) twice: once for Python output and once for JavaScript/TypeScript output. A single source file in `/src/oss/...` produces two built files:
-
-- `/build/oss/python/...` (Python variant)
-- `/build/oss/javascript/...` (JavaScript/TypeScript variant)
-
-Language-agnostic content (Deep Agents Code, OpenWiki) builds once at `/build/oss/deepagents/code/...` or `/build/oss/openwiki/...` with no language split.
-
-## Basic Conditional Blocks
-
-### Writing Language-Specific Sections
-
-Use indented fence blocks to mark content that only appears in one language:
-
-```markdown
-:::python
-This section is only shown to Python users.
-:::
-
-:::js
-This section is only shown to JavaScript/TypeScript users.
-:::
-
-This section appears in both versions.
+```mermaid
+flowchart TD
+    Start["Classify source ownership"] --> Shared["Shared OSS source"]
+    Start --> Owned["Language-owned OSS source"]
+    Start --> MDA["Managed Deep Agents source"]
+    Start --> Product["Unversioned OSS product"]
+    Shared --> Dual["Python and JavaScript routes"]
+    Owned --> Single["Matching language route"]
+    MDA --> MDADual["LangSmith language routes"]
+    Product --> Plain["Unprefixed route"]
+    Dual --> Configure["Configure navigation and redirects"]
+    Single --> Configure
+    MDADual --> Configure
+    Plain --> Configure
+    Configure --> Verify["Build and inspect emitted files"]
 ```
 
-**Key properties:**
-- Blocks are indented and closed with a matching `:::` at the same indentation level
-- Content between `:::python` and `:::` is removed from JavaScript builds
-- Content between `:::js` and `:::` is removed from Python builds
-- Content outside conditional blocks appears in both versions
-- Unsupported language specifiers (neither `python` nor `js`) are left unchanged
+This workflow separates source ownership from the public-route, sidebar, and backwards-compatibility decisions.
 
-### Escaping Conditional Markers
+## 1. Choose the source owner
 
-When writing documentation that explains the conditional syntax itself, escape the opening marker with a backslash:
+The builder uses `python` and `js` internally; the JavaScript URL segment is `javascript`.
 
-```markdown
-\:::python
-This will appear literally as :::python in the output
-\:::
+| Content | Author in | Emitted route(s) |
+| --- | --- | --- |
+| Shared OSS page | Most of `src/oss/` | `/oss/python/...` and `/oss/javascript/...` |
+| Language-owned OSS page | `src/oss/python/...` or `src/oss/javascript/...` | Only the matching language route, with that source directory removed |
+| Deep Agents Code or OpenWiki | `src/oss/deepagents/code/...` or `src/oss/openwiki/...` | One unprefixed product route |
+| Managed Deep Agents page | Direct `src/langsmith/managed-deep-agents*.mdx` file | `/langsmith/python/...` and `/langsmith/javascript/...` |
+| Other LangSmith page | `src/langsmith/...` | One unprefixed `/langsmith/...` route, processed with the Python target |
 
-\:::js
-This will appear literally as :::js in the output
-\:::
-```
+Use a shared page when the explanation and structure are common but SDK names, package strings, files, API spellings, or examples differ. `src/oss/python/` and `src/oss/javascript/` are for a guide owned by one SDK, not a way to make a shared guide appear in a particular sidebar. During a full OSS build, language-owned sources are processed only for their matching target and their ownership directory disappears from the route.
 
-The backslash is stripped during processing, leaving literal fence syntax in the output. This is useful for:
-- Documenting the syntax itself
-- Showing examples of conditional blocks in tutorials
-- Creating reference material about the build system
+Deep Agents Code and OpenWiki are intentionally single-output products. They render conditional content using the Python target as a deterministic fallback; this does not make them Python documentation. Their product links remain unprefixed, while an ordinary bare `/oss/...` link in such a page resolves to its Python route.
 
-## Conditional Code Examples
+Managed Deep Agents is a LangSmith exception. The full build discovers direct `managed-deep-agents*.mdx` files in a dedicated pass and emits both variants. The normal LangSmith pass excludes these files, preventing unversioned duplicate pages. Use a direct `.mdx` filename matching that pattern: although individual-file classification accepts `.md`, the full-build glob does not discover it.
 
-### Simple Language-Specific Examples
+## 2. Branch only the language-specific unit
 
-Wrap entire code blocks in conditional fences when they differ between languages:
+Keep shared headings, conceptual prose, and behavior outside branches. Use adjacent `:::python` and `:::js` blocks for content that actually differs:
 
-```markdown
-### Install the package
-
-:::python
-```bash
-pip install langchain
-```
-:::
-
-:::js
-```bash
-npm install @langchain/core
-```
-:::
-```
-
-### Side-by-Side Comparisons
-
-Use a neutral heading, then provide language-specific content:
-
-```markdown
-### Using tools
-
-:::python
-```python
-@tool
-def add(a: int, b: int) -> int:
-    """Add two numbers."""
-    return a + b
-```
-:::
-
-:::js
-```typescript
-const add = tool(
-  async (a: number, b: number) => {
-    return a + b;
-  },
-  {
-    name: "add",
-    description: "Add two numbers",
-  }
-);
-```
-:::
-```
-
-### Mixed Explanatory Content and Code
-
-Combine narrative text with language-specific code blocks:
-
-```markdown
-## Creating an agent
-
-To create an agent, instantiate the appropriate class for your framework:
+````markdown
+Shared explanation.
 
 :::python
 ```python
 from langchain.agents import create_agent
-
-agent = create_agent(
-    llm=model,
-    tools=tools,
-    prompt=prompt
-)
 ```
 :::
 
 :::js
 ```typescript
-import { createAgent } from "@langchain/langgraph";
-
-const agent = createAgent({
-  llm: model,
-  tools: tools,
-  prompt: prompt,
-});
+import { createAgent } from "langchain";
 ```
 :::
+````
 
-You can now invoke the agent with:
+For the selected target, the preprocessor removes matching supported-block markers and keeps their content; it removes the other supported block. Only `python` and `js` are valid rendering targets, and another target raises `ValueError`. Unsupported labels are preserved rather than validated or removed.
 
-:::python
-```python
-result = agent.invoke({"query": "hello"})
-```
-:::
+Branch an entire coherent unit—such as a table, setup command plus filename, or sample-component invocation—rather than only a code fence. For example, the Managed Deep Agents overview uses separate capability tables for `agent.py`/`memory.py` and `agent.ts`/`memory.ts`; the Deep Agents model and RAG pages pair target-specific imports and snippets with matching branches. This prevents a Python filename or import from accompanying a JavaScript example.
 
-:::js
-```typescript
-const result = await agent.invoke({
-  query: "hello",
-});
-```
-:::
-```
+### Conditional syntax is not structural parsing
 
-## Handling Links in Versioned Content
+Conditional rendering is a whole-document regex transformation. It is not code-fence-aware and cannot safely model nested conditionals. Literal syntax must be escaped:
 
-### Automatic Link Rewriting
+````markdown
+\:::python
+This is displayed literally.
+\:::
+````
 
-Don't manually prefix links to versioned products. Write unprefixed paths, and the build system automatically rewrites them:
+Do not nest conditional blocks and do not rely on indentation or a Markdown code fence to protect live conditional syntax. The pattern may retry an opener with an empty indentation capture, and the first eligible closer terminates its non-greedy match.
 
-```markdown
-<!-- openwiki: broken internal link [/oss/langgraph/overview] file "/oss/langgraph/overview" does not exist. Fix the href or restore the target, then delete this comment. -->
-See the [LangGraph overview](/oss/langgraph/overview) for more details.
-```
+### Scope autolinks deliberately
 
-During build:
-- Python build rewrites to: `/oss/python/langgraph/overview`
-- JavaScript build rewrites to: `/oss/javascript/langgraph/overview`
+Markdown preprocessing resolves `@[Name]`, `@[title][Name]`, and backticked forms before it renders conditionals. Outside normal Markdown code fences, an active `:::python` or `:::js` fence selects the autolink map; otherwise the build target is the default scope. An unknown reference is logged and left unchanged rather than failing the build. After changing references, run:
 
-### Language-Agnostic Product Links
-
-Always use unprefixed URLs for language-agnostic products; these are never rewritten:
-
-```markdown
-<!-- openwiki: broken internal link [/oss/deepagents/code/overview] file "/oss/deepagents/code/overview" does not exist. Fix the href or restore the target, then delete this comment. -->
-See [Deep Agents Code](/oss/deepagents/code/overview) for details.
-See [OpenWiki](/oss/openwiki/) for information.
-```
-
-These links remain `/oss/deepagents/code/...` and `/oss/openwiki/...` in both builds.
-
-### External and Unversioned Links
-
-Links to external sites, images, and unversioned content are unaffected:
-
-```markdown
-<!-- openwiki: broken internal link [/langsmith/overview] file "/langsmith/overview" does not exist. Fix the href or restore the target, then delete this comment. -->
-[Visit LangSmith](/langsmith/overview)
-[API Reference](https://example.com)
-![Example image](/oss/images/diagram.png)
-```
-
-## Importing Language-Specific Snippets
-
-### Snippet Sources
-
-Snippets are short reusable markdown fragments stored in `/src/snippets/`. The build system generates language-specific copies:
-
-- `/src/snippets/example.mdx` → `/build/snippets/python/example.mdx` (Python build)
-- `/src/snippets/example.mdx` → `/build/snippets/javascript/example.mdx` (JavaScript build)
-- `/build/snippets/example.mdx` → Python-default copy (for unversioned pages)
-
-### Importing Snippets in Versioned Pages
-
-In versioned pages (those built for both Python and JavaScript), import snippets without the language prefix. The build system automatically inserts the language path:
-
-```mdx
-import MySnippet from '/snippets/my-snippet.mdx'
-```
-
-During build:
-- Python build rewrites to: `import MySnippet from '/snippets/python/my-snippet.mdx'`
-- JavaScript build rewrites to: `import MySnippet from '/snippets/javascript/my-snippet.mdx'`
-
-### Importing Snippets in Unversioned Pages
-
-In unversioned pages (language-agnostic content), import snippets at the base path or with the `python/` prefix:
-
-```mdx
-import MySnippet from '/snippets/my-snippet.mdx'
-// or explicitly:
-import MySnippet from '/snippets/python/my-snippet.mdx'
-```
-
-Both work; already-prefixed imports are left unchanged by the rewrite system.
-
-### Creating Snippet Sources
-
-If a snippet needs to be language-specific, author it with conditional blocks:
-
-```mdx
-<!-- /src/snippets/installation.mdx -->
-
-:::python
 ```bash
-pip install langchain
-```
-:::
-
-:::js
-```bash
-npm install @langchain/core
-```
-:::
+make check-cross-refs
 ```
 
-This single source snippet becomes language-specific when built, producing `/snippets/python/installation.mdx` and `/snippets/javascript/installation.mdx`.
+A reference outside a branch in a shared page must make sense for both outputs. Put an SDK-specific autolink inside its branch. Escaped autolinks are preserved literally after their escape is removed.
 
-## Testing in Local Development
+## 3. Author links and snippets for the target output
 
-### Verify Conditional Rendering
+### OSS and Managed Deep Agents links
 
-When you build or start the development server with `make dev`, check that conditional blocks are properly resolved:
+For an ordinary OSS destination that should follow the active language, author an absolute, unqualified OSS route:
 
-1. **Python variant**: Navigate to the `/oss/python/...` route in your browser. You should see only `:::python` content and no `:::js` sections.
-2. **JavaScript variant**: Navigate to the `/oss/javascript/...` route. You should see only `:::js` content and no `:::python` sections.
-3. **Shared content**: Verify that non-conditional text appears in both variants.
+```mdx
+<!-- openwiki: broken internal link [/oss/deepagents/overview] file "/oss/deepagents/overview" does not exist. Fix the href or restore the target, then delete this comment. -->
+[Deep Agents overview](/oss/deepagents/overview)
+```
 
-### Language Selector
+A targeted build inserts `python` or `javascript` after `/oss/`. It does not rewrite an already-qualified route, a path containing `images`, or an OpenWiki or Deep Agents Code root/path. Explicitly qualify a route only when the link must remain fixed to one SDK.
 
-The documentation site displays a language dropdown (Python/TypeScript) at the top. Switch between languages to verify:
-- Content inside matching conditional blocks appears
-- Content inside non-matching blocks is absent
-- Links are rewritten correctly for the target language
-- Snippet imports resolve to the correct language variant
+Use the same approach for a Managed Deep Agents link that should follow the selected variant:
 
-### Local Build Testing
+```mdx
+<!-- openwiki: broken internal link [/langsmith/managed-deep-agents-deploy] file "/langsmith/managed-deep-agents-deploy" does not exist. Fix the href or restore the target, then delete this comment. -->
+[Deploy](/langsmith/managed-deep-agents-deploy)
+```
 
-Build the documentation locally to catch link and snippet issues early:
+The builder rewrites this to the target's `/langsmith/python/...` or `/langsmith/javascript/...` route. An already-language-qualified Managed Deep Agents route remains fixed. This makes bare source links correct even though no unprefixed Managed Deep Agents page is emitted.
+
+### Markdown snippets
+
+Store reusable Markdown/MDX fragments below `src/snippets/`, and import an unqualified Markdown fragment from a versioned page:
+
+```mdx
+import RequiresLanggraphServer from '/snippets/oss/requires-langgraph-server.mdx';
+```
+
+The builder rewrites eligible `.md` and `.mdx` imports to `/snippets/python/` or `/snippets/javascript/`; already-scoped imports and JSX/TSX component imports are unchanged. It independently preprocesses Markdown snippets into Python and JavaScript copies plus a Python-targeted default copy. Use absolute `/oss/...` links inside a shared fragment so each emitted copy works from consumers at arbitrary nesting depths.
+
+For runnable example ownership, testing, extraction markers, and regeneration of components under `src/snippets/code-samples/`, follow [Code Sample Lifecycle](/openwiki/workflows/code-sample-lifecycle.md). Import language-specific generated components in their matching conditional branch.
+
+## 4. Change navigation and redirects separately
+
+Creating a source file does not create a sidebar entry. After confirming emitted paths, edit `src/docs.json` in the appropriate product/menu/dropdown/tab/group. Navigation entries use extensionless paths relative to `src`.
+
+For shared OSS pages, add the Python and JavaScript paths in their respective dropdowns. A language-owned page belongs only in its matching navigation. An unversioned product page has its one unprefixed entry. Managed Deep Agents has parallel Python and JavaScript entries in its separate language dropdowns.
+
+Redirects are a separate public-URL contract. `docs.json` redirects unprefixed and older Managed Deep Agents URLs to Python destinations because the builder deliberately emits no unprefixed Managed Deep Agents page. When moving or versioning a public page, decide whether the retired URL needs a redirect to the maintained canonical route; do not generate an orphaned unversioned duplicate merely for compatibility.
+
+For every route change, explicitly review:
+
+1. The source owner and all routes that must exist.
+2. Sidebar placement for every reader-facing output.
+3. Existing public URLs and required redirects.
+4. Links from shared, language-specific, and unversioned pages.
+
+See [Adding and Maintaining Documentation Pages](/openwiki/operations/adding-pages.md) for the general page-move procedure.
+
+## 5. Build and inspect the generated contract
+
+Run a clean build when changing shared pages, links, snippets, builder rules, navigation, or redirects:
 
 ```bash
 make build
+make broken-links
 ```
 
-Check the build output in `/build/oss/python/` and `/build/oss/javascript/` to verify:
-- Conditional blocks are properly removed
-- Links are rewritten with language prefixes
-- Snippet imports are rewritten with language paths
+`build_all()` removes the old build directory, builds both OSS variants, builds the two unversioned OSS products, builds ordinary LangSmith pages, then emits Managed Deep Agents variants before copying shared files. `make broken-links` builds first and invokes Mint with redirect checking; use `make broken-links-with-anchors` when anchor changes matter.
 
-## Fallback for Language Parity Issues
+Inspect the relevant generated files; do not modify them:
 
-When a feature is only available in one language, document it with a note:
+1. Required routes exist and prohibited language siblings do not.
+2. Each variant retains shared prose and its own branch only, without selected-branch markers.
+3. SDK-scoped autolinks resolve in the intended branch.
+4. Bare OSS links, bare Managed Deep Agents links, and Markdown imports point at the expected target path.
+5. Already-qualified links, image paths, and unversioned product paths remain unchanged.
+6. `docs.json` exposes each new route and redirects each retired public route deliberately.
 
-```markdown
-:::python
-```python
-from langchain.agents import create_agent
-agent = create_agent(...)
-```
-:::
+When changing build behavior, add a focused regression to `tests/unit_tests/test_builder.py` that asserts both content and route presence or absence. Existing tests cover OSS link exemptions, single-output products, snippet variants, and Managed Deep Agents route and link rewriting.
 
-:::js
-<Note>
-    This feature is not yet available in TypeScript. See the Python variant for an example.
-</Note>
-:::
-```
+## Completion checklist
 
-Alternatively, provide a note about the feature gap:
+- [ ] Select source ownership before deciding sidebar placement or redirects.
+- [ ] Put common prose outside sequential `:::python` and `:::js` branches.
+- [ ] Do not nest conditionals or trust indentation/code fences to protect conditional markers.
+- [ ] Put language-specific autolinks in their branch and run `make check-cross-refs` after reference changes.
+- [ ] Use bare `/oss/...` and Managed Deep Agents links only when they should track the active language.
+- [ ] Import shared Markdown snippets without a language prefix and use absolute OSS paths inside them.
+- [ ] Update navigation and redirects in `src/docs.json` independently of source placement.
+- [ ] Run `make build` and link validation, then inspect generated routes without editing `build/`.
 
-```markdown
-This feature is currently available in Python only. TypeScript support is coming soon.
-```
+## See also
 
-## Common Patterns
-
-### Parameter Names That Differ
-
-When parameter names differ between languages, use conditional blocks:
-
-```markdown
-Call the function with the required parameters:
-
-:::python
-- `model`: The LLM instance
-- `tools`: List of tools the agent can use
-:::
-
-:::js
-- `llm`: The language model instance
-- `tools`: Array of tools the agent can invoke
-:::
-```
-
-### Error Messages and Diagnostics
-
-When error messages or debugging output differs:
-
-```markdown
-If you encounter an error, check the output:
-
-:::python
-```
-ValueError: Model not initialized
-```
-:::
-
-:::js
-```
-Error: Model not initialized
-```
-:::
-```
-
-### Import Statements
-
-Always show language-specific imports:
-
-```markdown
-### Import the module
-
-:::python
-```python
-from langchain.tools import tool
-```
-:::
-
-:::js
-```typescript
-import { tool } from "@langchain/core/tools";
-```
-:::
-```
-
-### API Reference Links
-
-Use semantic cross-references (`@[ClassName]`) instead of hardcoding URLs. These resolve to language-specific API docs:
-
-```markdown
-See @[StateGraph] for details on graph state management.
-```
-
-## Best Practices
-
-1. **Keep parity in mind**: Ensure documentation covers both languages equally unless a feature is truly unavailable.
-
-2. **Use neutral headings**: When heading introduces content that differs by language, avoid language-specific headings. The conditional blocks handle the language split.
-
-3. **Don't hardcode language prefixes**: Write `/oss/langgraph/overview` not `/oss/python/langgraph/overview`. Let the preprocessor handle language routing.
-
-4. **Test both variants**: Check that the Python and JavaScript tabs both render correctly in the dev server before submitting.
-
-5. **Keep code current**: If you update a code example for one language, consider whether the other language example needs updating too.
-
-6. **Document assumptions**: If Python and JavaScript implementations differ significantly, explain the differences clearly.
-
-7. **Use code highlighting carefully**: Conditional blocks protect regular code fences (``` or ~~~) from being processed as conditional content. You can nest code blocks inside conditional fences safely.
-
-8. **Escape when needed**: Only use backslash escapes (`\:::`) when documenting the syntax itself, not in regular content.
-
-## Conditional Block Invariants
-
-The preprocessor enforces these rules:
-
-- **Code fence protection**: Content inside triple-backtick or triple-tilde code blocks is never processed as conditional content. If you have `:::python` inside a code fence, it's treated as literal text.
-- **Indentation matching**: Conditional blocks are matched at the same indentation level. A `:::python` block must close with `:::` at the same indentation.
-- **Nested conditionals not supported**: The innermost unescaped `:::` closes the current block. Nested conditionals like `:::python` → `:::js` → `:::` are not supported.
-- **Order preservation**: All transformations occur in a strict order: conditional rendering first, then cross-references, then link rewriting, then snippet import rewriting.
-
-## Troubleshooting
-
-### Conditional Block Not Working
-
-**Problem**: A `:::python` block appears in the JavaScript build.
-
-**Solution**:
-- Check indentation: The closing `:::` must match the indentation of `:::python`.
-- Verify the fence is not inside a code block. If `:::python` is inside triple backticks, it's literal text, not a conditional marker.
-- Check that the file is in a versioned OSS path (`/src/oss/langgraph/`, `/src/oss/langchain/`, etc.), not an unversioned path.
-
-### Links Not Rewriting
-
-**Problem**: A link like `/oss/langgraph/overview` appears without the language prefix in the build output.
-
-**Solution**:
-- Check that the link path starts with `/oss/` and doesn't already contain `/python/` or `/javascript/`.
-- Verify the page is in a versioned OSS path that gets built for both languages.
-- Check for typos in the URL path.
-
-### Snippet Import Not Found
-
-**Problem**: A build error says the snippet file doesn't exist.
-
-**Solution**:
-- Verify the snippet source exists at `/src/snippets/my-snippet.mdx`.
-- Check that you're importing the unversioned path (`/snippets/my-snippet.mdx`), not the language-specific path (which is added during build).
-- If the snippet contains language-specific content, ensure it's inside conditional blocks so both language variants are generated.
-
-## Related Documentation
-
-<!-- openwiki: broken internal link [/oss/openwiki/concepts/versioning.md] file "/oss/openwiki/concepts/versioning.md" does not exist. Fix the href or restore the target, then delete this comment. -->
-- [Language Versioning Strategy](/oss/openwiki/concepts/versioning.md) — Deep dive into how the build system creates language-specific variants
-<!-- openwiki: broken internal link [/oss/openwiki/concepts/preprocessing.md] file "/oss/openwiki/concepts/preprocessing.md" does not exist. Fix the href or restore the target, then delete this comment. -->
-- [Markdown Preprocessing Pipeline](/oss/openwiki/concepts/preprocessing.md) — Complete reference for all six preprocessing layers
-- [Local Development Workflow](/openwiki/workflows/local-development.md) — How to test changes locally in both Python and JavaScript builds
+- [Source Map](/openwiki/architecture/source-map.md)
+- [Markdown Preprocessing](/openwiki/concepts/preprocessing.md)
+- [Versioned Documentation and Routes](/openwiki/concepts/versioning.md)
+- [Adding and Maintaining Documentation Pages](/openwiki/operations/adding-pages.md)
+- [Code Sample Lifecycle](/openwiki/workflows/code-sample-lifecycle.md)
