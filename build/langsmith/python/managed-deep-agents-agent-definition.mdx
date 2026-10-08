@@ -1,16 +1,14 @@
 ---
 title: Define a Managed Deep Agent
 sidebarTitle: Agent definition
-description: Configure the model and core capabilities of a Managed Deep Agent.
+description: Configure the model and core capabilities of a managed deep agent.
 ---
 
-import ManagedDeepAgentsPrivateBetaNote from '/snippets/python/langsmith/managed-deep-agents-private-beta-note.mdx';
+import ManagedDeepAgentsPublicBetaNote from '/snippets/python/langsmith/managed-deep-agents-public-beta-note.mdx';
 
-The agent definition selects the model and core capabilities of a Managed Deep Agent.
+The agent definition selects the model and core capabilities of a managed deep agent.
 
-<ManagedDeepAgentsPrivateBetaNote />
-
-## Project structure
+<ManagedDeepAgentsPublicBetaNote />
 
 The agent entry lives at the project root:
 
@@ -19,14 +17,12 @@ my-agent/
   agent.py
 ```
 
-Export the agent definition as a named `agent`.
 
 
 
+For the full project layout, see [Project structure](/langsmith/python/managed-deep-agents-project-structure).
 
-## Define an agent
-
-Use `define_deep_agent`:
+To define the agent, use `define_deep_agent`:
 
 <CodeGroup>
 ```python OpenAI
@@ -59,93 +55,158 @@ agent = define_deep_agent(
 
 
 
+
+Configure the system prompt, skills, memory, sandbox, identity, channels, and schedules through their project files rather than the agent definition. See [Project structure](/langsmith/python/managed-deep-agents-project-structure). To select the system prompt, skills, MCP servers, or sandbox for each run, see [Select configuration per run](#select-configuration-per-run).
+
+`define_deep_agent` does not compile an agent. It returns a definition, and the managed runtime compiles it with [create_deep_agent](https://reference.langchain.com/python/deepagents/graph/create_deep_agent) at deploy time. The parameters below are the [create_deep_agent](https://reference.langchain.com/python/deepagents/graph/create_deep_agent) surface without the ones the runtime owns. See [Relationship to Deep Agents](/langsmith/python/managed-deep-agents-overview#relationship-to-deep-agents).
+
+
+
+
+## Parameters
 
 | Parameter | What it does |
 |---|---|
-| [`name=`](#name) | Sets the agent and default deployment name |
-| [`model=`](#model) | Selects the chat model |
-| [`tools=`](#tools) | Adds tools the agent can call |
-| [`middleware=`](#middleware) | Adds behavior around model calls, tool calls, and the agent lifecycle |
-| [`subagents=`](#subagents) | Defines specialized agents for delegated tasks |
-| [`permissions=`](#permissions) | Controls path-level access for filesystem tools |
-| [`interrupt_on=`](#human-in-the-loop) | Pauses before selected tool calls for human approval |
-| [`response_format=`](#structured-output) | Defines a structured output schema |
+| `name=` | Required. Pass a static string that starts with a letter and contains only letters, numbers, underscores, or hyphens, such as `"research-assistant"`.<br /><br /> Managed Deep Agents uses the name as the agent's graph ID and the default LangSmith deployment name, and clients pass it as `assistant_id` when they call the deployment. You can override the deployment name with `mda deploy --name` without changing the agent definition. |
+| `model=` | Set the chat model the agent uses. The simplest option is a `provider:model` string. Add the provider's API key to `.env` so the model works locally and in the deployment.<br /><br /> Pass a LangChain chat model instance instead when you need to configure model parameters in code. For model options and supported providers, see [Models](/oss/python/deepagents/models).<br /><br /> To connect to LLM Gateway, see [Use LLM Gateway](#use-llm-gateway). |
+| `tools=` | Adds tools the agent can call. Pass tools in the `tools` list so the agent can call application logic or external services.<br /><br /> Define tools in local modules, import them into the agent entry, and add them to the definition. See [Custom tools](/langsmith/python/managed-deep-agents-tools). To add tools from remote MCP servers without importing them into the agent entry, use [MCP connectors](/langsmith/python/managed-deep-agents-mcp-connectors). |
+| `middleware=` | Adds behavior around model calls, tool calls, and the agent lifecycle. Pass middleware in the `middleware` list. Middleware runs in list order. See [Custom middleware](/langsmith/python/managed-deep-agents-middleware). |
+| `subagents=` | Defines specialized agents for delegated tasks. Pass subagent definitions when the agent should delegate specialized or context-heavy work. Each subagent can have its own prompt, model, and tools. See [Subagents](/oss/python/deepagents/subagents). |
+| `permissions=` | Controls path-level access for filesystem tools. Pass filesystem permission rules to control which paths the agent's built-in filesystem tools can read or write. Cleared when the project declares a [sandbox](/langsmith/python/managed-deep-agents-sandboxes), because a permission rule disables the sandbox `execute` tool. See [Permissions](/oss/python/deepagents/permissions). |
+| `interrupt_on=` | Pauses before selected tool calls for human approval. Set `interrupt_on` to pause before selected tool calls, so a person can approve, edit, or reject the call before it runs. See [Human-in-the-loop](/langsmith/python/managed-deep-agents-tools#human-in-the-loop). |
+| `response_format=` | Set when the agent must return data that matches a schema instead of an unconstrained text response. See [Structured output](/oss/python/langchain/structured-output). |
 
 
 
 
-## Name
+## Select configuration per run
 
-`name` is required. Pass a static string that starts with a letter and contains only letters, numbers, underscores, or hyphens, such as `"research-assistant"`.
+To select the agent's configuration for each run, export a function as `agent` instead of a definition. One deployment can then adapt to different users, tasks, or repositories. The function is a graph factory, the same pattern LangGraph uses to [rebuild a graph at runtime](/langsmith/graph-rebuild): it receives the runtime and returns a definition.
 
-Managed Deep Agents uses the name as the LangGraph assistant ID and the default LangSmith deployment name. You can override the deployment name with `mda deploy --name` without changing the agent definition.
+This example selects instructions and skills for the repository a run works on. It assumes the project has `skills/python-service/` and `skills/typescript-web/`, each with a [`SKILL.md`](/langsmith/python/managed-deep-agents-skills).
 
-## Model
+```python agent.py
+from typing import TypedDict
 
-Set `model` to the chat model the agent uses. The simplest option is a `provider:model` string. Add the provider's API key to `.env` so the model works locally and in the deployment.
+from managed_deepagents import ManagedServerRuntime, define_deep_agent
 
-<CodeGroup>
-```python OpenAI
-from managed_deepagents import define_deep_agent
 
-agent = define_deep_agent(
-    name="research-assistant",
-    model="openai:gpt-5.5",
+class AppContext(TypedDict, total=False):
+    repository: str
+
+
+def agent(runtime: ManagedServerRuntime[AppContext]):
+    execution = runtime.execution_runtime
+    context = execution.context if execution is not None else None
+    python_service = context is not None and context.get("repository") == "payments-service"
+    return define_deep_agent(
+        name="open-swe",
+        model="openai:gpt-5.5",
+        instructions=(
+            "Follow the payments service's API and reliability conventions."
+            if python_service
+            else "Follow the storefront's frontend and accessibility conventions."
+        ),
+        skills=["./skills/python-service" if python_service else "./skills/typescript-web"],
+        context_schema=AppContext,
+    )
+```
+
+The factory can be sync or async. It receives a `ManagedServerRuntime`, which extends the native LangGraph `ServerRuntime`. Read run context from `execution_runtime.context`. It is `None` on channel runs, and `execution_runtime` is `None` when Agent Server loads the agent for inspection.
+
+
+
+
+Callers choose the configuration through the run's `context`:
+
+```python
+await client.runs.create(
+    thread_id,
+    "open-swe",
+    input={"messages": [{"role": "user", "content": "Run the service test suite."}]},
+    context={"repository": "payments-service"},
 )
 ```
 
-```python Anthropic
-from managed_deepagents import define_deep_agent
 
-agent = define_deep_agent(
-    name="research-assistant",
-    model="anthropic:claude-sonnet-4-6",
-)
+
+
+Run context is application data, not verified identity. Check authorization in [tools](/langsmith/python/managed-deep-agents-tools) against the verified caller on the runtime.
+
+### Select managed resources
+
+A factory can also select the resources that a static agent reads from project files. Omitting a field keeps the project's configuration. Providing a value replaces it for that run:
+
+| Field | Omitted | Selected | Cleared |
+|---|---|---|---|
+| `instructions` | Uses `instructions.md`. | Uses the supplied prompt. | `""` removes authored instructions. |
+| `skills` | Exposes all project skills. | Exposes only the selected skills. | `[]` exposes no skills. |
+| `mcp` | Uses the `mcp` declaration. | Uses only the selected MCP definitions. | `[]` exposes no MCP tools. |
+| `sandbox` | Uses the `sandbox` declaration. | Uses the supplied sandbox. | `None` disables the sandbox. |
+
+
+
+
+Static definitions cannot set these fields. A skill path must end in `skills/<name>` and point to a skill in the project. A factory can also return generated skill definitions, whose names must not duplicate project skill names.
+
+This example enables the docs MCP server on request and gives one repository a longer sandbox timeout. It imports the declarations from [`tools/mcp`](/langsmith/python/managed-deep-agents-mcp-connectors) and [`sandbox/`](/langsmith/python/managed-deep-agents-sandboxes):
+
+```python agent.py
+from typing import TypedDict
+
+from managed_deepagents import ManagedServerRuntime, define_deep_agent, define_sandbox
+
+from sandbox import sandbox
+from tools.mcp import mcp
+
+
+class AppContext(TypedDict, total=False):
+    repository: str
+    needs_docs: bool
+
+
+def agent(runtime: ManagedServerRuntime[AppContext]):
+    execution = runtime.execution_runtime
+    context = execution.context if execution is not None else None
+    python_service = context is not None and context.get("repository") == "payments-service"
+    needs_docs = context is not None and context.get("needs_docs", False)
+    return define_deep_agent(
+        name="open-swe",
+        model="openai:gpt-5.5",
+        mcp=[mcp] if needs_docs else [],
+        sandbox=define_sandbox(default_timeout=600) if python_service else sandbox,
+        context_schema=AppContext,
+    )
 ```
 
-```python Google Gemini
+
+
+
+Memory is not selected per run. Declare it in the project's memory file, and control access for each run with an `allow` policy. See [Control access to a layer](/langsmith/python/managed-deep-agents-memory#control-access-to-a-layer).
+
+### Keep the factory repeatable
+
+Managed Deep Agents calls the factory at the start of each run, and again when a run resumes or retries. Agent Server also calls it to read schemas and state. Follow these rules:
+
+- **No side effects**: Return the same definition for the same context. Do not create records, call external APIs, or change shared state in the factory.
+- **Stable interrupts**: Keep middleware that can interrupt a run in every configuration. When a run resumes, the middleware that raised the interrupt must still be present.
+- **Inline name**: Set `name` as an inline string. `mda build` reads it without calling the factory and uses it as the graph ID and default deployment name.
+- **Model dependencies**: Install the integration package for every model the factory can return. The build does not detect them.
+
+To change behavior between model calls within a run, use [custom middleware](/langsmith/python/managed-deep-agents-middleware).
+
+## Use LLM Gateway
+
+You can use [LLM Gateway](/langsmith/llm-gateway) to apply rate limits, fallbacks, and other policies to model calls.
+
+Prefix the gateway model ID with `langsmith:`:
+
+```python
 from managed_deepagents import define_deep_agent
-
-agent = define_deep_agent(
-    name="research-assistant",
-    model="google_genai:gemini-3.6-flash",
-)
-```
-</CodeGroup>
-
-
-
-
-Pass a LangChain chat model instance instead when you need to configure model parameters in code. For model options and supported providers, see [Models](/oss/python/deepagents/models).
-
-### Use LLM Gateway
-
-You can use [LLM Gateway](langsmith/llm-gateway) to control rate limits, fallbacks, and more.
-
-In order to use LLM Gateway, you should:
-- Use the ChatOpenAI model directly
-- Set a base url of `https://gateway.smith.langchain.com/v1`
-- Use your `LANGSMITH_API_KEY` for authentication. Set `LANGSMITH_GATEWAY_API_KEY` only if you need a different key for gateway calls.
-
-```py
-import os
-
-from managed_deepagents import define_deep_agent
-from langchain_openai import ChatOpenAI
-
-api_key = os.environ.get(
-    "LANGSMITH_GATEWAY_API_KEY",
-    os.environ.get("LANGSMITH_API_KEY", "missing-langsmith-api-key"),
-)
-base_url = "https://gateway.smith.langchain.com/v1"
 
 agent = define_deep_agent(
     name="my-agent",
-    model=ChatOpenAI(
-        model="moonshotai/Kimi-K3",
-        api_key=api_key,
-        base_url=base_url,
-    ),
+    model="langsmith:moonshotai/kimi-k3",
 )
 ```
 
@@ -153,66 +214,24 @@ agent = define_deep_agent(
 
 
 <Note>
-The model slug should be `provider/model-name` when using Gateway. When NOT using Gateway, it is normally `provider:model-name`
+Gateway model IDs use a slash between provider and model (`langsmith:provider/model-name`). Model strings that call a provider directly use a colon (`provider:model-name`).
 </Note>
 
-In order to scaffold your project to use Gateway from the start, you can pass a `--gateway` flag when initializing your agent:
+The gateway routes each request by model ID. `moonshotai/kimi-k3` is a LangChain-hosted model, so it requires no provider secret and draws on [Gateway Credits](/langsmith/llm-gateway-credits). A model ID that starts with a provider your workspace has configured, such as `anthropic/claude-opus-5`, uses that [provider secret](/langsmith/llm-gateway-admin-setup#1-add-provider-secrets) and bills to your own provider account.
+
+For more information, see [LLM Gateway](/langsmith/llm-gateway).
+
+To scaffold a project that uses Gateway from the start, pass `--gateway` when initializing:
 
 ```bash
 mda init my-agent --gateway
 ```
 
-## Tools
-
-Pass tools in the `tools` list to let the agent call application logic or external services.
-
-
-
-
-Define tools in local modules, import them into the agent entry, and add them to the definition. See [Custom tools](/langsmith/python/managed-deep-agents-tools). To add tools from remote MCP servers without importing them into the agent entry, use [MCP connectors](/langsmith/python/managed-deep-agents-mcp-connectors).
-
-## Middleware
-
-Pass middleware in the `middleware` list to add behavior around model calls, tool calls, and the agent lifecycle. Middleware runs in list order.
-
-
-
-
-See [Custom middleware](/langsmith/python/managed-deep-agents-middleware).
-
-## Subagents
-
-Pass subagent definitions in `subagents` when the agent should delegate specialized or context-heavy work. Each subagent can have its own prompt, model, and tools. See [Subagents](/oss/python/deepagents/subagents).
-
-## Permissions
-
-Pass filesystem permission rules in `permissions` to control which paths the agent's built-in filesystem tools can read or write. See [Permissions](/oss/python/deepagents/permissions).
-
-## Human-in-the-loop
-
-Set `interrupt_on` to pause before selected tool calls.
-
-
-
-
-Use this for actions that require a person to approve, edit, or reject the call before it runs. See [Human-in-the-loop](/langsmith/python/managed-deep-agents-tools#human-in-the-loop).
-
-## Structured output
-
-Set `response_format` when the agent must return data that matches a schema instead of an unconstrained text response.
-
-
-
-
-See [Structured output](/oss/python/langchain/structured-output).
-
-Configure the system prompt, skills, memory, sandbox, identity, channels, and schedules through their project files rather than the agent definition. See [Project structure](/langsmith/python/managed-deep-agents-project-structure).
-
 ---
 
 <div className="source-links">
 <Callout icon="terminal-2">
-    [Connect these docs](/use-these-docs) to Claude, VSCode, and more via MCP for real-time answers.
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
 </Callout>
 <Callout icon="edit">
     [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/managed-deep-agents-agent-definition.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
