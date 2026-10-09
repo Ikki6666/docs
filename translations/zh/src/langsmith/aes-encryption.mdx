@@ -1,0 +1,83 @@
+---
+title: 配置 AES 静态加密
+sidebarTitle: AES 加密
+description: 为 Agent Server 数据配置内置 AES 加密和惰性 key rotation。
+---
+
+内置 AES 加密是对 Agent Server 数据进行静态加密的推荐方式。仅当你需要按租户隔离密钥，或使用外部 key management system 时，才使用 [custom encryption handler](/langsmith/custom-encryption)。
+
+## 配置 AES 加密
+
+设置 `LANGGRAPH_AES_KEY` 以自动加密 checkpoint blob：
+
+1. 在 `langgraph.json` 中把 `pycryptodome` 添加到依赖里：
+   ```json
+   {
+     "dependencies": [".", "pycryptodome"],
+     "graphs": {
+       "agent": "./agent.py:graph"
+     }
+   }
+   ```
+
+2. 将 `LANGGRAPH_AES_KEY` 设为一个 16、24 或 32 字节的密钥，分别对应 AES-128、AES-192 或 AES-256。
+
+### 加密 JSON 字段
+
+把 `LANGGRAPH_AES_JSON_KEYS` 设置为一个用逗号分隔的待加密 JSON key 列表：
+
+```bash
+export LANGGRAPH_AES_KEY="your-16-24-or-32-byte-key"
+export LANGGRAPH_AES_JSON_KEYS="api_key,secret_token,user_credentials"
+```
+
+这些 key 无论出现在 thread、assistant、run、cron 还是 store 数据中，都会被加密。
+
+<Warning>
+加密后的字段无法被搜索或过滤。
+</Warning>
+
+以下系统字段不能加密：`langgraph_version`、`langgraph_api_version`、`langgraph_plan`、`langgraph_host`、`langgraph_api_url`、`langgraph_request_id`、`langgraph_auth_user_id` 和 `langgraph_auth_permissions`。
+
+## 轮换 AES 密钥
+
+<Note>
+AES key rotation 要求 Agent Server 版本为 `0.17.0.dev3` 或更高，使用 PostgreSQL checkpointer 并设置 `PREFER_GRPC_CHECKPOINTER=true`，以及使用 Go store 并设置 `LANGGRAPH_STORE_BACKEND=grpc`。Python、custom、SQLite 和 MongoDB checkpointer 不支持轮换。
+</Note>
+
+Agent Server 使用 `LANGGRAPH_AES_KEY` 加密新数据。key envelope 标识由哪个已配置的密钥来解密每个值。当 Agent Server 读取用旧密钥加密的数据时，它会返回明文，并用当前密钥惰性地重新加密存储的值。
+
+如需轮换密钥：
+
+1. 在每个 replica 上配置当前的 primary key 和 future key：
+
+   ```bash
+   export LANGGRAPH_AES_KEY="your-current-16-24-or-32-byte-key"
+   export LANGGRAPH_AES_FALLBACK_KEYS="your-future-16-24-or-32-byte-key"
+   ```
+
+2. 将此配置推广到每个 replica。
+3. 在每个 replica 都能解密这两个密钥后，将 `LANGGRAPH_AES_KEY` 切换为 future key。
+4. 在两个兼容性设置中保留旧密钥：
+
+   ```bash
+   export LANGGRAPH_AES_KEY="your-future-16-24-or-32-byte-key"
+   export LANGGRAPH_AES_LEGACY_KEY="your-old-16-24-or-32-byte-key"
+   export LANGGRAPH_AES_FALLBACK_KEYS="your-old-16-24-or-32-byte-key"
+   ```
+
+   `LANGGRAPH_AES_LEGACY_KEY` 用于解密未带标签的历史 ciphertext。`LANGGRAPH_AES_FALLBACK_KEYS` 用于解密用旧密钥创建的、带标签的 ciphertext。
+
+5. 保持旧密钥处于配置状态，直到 telemetry 确认不再需要它们。
+
+<Warning>
+- 在每个 replica 都能解密这两个密钥之前，绝不要更改 primary key。
+- 惰性轮换只更新被访问的行。冷数据和 compare-and-swap 未命中可能保留旧 ciphertext。
+- 过早移除密钥可能导致保留的数据无法读取。
+- 一旦存在 key envelope ciphertext，不支持 envelope 的 Agent Server 版本就无法读取它。
+</Warning>
+
+## Related
+
+- [选择加密方式](/langsmith/encryption)
+- [配置自定义加密](/langsmith/custom-encryption)

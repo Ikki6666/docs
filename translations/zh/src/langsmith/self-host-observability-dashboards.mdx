@@ -1,0 +1,166 @@
+---
+title: 使用 Datadog 或 Grafana 监控自托管 LangSmith
+sidebarTitle: 可观测性仪表板
+description: 将带标签页的 SmithDB 和 Sandbox 仪表板导入你自己的监控实例，并配置组件 telemetry 采集。
+---
+
+LangSmith Self-Hosted 仪表板将运维指标分组到 SmithDB 和 Sandboxes 标签页中。你可以用它们监控运行在你自己的基础设施中的组件，每个监控平台使用一个仪表板。
+
+从 [LangSmith observability bundle](https://github.com/langchain-ai/helm/tree/main/charts/langsmith/examples/langsmith-observability) 下载仪表板定义和采集示例，并将它们导入你自己的 Datadog 组织或 Grafana 实例。请从 repository 下载这些文件，而不是 Helm chart 归档。这些下载内容只包含查询，不包含 telemetry，也不提供对 LangChain 托管监控的访问。
+
+## 选择平台
+
+这两个仪表板的组件组织方式相同，但数据源和覆盖范围不同。
+
+| 覆盖范围 | Datadog | Grafana with Prometheus |
+| --- | --- | --- |
+| SmithDB 指标和 LangSmith 摄取路径 | 包含 | 包含 |
+| Sandbox host 容量、生命周期、执行、资源、网络和健康状态 | 包含 | 包含 |
+| JuiceFS mount 指标 | 可选的单独抓取 | 可选的单独抓取 |
+| Sandbox API/APM 视图 | 可选的 Datadog APM | 不包含 |
+| AWS/GCP bucket 指标 | 可选的云集成 | 不包含 |
+
+Grafana 的 Sandbox 标签页不假定 Prometheus 中存在来自 Datadog 的指标。即使没有 APM，host 侧的命令计数和时长仍然可用。抓取时机、rollup 和 counter 外推的差异也意味着两个平台显示的数值可能不同。
+
+## 检查前置条件
+
+使用已有的[自托管 LangSmith 部署](/langsmith/deploy-self-hosted-full-platform)和监控安装。只为你自己运维的组件启用采集。这些示例不会安装监控软件，也不会启用 SmithDB 或 sandbox。
+
+- **Datadog**：使用带 Kubernetes Autodiscovery 的 Agent 和 [OpenMetrics integration](https://docs.datadoghq.com/integrations/openmetrics/)。Sandbox 注解要求 Agent 7.36 或更高版本。
+- **Grafana**：使用 Grafana 13 或更高版本以获得原生标签页和 V2 dashboard 资源格式。配置已有的 Prometheus data source。
+- **私有连接**：collector 需要访问组件的 metrics endpoint。不要通过公共 ingress 暴露它们。Sandbox host 使用节点网络，因此请通过节点防火墙配置限制访问。
+- **权限**：你需要有导入仪表板和更新采集配置的权限。Prometheus pod 发现需要访问所选的 Kubernetes namespace。
+
+通过你已有的监控安装配置凭证，而不是通过这些示例。保留 collector 的 tolerations，让采集也能在专用的 sandbox 节点上运行。
+
+对于 Sandbox 采集，chart 必须支持 `sandboxes.sandboxHost.deployment.podAnnotations`，并且部署必须使用 `sandbox-host` Firecracker runtime。请检查已安装 chart 的 values schema。较旧的 runtime 版本可能不会发出每个指标。
+
+## 采集组件指标
+
+每个组件在 bundle 的 `components/` 目录下都有自己的配置。
+
+### SmithDB
+
+按照[配置 SmithDB 可观测性](/langsmith/self-host-smithdb-observability)操作，并使用 `components/smithdb/` 中合适的采集示例。这些示例还会从 ingest queue 和 platform-backend 采集摄取路径指标。
+
+Datadog 下载内容默认为 SmithDB 指标使用 `smithdb.` 前缀；Grafana 使用原始 Prometheus 名称。关于指标含义，请参见 [SmithDB metrics 参考](/langsmith/self-host-smithdb-metrics)。Datadog 的 SmithDB error-log 面板还要求 logs 匹配 `service:smithdb*`。
+
+如果你的 collector 使用其他 namespace，请从 Helm repository 的本地副本重新生成仪表板：
+
+```bash
+python3 charts/langsmith/examples/langsmith-observability/generate_dashboards.py \
+  --smithdb-metrics-prefix custom_smithdb.
+```
+
+请包含末尾的点；或者传入 `--smithdb-metrics-prefix ''` 以使用不带前缀的 SmithDB 指标。该选项只改变 SmithDB 指标名称及其在 Datadog 导出中的前缀说明。Grafana、Sandbox 查询、不带前缀的 `langsmith_*` 指标以及 log 过滤器保持不变。
+
+生成器不会修改采集设置。请让 SmithDB OpenMetrics namespace 与前缀匹配：对示例使用 `namespace: custom_smithdb`，对不带前缀的指标使用空 namespace。
+
+### 使用 Datadog 采集 Sandbox
+
+Sandbox host 在端口 `19190` 上导出指标。如需采集并导入它们：
+
+1. 下载根目录的 `datadog-dashboard.json` 以及 `components/sandboxes/datadog-values.yaml` 中的 values。
+2. 将 OpenMetrics 注解合并到你已有的 release values 中。Helm 字符串会替换整个注解，而不是单个 JSON 实例。请整理已有的 checks 以避免重复抓取。
+3. 通过你的 release manager 应用 values，并使用你当前运行的相同 chart 版本。pod 注解的更改会滚动重启 sandbox-host pods 并暂停其中正在运行的 sandbox。请在维护窗口内安排这次更新。
+4. 检查 Agent 的抓取状态，确认 `langsmith_sandbox_host_live_sandboxes` 和 `langsmith_sandbox_host_juicefs_mount_ready` 已到达 Datadog。
+5. 导入仪表板 JSON 并打开 Sandboxes 标签页。
+
+host 示例不添加指标 namespace 前缀。Datadog counter 使用 `.count` 而不是 `_total`。采集会在 distribution 之外保留 histogram 的 `.sum` 和 `.count` 序列；host 时长图表用它们计算平均值。请检查你的 Datadog 计划中的自定义指标用量和 label 基数。
+
+### 使用 Grafana 采集 Sandbox
+
+Grafana 标签页使用来自 host 和可选 JuiceFS mount 的 Prometheus 指标。如需配置采集：
+
+1. 将 `components/sandboxes/prometheus/host-scrape.yaml` 中的 `scrape_configs` 条目合并到你已有的 Prometheus 配置中。这个文件不是 Helm values。
+2. 替换 namespace 和 cluster 占位符。每个 host listener 保留一个抓取 job。示例会选择 `sandbox-host` container 及其声明的 `19190` 端口，并附加 namespace、cluster、pod 和 instance 标签。
+3. （可选）在确认可以通过私有网络访问 mount 在端口 `9567` 上的 metrics listener 后，合并 `juicefs-scrape.yaml`。
+4. 检查 target 健康状态，确认 host 指标已到达 Prometheus。
+5. 导入根目录的 `grafana-dashboard.json`。选择共享的 Data source 和 Namespace(s)，然后选择 Sandbox cluster。如果组件位于不同 namespace，请同时选择两个 namespace。
+
+这些示例使用 `scrape_protocols` 请求 Prometheus 文本格式，以保留 JuiceFS counter 命名。它们已用 Prometheus 3.5.0 验证；如果你运行较旧的版本，请检查配置兼容性。这些文件不会创建额外的 Kubernetes 权限或公共网络资源。
+
+## 选择你的部署
+
+共享选择器适用于 telemetry 含义相同的组件标签页。在解读 ready-host 或 desired-replica 计数之前，请只选择一个 Sandbox pool。你可以在不选择额外 Sandbox pool 的情况下包含单独的 SmithDB namespace。
+
+| Datadog 过滤器 | Tag | 范围 |
+| --- | --- | --- |
+| `env` | `env` | SmithDB、Sandbox host、JuiceFS 和 APM |
+| `cluster` | SmithDB 用 `cluster_name`；Sandbox host 和 JuiceFS 用 `kube_cluster_name` | 共享 cluster 选择 |
+| `namespace` | `kube_namespace` | SmithDB、Sandbox host 和 JuiceFS |
+| `api_service` | `service` | 仅 Sandbox APM |
+| `gcs_bucket` | `bucket_name` | 仅 GCS storage |
+| `s3_bucket` | `bucketname` | 仅 S3 storage |
+
+Datadog cluster 选择器默认从 `cluster_name` 发现值。如果你的账号只暴露 `kube_cluster_name`，请将其用作选择器的 tag key。查询使用 `$cluster.value` 配合每个组件显式的 tag key，因此更改选择器不会重新打标指标。tag key 必须使用匹配的 cluster 名称值。如果你的指标使用其他 tag key，请同时更新相关的查询过滤器和 group-by 子句。
+
+APM 只使用 `env` 和 `api_service`；云指标使用各自的 bucket 选择器。API service 和 bucket 选择器遵循共享过滤器。Datadog 将溢出控制放在其 additional-variable 菜单中。
+
+Grafana 显示三个控件：Data source、Namespace(s) 和 Sandbox cluster。Data source 和 Namespace(s) 适用于两个标签页。namespace 列表包含 SmithDB 和 Sandbox 指标 namespace，并支持多选。Sandbox cluster 只适用于 Sandboxes，因为 SmithDB 采集示例不保证存在 `cluster` 标签。
+
+Grafana 的 `sandbox_job` 和 `juicefs_job` 变量默认为 All，并在常规标头中隐藏。要区分采集 job，请编辑它们保存的值，或在变量设置中取消隐藏。即使这些过滤器选择 All，也要避免重复抓取。使用独立 Prometheus backend 的安装必须自定义组件面板和变量的 data source 引用；默认 bundle 只使用一个 backend。
+
+仪表板过滤器不是访问控制；请使用监控实例的权限来控制对 telemetry 的访问。
+
+## 解读 Sandbox 面板
+
+这些仪表板会区分最近的 fleet 快照和历史趋势。它们精心设计的网格混合使用不同面板宽度，而不是强制两列布局。紧凑的趋势图共享三面板行。密集图表和存储对比使用半宽面板，长标签排名拥有更多空间。当某个部分有两张头条卡片时，它们保持成对排列。
+
+- **Fleet 快照**：计数和 host 排名使用五分钟面板窗口。Datadog 的每 host 样本最多对齐 60 秒。Grafana 在时间范围末尾评估快照 gauge，并要求 60 秒内有样本。
+- **Pool 计数**：ready 和 desired 计数使用 `max`，而不是累加多次 leader 报告。它们描述的是单个所选 pool，而不是所有 pool 的总和。desired-replica 目标只在 autoscaling 活跃时更新。
+- **计数**：排名和错误总数跟随所选时间范围。Grafana 在聚合前使用 `increase` 来处理 counter 重置。由于 Prometheus 会对抓取边界做外推，其计数可能是小数。
+- **时长**：host 图表显示的是平均值，而不是百分位数。Datadog 的公共 HTTP endpoint 排名使用整个窗口的 p95，而不是各区间百分位数的平均值。
+
+Grafana 时间序列计数面板显示 `$__rate_interval` 上的滚动增量，而不是互不相交的 Datadog bucket。图例统计汇总的是绘制的点，而不是整个时间范围的事件加权统计。失败汇总包含没有记录 stage 的错误。缺失数据意味着未知，而不是零。
+
+## 配置可选 telemetry
+
+JuiceFS 与 host 分开导出 `juicefs_*` 指标。对于 Datadog，`datadog-juicefs-values.yaml` 会替换仅含 host 的 values 文件，并采集两个 listener。对于 Prometheus，请添加单独的 JuiceFS job。
+
+JuiceFS 默认使用 loopback。这些示例不会更改它的 listener。如果你更改 bind address，请将其限制在预期的私有网络内，并保留已有的 mount 选项。mount 配置的更改还需要一次 host rollout。请单独配置外部管理的 mount，并避免重复抓取。由于 sparse image 和 copy-on-write 克隆，逻辑文件系统大小与物理 bucket 用量不同。
+
+Datadog 的可选 API widget 使用 `trace.http.request`、`trace.http.request.hits` 和 `trace.http.request.errors`。按照[导出 LangSmith telemetry](/langsmith/export-backend#traces)操作，并选择一个 `api_service` 以避免重复计数。请在你的账号中核实名称，因为 OpenTelemetry instrumentation 可能不同。公共 API 面板不包含内部上报，内部上报有自己的部分。HTTP 延迟不包含流式和 service-proxy 流量；单独的面板显示连接时长。APM 错误标记和 HTTP 5xx 响应是独立的信号。
+
+对于 Datadog bucket 面板，请启用相应的 AWS 或 GCP 集成，并选择确切的 JuiceFS bucket。占位符默认值不选择任何 bucket。Grafana 提供的 Sandbox 标签页不包含这些 API/APM 或 provider storage 集成。
+
+## 预览 Datadog Sandbox 标签页
+
+Datadog 预览显示了共享过滤器、组件标签页和带颜色的 Sandbox 部分。其图表展示的是匿名化的开发 telemetry，而不是性能基准。
+
+![Datadog 仪表板，带共享部署过滤器、SmithDB 和 Sandboxes 标签页、带颜色的部分以及启动路径图表](/images/sandbox-dashboard-datadog-overview.png)
+
+<Accordion title="公共 API 流量和延迟">
+  ![Sandbox API 按状态的请求、延迟百分位数和 endpoint 排名](/images/sandbox-dashboard-api.png)
+</Accordion>
+
+<Accordion title="生命周期操作和失败">
+  ![Sandbox 操作错误、操作速率以及按结果和阶段划分的创建时长](/images/sandbox-dashboard-lifecycle.png)
+</Accordion>
+
+## 预览 Grafana Sandbox 标签页
+
+Grafana 预览显示了共享过滤器和混合宽度的 Sandbox 面板。其图表使用合成的示例数据，而不是实时 telemetry 或性能基准。
+
+![Grafana 仪表板，带共享 data source 和 namespace 选择器、组件标签页以及混合宽度的 Sandbox 图表](/images/sandbox-dashboard-grafana-overview.png)
+
+## 更新已有仪表板
+
+导入替换内容之前，请备份自定义的仪表板。Datadog JSON 导入会覆盖已有仪表板内容。统一 Grafana 导出使用的 UID 与旧版 SmithDB 仪表板不同；保存前请检查导入目标。
+
+原来的 `smithdb-observability/` 目录已被移除。请更新书签和自动化，改用统一 bundle 的下载路径；已导入的仪表板不受影响。
+
+对于没有原生标签页的 Grafana 安装，请下载 [Classic 格式的独立 SmithDB 仪表板](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/examples/langsmith-observability/components/smithdb/grafana.json)。它只包含 SmithDB 面板。这些仪表板示例不需要已弃用的 LangSmith Observability Helm chart。
+
+## 排查数据缺失
+
+在解读空的失败图表之前，请先检查 collector 健康状态和一个持续导出的 gauge。在事件发生之前，counter 可能没有序列。在抓取之前退出的进程可能丢失其最后一次 counter 增量；在排查退出时请检查 logs。
+
+对于空的可选部分，请在更改 runtime 之前检查集成可用性、指标名称和选择器值。
+
+## 另请参阅
+
+- [导出 LangSmith telemetry](/langsmith/export-backend)
+- [配置 SmithDB 可观测性](/langsmith/self-host-smithdb-observability)
+- [配置 observability collector](/langsmith/langsmith-collector)
+- [LangSmith sandbox](/langsmith/sandboxes)

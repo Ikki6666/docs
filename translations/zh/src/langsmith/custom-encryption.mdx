@@ -1,0 +1,388 @@
+---
+title: 配置自定义静态加密
+sidebarTitle: 自定义加密
+---
+
+Custom encryption 让 Agent Server 使用你的 encryption handler 来实现 per-tenant key 和外部 key management system。除非你需要这些能力，否则请使用 [内置 AES 加密](/langsmith/aes-encryption)。
+
+<Warning>
+Agent Server 0.5.34–0.6.21 包含 custom encryption 的预发布版本。使用这些版本加密的数据，在升级到 0.6.22+ 时会被损坏。不要在这些版本上使用 custom encryption。
+</Warning>
+
+<Warning>
+只有在内置 AES 加密不能满足需求时才应使用 custom encryption。Custom encryption 要求你自己实现并维护 encryption handler，也会增加运维复杂度。如果你只需要静态密钥、key rotation 或可选的选择性字段加密，请改用 [内置 AES 加密](/langsmith/aes-encryption)。
+</Warning>
+
+以下场景适合使用 custom encryption：
+
+- **Per-tenant key isolation**，按租户隔离密钥，不同客户使用不同加密密钥
+- **KMS integration**，与 AWS KMS、Google Cloud KMS 或 HashiCorp Vault 集成，实现密钥管理、轮换和审计日志
+
+## 配置 custom encryption
+
+### 工作原理
+
+1. 在 `langgraph.json` 中 [Configure](#configuration) encryption module 路径
+2. [定义一个 encryption context handler](#define-encryption-context)，从已认证用户中推导出 tenant ID 等值
+3. [定义你的 encryption module](#defining-your-encryption-module)，为 blob 和 JSON 加密提供 handler
+4. Agent Server 会在存储数据前和读取数据后调用你的 handler
+
+如果是带有 key rotation 和 audit logging 的生产部署，请参阅 [Envelope encryption with AWS Encryption SDK](#envelope-encryption-with-aws-encryption-sdk)。
+
+### 配置
+
+把你的 encryption module 添加到 `langgraph.json`：
+
+```json
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./agent.py:graph"
+  },
+  "encryption": {
+    "path": "./encryption.py:encryption"
+  }
+}
+```
+
+<Note>
+如果你正从 basic encryption 迁移，请保留 `LANGGRAPH_AES_KEY` 配置。Custom encryption 负责新写入的数据，而已有的 AES 加密数据仍然可以被读取。
+</Note>
+
+### 定义 encryption context
+
+使用 `@encryption.context` 从已认证用户中推导 encryption context：
+
+```python
+from langgraph_sdk import Encryption, EncryptionContext
+from starlette.authentication import BaseUser
+
+encryption = Encryption()
+
+
+@encryption.context
+async def get_encryption_context(user: BaseUser, ctx: EncryptionContext) -> dict:
+    return {
+        **ctx.metadata,
+        "tenant_id": user.identity,
+    }
+```
+
+这个 handler 会在每次请求中，于认证完成后执行一次。它返回的 dictionary 会成为该请求中所有加密操作的 `ctx.metadata`，并以明文存储，以便 Agent Server 在解密时恢复它。只包含非机密的标识符和路由 metadata，绝不包含 key、token 或 credential。
+
+### 定义你的 encryption module
+
+#### Blob 加密（checkpoint）
+
+Blob handler 用于加密 checkpoint 数据，也就是 graph 执行过程中序列化后的 state。下面是一个简化示例，使用 [Fernet](https://cryptography.io/en/latest/fernet/)，来自 `cryptography` library 的对称加密方案，按租户使用不同密钥：
+
+```python
+import os
+from cryptography.fernet import Fernet
+from langgraph_sdk import EncryptionContext
+
+# In production, fetch from a secrets manager
+TENANT_KEYS = {
+    "tenant-a": Fernet(os.environ["TENANT_A_KEY"]),
+    "tenant-b": Fernet(os.environ["TENANT_B_KEY"]),
+}
+
+
+def _get_fernet(ctx: EncryptionContext) -> Fernet:
+    tenant_id = ctx.metadata.get("tenant_id")
+    if not tenant_id or tenant_id not in TENANT_KEYS:
+        raise ValueError(f"Unknown tenant: {tenant_id}")
+    return TENANT_KEYS[tenant_id]
+
+
+@encryption.encrypt.blob
+async def encrypt_blob(ctx: EncryptionContext, data: bytes) -> bytes:
+    return _get_fernet(ctx).encrypt(data)
+
+
+@encryption.decrypt.blob
+async def decrypt_blob(ctx: EncryptionContext, data: bytes) -> bytes:
+    return _get_fernet(ctx).decrypt(data)
+```
+
+`ctx.metadata` dictionary 来自 context handler，因此每个 encryption handler 都能选择正确的密钥。
+
+#### JSON 加密（metadata）
+
+JSON handler 用于加密结构化数据，例如 thread metadata、assistant context 和 run kwargs。与 blob 加密不同，JSON 加密由你决定加密哪些字段，因此你可以保留部分字段不加密，以支持搜索和过滤。
+
+```python
+import json
+import os
+from cryptography.fernet import Fernet
+from langgraph_sdk import EncryptionContext
+
+TENANT_KEYS = {
+    "tenant-a": Fernet(os.environ["TENANT_A_KEY"]),
+    "tenant-b": Fernet(os.environ["TENANT_B_KEY"]),
+}
+
+SKIP_FIELDS = {
+    "tenant_id", "owner",
+    "run_id", "thread_id", "graph_id", "assistant_id", "user_id", "checkpoint_id",
+    "source", "step", "parents", "run_attempt",
+    "langgraph_version", "langgraph_api_version", "langgraph_plan", "langgraph_host",
+    "langgraph_api_url", "langgraph_request_id", "langgraph_auth_user",
+    "langgraph_auth_user_id", "langgraph_auth_permissions",
+}
+ENCRYPTED_PREFIX = "encrypted:"
+
+
+def _get_fernet(ctx: EncryptionContext) -> Fernet:
+    tenant_id = ctx.metadata.get("tenant_id")
+    if not tenant_id or tenant_id not in TENANT_KEYS:
+        raise ValueError(f"Unknown tenant: {tenant_id}")
+    return TENANT_KEYS[tenant_id]
+
+
+@encryption.encrypt.json
+async def encrypt_json(ctx: EncryptionContext, data: dict) -> dict:
+    fernet = _get_fernet(ctx)
+    result = {}
+    for k, v in data.items():
+        if k in SKIP_FIELDS or v is None:
+            result[k] = v
+        else:
+            value_json = json.dumps(v)
+            encrypted = fernet.encrypt(value_json.encode()).decode()
+            result[k] = ENCRYPTED_PREFIX + encrypted
+    return result
+
+
+@encryption.decrypt.json
+async def decrypt_json(ctx: EncryptionContext, data: dict) -> dict:
+    fernet = _get_fernet(ctx)
+    result = {}
+    for k, v in data.items():
+        if isinstance(v, str) and v.startswith(ENCRYPTED_PREFIX):
+            encrypted_value = v[len(ENCRYPTED_PREFIX):]
+            decrypted = fernet.decrypt(encrypted_value.encode()).decode()
+            result[k] = json.loads(decrypted)
+        else:
+            result[k] = v
+    return result
+```
+
+#### JSON 加密注意事项
+
+<Warning>
+**Encrypted fields cannot be searched or filtered.** 设计 metadata schema 时，请确保你仍需查询的字段保持未加密状态。
+</Warning>
+
+<Warning>
+**JSON encryptors must preserve key structure.** SQL JSONB merge 操作是按 key 级别进行的。任何会改变 key 的加密器，无论是把敏感字段集中到 `__encrypted__` 之类字段中，还是把 key 名本身加密，都会在 merge 时造成数据丢失。请使用按 key 加密的方式：保留原 key，只在原地转换其 value。
+</Warning>
+
+<Note>
+**Migration consideration:** 请给加密值使用可识别的前缀或格式，这样 decryptor 就能识别并跳过尚未加密的数据。这使你可以在未来逐步增加需要加密的字段，而无需重新加密已有记录。上面的示例就使用了这种模式。
+</Note>
+
+<Note>
+**Performance consideration:** 按 key 加密意味着每个字段都要执行一次加密调用。如果你的加密流程依赖外部服务往返，例如 KMS，这会明显增加延迟。可考虑在本地缓存 data key，或使用 envelope encryption，即用 KMS 加密一个本地 data key，再用它加密多个字段。
+</Note>
+
+用于 authorization filter 的字段，例如 `tenant_id`、`owner`，必须保持不变且**未加密**，用于搜索和过滤的字段也是如此。如果自定义加密器更改了 authorization filter 字段，Agent Server 会拒绝写入。此外，**某些系统管理的字段永远不会被加密**：
+
+- 资源标识符，例如 `thread_id`、`run_id`、`assistant_id`、`graph_id`、`checkpoint_id`、`task_id`
+- 具名的 LangGraph 系统字段，例如 `langgraph_version`、`langgraph_api_version`、`langgraph_plan`、`langgraph_host`、`langgraph_api_url`、`langgraph_request_id`、`langgraph_auth_user`、`langgraph_auth_user_id`、`langgraph_auth_permissions`
+- 必需的 checkpoint metadata，例如 `source`、`step`、`parents`、`run_attempt`
+- 用于调度和编排的具名内部字段，包括 `__after_seconds__` 和 `__request_start_time_ms__`
+- 在 run 的 `config` 中声明的 run 级执行限制，例如 `max_concurrency`、`recursion_limit`
+- 在 run 的 `config.configurable` 中声明的 thread TTL 更新，例如 `ttl`
+
+
+#### 哪些数据会被加密
+
+**JSON handler**，`@encryption.encrypt.json` / `@encryption.decrypt.json`，会递归应用到以下字段：
+- `thread.metadata`、`thread.values`
+- `assistant.metadata`、`assistant.context`
+- `run.metadata`、`run.kwargs`
+- `cron.metadata`、`cron.payload`
+- `store.value`
+
+[部分字段会被排除在加密之外。](#json-encryption-considerations) 除非另有说明，这些排除规则会作用于嵌套 JSON 对象的每一层，而不仅是根层。
+
+**Blob handler**，`@encryption.encrypt.blob` / `@encryption.decrypt.blob`，会应用到 checkpoint blob，也就是 graph execution state。
+
+
+### 惰性轮换 custom encryption key
+
+<Note>
+惰性重新加密要求 Agent Server 版本为 `0.14.0` 或更高，Python SDK 版本为 `langgraph-sdk>=0.4.3`，使用 PostgreSQL checkpointer 并设置 `PREFER_GRPC_CHECKPOINTER=true`，以及设置 `LANGGRAPH_STORE_BACKEND=grpc`。
+</Note>
+
+当 decrypt handler 用旧密钥解密数据时，可以在 blob 或 JSON decrypt handler 中返回 `DecryptResult`。它的 `plaintext` 值会返回给调用方，它的 `replacement` 值是新的 ciphertext，供 Agent Server 持久化。
+
+例如，把上面的 blob decrypt handler 替换为下面这个：先尝试当前租户密钥，当 legacy key 解密成功时返回 replacement ciphertext：
+
+```python
+import os
+
+from cryptography.fernet import Fernet, InvalidToken
+from langgraph_sdk import DecryptResult, EncryptionContext
+
+LEGACY_TENANT_KEYS = {
+    "tenant-a": [Fernet(os.environ["TENANT_A_LEGACY_KEY"])],
+    "tenant-b": [Fernet(os.environ["TENANT_B_LEGACY_KEY"])],
+}
+
+
+@encryption.decrypt.blob
+async def decrypt_blob(
+    ctx: EncryptionContext, data: bytes
+) -> bytes | DecryptResult[bytes]:
+    current_key = _get_fernet(ctx)
+    try:
+        return current_key.decrypt(data)
+    except InvalidToken:
+        tenant_id = ctx.metadata["tenant_id"]
+        for legacy_key in LEGACY_TENANT_KEYS.get(tenant_id, []):
+            try:
+                plaintext = legacy_key.decrypt(data)
+                return DecryptResult(
+                    plaintext=plaintext,
+                    replacement=current_key.encrypt(plaintext),
+                )
+            except InvalidToken:
+                continue
+        raise
+```
+
+JSON decrypt handler 可以用同样的方式返回 `DecryptResult[dict]`。replacement 的形状必须与对应 encrypt handler 的普通结果一致。
+
+Agent Server 通过 compare-and-swap 操作写入 replacement，因此不会覆盖并发更新。重新加密是 best effort：如果存储的值在写回前发生变化，或写回失败，读取仍然会成功。
+
+<Warning>
+惰性重新加密只在读取数据时更新它。在未读数据可能仍需要旧密钥时，请保持旧密钥可用。
+</Warning>
+
+### 监控惰性重新加密
+
+Agent Server 会为 replacement writeback 发出以下 INFO 级别的 [internal metrics](/langsmith/self-hosted-agent-server-metrics#internal-metrics)：
+
+| 指标 | 含义 |
+|--------|---------|
+| `lg_api_reencrypt_writeback_succeeded_counter` | replacement ciphertext 已被存储。 |
+| `lg_api_reencrypt_writeback_cas_skipped_counter` | 并发更新在写回前更改了存储的值。Agent Server 保留了较新的值，未做更改。 |
+| `lg_api_reencrypt_writeback_failed_counter` | Agent Server 无法写入 replacement。读取仍然成功。 |
+
+每个指标都包含 `reencryption_table` 和 `reencryption_column` 属性。可以用它们找到仍在读取旧 ciphertext 的位置，并隔离 writeback 失败。
+
+CAS 未命中会产生带有 `Re-encryption writeback skipped due to concurrent update` 的 warning log。失败会产生带有 `Re-encryption writeback failed` 的 error log。两者都包含 table 和 column。成功的 writeback 不会产生 log。
+
+对于 Prometheus，设置 `EXPOSE_INTERNAL_METRICS_PROMETHEUS=true` 并抓取 Agent Server 的 `/metrics` endpoint。Internal metrics 也可以通过文档中描述的 Datadog export 获取。
+
+这些 counter 度量的是 writeback 结果，而不是剩余旧 ciphertext 的数量。一段没有新 writeback 的时间并不能证明每条记录都已被读取并轮换。在你的 retention policy 或单独的穷举式迁移确认没有未读数据需要旧密钥之前，请保持旧密钥可用。
+
+### 使用 AWS Encryption SDK 的 envelope encryption
+
+如果你在 AWS 上做生产部署，建议使用 [AWS Encryption SDK](https://docs.aws.amazon.com/encryption-sdk/latest/developer-guide/python.html) 配合 AWS KMS，或者在你的云服务商中使用等价方案。这个方式可以：
+
+- 自动处理 envelope encryption，无需手动封装 key
+- 提供 key rotation 和 audit logging
+- 把 ciphertext 与 encryption context 绑定，实现 tenant isolation
+- 在本地缓存 data key，避免反复调用 KMS 造成的延迟和限流
+
+#### 完整示例
+
+```python
+import base64
+import json
+import os
+
+import aws_encryption_sdk
+from aws_encryption_sdk import (
+    CachingCryptoMaterialsManager,
+    CommitmentPolicy,
+    LocalCryptoMaterialsCache,
+    StrictAwsKmsMasterKeyProvider,
+)
+from langgraph_sdk import Encryption, EncryptionContext
+
+encryption = Encryption()
+
+# The SDK uses envelope encryption: one KMS API call generates a data key,
+# then encrypts/decrypts locally. The cache reuses data keys across operations.
+client = aws_encryption_sdk.EncryptionSDKClient(
+    commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT
+)
+key_provider = StrictAwsKmsMasterKeyProvider(key_ids=[os.environ["KMS_KEY_ARN"]])
+cache = LocalCryptoMaterialsCache(capacity=100)
+cmm = CachingCryptoMaterialsManager(
+    master_key_provider=key_provider,
+    cache=cache,
+    max_age=300.0,
+    max_messages_encrypted=100,
+)
+
+SKIP_FIELDS = {
+    "tenant_id", "owner",
+    "run_id", "thread_id", "graph_id", "assistant_id", "user_id", "checkpoint_id",
+    "source", "step", "parents", "run_attempt",
+    "langgraph_version", "langgraph_api_version", "langgraph_plan", "langgraph_host",
+    "langgraph_api_url", "langgraph_request_id", "langgraph_auth_user",
+    "langgraph_auth_user_id", "langgraph_auth_permissions",
+}
+ENCRYPTED_PREFIX = "encrypted:"
+
+
+@encryption.encrypt.blob
+async def encrypt_blob(ctx: EncryptionContext, data: bytes) -> bytes:
+    ciphertext, _ = client.encrypt(
+        source=data,
+        materials_manager=cmm,
+        encryption_context={"tenant_id": ctx.metadata["tenant_id"]},
+    )
+    return ciphertext
+
+
+@encryption.decrypt.blob
+async def decrypt_blob(ctx: EncryptionContext, data: bytes) -> bytes:
+    plaintext, _ = client.decrypt(source=data, key_provider=key_provider)
+    return plaintext
+
+
+@encryption.encrypt.json
+async def encrypt_json(ctx: EncryptionContext, data: dict) -> dict:
+    tenant_id = ctx.metadata["tenant_id"]
+    result = {}
+    for k, v in data.items():
+        if k in SKIP_FIELDS or v is None:
+            result[k] = v
+        else:
+            ciphertext, _ = client.encrypt(
+                source=json.dumps(v).encode(),
+                materials_manager=cmm,
+                encryption_context={"tenant_id": tenant_id},
+            )
+            result[k] = ENCRYPTED_PREFIX + base64.b64encode(ciphertext).decode()
+    return result
+
+
+@encryption.decrypt.json
+async def decrypt_json(ctx: EncryptionContext, data: dict) -> dict:
+    result = {}
+    for k, v in data.items():
+        if isinstance(v, str) and v.startswith(ENCRYPTED_PREFIX):
+            ciphertext = base64.b64decode(v[len(ENCRYPTED_PREFIX):])
+            plaintext, _ = client.decrypt(source=ciphertext, key_provider=key_provider)
+            result[k] = json.loads(plaintext.decode())
+        else:
+            result[k] = v
+    return result
+```
+
+这里的 `encryption_context` 会通过 KMS 被加密绑定到 ciphertext 上，如果 context 不匹配，解密就会失败。由于 context 已嵌入 ciphertext，因此 decrypt handler 不需要再引用 `ctx.metadata`。
+
+#### Key rotation
+
+KMS 会自动轮换同一 key ID 的 backing material。旧的加密 data key 仍然可以解密，因此已有数据无需重新加密。
+
+## Related
+
+- [自定义身份验证](/langsmith/custom-auth)
