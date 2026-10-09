@@ -1,4 +1,4 @@
-.PHONY: all dev dev-zh build build-zh zh-status zh-stamp zh-sync export htmltest export-htmltest format lint test install install_vale clean lint_md lint_md_fix lint_prose broken-links broken-links-with-anchors format-check code-snippets test-code-samples update-code-sample-traces check-cross-refs skills start-static start-dev
+.PHONY: all dev dev-zh build build-zh zh-status zh-stamp zh-sync export htmltest export-htmltest format lint test install install_vale clean lint_md lint_md_fix lint_prose broken-links broken-links-with-anchors format-check code-snippets test-code-samples update-code-sample-traces check-cross-refs skills start-static start-dev mintlify-deploy-zh
 
 # Default target
 all: help
@@ -268,6 +268,13 @@ skills:
 	@for l in .claude/skills/*; do \
 		if [ -L "$$l" ] && [ ! -e "$$l" ]; then rm "$$l"; echo "Removed stale link $$l"; fi; \
 	done
+
+# Sync the Chinese build output to the Mintlify deploy branch (orphan branch
+# holding generated content only; Mintlify builds the branch directly).
+# Optional: pass --no-build to reuse the existing build/ directory.
+mintlify-deploy-zh:
+	@chmod +x scripts/sync_mintlify_deploy.sh
+	@./scripts/sync_mintlify_deploy.sh $(MINT_DEPLOY_ARGS)
 
 help:
 	@echo "Available commands:"
