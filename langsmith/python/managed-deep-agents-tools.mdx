@@ -1,0 +1,180 @@
+---
+title: Add custom tools to Managed Deep Agents
+sidebarTitle: Tools
+description: 为 managed deep agent 项目定义自编写 tools。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/python/langsmith/managed-deep-agents-public-beta-note.mdx';
+
+Custom tools 是 agent 可以调用的应用代码，用于获取实时数据、查询数据库、执行代码以及执行操作。与 [instructions](/langsmith/python/managed-deep-agents-instructions) 和 [skills](/langsmith/python/managed-deep-agents-skills) 不同，MDA 不会自动发现它们。
+
+要从远程 MCP server 加载 tools，请参见 [Connect to MCP servers](/langsmith/python/managed-deep-agents-mcp-connectors)。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+把自编写 tools 放在 `tools/` 目录下，将它们导入 agent 入口文件，并传给 agent 定义：
+
+```text
+my-agent/
+  agent.py
+  tools/
+    customer.py
+```
+
+
+
+
+完整的项目布局请参见 [Project structure](/langsmith/python/managed-deep-agents-project-structure)。
+
+要在不把 tools 导入 agent 入口的情况下从远程 MCP server 加载 tools，请改用 [MCP connector](/langsmith/python/managed-deep-agents-mcp-connectors)。
+
+MCP connectors 同样声明在 `tools/` 目录下，因此 `tools/mcp.py` 这个文件名被保留用于该声明。
+
+
+
+
+## 添加 tool
+
+自编写 tools 适用于业务逻辑、私有 API、数据库访问，以及其他应放在你的 agent 项目中的代码。
+
+<Steps>
+  <Step title="定义 tool 模块" id="define-a-tool-module">
+
+```python tools/customer.py
+from langchain.tools import tool
+
+
+@tool(parse_docstring=True)
+def lookup_customer(customer_id: str) -> str:
+    """Look up a customer record by ID.
+
+    Args:
+        customer_id: Customer ID from the CRM.
+    """
+    return f"Customer {customer_id} is on the enterprise plan."
+```
+
+
+
+
+请使用清晰且唯一的 tool 名称，以避免命名冲突。关于 LangChain tool 定义的更多信息，请参见 [Tools](/oss/python/langchain/tools)。
+
+  </Step>
+  <Step title="将 tool 挂到 agent 上" id="attach-the-tool">
+
+把 tool 导入项目根目录下的 agent 入口，并放进 `tools` 列表中：
+
+```python agent.py
+from managed_deepagents import define_deep_agent
+
+from tools.customer import lookup_customer
+
+agent = define_deep_agent(
+    name="support-agent",
+    model="openai:gpt-5.5",
+    tools=[lookup_customer],
+)
+```
+
+
+
+
+你的 imports 行为应与普通本地 Python 项目一致。
+
+
+
+
+  </Step>
+  <Step title="添加 human-in-the-loop（可选）" id="human-in-the-loop">
+
+在敏感 tool calls 执行前暂停 agent，让人工可以批准、编辑或拒绝。
+
+你可以在 agent 定义中设置 `interrupt_on`，并根据需要结合 `permissions` 限制工具和文件系统访问：
+
+
+
+
+```python agent.py
+from managed_deepagents import define_deep_agent
+
+from tools.customer import lookup_customer
+
+agent = define_deep_agent(
+    name="support-agent",
+    model="openai:gpt-5.5",
+    tools=[lookup_customer],
+    interrupt_on={"lookup_customer": True},
+)
+```
+
+
+
+
+`interrupt_on` 的行为与 LangChain 的 [human-in-the-loop middleware](/oss/python/langchain/guardrails#human-in-the-loop) 一致。
+
+
+
+
+关于决策类型（approve、edit、reject）、条件中断与 permission 规则，请参见 Deep Agents 的 [Human-in-the-loop](/oss/python/deepagents/human-in-the-loop) 和 [Permissions](/oss/python/deepagents/permissions) 指南。
+
+要恢复暂停的 run，请参见 [Respond to an interrupt](#respond-to-an-interrupt)。
+
+如果希望改为在 tool 自己发布到 Slack 的表单上暂停，请参见 [Agent-owned interrupts](/langsmith/python/managed-deep-agents-agent-owned-interrupts)。
+
+  </Step>
+</Steps>
+
+## 使用 secrets 和 context
+
+Tools 可以通过环境变量读取 deployment secrets。本地开发时，把值写入 `.env`，供 `mda dev` 加载；部署时，`mda deploy` 会把非保留 `.env` 值转发为托管 deployment secrets。
+
+对于 request metadata 或 feature flags 等按 run 变化的值，请使用标准 LangChain 工具运行时 context 模式。请参见 [how to access context from within your tools](/oss/python/langchain/tools#access-context)。
+
+## 部署
+
+`mda dev` 和 `mda deploy` 会把项目文件（包括 `tools/` 目录下的模块）复制到编译后的 build 中。Tools 不会同步到 Context Hub，而是随 agent 代码一起发布。
+
+## 何时使用 tools
+
+| Concept | Kind | How it reaches the agent |
+| --- | --- | --- |
+| **Tools** | 应用代码 | 导入并传给 agent 定义 |
+| **[MCP connectors](/langsmith/python/managed-deep-agents-mcp-connectors)** | 托管配置 | 声明在 `tools/` 目录下的 MCP 模块中；无需导入 agent 入口 |
+| **[Skills](/langsmith/python/managed-deep-agents-skills)** | 托管 context | agent 在相关时加载的步骤说明 |
+| **[Instructions](/langsmith/python/managed-deep-agents-instructions)** | 托管 context | 常驻 system prompt |
+
+更多信息请参见 [Project structure](/langsmith/python/managed-deep-agents-project-structure)。
+
+## 响应 interrupt
+
+当 run 命中 interrupt 时，它会暂停，并在继续之前等待人工响应。
+
+- **本地开发时**，`mda dev` 会在 LangSmith Studio 中运行 agent，你可以在那里查看待执行的 tool call 并恢复 run。
+- **部署后的 agent**，你需要通过 LangGraph server API 发送 `Command(resume=...)` payload 来恢复暂停的 run。请参见 [Human-in-the-loop using server API](/langsmith/add-human-in-the-loop)。
+
+
+
+Human-in-the-loop 依赖持久化 thread state 才能暂停和恢复。托管运行时负责 checkpointer，因此不需要额外配置。
+
+## 使用需要认证的 tools
+
+如果某个 tool 需要 API key 或 OAuth token，请使用 connection 在运行时解析凭据。参见 [Manage connections](/langsmith/python/managed-deep-agents-connections)。
+
+## 访问运行时 context
+
+对于 request metadata 或 feature flags 等按 run 变化的值，请使用标准 LangChain 工具运行时 context 模式。请参见 [how to access context from within your tools](/oss/python/langchain/tools#access-context)。
+
+Managed Deep Agents 添加的 caller、channel 和 sandbox 字段请参见 [Runtime](/langsmith/python/managed-deep-agents-runtime)。
+
+要在 tool 中读写 thread sandbox 中的文件，请使用 `runtime.backend`。参见 [Read and write sandbox files from code](/langsmith/python/managed-deep-agents-sandboxes#read-and-write-sandbox-files-from-code)。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/managed-deep-agents-tools.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

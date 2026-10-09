@@ -1,0 +1,333 @@
+---
+title: 声明式 generative UI
+sidebarTitle: 声明式
+description: 使用 json-render 和 A2UI，从已注册的组件目录中组合智能体生成的界面
+---
+
+## 概览
+
+声明式 generative UI 位于 [generative UI 范围](/oss/python/langchain/frontend/generative-ui-overview) 的中间。智能体发出一个结构化的规格，前端从你预先注册的组件目录中组合出界面。智能体的输出**就是** UI：表单、卡片、仪表盘等，而不是在聊天气泡里渲染文本响应。你定义哪些组件可用（即“目录”），智能体将它们组合成一棵有效的 UI 树。
+
+目录是让这种方式变得安全的护栏：智能体可以自由排列和组合你的组件，但不能超出你批准的集合。这在创造力与可预测性之间取得平衡。长尾需求就落在这里，它以像素级精确换取覆盖面，适合次要交互、内部工具和仪表盘，在这些场景下展示有用的内容比精确控制更重要。本页介绍通过 [json-render](https://json-render.dev) 实现的声明式 generative UI，这是一个 generative UI 框架，用于定义组件目录、用 AI 生成规格，并在 React、Vue、Svelte 和 Angular 上安全地渲染它们。关于 Google 的 A2UI 规格（通过 CopilotKit 集成），参见下文 [A2UI](#a2ui-an-alternative-declarative-spec)。
+
+import { PatternEmbed } from "/snippets/pattern-embed.jsx"
+
+<PatternEmbed pattern="generative-ui" />
+
+## 何时使用这种方式
+
+在产品的长尾需求上使用声明式 generative UI，在这些场景下，智能体可以组合出你没有完全预料到的布局，同时停留在一组你批准的组件之内：次要交互、内部工具和仪表盘。当某个界面是高流量或品牌关键且必须精确时，转向[受控 generative UI](/oss/python/langchain/frontend/controlled-generative-ui)。当你想要界面在你的应用程序之外创建时，转向[开放式 generative UI](/oss/python/langchain/frontend/open-ended-generative-ui)。
+
+## 工作原理
+
+1. **定义目录**：声明 AI 可以使用哪些组件，并带有类型化的 props
+2. **提示 AI**：用自然语言描述你想要的 UI
+3. **AI 生成规格**：一个描述组件树的 JSON 文档
+4. **安全渲染**：json-render 的 `Renderer` 使用你的组件渲染该规格
+
+目录充当护栏：AI 只能使用你定义的组件，其 props 必须匹配你的 schema。输出始终是可预测且安全的。
+
+## 定义组件目录
+
+目录描述 AI 允许使用的每个组件。每个组件都有一个用于其 props 的 Zod schema，以及一段 AI 阅读后知道何时使用它的描述：
+
+```ts
+import { defineCatalog } from "@json-render/core";
+import { schema } from "@json-render/react/schema";
+import { z } from "zod";
+
+const catalog = defineCatalog(schema, {
+  components: {
+    Card: {
+      description: "A card container with optional title and padding",
+      props: z.object({
+        title: z.string().optional(),
+        padding: z.enum(["sm", "md", "lg"]).optional(),
+      }),
+    },
+    Stack: {
+      description: "Layout children vertically or horizontally with consistent spacing",
+      props: z.object({
+        direction: z.enum(["vertical", "horizontal"]).optional(),
+        gap: z.enum(["sm", "md", "lg"]).optional(),
+      }),
+    },
+    TextInput: {
+      description: "A text input field with optional label and placeholder",
+      props: z.object({
+        label: z.string().optional(),
+        placeholder: z.string().optional(),
+        type: z.enum(["text", "email", "password", "number", "textarea"]).optional(),
+      }),
+    },
+    Button: {
+      description: "A clickable button with label and style variants",
+      props: z.object({
+        label: z.string(),
+        variant: z.enum(["primary", "secondary", "ghost", "link"]).optional(),
+        fullWidth: z.boolean().optional(),
+      }),
+    },
+  },
+  actions: {},
+});
+```
+
+<Tip>
+保持目录聚焦。只包含该使用场景下 AI 需要的组件。更小的目录比大而全的方式产生更好的结果。
+</Tip>
+
+## 构建组件注册表
+
+注册表将每个目录组件映射到其实际的渲染实现。使用 `defineRegistry` 获得目录 props 与你的组件函数之间的类型安全绑定：
+
+<CodeGroup>
+
+```tsx React
+import { defineRegistry, Renderer, JSONUIProvider } from "@json-render/react";
+
+const { registry } = defineRegistry(catalog, {
+  components: {
+    Card: ({ props, children }) => (
+      <div className="card">
+        {props.title && <h2>{props.title}</h2>}
+        {children}
+      </div>
+    ),
+    Stack: ({ props, children }) => (
+      <div className={`stack stack-${props.direction ?? "vertical"} gap-${props.gap ?? "md"}`}>
+        {children}
+      </div>
+    ),
+    TextInput: ({ props }) => (
+      <div>
+        {props.label && <label>{props.label}</label>}
+        <input type={props.type ?? "text"} placeholder={props.placeholder} />
+      </div>
+    ),
+    Button: ({ props }) => (
+      <button className={props.variant ?? "primary"}>
+        {props.label}
+      </button>
+    ),
+  },
+});
+```
+
+```vue Vue
+<script setup lang="ts">
+import { h } from "vue";
+import { defineRegistry, Renderer, JSONUIProvider } from "@json-render/vue";
+
+const { registry } = defineRegistry(catalog, {
+  components: {
+    Card: ({ props, children }) =>
+      h("div", { class: "card" }, [
+        props.title ? h("h2", null, props.title) : null,
+        children,
+      ]),
+    Stack: ({ props, children }) =>
+      h("div", { class: `stack stack-${props.direction ?? "vertical"} gap-${props.gap ?? "md"}` }, children),
+    TextInput: ({ props }) =>
+      h("div", null, [
+        props.label ? h("label", null, props.label) : null,
+        h("input", { type: props.type ?? "text", placeholder: props.placeholder }),
+      ]),
+    Button: ({ props }) =>
+      h("button", { class: props.variant ?? "primary" }, props.label),
+  },
+});
+</script>
+```
+
+</CodeGroup>
+
+## 连接到智能体
+
+智能体使用 structured output 返回 json-render 规格。用你的智能体的 assistant ID 设置 `useStream`，然后从 AI 消息的 `tool_calls` 中提取规格：
+
+<CodeGroup>
+
+```tsx React
+import { useStream } from "@langchain/react";
+import { AIMessage } from "langchain";
+
+function GenerativeUI() {
+  const stream = useStream<typeof myAgent>({
+    apiUrl: "http://localhost:2024",
+    assistantId: "generative_ui",
+  });
+
+  const aiMessage = stream.messages.find(AIMessage.isInstance);
+  const rawSpec = aiMessage?.tool_calls?.[0]?.args;
+
+  // ... filter and render (see streaming section below)
+}
+```
+
+```vue Vue
+<script setup lang="ts">
+import { useStream } from "@langchain/vue";
+import { AIMessage } from "langchain";
+import { computed } from "vue";
+
+const stream = useStream<typeof myAgent>({
+  apiUrl: "http://localhost:2024",
+  assistantId: "generative_ui",
+});
+
+const aiMessage = computed(() => stream.messages.value.find(AIMessage.isInstance));
+const rawSpec = computed(() => aiMessage.value?.tool_calls?.[0]?.args);
+</script>
+```
+
+```svelte Svelte
+<script lang="ts">
+  import { useStream } from "@langchain/svelte";
+  import { AIMessage } from "langchain";
+
+  const stream = useStream<typeof myAgent>({
+    apiUrl: "http://localhost:2024",
+    assistantId: "generative_ui",
+  });
+
+  const aiMessage = $derived(stream.messages.find((m) => AIMessage.isInstance(m)));
+  const rawSpec = $derived(aiMessage?.tool_calls?.[0]?.args);
+</script>
+```
+
+```ts Angular
+import { Component } from "@angular/core";
+import { injectStream } from "@langchain/angular";
+import { AIMessage } from "langchain";
+
+@Component({
+  selector: "app-generative-ui",
+  template: `...`,
+})
+export class GenerativeUIComponent {
+  stream = injectStream<typeof myAgent>({
+    apiUrl: "http://localhost:2024",
+    assistantId: "generative_ui",
+  });
+
+  get rawSpec() {
+    const ai = this.stream.messages().find(AIMessage.isInstance);
+    return ai?.tool_calls?.[0]?.args;
+  }
+}
+```
+
+</CodeGroup>
+
+## 流式渐进渲染
+
+在流式输出期间，规格是逐步构建的。元素一次到达一个，最初可能缺少 `type` 或 `props`。过滤出完整的元素，并将 `loading={true}` 传给 `Renderer`，它会静默跳过尚未到达的子元素。UI 逐个组件地构建起来：
+
+```tsx
+/*
+ * Filter the streamed spec to only include elements with valid type/props,
+ * enabling progressive rendering as the AI response builds up. Passing
+ * loading={true} to the Renderer tells it to skip missing children silently.
+ */
+const spec = (() => {
+  if (!rawSpec?.root || !rawSpec?.elements) return null;
+  const rootEl = rawSpec.elements[rawSpec.root];
+  if (!rootEl?.type || rootEl?.props == null) return null;
+
+  const safeElements = {};
+  for (const [key, el] of Object.entries(rawSpec.elements)) {
+    if (el?.type && el?.props != null) {
+      safeElements[key] = el;
+    }
+  }
+  return { root: rawSpec.root, elements: safeElements };
+})();
+
+return (
+  <>
+    {spec && (
+      <JSONUIProvider registry={registry}>
+        <Renderer spec={spec} registry={registry} loading={stream.isLoading} />
+      </JSONUIProvider>
+    )}
+  </>
+);
+```
+
+<Note>
+必须使用 `JSONUIProvider` 来设置 json-render 的内部 context 提供者（state、visibility、validation、actions）。`Renderer` 组件必须渲染在它内部。
+</Note>
+
+## 规格格式
+
+AI 智能体生成一个扁平的 JSON 规格，其中 `root` 键指向根元素，`elements` 映射包含所有组件：
+
+```json
+{
+  "root": "login-card",
+  "elements": {
+    "login-card": {
+      "type": "Card",
+      "props": { "title": "Login" },
+      "children": ["login-stack"]
+    },
+    "login-stack": {
+      "type": "Stack",
+      "props": { "direction": "vertical", "gap": "md" },
+      "children": ["email-input", "password-input", "submit-btn"]
+    },
+    "email-input": {
+      "type": "TextInput",
+      "props": { "label": "Email", "placeholder": "Enter your email", "type": "email" },
+      "children": []
+    },
+    "password-input": {
+      "type": "TextInput",
+      "props": { "label": "Password", "placeholder": "Enter your password", "type": "password" },
+      "children": []
+    },
+    "submit-btn": {
+      "type": "Button",
+      "props": { "label": "Sign In", "variant": "primary", "fullWidth": true },
+      "children": []
+    }
+  }
+}
+```
+
+每个元素通过 ID 引用其子元素，`TextInput` 和 `Button` 等叶子元素具有空的 `children` 数组。
+
+## A2UI：另一种声明式规格
+
+以声明方式描述界面的一种方式是 json-render。A2UI 是另一种：Google 的声明式、流式优先的 generative UI 规格，通过 CopilotKit 集成。与 json-render 一样，它从你注册的组件中组合界面，因此智能体停留在你定义的护栏之内。A2UI 有两种变体：
+
+- **动态 schema**：由一个辅助模型从对话中生成完整界面，包括 schema、数据和布局，以获得最大的灵活性。
+- **固定 schema**：组件树在前端定义，智能体只向其中流式传入数据，以获得最快、最可预测的渲染。
+
+详情参见 CopilotKit 关于 [A2UI](https://docs.copilotkit.ai/generative-ui/a2ui)、[dynamic schema](https://docs.copilotkit.ai/generative-ui/a2ui/dynamic-schema) 和 [fixed schema](https://docs.copilotkit.ai/generative-ui/a2ui/fixed-schema) 的文档。要将 CopilotKit 接入 LangGraph 部署，参见 [CopilotKit](/oss/python/langchain/frontend/integrations/copilotkit)。
+
+## 最佳实践
+
+- **使用描述性的组件描述**：AI 使用这些描述来理解何时使用每个组件。清晰的描述能带来更好的 UI 生成效果。
+- **渲染前验证**：由于流式传输会交付部分数据，在传给 Renderer 之前，始终检查元素是否具有有效的 `type` 和非 null 的 `props`。
+- **为流式设计**：在流式输出期间传入 `loading={true}`，让 Renderer 优雅地处理尚未到达的子元素。用户可以实时看到 UI 逐步构建，而不是等待完整响应。
+- **使用 design token 设置样式**：使用 CSS 自定义属性，让渲染的组件自动适应明暗主题。
+- **用 JSONUIProvider 包裹**：`Renderer` 必须位于 `JSONUIProvider` 内部，才能访问 json-render 用于 state、visibility 和 actions 的内部 context。
+
+## 另请参阅
+
+- [Generative UI 概览](/oss/python/langchain/frontend/generative-ui-overview)
+- [受控 generative UI](/oss/python/langchain/frontend/controlled-generative-ui)
+- [开放式 generative UI](/oss/python/langchain/frontend/open-ended-generative-ui)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/langchain/frontend/declarative-generative-ui.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

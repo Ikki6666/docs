@@ -1,0 +1,301 @@
+---
+title: "Composio 集成"
+description: 通过 Composio 的统一 API 平台，为 agent 安全访问 1,000 多个 toolkit 和 20,000 多个工具，并支持 OAuth 处理、事件驱动工作流和多用户场景。
+integration:
+  name: Composio
+  pypi: composio-langchain
+---
+
+[Composio](https://composio.dev) 是一个集成平台，可为 agent 安全访问 GitHub、Slack、Notion 等常用应用中的 1,000 多个 toolkit 和 20,000 多个工具。Agent 可以通过 MCP 或直接 API 使用 Composio 与外部服务交互，而由 Composio 处理认证、权限以及事件驱动工作流。
+
+`composio-langchain` 包将 Composio 工具包装为 LangChain 工具，并与 LangChain 当前的 `create_agent` API 配合使用。
+
+## 概览
+
+### 集成详情
+
+| Class | Package | Serializable | JS support | Version |
+| :--- | :--- | :---: | :---: | :---: |
+| `Composio` | [`composio-langchain`](https://pypi.org/project/composio-langchain/) | No | Yes | ![PyPI - Version](https://img.shields.io/pypi/v/composio-langchain?style=flat-square&label=%20) |
+
+JavaScript 和 TypeScript 用法请参见 [Composio JS 集成文档](https://js.langchain.com/docs/integrations/tools/composio)。
+
+### 工具特性
+
+- **1,000+ toolkit 和 20,000+ 工具**：为 GitHub、Slack、Gmail、Jira、Notion 等提供预构建集成，可通过 MCP 或直接 API 使用。
+- **认证管理**：处理 OAuth 流程、API 密钥和认证状态。
+- **事件驱动工作流**：基于外部事件触发 agent，例如新的 Slack 消息或 GitHub commit。
+- **细粒度权限控制**：按用户控制工具访问和数据暴露。
+- **企业级控制**：支持治理、可审计性、SSO、组织级控制，以及用于企业安全审查的 SOC 2 / ISO 27001:2022 认证。
+- **自定义工具支持**：添加私有 API 和内部工具。
+
+## 设置
+
+该集成位于 `composio-langchain` 包中。
+
+<CodeGroup>
+```bash pip
+pip install -U composio-langchain langchain langchain-openai
+```
+
+```bash uv
+uv add composio-langchain langchain langchain-openai
+```
+
+</CodeGroup>
+
+### 凭证
+
+你需要一个 Composio API 密钥。前往 [composio.dev](https://composio.dev) 注册以获取 API 密钥。
+
+```python
+import getpass
+import os
+
+if not os.environ.get("COMPOSIO_API_KEY"):
+    os.environ["COMPOSIO_API_KEY"] = getpass.getpass("Composio API key:\n")
+```
+
+同时建议配置 [LangSmith](/langsmith/home) 以进行追踪：
+
+```python
+# os.environ["LANGSMITH_API_KEY"] = getpass.getpass("LangSmith API key:\n")
+# os.environ["LANGSMITH_TRACING"] = "true"
+```
+
+## 实例化
+
+使用 LangChain provider 初始化 Composio。为希望 agent 访问的用户和 toolkit 集合创建一个 session：
+
+```python
+from composio import Composio
+from composio_langchain import LangchainProvider
+
+composio = Composio(provider=LangchainProvider())
+session = composio.create(user_id="user_123", toolkits=["GITHUB"])
+tools = session.tools()
+```
+
+`session.tools()` 返回 Composio router 工具，例如 `COMPOSIO_SEARCH_TOOLS`、`COMPOSIO_GET_TOOL_SCHEMAS` 和 `COMPOSIO_MANAGE_CONNECTIONS`。Agent 使用这些工具来发现具体的 toolkit 工具、查看 schema、管理认证并执行操作。
+
+### 可用 toolkit
+
+Composio 为多种服务提供 toolkit：
+
+| Category           | Example toolkits                                              |
+| :----------------- | :------------------------------------------------------------ |
+| Productivity       | GitHub, Slack, Gmail, Jira, Notion, Asana, Trello, ClickUp    |
+| Communication      | Discord, Telegram, WhatsApp, Microsoft Teams                  |
+| Development        | GitLab, Bitbucket, Linear, Sentry                             |
+| Data and analytics | Google Sheets, Airtable, HubSpot, Salesforce                  |
+
+完整列表请参见 [Composio toolkits catalog](https://docs.composio.dev/toolkits/introduction)。
+
+## 调用
+
+### 发现工具
+
+在让 agent 执行任何操作之前，使用 `session.search(...)` 查看匹配的具体 toolkit 工具及其连接状态：
+
+```python
+search = session.search(query="get authenticated github user")
+
+for result in search.results:
+    print(result.primary_tool_slugs)
+
+for status in search.toolkit_connection_statuses:
+    print(status.toolkit, status.has_active_connection, status.status_message)
+```
+
+如果 toolkit 尚未连接，Composio 会引导 agent 使用 `COMPOSIO_MANAGE_CONNECTIONS`，你也可以自行创建授权链接，参见[认证设置](#认证设置)。
+
+### 低层工具加载
+
+对于大多数 agent 工作流，推荐使用 `composio.create(...)` 和 `session.tools()`。当你想自行加载直接工具列表时，也可以使用更底层的 `composio.tools.get(...)` API：
+
+```python
+github_tools = composio.tools.get(
+    user_id="user_123",
+    toolkits=["GITHUB"],
+    limit=10,
+)
+
+read_scoped_tools = composio.tools.get(
+    user_id="user_123",
+    toolkits=["GITHUB"],
+    scopes=["read"],
+    limit=10,
+)
+
+specific_tool = composio.tools.get(
+    user_id="user_123",
+    tools=["GITHUB_GET_THE_AUTHENTICATED_USER"],
+)
+```
+
+## 在 agent 中使用
+
+下面是一个完整的只读示例，展示如何把 Composio 工具与 LangChain agent 结合使用。它让模型查看可用于读取 GitHub 用户资料的工具，而不修改外部状态。
+
+```python
+import getpass
+import os
+
+if not os.environ.get("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = getpass.getpass("OpenAI API key:\n")
+```
+
+```python
+from composio import Composio
+from composio_langchain import LangchainProvider
+from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
+
+composio = Composio(provider=LangchainProvider())
+session = composio.create(user_id="user_123", toolkits=["GITHUB"])
+tools = session.tools()
+
+model = ChatOpenAI(model="gpt-5.4-mini")
+agent = create_agent(model=model, tools=tools)
+
+result = agent.invoke(
+    {
+        "messages": [
+            (
+                "user",
+                "List available Composio tool names for reading GitHub user "
+                "profile data. Do not execute external account actions, do not "
+                "ask me to authenticate, and do not mutate anything.",
+            )
+        ]
+    }
+)
+
+print(result["messages"][-1].content)
+```
+
+## 认证设置
+
+访问用户外部账户的工具要求该用户先连接对应的 toolkit。
+
+对于手动认证，可从 session 创建一个连接请求：
+
+```python
+connection_request = session.authorize("github")
+print(connection_request.redirect_url)
+```
+
+用户完成授权流程后，同一个 `user_id` 即可使用该已连接的账户。
+
+对于聊天内认证，当某个 toolkit 没有活动连接时，允许 agent 调用 `COMPOSIO_MANAGE_CONNECTIONS`。随后 agent 可以引导用户先连接所需账户，再执行 toolkit 操作。
+
+## 多用户场景
+
+为每个应用用户使用稳定的 `user_id`。每个用户连接自己的账户，Composio 使用与该 `user_id` 关联的凭证执行 toolkit 操作。
+
+```python
+session_alice = composio.create(user_id="alice", toolkits=["GITHUB"])
+session_bob = composio.create(user_id="bob", toolkits=["GITHUB"])
+
+alice_agent = create_agent(model=model, tools=session_alice.tools())
+bob_agent = create_agent(model=model, tools=session_bob.tools())
+```
+
+## 事件驱动工作流
+
+Composio 支持基于外部事件触发 agent。当连接的应用中发生事件时，例如新的 GitHub commit 或 Slack 消息，trigger 可以把结构化负载发送到你的应用。
+
+### 查看 trigger 配置
+
+在创建 trigger 之前，先查看所需的配置：
+
+```python
+from composio import Composio
+
+composio = Composio()
+
+trigger_type = composio.triggers.get_type("GITHUB_COMMIT_EVENT")
+print(trigger_type.config)
+```
+
+### 创建 trigger
+
+在相关账户已连接并具备所需配置之后创建 trigger：
+
+```python
+trigger = composio.triggers.create(
+    slug="GITHUB_COMMIT_EVENT",
+    user_id="user_123",
+    trigger_config={
+        "owner": "composiohq",
+        "repo": "composio",
+    },
+)
+
+print(trigger.trigger_id)
+```
+
+### Webhooks
+
+在生产环境中，请在 [Composio dashboard](https://platform.composio.dev/settings/events) 中配置 webhook：
+
+```python
+from fastapi import FastAPI, Request
+
+app = FastAPI()
+
+
+@app.post("/webhook")
+async def webhook_handler(request: Request):
+    payload = await request.json()
+
+    if payload.get("triggerSlug") == "GITHUB_COMMIT_EVENT":
+        commit_data = payload.get("payload")
+        # 在此处用 commit_data 调用你的 agent。
+
+    return {"status": "success"}
+```
+
+更多细节请参阅 [Composio triggers documentation](https://docs.composio.dev/docs/using-triggers)。
+
+## 自定义工具
+
+Composio 允许你创建自定义工具，并与内置工具一起使用。
+
+```python
+from pydantic import BaseModel, Field
+
+
+class AddTwoNumbersInput(BaseModel):
+    a: int = Field(description="The first number to add")
+    b: int = Field(description="The second number to add")
+
+
+@composio.tools.custom_tool
+def add_two_numbers(request: AddTwoNumbersInput) -> int:
+    """Add two numbers."""
+    return request.a + request.b
+
+
+tools = session.tools()
+tools.append(add_two_numbers)
+```
+
+## API reference
+
+如需了解 Composio 特性和配置选项的详细文档，请参阅：
+
+- [Composio documentation](https://docs.composio.dev)
+- [Composio LangChain provider guide](https://docs.composio.dev/docs/providers/langchain)
+- [Available tools and actions](https://docs.composio.dev/toolkits/introduction)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/python/integrations/tools/composio.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

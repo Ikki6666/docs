@@ -1,0 +1,448 @@
+---
+title: AWS Terraform 故障排查
+sidebarTitle: 故障排查
+description: 使用 LangChain Terraform modules 部署的 LangSmith self-hosted（AWS EKS）常见问题、修复方法与诊断命令。
+---
+
+本页记录使用 [AWS Terraform modules](https://github.com/langchain-ai/terraform/tree/main/modules/aws) 预配的 LangSmith 部署的常见问题、修复方法和诊断命令。
+
+<Tip>
+升级之前，请先查看 [LangSmith self-hosted changelog](/langsmith/self-hosted-changelog)，了解破坏性变更和需要更新的变量。在运行任何 `kubectl` 命令之前，先执行 `aws eks update-kubeconfig --region <region> --name <cluster-name>`。
+</Tip>
+
+本页用到的 `kubectl`、`helm` 和 `aws` 调用的可复制参考，可直接跳到[诊断命令](#diagnostic-commands)。
+
+## 自动诊断
+
+在逐条运行命令之前，先试试内置脚本：
+
+```bash
+# Deployment status across all layers + next-step guidance
+make status
+
+# SSM parameter validation
+./infra/scripts/manage-ssm.sh validate
+```
+
+## 已知问题
+
+### EKS 节点组创建失败：CREATE_FAILED
+
+**症状**
+
+```
+Error: waiting for EKS Node Group creation: unexpected state 'CREATE_FAILED'
+```
+
+**原因：** 节点组创建开始时，EKS control plane 尚未完全激活。在 apply 被中断后很常见。
+
+**修复**
+
+```bash
+aws eks wait cluster-active --name <cluster-name> --region <region>
+
+aws eks describe-nodegroup \
+  --cluster-name <cluster-name> \
+  --nodegroup-name <nodegroup-name> \
+  --region <region> \
+  --query "nodegroup.health"
+
+terraform apply -var-file=terraform.tfvars
+```
+
+### kubectl 失败："You must be logged in to the server"
+
+**症状：** 所有 `kubectl` 命令都失败，报 `error: You must be logged in to the server (Unauthorized)`。
+
+**原因：** kubeconfig 已过期、AWS 凭证与创建集群时的凭证不一致，或 token 已过期。
+
+**修复**
+
+```bash
+aws eks update-kubeconfig --region <region> --name <cluster-name>
+kubectl cluster-info
+
+aws sts get-caller-identity
+```
+
+如果集群是用不同的 IAM 角色创建的，请通过 `aws-auth` ConfigMap 授予访问权限：
+
+```bash
+kubectl edit configmap aws-auth -n kube-system
+# Add your IAM user or role under mapUsers / mapRoles
+```
+
+### Helm 安装后未创建 ALB
+
+**症状：** `kubectl get ingress -n langsmith` 在几分钟后仍未显示 ADDRESS。
+
+**原因：** AWS Load Balancer Controller 未运行或缺少 IRSA 权限、Terraform 预配的 ALB 未被正确引用，或设置了 `alb_scheme = "internal"`（内部 ALB 没有公网地址；参见 [ALB 没有公网地址](#alb-has-no-public-address-internal-scheme)）。
+
+**修复**
+
+```bash
+kubectl get pods -n kube-system | grep aws-load-balancer
+kubectl logs -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller --tail=50
+kubectl get sa -n kube-system aws-load-balancer-controller -o yaml | grep eks.amazonaws.com
+
+terraform output alb_dns_name
+aws elbv2 describe-load-balancers --query "LoadBalancers[?DNSName=='<alb-dns-name>'].State"
+```
+
+### EKS pods 连接 RDS 被拒绝
+
+**症状：** Backend 日志中针对 RDS endpoint 显示 `connection refused` 或 `timeout`。
+
+**原因：** RDS 安全组不允许来自 EKS 节点或集群安全组的入站 TCP 5432。
+
+**修复**
+
+```bash
+aws eks describe-cluster --name <cluster-name> \
+  --query "cluster.resourcesVpcConfig.clusterSecurityGroupId"
+
+aws rds describe-db-instances \
+  --db-instance-identifier <db-id> \
+  --query "DBInstances[0].VpcSecurityGroups"
+
+aws ec2 describe-security-group-rules \
+  --filter "Name=group-id,Values=<rds-sg-id>"
+```
+
+`postgres` module 会自动设置安全组。如果规则缺失，请重新 apply：
+
+```bash
+terraform apply -var-file=terraform.tfvars -target=module.postgres
+```
+
+### pods 访问 S3 被拒绝（IRSA 未配置）
+
+**症状：** Backend 日志在读写 S3 时显示 `AccessDenied`。
+
+**原因：** LangSmith service account 缺少 IRSA 标注，或 S3 VPC Gateway Endpoint 未正确路由。
+
+**修复**
+
+```bash
+kubectl get sa langsmith -n langsmith -o yaml | grep eks.amazonaws.com
+
+aws ec2 describe-vpc-endpoints \
+  --filters "Name=service-name,Values=com.amazonaws.<region>.s3" \
+  --query "VpcEndpoints[].State"
+
+kubectl run s3-test --rm -it --image=amazon/aws-cli -n langsmith -- \
+  s3 ls s3://<bucket-name>
+```
+
+如果缺少 IRSA 标注，请确认 `terraform.tfvars` 中 `create_langsmith_irsa_role = true`，且 Helm values 中的 service account 名称与 `langsmith` 一致。
+
+### ElastiCache Redis 连接超时
+
+**症状：** Pods 无法连接 Redis。日志显示 `dial tcp: i/o timeout`。
+
+**原因：** ElastiCache 安全组不允许来自 EKS 节点安全组的入站 TCP 6379。
+
+**修复**
+
+```bash
+aws elasticache describe-cache-clusters \
+  --cache-cluster-id <cluster-id> \
+  --query "CacheClusters[0].SecurityGroups"
+
+kubectl run redis-test --rm -it --image=redis:7 -n langsmith -- \
+  redis-cli -h <elasticache-endpoint> -a <auth-token> ping
+```
+
+### EKS 节点未自动扩缩
+
+**症状：** Pods 一直处于 `Pending` 状态。节点数量没有增加。
+
+**原因：** Cluster Autoscaler 缺少 IAM 权限、指向了错误的 ASG，或节点组的 `min_size = max_size`。
+
+**修复**
+
+```bash
+kubectl logs -n kube-system -l app=cluster-autoscaler --tail=50
+
+aws autoscaling describe-auto-scaling-groups \
+  --query "AutoScalingGroups[?contains(Tags[].Key, 'k8s.io/cluster-autoscaler/<cluster-name>')].[AutoScalingGroupName]" \
+  --output table
+```
+
+### cert-manager 无法签发 Let's Encrypt 证书
+
+**症状：** `kubectl get certificate -n langsmith` 显示 `READY=False`。HTTP01 challenge 失败。
+
+**原因：** ALB 未把 80 端口转发给 cert-manager solver pod，或该域名的 DNS 记录未指向 ALB。
+
+**修复**
+
+```bash
+kubectl describe certificate <cert-name> -n langsmith
+kubectl get challenges -n langsmith
+
+aws elbv2 describe-listeners --load-balancer-arn <alb-arn>
+
+dig +short <your-langsmith-domain>
+# Expected: CNAME to the ALB DNS name
+```
+
+### postgres_deletion_protection 阻塞 terraform destroy
+
+**症状**
+
+```
+Error: deleting RDS DB Instance: InvalidParameterCombination:
+Cannot delete, DeletionProtection is enabled.
+```
+
+**修复：** 在 `terraform.tfvars` 中禁用删除保护，执行 apply，然后 destroy：
+
+```hcl
+postgres_deletion_protection = false
+```
+
+```bash
+terraform apply -var-file=terraform.tfvars
+terraform destroy
+```
+
+### ESO 同步失败：langsmith-config secret 缺失
+
+**症状：** Pods 卡在 `CreateContainerConfigError`。`kubectl get secret langsmith-config -n langsmith` 返回 `NotFound`。
+
+**原因：** ESO 同步是全有或全无的。如果 `ExternalSecret` 引用的任何一个 SSM 参数缺失，ESO 会拒绝创建 Kubernetes Secret。所有 pods 都会失败，包括与缺失参数无关的 pods。
+
+**修复**
+
+```bash
+kubectl get externalsecret langsmith-config -n langsmith
+kubectl describe externalsecret langsmith-config -n langsmith
+
+./infra/scripts/manage-ssm.sh validate
+
+source ./infra/scripts/setup-env.sh
+./helm/scripts/apply-eso.sh
+```
+
+`describe` 输出会显示哪个 `remoteRef.key` 失败了。将其与 SSM 前缀 `/langsmith/{name_prefix}-{environment}/` 进行比对。
+
+### SSM 参数前缀不匹配
+
+**症状：** `manage-ssm.sh validate` 通过，但 ESO 仍然无法同步。或者 `setup-env.sh` 把参数写在了与 ESO 预期不同的前缀下。
+
+**原因：** SSM 前缀由 `terraform.tfvars` 中的 `name_prefix` 和 `environment` 推导而来。如果这些值在初始设置后被修改过，旧参数仍位于旧前缀下，而 ESO 在新前缀下查找。
+
+**修复**
+
+```bash
+kubectl get externalsecret langsmith-config -n langsmith -o yaml | grep 'key:'
+
+./infra/scripts/manage-ssm.sh list
+
+./infra/scripts/migrate-ssm.sh
+```
+
+<Warning>
+切勿修改现有部署的 `name_prefix` 或 `environment`。
+</Warning>
+
+### Postgres 密码未通过 Terraform 校验
+
+**症状**
+
+```
+Error: Invalid value for variable "postgres_password"
+RDS master password must not contain '/', '@', '"', single quotes, or spaces.
+```
+
+**原因：** 密码中包含 RDS 不允许出现在 master password 中的字符。
+
+**修复：** 重新生成不包含受限字符的密码。`setup-env.sh` 会自动生成合规的密码；手动更新方式如下：
+
+```bash
+./infra/scripts/manage-ssm.sh set postgres-password "$(openssl rand -base64 24 | tr -d '/+= ')"
+source ./infra/scripts/setup-env.sh
+terraform apply -var-file=terraform.tfvars
+```
+
+### 私有 EKS 集群不可达（需要 bastion）
+
+**症状：** 当 `enable_public_eks_cluster = false` 时，`kubectl` 和 `terraform apply` 超时。
+
+**原因：** EKS API endpoint 是私有的。命令必须在 VPC 内运行，可以通过 bastion 主机或 VPN 连接。
+
+**修复**
+
+```bash
+# If the bastion was provisioned (create_bastion = true)
+aws ssm start-session --target <bastion-instance-id>
+
+# From the bastion
+aws eks update-kubeconfig --region <region> --name <cluster-name>
+kubectl get nodes
+```
+
+如果没有预配 bastion，请设置 `create_bastion = true` 并重新 apply，或临时设置 `enable_public_eks_cluster = true`。
+
+### ALB 没有公网地址（internal scheme）
+
+**症状：** `kubectl get ingress -n langsmith` 显示了 ADDRESS，但它只能在 VPC 内解析。
+
+**原因：** `terraform.tfvars` 中设置了 `alb_scheme = "internal"`。内部 ALB 只能从 VPC 内（VPN、peering 或 PrivateLink）访问。
+
+**修复：** 对私有部署来说这是有意为之。要让 ALB 可公开访问：
+
+```hcl
+alb_scheme = "internet-facing"
+```
+
+```bash
+terraform apply -var-file=terraform.tfvars
+# Then redeploy Helm to pick up the new ALB
+```
+
+### Ingress 重建后 ALB hostname 发生变化
+
+**症状：** LangSmith URL 失效。Agent deployments 卡在 `DEPLOYING`。DNS 记录或书签指向一个已无法解析的旧 ALB hostname。
+
+**原因：** 删除 Kubernetes ingress（通过 `helm uninstall`、`kubectl delete ingress` 或删除 namespace）会一并撤销 ALB。当 ingress 重建时，会签发一个 hostname 不同的新 ALB。Helm values 中的 `config.deployment.url` 仍指向旧 hostname，因此 operator 的健康检查失败，deployments 一直卡住。
+
+如果 ALB controller 创建了新 ALB 而没有复用 Terraform 预配的那个，也会发生同样的问题。为防止这一点，除了 `load-balancer-arn` 之外还必须设置 `group.name` 标注。
+
+**预防**
+
+- 确保同时设置了 `group.name` 和 `load-balancer-arn` 标注。当存在预配好的 ALB 时，`init-values.sh` 会自动完成。
+- 除非计划更新所有依赖 hostname 的配置，否则不要删除 ingress。
+- 避免不带 `--server-side=false` 的 `helm rollback`。ingress 的 SSA 冲突可能触发删除/重建循环。
+
+**修复**
+
+```bash
+# 1. Check what hostname the ingress currently has
+kubectl get ingress langsmith-ingress -n langsmith \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+
+# 2. Check what Terraform expects
+terraform output alb_dns_name
+
+# 3. If they differ, re-run init-values.sh and redeploy
+make init-values
+make deploy
+```
+
+### 节点组扩缩变更未由 Terraform 应用
+
+**症状：** 修改 `terraform.tfvars` 中的 `min_size` 或 `max_size` 后，`terraform plan` 显示 "No changes"。
+
+**原因：** ASG 被带外修改（AWS CLI、控制台或 cluster autoscaler），且 Terraform state 已反映新值。社区版 EKS module 会忽略 `desired_size` 的变更，以便 autoscaler 管理它；`min_size` 和 `max_size` 应当正常传播。
+
+**修复**
+
+```bash
+terraform refresh
+terraform plan
+
+# For an immediate change, use the AWS CLI directly
+aws eks update-nodegroup-config \
+  --cluster-name <cluster> \
+  --nodegroup-name <nodegroup> \
+  --scaling-config minSize=3,maxSize=8,desiredSize=5 \
+  --region <region>
+```
+
+## 诊断命令
+
+### 集群访问
+
+```bash
+aws eks update-kubeconfig --region <region> --name <cluster-name>
+kubectl config current-context
+kubectl get nodes -o wide
+aws sts get-caller-identity
+```
+
+### Pods
+
+```bash
+kubectl get pods -n langsmith
+kubectl get pods -n langsmith -w
+kubectl describe pod <pod-name> -n langsmith
+kubectl logs <pod-name> -n langsmith --tail=50
+kubectl logs <pod-name> -n langsmith --previous --tail=50
+kubectl logs -n langsmith deploy/langsmith-backend --tail=100 -f
+```
+
+### ALB 与 ingress
+
+```bash
+kubectl get ingress -n langsmith
+kubectl describe ingress -n langsmith
+aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName, 'langsmith')]"
+```
+
+### TLS 与证书
+
+```bash
+kubectl get certificate -n langsmith
+kubectl describe certificate <cert-name> -n langsmith
+kubectl get challenges -n langsmith
+kubectl get clusterissuer
+```
+
+### ESO 与机密
+
+```bash
+kubectl get externalsecret -n langsmith
+kubectl describe externalsecret langsmith-config -n langsmith
+kubectl get clustersecretstore langsmith-ssm
+kubectl get secret langsmith-config -n langsmith -o jsonpath='{.data}' | jq 'keys'
+./infra/scripts/manage-ssm.sh validate
+./infra/scripts/manage-ssm.sh diff
+```
+
+### Helm
+
+```bash
+helm status langsmith -n langsmith
+helm history langsmith -n langsmith
+helm get values langsmith -n langsmith
+```
+
+### IRSA 与 IAM
+
+```bash
+kubectl get sa langsmith -n langsmith -o yaml | grep eks.amazonaws.com
+terraform output langsmith_irsa_role_arn
+aws iam get-role --role-name <irsa-role-name>
+```
+
+### LangSmith Deployment
+
+```bash
+kubectl get pods -n langsmith | grep -E "host-backend|listener|operator"
+kubectl get lgp -n langsmith
+kubectl get crd | grep langchain
+kubectl get pods -n keda
+```
+
+### 快速健康检查
+
+```bash
+echo "=== Context ===" && kubectl config current-context
+echo "=== Nodes ===" && kubectl get nodes
+echo "=== Pods ===" && kubectl get pods -n langsmith
+echo "=== Ingress ===" && kubectl get ingress -n langsmith
+echo "=== Helm ===" && helm status langsmith -n langsmith 2>/dev/null | grep -E "STATUS|LAST DEPLOYED"
+```
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/self-host-terraform-aws-troubleshooting.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

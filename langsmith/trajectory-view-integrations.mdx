@@ -1,0 +1,389 @@
+---
+title: Trajectory view 集成
+description: 在 LangSmith Trajectory view 中渲染的 frameworks 和 SDKs，以及各自设置的 metadata。
+---
+
+[Trajectory view](/langsmith/view-traces#trajectory-view) 将某个 [thread](/langsmith/observability-concepts#threads) 的 [traces](/langsmith/observability-concepts#traces) 渲染为一条 [trajectory](/langsmith/observability-concepts#trajectories)：用户 prompts、模型响应、tool calls 和 tool results，按顺序排列。Trajectory view 需要两条 run metadata 才能渲染 trajectory：
+
+- **Thread 分组**：每个 run 上的 `thread_id` 告诉 LangSmith 这一组 runs 属于同一段对话。
+- **Run 分类**：某一轮顶层 run 上的 `ls_agent_type: "root"` 将该 run 标记为主对话的一部分。标记为 subagent 的 runs 会作为 subagent action 显示在 thread 中，而标记为 middleware 或 compaction 的 runs 目前会被过滤掉。
+
+对于大多数 LangSmith integrations，这两项都会为你自动设置。当你需要手动设置 metadata 时，以下示例涵盖 [chaining 模式下的 OpenAI Responses API](#openai-responses-api-with-chaining) 以及标记自定义 middleware 或 guardrails。
+
+## 支持的集成
+
+以下 integrations 会自动设置 `thread_id` 和 `ls_agent_type`：
+
+- [Claude Code](/langsmith/trace-claude-code)
+- [Claude Agent SDK](/langsmith/trace-claude-agent-sdk)
+- [OpenAI Codex](/langsmith/trace-with-codex)
+- [Cursor](/langsmith/trace-with-cursor)
+- [Pi](/langsmith/trace-with-pi)
+- [OpenCode](/langsmith/trace-with-opencode)
+- [GitHub Copilot](/langsmith/trace-with-vscode-copilot)
+- [Deep Agents](/langsmith/trace-deep-agents)
+- [LangChain](/langsmith/trace-with-langchain)
+- [LangGraph](/langsmith/trace-with-langgraph)
+- OpenAI Chat Completions（`wrap_openai`）
+- OpenAI Responses API，单次调用（`wrap_openai`）
+
+**chaining 模式下的 OpenAI Responses API**（`previous_response_id`）会自动设置 `ls_agent_type`，但 `thread_id` 需要你自己设置。更多详情，请参阅 [chaining 模式下的 OpenAI Responses API](#openai-responses-api-with-chaining) 示例。
+
+关于完整的 `ls_agent_type` schema，以及官方 integrations 在非 root runs 上设置的其他值（`subagent`、`middleware`、`compaction`），请参阅 [Coding agent metadata contract](/langsmith/coding-agent-metadata-contract)。关于底层的 thread 分组机制，请参阅[配置 threads](/langsmith/threads)。
+
+## chaining 模式下的 OpenAI Responses API
+
+当你通过传递 `previous_response_id` 链式调用 OpenAI Responses API 时，OpenAI 在服务端存储对话状态，LangSmith wrapper 没有自然的 key 将多次调用分组到一个 thread 中。你需要自己设置 `thread_id`，可以按调用设置，也可以在 wrapper 初始化时设置。
+
+<Note>
+`thread_id` 请使用 [UUID v7](https://uuid7.com)。LangSmith 的 SDK 导出了 `uuid7` 辅助函数，UUID v7 按创建时间排序，因此 threads 在列表视图中保持有序。
+</Note>
+
+### 按调用设置 metadata
+
+在每次调用上设置 `thread_id`。当一个包装后的 client 服务多个 threads 时（例如每个进程一个 client，多个并发对话），使用此方式。
+
+<CodeGroup>
+
+```python Python
+import openai
+from langsmith import uuid7
+from langsmith.wrappers import wrap_openai
+
+client = wrap_openai(openai.Client())
+thread_id = str(uuid7())
+
+res1 = client.responses.create(
+    model="gpt-5.6",
+    input="What is the capital of France?",
+    store=True,
+    langsmith_extra={"metadata": {"thread_id": thread_id}},
+)
+
+res2 = client.responses.create(
+    model="gpt-5.6",
+    input="And its population?",
+    previous_response_id=resp1.id,
+    store=True,
+    langsmith_extra={"metadata": {"thread_id": thread_id}},
+)
+```
+
+```typescript TypeScript
+import OpenAI from "openai";
+import { uuid7 } from "langsmith";
+import { wrapOpenAI } from "langsmith/wrappers";
+
+const client = wrapOpenAI(new OpenAI());
+const threadId = uuid7();
+
+const res1 = await client.responses.create({
+  model: "gpt-5.6",
+  input: "What is the capital of France?",
+  metadata: { thread_id: threadId },
+  store: true,
+});
+
+const res2 = await client.responses.create({
+  model: "gpt-5.6",
+  input: "And its population?",
+  previous_response_id: res1.id,
+  metadata: { thread_id: threadId },
+  store: true,
+});
+```
+
+</CodeGroup>
+
+### 初始化时设置 metadata
+
+在包装 client 时设置一次 `thread_id`。通过该 wrapper 发出的每次调用都会打上同一个 thread 的标记。当包装后的 client 在其生命周期内只服务一个 thread 时（例如每个对话一个 worker），使用此方式。
+
+<CodeGroup>
+
+```python Python
+import openai
+from langsmith import uuid7
+from langsmith.wrappers import wrap_openai
+
+thread_id = str(uuid7())
+
+client = wrap_openai(
+    openai.Client(),
+    tracing_extra={"metadata": {"thread_id": thread_id}},
+)
+
+res1 = client.responses.create(
+    model="gpt-5.6",
+    input="What is the capital of France?",
+    store=True,
+)
+
+res2 = client.responses.create(
+    model="gpt-5.6",
+    input="And its population?",
+    previous_response_id=resp1.id,
+    store=True,
+)
+```
+
+```typescript TypeScript
+import OpenAI from "openai";
+import { uuid7 } from "langsmith";
+import { wrapOpenAI } from "langsmith/wrappers";
+
+const threadId = uuid7();
+
+const client = wrapOpenAI(new OpenAI(), { metadata: { thread_id: threadId } });
+
+const res1 = await client.responses.create({
+  model: "gpt-5.6",
+  input: "What is the capital of France?",
+  store: true,
+});
+
+const res2 = await client.responses.create({
+  model: "gpt-5.6",
+  input: "And its population?",
+  previous_response_id: res1.id,
+  store: true,
+});
+```
+
+</CodeGroup>
+
+## 隐藏自定义 middleware 或 guardrails
+
+当你围绕 LLM 或 tool call 编写自己的 guardrail 或 middleware 函数时，将其包裹在 `@traceable` 中，并在 metadata 上设置 `ls_agent_type: "middleware"`。Trajectory view 会将这些 runs 从主对话中过滤掉。
+
+<CodeGroup>
+
+```python Python
+from langsmith import traceable
+
+@traceable(
+    run_type="llm",
+    metadata={"ls_agent_type": "middleware"},
+)
+def entry_guardrail(prompt: str) -> dict:
+    # Your guardrail logic
+    return {"decision": "allow"}
+```
+
+```typescript TypeScript
+import { traceable } from "langsmith/traceable";
+
+const entryGuardrail = traceable(
+  async (prompt: string) => {
+    // Your guardrail logic
+    return { decision: "allow" };
+  },
+  { run_type: "llm", metadata: { ls_agent_type: "middleware" } },
+);
+```
+
+</CodeGroup>
+
+## 从 Trajectory view 中排除 runs
+
+在某个 run 的 metadata 上设置 `LS_MESSAGE_VIEW_EXCLUDE`，即可告诉 Trajectory view 跳过该 run。起作用的是该 key 的存在；`True` 是惯用值。该过滤器会在任何 extraction strategy 看到该 trace 之前运行，因此被排除的 LLM 或 tool run 不会影响检测、消息提取或 tool call 配对。
+
+`LS_MESSAGE_VIEW_EXCLUDE` 是从 `langsmith`（Python 和 JS）导出的顶层常量，其值为字符串 `"ls_message_view_exclude"`。优先使用该常量以避免拼写错误；直接使用字面字符串同样有效。
+
+将其用于不是对话轮次的 LLM subspans，例如分类调用、embedding 查找、安全过滤器或路由/guardrail 决策，这些内容你仍希望在其他 LangSmith 视图中可见，但不希望它们干扰对话 transcript。
+
+<Tabs>
+  <Tab title="Python">
+
+**1. 在 `@traceable` 装饰器上**：排除整个函数的 run。
+
+```python
+from langsmith import LS_MESSAGE_VIEW_EXCLUDE, traceable
+
+@traceable(run_type="llm", metadata={LS_MESSAGE_VIEW_EXCLUDE: True})
+def classify_intent(query: str) -> str:
+    # This LLM call is internal routing, not part of the chat
+    return llm.predict(f"Classify the intent of: {query}")
+```
+
+**2. 通过 `trace` 上下文管理器**：排除临时的 span。
+
+```python
+from langsmith import LS_MESSAGE_VIEW_EXCLUDE, trace
+
+with trace(
+    "safety_check",
+    run_type="llm",
+    metadata={LS_MESSAGE_VIEW_EXCLUDE: True},
+) as run:
+    result = safety_model.score(text)
+    run.end(outputs={"score": result})
+```
+
+**3. 从运行中的函数内部**：在 run 被 patch 之前的任意时刻，在当前 run tree 上设置该 key。
+
+```python
+from langsmith import LS_MESSAGE_VIEW_EXCLUDE, get_current_run_tree, traceable
+
+@traceable(run_type="llm")
+def maybe_internal(query: str) -> str:
+    result = llm.predict(query)
+    if _looks_like_routing(query):
+        rt = get_current_run_tree()
+        if rt is not None:
+            rt.add_metadata({LS_MESSAGE_VIEW_EXCLUDE: True})
+    return result
+```
+
+**4. 使用 `wrap_openai` / `wrap_anthropic` 时按调用设置**：将 `langsmith_extra` 透传给被包装的 client 调用。
+
+```python
+import openai
+from langsmith import LS_MESSAGE_VIEW_EXCLUDE
+from langsmith.wrappers import wrap_openai
+
+client = wrap_openai(openai.Client())
+
+resp = client.chat.completions.create(
+    model="gpt-5.6",
+    messages=[{"role": "user", "content": "Classify: ..."}],
+    langsmith_extra={"metadata": {LS_MESSAGE_VIEW_EXCLUDE: True}},
+)
+```
+
+**5. LangChain `RunnableConfig`**：排除 chain 或 chat model 的单次调用。
+
+```python
+from langchain_openai import ChatOpenAI
+from langsmith import LS_MESSAGE_VIEW_EXCLUDE
+
+llm = ChatOpenAI(model="gpt-5.6")
+result = llm.invoke(
+    "Classify this query",
+    config={"metadata": {LS_MESSAGE_VIEW_EXCLUDE: True}},
+)
+```
+
+  </Tab>
+  <Tab title="TypeScript">
+
+**1. 在 `traceable` wrapper 上**：排除整个函数的 run。
+
+```typescript
+import { LS_MESSAGE_VIEW_EXCLUDE } from "langsmith";
+import { traceable } from "langsmith/traceable";
+
+const classifyIntent = traceable(
+  async (query: string) => {
+    return await llm.predict(`Classify the intent of: ${query}`);
+  },
+  {
+    name: "classify_intent",
+    run_type: "llm",
+    metadata: { [LS_MESSAGE_VIEW_EXCLUDE]: true },
+  },
+);
+```
+
+**2. 从运行中的函数内部**：修改当前 run tree。
+
+```typescript
+import { LS_MESSAGE_VIEW_EXCLUDE } from "langsmith";
+import { traceable, getCurrentRunTree } from "langsmith/traceable";
+
+const maybeInternal = traceable(
+  async (query: string) => {
+    const result = await llm.predict(query);
+    if (looksLikeRouting(query)) {
+      const rt = getCurrentRunTree();
+      rt.extra = rt.extra ?? {};
+      rt.extra.metadata = { ...rt.extra.metadata, [LS_MESSAGE_VIEW_EXCLUDE]: true };
+    }
+    return result;
+  },
+  { run_type: "llm" },
+);
+```
+
+**3. 使用 `wrapOpenAI` 时按调用设置**：在调用上传递 `langsmithExtra`。
+
+```typescript
+import { LS_MESSAGE_VIEW_EXCLUDE } from "langsmith";
+import { wrapOpenAI } from "langsmith/wrappers";
+import OpenAI from "openai";
+
+const client = wrapOpenAI(new OpenAI());
+
+const resp = await client.chat.completions.create(
+  {
+    model: "gpt-5.6",
+    messages: [{ role: "user", content: "Classify: ..." }],
+  },
+  { langsmithExtra: { metadata: { [LS_MESSAGE_VIEW_EXCLUDE]: true } } },
+);
+```
+
+**4. Vercel AI SDK middleware**：通过 `wrapAISDK` 上的 `lsConfig.metadata` 传递该 key。该 middleware 会将其合并到每个发出的 LLM run 上。
+
+```typescript
+import * as ai from "ai";
+import { LS_MESSAGE_VIEW_EXCLUDE } from "langsmith";
+import { wrapAISDK } from "langsmith/experimental/vercel";
+
+const { generateText } = wrapAISDK(ai, {
+  metadata: { [LS_MESSAGE_VIEW_EXCLUDE]: true },
+});
+```
+
+要只排除部分调用而保留其他调用，请按常规方式使用 `wrapAISDK` 包装，改为在调用 AI SDK 的父级 `traceable` 内部修改 `getCurrentRunTree()`，或使用带有 `createChild({ extra: { metadata: { [LS_MESSAGE_VIEW_EXCLUDE]: true } } })` 的子级 `RunTree`。
+
+**5. 手动使用 `RunTree.createChild`**：当你手动构建 runs 时使用。
+
+```typescript
+import { LS_MESSAGE_VIEW_EXCLUDE } from "langsmith";
+import { RunTree } from "langsmith/run_trees";
+
+const parent = new RunTree({ name: "agent", run_type: "chain" });
+const child = parent.createChild({
+  name: "safety_check",
+  run_type: "llm",
+  extra: { metadata: { [LS_MESSAGE_VIEW_EXCLUDE]: true } },
+});
+```
+
+  </Tab>
+</Tabs>
+
+### 注意事项
+
+- 过滤器检查的是**该 key 是否存在**，而不是真值。`{LS_MESSAGE_VIEW_EXCLUDE: false}` 仍然会排除该 run。要包含该 run，请完全省略该 key。
+- 在 `@traceable`（Python）或 `traceable`（JS）父级中执行的子 runs 会通过共享的 tracing context 继承排除设置：Python 的 `_METADATA` `ContextVar` 和 JS 的 `AsyncLocalStorage`。子级自身在装饰时设置的 metadata 会叠加在继承的值之上。
+- 被排除的 runs 仍会出现在常规 trace view、runs explorer 和 metrics 中。只有 Trajectory view 会将它们过滤掉。
+
+## 手动 instrumentation
+
+如果你不使用[支持的集成](#支持的集成)中的某个 wrapper 来跟踪（例如通过 `RunTree`、REST API 或围绕某个 provider SDK 的自定义 wrapper 发出 runs），请在每个 LLM run 的 metadata 上设置 `ls_message_format`，将 trace 路由到正确的 extractor：
+
+| Trace shape | Set on metadata |
+| --- | --- |
+| LangChain messages（constructor envelope） | `ls_message_format: "langchain"` |
+| OpenAI Chat Completions | `ls_message_format: "completions"` |
+| OpenAI Responses API | `ls_message_format: "responses"` |
+| Anthropic Messages API | `ls_message_format: "anthropic"` |
+
+## 相关页面
+
+- [Configure threads](/langsmith/threads)：`thread_id` 如何在整个 LangSmith 中对 runs 进行分组。
+- [Coding agent metadata contract](/langsmith/coding-agent-metadata-contract)：完整的 `ls_agent_type` schema。
+- [View traces](/langsmith/view-traces#trajectory-view)：Trajectory view 显示的内容以及如何自定义它。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/trajectory-view-integrations.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

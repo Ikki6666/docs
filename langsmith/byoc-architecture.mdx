@@ -1,0 +1,109 @@
+---
+title: BYOC 架构
+sidebarTitle: 架构（AWS）
+description: LangSmith BYOC 部署如何跨越 LangChain control plane 和你的 AWS 账户中的 data plane 进行组织。
+icon: "sitemap"
+---
+
+## Control plane 与 data plane 模型
+
+BYOC 部署被拆分到两个 plane 上。本页介绍每个 plane 的组成、它们之间如何通信，以及 LangChain 会在你的账户中预置哪些资源。
+
+**Control plane** 运行在 LangChain 的云中，负责身份验证、组织配置和计费。它负责预置、监控和编排你的部署，但不持有任何敏感应用数据。
+
+**Data plane** 运行在你的 AWS 账户中，负责摄取、存储和查询你所有的敏感应用数据。它包含你的 VPC、EKS 集群、数据库以及其他资源。
+
+下表总结了这种拆分：
+
+| Plane | 运行位置 | 持有的内容 |
+|-------|---------------|---------------|
+| **Control plane** | LangChain 的云，`us-east-2` | 身份验证、组织和 workspace 配置、计费和使用量元数据、LangSmith API keys，以及静态前端资源 |
+| **Data plane** | 你的 AWS 账户，位于你选择的 region | Traces、prompts、datasets、evaluators、experiments、insights runs、annotation queues、agent 部署、workspace secrets 以及其他应用数据 |
+
+<img
+  src="/langsmith/images/byoc-architecture.png"
+  alt="BYOC architecture diagram. The LangSmith UI and the client apps in your application VPC both reach the data plane over one private connection, using PrivateLink, VPC peering, or Tailscale, which terminates at a network load balancer. The load balancer feeds an Istio ingress in an EKS cluster in your AWS account, which routes to the LangSmith services that run the backend, SmithDB, and sandboxes, and those services read and write S3, RDS, and ElastiCache. The LangChain cloud control plane holds Crossplane, on-call engineers, alerting, and the LangSmith control plane services. It reaches the cluster over PrivateLink for scaling and upgrades, receives auth and telemetry back over a second PrivateLink, and assumes an IAM role in your account to provision resources."
+/>
+
+## 预置的资源
+
+LangChain 会在你的账户中预置以下资源：
+
+- **VPC**：默认情况下，是一个横跨该 region 各可用区的专用 VPC，带有私有 ingress。它使用 VPC endpoints 与 AWS 服务进行私有通信，并使用 PrivateLink 在 data plane 与 control plane 之间通信。使用 [BYOVPC](/langsmith/byoc-byovpc) 时，改由你来创建和管理 VPC 及其基础网络资源。
+- **托管数据库**：RDS 用于关系型工作负载，ElastiCache 用于缓存。
+- **存储**：S3 存储桶，用于存放 trace 数据的 blob store、VPC flow logs 以及 ClickHouse 备份。
+- **EKS**：一个带有托管附加组件的私有 EKS 集群。
+- **计算**：一个用于平台工作负载的 system node group，以及通过 Karpenter 管理的 application node groups。
+- **集群内资源**：LangSmith Helm chart、Istio、KEDA 以及其他集群内资源。
+- **IAM roles**：Kubernetes 资源所需的角色和权限。
+
+## 跨账户 IAM 权限
+
+LangChain 需要跨账户 IAM 权限才能在你的 AWS 账户内预置和管理资源。这些权限让 LangChain 可以：
+
+- **预置基础设施**：创建和配置 VPC、子网、安全组以及其他网络组件。使用 BYOVPC 时，该角色仍保留工作负载网络方面的权限，而由你管理基础网络。
+- **管理 Kubernetes 集群**：部署和维护 EKS 集群、其 node groups 以及集群附加组件。
+- **创建存储资源**：预置 RDS、ElastiCache，以及用于应用数据和备份的 S3 存储桶。
+- **创建 IAM roles**：创建和配置 Kubernetes service accounts 及配套服务所使用的角色。
+- **运维配套服务**：部署和管理 ingress 与自动扩缩容，并对 LangSmith 工作负载进行扩容和升级。
+
+权限通过单一的跨账户 IAM role 授予，该角色由你在入门流程中应用 [`langsmith-byoc-role` Terraform module](https://github.com/langchain-ai/terraform/tree/main/modules/byoc/aws/langsmith-byoc-role) 创建。
+
+对于 BYOVPC，需要禁用基础 VPC 创建权限，并将安全组创建的范围限制在你提供的 VPC ID 上。参见 [Create the reduced-permission IAM role](/langsmith/byoc-byovpc#create-the-reduced-permission-iam-role)。
+
+LangChain 会提供该角色信任策略中使用的 external ID。通过 **Settings > Data Planes** 中 **Data Planes** 标题旁的按钮复制它，并在应用该 module 时使用。该角色的 `ExternalId` 条件必须与此值匹配。
+
+### 如何实施最小权限
+
+该角色的范围仅限于 BYOC 操作所需的内容：
+
+- **仅限于 LangSmith 拥有的资源**：在 AWS 支持资源级限定的地方，权限会被限制为仅能作用于带有特定 tag 和名称前缀的资源，因此该角色无法对账户中无关的资源执行操作。
+- **限于基础设施，而非数据**：该角色可以管理存放你数据的资源，但无法通过 AWS 数据 API 读取数据本身。它不持有 trace 存储桶上的 `s3:GetObject`，不持有 PostgreSQL 的 `rds-db:connect`，也不持有 Redis 的 `elasticache:Connect`。
+
+## 网络
+
+### 数据流量
+
+敏感数据不会离开你的 VPC，也不会经过 LangChain 的 VPC。
+
+1. 当用户打开 `aws.smith.langchain.com` 时，浏览器会从 LangChain 的云中获取由 HTML、JavaScript、CSS 和图片组成的 LangSmith UI bundle。这些资源与每个 BYOC 和 Cloud 租户运行的代码相同，不包含任何客户数据。
+1. 加载完成后，应用会解析所选 workspace 的 data plane endpoint，并将每一个针对敏感数据的请求路由到你的 VPC。
+
+若要以编程方式摄取或查询数据，请将你的客户端直接指向你的 data plane。数据流始终是 `browser or client → data plane → back to client`。
+
+<img
+  src="/langsmith/images/byoc-data-flow.png"
+  alt="Data traffic diagram. A user on their own machine, VPC, or network opens aws.smith.langchain.com in a browser. The browser makes two requests: first it fetches the UI bundle of HTML, CSS, and JavaScript from the static assets in LangChain's cloud, which hold no customer data; second it sends data plane API requests to the network load balancer in your BYOC VPC, which routes to the EKS cluster running LangSmith and on to S3, RDS, and the cache."
+/>
+
+### 连接性
+
+Control plane 与你的 data plane 之间的所有通信都通过 AWS PrivateLink 双向传输。LangChain 不会通过公共互联网访问你的环境。BYOC 会建立两条 PrivateLink 连接：
+
+- **Control plane 到 data plane（管理路径）**：仅暴露你集群的 Kubernetes API server，LangChain 用它来安装和调和 LangSmith 组件。通过这条连接无法访问你的数据。
+- **Data plane 到 control plane（运行时路径）**：data plane 调用 control plane 来验证请求、验证 API keys、解析角色和权限，以及加载组织和 workspace 配置。
+
+容器镜像通过 VPC endpoints 以只读方式从 LangChain 的 control plane ECR repositories 拉取。
+
+使用 BYOVPC 时，由你配置客户侧的 AWS service endpoints 以及 data plane 到 control plane 的 PrivateLink endpoint。LangChain 管理集群管理路径的 endpoint service。参见 [Configure connectivity](/langsmith/byoc-byovpc#configure-connectivity)。
+
+### DNS 与 ingress
+
+流量通过由 AWS NLB 提供前置的 Istio ingress 到达 LangSmith，并使用 Route 53 进行 DNS 解析。Data plane 创建后，其 API URL 会列在 LangSmith UI 的 **Settings > Data Planes** 下。
+
+## 下一步
+
+- [BYOC 概览](/langsmith/byoc)
+- [运维](/langsmith/byoc-operations)
+- [用于计费和运维遥测的出口流量](/langsmith/self-host-egress)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/byoc-architecture.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

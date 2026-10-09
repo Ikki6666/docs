@@ -1,0 +1,236 @@
+---
+title: Agent User Interaction Protocol (AG-UI)
+sidebarTitle: AG-UI
+description: 通过 Agent User Interaction Protocol (AG-UI) 暴露 deep agents，将事件流式传输到任意 AG-UI 客户端或前端。
+---
+
+[Agent User Interaction Protocol (AG-UI)](https://docs.ag-ui.com) 是一个开放、轻量、基于事件的协议，用于标准化 AI agent 连接到面向用户的应用的方式。
+通过 AG-UI 暴露 deep agent 会把它的运行变成一个类型化的事件流（消息、tool calls、推理、state 和生命周期），任何 AG-UI 客户端都可以消费该事件流，因此你可以在不把前端耦合到 LangGraph 内部实现的情况下驱动前端。
+
+<Note>
+    AG-UI 为 agent 与用户的交互而设计：即 agentic backend 与面向用户的前端之间的连接。它与其他 Deep Agents 协议不同：
+
+    - **AG-UI** 将 deep agent 连接到前端应用（本页面）。
+    - [Agent Client Protocol (ACP)](/oss/javascript/deepagents/acp) 将 deep agent 连接到代码编辑器和 IDE。
+    - [Model Context Protocol (MCP)](/oss/javascript/langchain/mcp) 让 deep agent 可以调用由外部 server 托管的工具。
+    - [Agent2Agent (A2A)](/oss/javascript/deepagents/a2a) 将 deep agent 连接到其他 agent。
+</Note>
+
+## 快速开始
+
+将 deep agent 作为 LangGraph graph 提供服务，然后连接 TypeScript 的 `@ag-ui/langgraph` 适配器，让 AG-UI 客户端可以驱动它。
+
+### 安装依赖
+
+
+
+安装 Deep Agents、LangGraph CLI 和 AG-UI LangGraph 适配器：
+
+<CodeGroup>
+```bash npm
+npm install @ag-ui/langgraph deepagents @langchain/langgraph-cli
+```
+
+```bash yarn
+yarn add @ag-ui/langgraph deepagents @langchain/langgraph-cli
+```
+
+```bash pnpm
+pnpm add @ag-ui/langgraph deepagents @langchain/langgraph-cli
+```
+</CodeGroup>
+
+
+用 `createDeepAgent` 创建的 deep agent（Python 中为 `create_deep_agent`）是一个 LangGraph graph。通过把它作为 LangGraph server 提供服务将它暴露给 AG-UI 客户端，然后把 AG-UI 适配器指向该 server。
+
+### 创建 deep agent
+
+定义 agent 并导出 graph，以便 LangGraph server 可以加载它。
+
+
+
+```ts icon="robot" title="agent.ts"
+import { createDeepAgent } from "deepagents";
+
+export const agent = createDeepAgent({
+  model: "anthropic:claude-sonnet-4-6",
+  systemPrompt: "You are an expert researcher.",
+});
+```
+
+
+### 提供 agent 服务
+
+在项目根目录的 `langgraph.json` 文件中注册 graph。
+
+
+
+```json icon="file-code" title="langgraph.json"
+{
+  "dependencies": ["."],
+  "graphs": {
+    "deep_agent": "./agent.ts:agent"
+  },
+  "env": ".env"
+}
+```
+
+
+启动 LangGraph 开发 server。它会在 `http://localhost:2024` 上通过 HTTP 暴露 graph。
+
+
+
+```bash
+npx @langchain/langgraph-cli dev
+```
+
+
+### 连接 AG-UI 适配器
+
+TypeScript 的 `@ag-ui/langgraph` 适配器会把运行中的 graph 包装成一个任何客户端都可以驱动的 AG-UI agent。将它指向 LangGraph server 并指定要加载的 graph 名称。无论 graph 是用 Python 还是 TypeScript 编写的，这都有效。
+
+```ts icon="plug" title="ag-ui agent"
+import { LangGraphAgent } from "@ag-ui/langgraph";
+
+const agent = new LangGraphAgent({
+  graphId: "deep_agent",
+  deploymentUrl: "http://localhost:2024",
+});
+```
+
+<Card title="AG-UI LangGraph adapter on npm" icon="brand-npm" href="https://www.npmjs.com/package/@ag-ui/langgraph">
+  `@ag-ui/langgraph` 包为 LangGraph graph（包括 deep agents）实现了 AG-UI 协议。
+</Card>
+
+## 流式输出事件
+
+AG-UI 是一个事件流。当 deep agent 运行时，适配器会把它在 LangGraph 上的执行翻译成类型化的 AG-UI 事件。客户端订阅这些事件并随事件到达而更新，而不是等待最终答案。
+
+一次 deep agent 运行会映射到多种 AG-UI 事件类型。以下是一些主要的事件：
+
+| Deep agent 活动 | AG-UI 事件 |
+| --- | --- |
+| Run 生命周期 | `RUN_STARTED`、`RUN_FINISHED`、`RUN_ERROR` |
+| Graph 节点进度 | `STEP_STARTED`、`STEP_FINISHED` |
+| Assistant 文本 | `TEXT_MESSAGE_START`、`TEXT_MESSAGE_CONTENT`、`TEXT_MESSAGE_END` |
+| Tool calls | `TOOL_CALL_START`、`TOOL_CALL_ARGS`、`TOOL_CALL_END`、`TOOL_CALL_RESULT` |
+| 推理 | `REASONING_START`、`REASONING_MESSAGE_CONTENT`、`REASONING_END` |
+| 共享 state（todos、subagents、自定义键） | `STATE_SNAPSHOT`、`STATE_DELTA` |
+| 对话历史 | `MESSAGES_SNAPSHOT` |
+
+State 更新使用 `STATE_SNAPSHOT` 表示完整基线，使用 `STATE_DELTA`（JSON Patch，RFC 6902）表示增量变化，因此客户端可以保持 todos、计划、subagent 状态同步，而无需在每个步骤重新发送整个 state。
+
+要直接观察事件流，请带一个 subscriber 运行 agent。每个事件都有对应的 `on…Event` 回调：
+
+```ts icon="activity" title="observe.ts"
+import { LangGraphAgent } from "@ag-ui/langgraph";
+
+const agent = new LangGraphAgent({
+  graphId: "deep_agent",
+  deploymentUrl: "http://localhost:2024",
+  initialMessages: [
+    { id: "1", role: "user", content: "Research the AG-UI protocol." },
+  ],
+});
+
+await agent.runAgent(
+  {},
+  {
+    onTextMessageContentEvent({ event }) {
+      process.stdout.write(event.delta);
+    },
+    onToolCallStartEvent({ event }) {
+      console.log(`\n[tool] ${event.toolCallName}`);
+    },
+    onStateSnapshotEvent({ event }) {
+      console.log("\n[state]", event.snapshot);
+    },
+    onRunFinishedEvent() {
+      console.log("\n[done]");
+    },
+  },
+);
+```
+
+当 deep agent 为等待人工输入而暂停时，运行会以 interrupt 结束。默认情况下，`@ag-ui/langgraph` 会在 `RUN_FINISHED` 之外发出一个旧版的 `on_interrupt` 自定义事件。要在 `RUN_FINISHED` 上接收结构化的 AG-UI interrupt 结果（`outcome.type === "interrupt"`），请在构造 agent 时设置 `emitInterruptOutcome: true`：
+
+```ts icon="hand-stop"
+const agent = new LangGraphAgent({
+  graphId: "deep_agent",
+  deploymentUrl: "http://localhost:2024",
+  emitInterruptOutcome: true,
+});
+```
+
+通过在下一次输入中发送标准的 AG-UI `resume` 字段来恢复运行：
+
+```ts icon="hand-stop"
+const input = {
+  threadId: "t1",
+  runId: "r2",
+  messages: [],
+  resume: [
+    { interruptId: "int-abc", status: "resolved", payload: { approved: true } },
+  ],
+};
+```
+
+interrupt 模型本身请参见 [Human-in-the-loop](/oss/javascript/deepagents/human-in-the-loop)。
+
+<Info>
+    完整的事件 schema 请参见 [AG-UI events reference](https://docs.ag-ui.com/concepts/events)。
+</Info>
+
+## 连接前端
+
+任何 AG-UI 客户端都可以驱动通过该协议暴露的 deep agent，因此你不必自己构建消息渲染、流式输出或 state 同步。把客户端指向适配器（或包装它的 runtime），并通过 `graphId` 选择 agent。
+
+<CardGroup cols={2}>
+  <Card title="CopilotKit" icon="brand-react" href="/oss/javascript/langchain/frontend/integrations/copilotkit">
+    支持 LangGraph 和 Deep Agents 的 AG-UI 的 React chat runtime，包括 Python FastAPI bridge。
+  </Card>
+  <Card title="AG-UI clients" icon="apps" href="https://docs.ag-ui.com/integrations">
+    AG-UI 客户端和 SDK 的完整列表，包括终端和移动客户端。
+  </Card>
+  <Card title="Build a custom client" icon="code" href="https://docs.ag-ui.com/quickstart/clients">
+    使用 AG-UI SDK 直接消费事件流，构建你自己的界面。
+  </Card>
+</CardGroup>
+
+## 程序化 API
+
+`LangGraphAgent` 连接到 LangGraph server 上的 deep agent，并将它暴露为 AG-UI agent。用要加载的 graph 构造它，然后用几个方法驱动它。
+
+```ts icon="plug"
+import { LangGraphAgent } from "@ag-ui/langgraph";
+
+const agent = new LangGraphAgent({
+  graphId: "deep_agent",              // matches a key in langgraph.json
+  deploymentUrl: "http://localhost:2024",
+});
+```
+
+- **`runAgent(parameters?, subscriber?)`**：运行 agent，并将 AG-UI 事件流式传输到 subscriber 的 `on…Event` 回调（参见 [Stream events](#stream-events)）。在运行结束时 resolve。
+- **`subscribe(subscriber)`**：附加一个持久 subscriber，它会在每次运行中接收事件，而不是仅限单次调用。
+- **`abortRun()`**：取消正在进行的运行。
+
+要预置输入，可以向构造函数传入 `initialMessages`，或在运行前调用 `addMessage` 或 `setMessages`。
+
+## See also
+
+- [CopilotKit](/oss/javascript/langchain/frontend/integrations/copilotkit)：通过 AG-UI 使用 Deep Agents 的 Python 和 TypeScript CopilotKit runtime 模式
+- [Frontend overview](/oss/javascript/deepagents/frontend/overview)：使用 LangChain 前端 SDK 构建 UI，流式展示 deep agent 进度
+- [Human-in-the-loop](/oss/javascript/deepagents/human-in-the-loop)：deep agents 的 interrupt 和恢复模型
+- [Agent Client Protocol (ACP)](/oss/javascript/deepagents/acp)：将 deep agents 连接到代码编辑器和 IDE
+- [AG-UI documentation](https://docs.ag-ui.com)：协议概念、事件和客户端 SDK
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/deepagents/ag-ui.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

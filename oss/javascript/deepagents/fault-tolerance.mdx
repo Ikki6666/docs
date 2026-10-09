@@ -1,0 +1,233 @@
+---
+title: 容错
+description: 通过 rate limiting、retry、fallback 和错误处理让你的 deep agent 更具韧性
+---
+
+容错 middleware 会在出问题时保持你的 deep agent 继续运行。并非所有错误都应该以相同的方式处理：瞬时失败（网络超时、rate limits）应该自动 retry，LLM 可以从中恢复的错误（错误的工具输出、解析失败）应该反馈给模型，而需要人工介入的错误应该暂停 agent。
+
+## 错误处理策略
+
+不同的错误需要不同的处理策略：
+
+| 错误类型 | 由谁处理 | 策略 | Middleware 或功能 |
+|------------|--------------|----------|----------------------|
+| 瞬时错误（网络问题、rate limits） | 系统（自动） | 使用指数退避 retry | [ModelRetryMiddleware](https://reference.langchain.com/javascript/langchain/index/modelRetryMiddleware), [ToolRetryMiddleware](https://reference.langchain.com/javascript/langchain/index/toolRetryMiddleware) |
+ | 用户可修复的错误（缺少信息、指令不清晰） | 人工 | 使用 `interrupt()` 暂停 | [Human-in-the-loop](/oss/javascript/deepagents/human-in-the-loop) |
+| Provider 宕机 | 系统（自动） | 回退到备用模型 | [ModelFallbackMiddleware](https://reference.langchain.com/python/langchain/agents/middleware/model_fallback/ModelFallbackMiddleware) |
+| 过度调用（失控循环） | 系统（自动） | 限制每次运行的模型和工具调用次数 | [ModelCallLimitMiddleware](https://reference.langchain.com/python/langchain/agents/middleware/model_call_limit/ModelCallLimitMiddleware), [ToolCallLimitMiddleware](https://reference.langchain.com/python/langchain/agents/middleware/tool_call_limit/ToolCallLimitMiddleware) |
+| 意外错误 | 开发者 | 让它们向上冒泡 | 无 middleware；让异常传播 |
+
+以下章节将通过代码示例介绍每种策略。
+
+<Tabs>
+  <Tab title="瞬时错误" icon="rotate">
+
+  添加 retry middleware 可以自动 retry 网络问题和 rate limits。模型调用和工具调用各自有带指数退避的 retry middleware：
+
+
+
+```typescript
+import { createAgent, modelRetryMiddleware, toolRetryMiddleware } from "langchain";
+
+const agent = createAgent({
+  model: "google:gemini-3.6-flash",
+  tools: [searchTool, fetchUrlTool],
+  middleware: [
+    modelRetryMiddleware({ maxRetries: 3, backoffFactor: 2.0, initialDelayMs: 1000 }),
+    toolRetryMiddleware({
+      maxRetries: 2,
+      tools: ["search", "fetch_url"],
+      retryOn: [TimeoutError, TypeError],
+    }),
+  ],
+});
+```
+
+
+  </Tab>
+
+
+
+  <Tab title="用户可修复" icon="user">
+
+  在需要时暂停并从用户那里收集信息（例如账户 ID、订单号或澄清）。使用 `interrupt_on` 在特定的 tool calls 之前暂停 agent：
+
+
+
+```typescript
+import { createDeepAgent } from "deepagents";
+
+const agent = createDeepAgent({
+  model: "google:gemini-3.6-flash",
+  tools: [sendEmailTool, deleteRecordTool],
+  interruptOn: {
+    send_email: true,
+    delete_record: true,
+  },
+});
+```
+
+
+  完整的 human-in-the-loop 指南请参见 [Human-in-the-loop](/oss/javascript/deepagents/human-in-the-loop)。
+
+  </Tab>
+
+  <Tab title="Provider 宕机" icon="arrows-exchange">
+
+  如果你的主模型 provider 完全宕机，使用 [ModelFallbackMiddleware](https://reference.langchain.com/javascript/langchain/index/modelFallbackMiddleware) 切换到备用模型：
+
+
+
+```typescript
+import { createAgent, modelFallbackMiddleware } from "langchain";
+
+const agent = createAgent({
+  model: "google:gemini-3.6-flash",
+  tools: [searchTool],
+  middleware: [
+    modelFallbackMiddleware("gpt-5.5"),
+  ],
+});
+```
+
+
+  </Tab>
+
+  <Tab title="过度调用" icon="gauge">
+
+  没有限制时，一个混乱的 agent 可能通过在同一个 tool call 上循环或发起数百次模型调用，在几分钟内耗尽你的 LLM API 预算。为每次运行的模型调用和工具执行都设置上限：
+
+
+
+```typescript
+import { createAgent, modelCallLimitMiddleware, toolCallLimitMiddleware } from "langchain";
+
+const agent = createAgent({
+  model: "google:gemini-3.6-flash",
+  tools: [searchTool],
+  middleware: [
+    modelCallLimitMiddleware({ runLimit: 50 }),
+    toolCallLimitMiddleware({ runLimit: 200 }),
+  ],
+});
+```
+
+
+  </Tab>
+
+  <Tab title="意外错误" icon="alert-triangle">
+
+
+
+  让它们向上冒泡以便调试。不要捕获你无法处理的东西。这种模式同样适用于 JavaScript SDK 中的自定义 middleware。
+
+
+  </Tab>
+</Tabs>
+
+## Rate limiting
+
+有两种互补的方式来限制资源使用：控制发往模型 provider 的请求速率，以及限制每次运行的总调用次数。
+
+### Provider rate limiting
+
+Chat model provider 会对给定时间段内可以发起的调用次数施加限制。要控制请求发出的速率，请在初始化模型时使用 `rate_limiter`：
+
+
+
+
+
+### 调用限制
+
+没有限制时，一个混乱的 agent 可能通过在同一个 tool call 上循环或发起数百次模型调用，在几分钟内耗尽你的 LLM API 预算。为每次运行的模型调用和工具执行都设置上限：
+
+
+
+```typescript
+import { createAgent, modelCallLimitMiddleware, toolCallLimitMiddleware } from "langchain";
+
+const agent = createAgent({
+  model: "google:gemini-3.6-flash",
+  middleware: [
+    modelCallLimitMiddleware({ runLimit: 50 }),
+    toolCallLimitMiddleware({ runLimit: 200 }),
+  ],
+});
+```
+
+
+使用 `run_limit` 限制单次调用中的调用次数（每回合重置）。使用 `thread_limit` 限制整个对话中的调用次数（需要 checkpointer）。完整配置请参见 [ModelCallLimitMiddleware](https://reference.langchain.com/javascript/langchain/index/modelCallLimitMiddleware) 和 [ToolCallLimitMiddleware](https://reference.langchain.com/javascript/langchain/index/toolCallLimitMiddleware)。
+
+## Retries
+
+瞬时失败（网络超时、rate limits）应该自动 retry。模型调用和工具调用各自有带指数退避的 retry middleware：
+
+
+
+```typescript
+import {
+  createAgent,
+  modelRetryMiddleware,
+  toolRetryMiddleware,
+} from "langchain";
+
+const agent = createAgent({
+  model: "google:gemini-3.6-flash",
+  middleware: [
+    // Retry model calls on rate limits, timeouts, and 5xx errors
+    modelRetryMiddleware({ maxRetries: 3, backoffFactor: 2.0, initialDelayMs: 1000 }),
+    // Retry specific tools that hit external APIs (not all tools)
+    toolRetryMiddleware({
+      maxRetries: 2,
+      tools: ["search", "fetch_url"],
+      retryOn: [TimeoutError, TypeError],
+    }),
+  ],
+});
+```
+
+
+将 [ToolRetryMiddleware](https://reference.langchain.com/javascript/langchain/index/toolRetryMiddleware) 限定到特定工具，而不是 retry 所有内容。失败的文件系统 `read_file` 无法从 retry 中受益，但超时的 web search 很可能可以。完整配置请参见 [ModelRetryMiddleware](https://reference.langchain.com/javascript/langchain/index/modelRetryMiddleware)。
+
+
+
+## Fallbacks
+
+如果你的主模型 provider 完全宕机，fallback middleware 会切换到备用模型：
+
+
+
+```typescript
+import {
+  createAgent,
+  modelFallbackMiddleware,
+} from "langchain";
+
+const agent = createAgent({
+  model: "google:gemini-3.6-flash",
+  middleware: [
+    // If the primary model is fully down, fall back to an alternative
+    modelFallbackMiddleware("gpt-5.5"),
+  ],
+});
+```
+
+
+完整配置请参见 [ModelFallbackMiddleware](https://reference.langchain.com/javascript/langchain/index/modelFallbackMiddleware)。
+
+## 错误处理
+
+
+
+当工具在执行期间抛出异常时，agent 运行默认会停止。`ToolErrorMiddleware` 在 JavaScript SDK 中尚不可用。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/deepagents/fault-tolerance.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

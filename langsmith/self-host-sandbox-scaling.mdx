@@ -1,0 +1,131 @@
+---
+title: 扩展自托管 Sandboxes
+sidebarTitle: 扩缩容与容量
+description: 通过 host 自动扩缩容、Kubernetes 节点扩缩、内存余量和共享文件系统缓存规划自托管 Sandbox 容量。
+---
+
+import { SandboxDiagram } from '/snippets/sandbox-diagram.jsx';
+
+自托管 Sandboxes 分两层扩缩：LangSmith 调整 host Deployment，你的节点 autoscaler 提供 Kubernetes 节点。两层要一起规划，确保新 host 在现有 pool 耗尽容量之前就绪。
+
+本指南建立在 [Sandbox 架构](/langsmith/self-host-sandbox-architecture)之上。云平台特定的基础设施设置，请参阅[启用 Sandboxes](/langsmith/deploy-self-hosted-full-platform#enable-sandboxes)。
+
+## 了解两层扩缩
+
+内置的 host autoscaler 运行在一台被选出的 `sandbox-host` 上。各 host 通过 Kubernetes Lease 发布其已占用的 vCPU 和 sandbox 数量。leader 使用这些信息来调整 Deployment 的副本数。
+
+<Frame caption="LangSmith 请求 host pods。你的基础设施提供节点。在 host 就绪之前，期望的副本还不是可用容量。">
+  <SandboxDiagram name="autoscaling" />
+</Frame>
+
+host autoscaler 不使用 HPA、KEDA 或 Prometheus adapter。不要配置另一个控制器来管理同一 Deployment 的副本数。
+
+新的 host pod 需要一个没有其他 host pod 的合格节点。没有可用节点时，它会保持 `Pending` 状态，直到你的节点 autoscaler 增加容量。为专用、支持 KVM 的 node pool 配置该 autoscaler，包括兼容的 label、taint 和实例要求。
+
+在正常缩容期间，host autoscaler 会在一个稳定窗口内保留最近的峰值目标。然后每个窗口最多移除一台 host。pod 删除成本会让负载较轻的 host 优先。移除运行中的 host 会[drain 其 sandbox](/langsmith/self-host-sandbox-operations#follow-a-host-drain)；这不是无中断操作。
+
+## 计算 host 目标
+
+已占用 vCPU 是就绪 host 上运行中的 sandbox 请求的 CPU，而不是实测 CPU 用量。对于同等规格 host 组成的 pool，基于负载的目标为：
+
+```text
+desired hosts = ceil(committed vCPU / (host vCPU × target fraction)) + headroom hosts
+```
+
+autoscaler 会将结果限制在 `minReplicas` 和 `maxReplicas` 之间。没有 host 容量信号时，它从最小值开始。使用同构 pool：该计算假设每台 host 具有相同的 CPU 容量。
+
+例如，使用 16 vCPU 的 host、70% 目标和一台余量 host：
+
+- **单 host 目标**：`16 × 0.70 = 11.2` 已占用 vCPU。
+- **工作负载**：60 个各请求 0.5 vCPU 的 sandbox 共占用 30 vCPU。
+- **pool 目标**：`ceil(30 / 11.2) + 1 = 4` 台 host，受配置边界约束。
+
+70% 目标不是单 host 容量上限。在 pool 扩缩过程中或达到最大值时，放置可以超过它。
+
+### 应对突发流量
+
+在节点和 host 就绪之前，副本目标可能上升。余量可以覆盖部分延迟；它不能让节点预配瞬时完成。
+
+<Frame caption="仅作示意的扩缩行为，不是延迟基准。扩容跟随需求；缩容会等待稳定窗口并逐步进行。">
+  <SandboxDiagram name="scaling-behavior" />
+</Frame>
+
+为节点启动期间需要吸收的突发量选择 `minReplicas` 和 `headroomHosts`。对于在单 host rollout 期间必须继续接受工作的 pool，保持至少两台 host。在有代表性的负载下测量节点启动、host 就绪和 sandbox 创建延迟。
+
+如果 pool 达到最大值，应调查需求和基础设施限制，而不是假设利用率目标能防止过载。没有就绪 host 时，创建 sandbox 的请求会失败。客户端需要为瞬态容量失败设置有界的重试和退避。
+
+## 配置 host autoscaler
+
+以下 Helm values 位于 `sandboxes.sandboxHost.autoscaling` 下。检查你的 chart 版本随附的 values；现有覆盖可能改变实际生效的设置。
+
+| 值 | Chart 默认值 | 运维建议 |
+| --- | --- | --- |
+| `enabled` | `false` | 当你的 node pool 能够随之扩缩时，启用 host 自动扩缩容。 |
+| `minReplicas` | `1` | 至少使用 `2`，避免正常 rollout 期间出现零就绪 host。 |
+| `maxReplicas` | `10` | 与合格节点容量和基础设施配额对齐。 |
+| `targetUtilizationPercent` | `70` | 较低的值留出更多 CPU 余量。它测量的是占用，而不是实时用量。 |
+| `headroomHosts` | `1` | 在基于负载的目标之上增加备用容量。 |
+| `scaleDownStabilizationSeconds` | `300` | 调大以减少短时需求低谷期间反复 drain。 |
+
+启用自动扩缩容后，chart 将 Deployment 的副本数交给 host autoscaler 管理。否则，`sandboxes.sandboxHost.deployment.replicas` 设置固定的 host 数量。
+
+以 `sandbox-host.smith.langchain.com/autoscale-` 为前缀的 Deployment annotation 可以在不重启 host 的情况下覆盖基准设置。当 Helm values 与观察到的扩缩行为不一致时，检查现有覆盖。常规运维优先使用持久的 Helm 配置。
+
+对齐三个独立的限制：
+
+1. 针对峰值工作负载设置 host 副本上限。
+2. 让 node pool 和基础设施配额能够提供相应数量的合格节点。
+3. 针对预期的并发 CPU、内存和 sandbox 数量设置 workspace sandbox 配额。
+
+Workspace 配额控制用户可以请求的内容。它们不预配节点，也不保证物理容量。
+
+## 一并规划 CPU 和内存
+
+以下示例将同样的 70% 目标和一台余量 host 应用到 500 个运行中的 sandbox。它展示的是 `maxReplicas` 限制之前的基于 CPU 的目标，不是性能保证。
+
+| 每个 sandbox 的 vCPU | 总占用 vCPU | 16-vCPU host | 32-vCPU host | 64-vCPU host |
+| --- | --- | --- | --- | --- |
+| 0.5 | 250 | 24 | 13 | 7 |
+| 1 | 500 | 46 | 24 | 13 |
+| 2 | 1,000 | 91 | 46 | 24 |
+
+内存需要单独核算。例如，500 个各配置 2 GiB 的 sandbox 请求 1,000 GiB 的 guest 内存，这还未计入 host 和文件系统开销。
+
+<Warning>
+host 自动扩缩容使用的是已占用 CPU，而不是内存压力。按 CPU 规划的 pool 仍可能耗尽内存。为 guest 内存、host daemon、JuiceFS、缓存和 Kubernetes 开销做预算。
+</Warning>
+
+host pod 的内存 request 必须反映其包含的工作负载。仅为 daemon 设置较小的 request 不会为它的 microVM 预留内存。对照节点可分配内存和实测峰值用量来审查 `sandboxes.sandboxHost.deployment.resources`。
+
+## 平衡节点规格与缓存容量
+
+更大的节点让更多 sandbox 共享本地 JuiceFS 缓存，并摊薄 host 开销。但是，每台 host 故障或 drain 会影响更多 sandbox，且保存它们的内存可能需要更长时间。
+
+根据以下约束选择节点：
+
+- **虚拟化**：在受支持的 Linux 节点配置上暴露 `/dev/kvm`。
+- **CPU 兼容性**：在整个 pool 中保持一致的 CPU 型号。参见[规划机型变更](/langsmith/self-host-sandbox-operations#plan-machine-changes)。
+- **内存**：为 host 和文件系统开销留出容量，而不仅仅是请求的 guest 内存。
+- **本地存储**：为工作集提供缓存空间，并监控磁盘压力。
+- **故障影响**：保持足够的 host 和备用容量，以容忍丢失或 drain 一台。
+
+对于 host 持有的 JuiceFS 挂载，`sandboxes.juicefs.hostMount.cacheDirs` 选择节点本地缓存路径。`sandboxes.juicefs.hostMount.mountOptions` 控制缓存选项。chart 的默认缓存预算是所有配置目录合计 50 GiB；安装更大的磁盘不会自动提高该预算。
+
+缓存可以在同一节点上的 pod 替换后保留，但不能在该节点本身被替换后保留。将缓存预热视为容量测试的一部分，而不是持久化存储恢复。
+
+## 另请参阅
+
+- [Sandbox 架构与生命周期](/langsmith/self-host-sandbox-architecture)
+- [升级与运维 Sandboxes](/langsmith/self-host-sandbox-operations)
+- [配置自托管资源用量](/langsmith/self-host-usage)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/self-host-sandbox-scaling.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

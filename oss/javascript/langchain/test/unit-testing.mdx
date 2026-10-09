@@ -1,0 +1,365 @@
+---
+title: 单元测试
+description: 使用 fake chat model 和内存持久化，在不发 API 调用的情况下测试智能体逻辑。
+---
+
+单元测试会隔离测试智能体中小而确定的部分。通过把真实 LLM 换成内存中的 fake（也就是 fixture），你可以脚本化精确响应（文本、工具调用和错误），这样测试既快、又免费，而且可重复，不需要 API key。
+
+
+
+## 使用 `fakeModel` 模拟聊天模型
+
+[`fakeModel`](https://reference.langchain.com/javascript/langchain/index/fakeModel) 是一个 builder 风格的 fake chat model，允许你脚本化精确响应（文本、工具调用、错误）并断言模型收到了什么。它扩展了 [`BaseChatModel`](https://reference.langchain.com/javascript/langchain-core/language_models/chat_models/BaseChatModel)，所以可以在任何需要真实模型的地方使用。
+
+```typescript
+import { fakeModel } from "langchain";
+```
+
+### 快速开始
+
+创建模型，用 `.respond()` 排队响应，然后调用。每次 `invoke()` 都会按顺序消费下一个排队的响应：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond(new AIMessage("I can help with that."))
+  .respond(new AIMessage("Here's what I found."))
+  .respond(new AIMessage("You're welcome!"));
+
+const r1 = await model.invoke([new HumanMessage("Can you help?")]);
+// r1.content === "I can help with that."
+
+const r2 = await model.invoke([new HumanMessage("What did you find?")]);
+// r2.content === "Here's what I found."
+
+const r3 = await model.invoke([new HumanMessage("Thanks!")]);
+// r3.content === "You're welcome!"
+```
+
+如果调用次数超过了已排队的响应数量，就会抛出一条描述清楚的错误：
+
+```typescript
+const model = fakeModel()
+  .respond(new AIMessage("only one"));
+
+await model.invoke([new HumanMessage("first")]);  // works
+await model.invoke([new HumanMessage("second")]); // throws: "no response queued for invocation 1"
+```
+
+### 工具调用响应
+
+`.respond()` 通过传入带有 `tool_calls` 的 [`AIMessage`](https://reference.langchain.com/javascript/langchain-core/messages/AIMessage) 也能支持工具调用：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond(new AIMessage({
+    content: "",
+    tool_calls: [
+      { name: "get_weather", args: { city: "San Francisco" }, id: "call_1", type: "tool_call" },
+    ],
+  }))
+  .respond(new AIMessage("It's 72°F and sunny in San Francisco."));
+
+const r1 = await model.invoke([new HumanMessage("What's the weather in SF?")]);
+console.log(r1.tool_calls[0].name); // "get_weather"
+
+const r2 = await model.invoke([new HumanMessage("Thanks")]);
+console.log(r2.content); // "It's 72°F and sunny in San Francisco."
+```
+
+`.respondWithTools()` 是同样功能的简写。与其构造完整的 `AIMessage`，不如只提供工具名和参数：
+
+```typescript
+// 下面这两个队列条目会生成相同的响应：
+
+model.respond(new AIMessage({
+  content: "",
+  tool_calls: [
+    { name: "get_weather", args: { city: "SF" }, id: "call_1", type: "tool_call" },
+  ],
+}));
+
+// 等价的简写：
+model.respondWithTools([  // [!code highlight]
+  { name: "get_weather", args: { city: "SF" }, id: "call_1" },  // [!code highlight]
+]);  // [!code highlight]
+```
+
+`id` 字段是可选的。如果省略，会自动生成唯一 ID。
+
+<Tip>
+    `.respond()` 和 `.respondWithTools()` 可以按任意顺序自由混用。这对于测试 agentic loop 特别有用，因为模型会在工具调用和文本回复之间交替。
+</Tip>
+
+### 模拟错误
+
+#### 特定轮次出错
+
+把一个 `Error` 传给 `.respond()` 会让模型在那次特定调用时抛错。错误可以出现在序列中的任何位置：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond(new Error("rate limit exceeded"))  // 第 1 轮：抛错  // [!code highlight]
+  .respond(new AIMessage("Recovered!"));      // 第 2 轮：成功
+
+try {
+  await model.invoke([new HumanMessage("first")]);
+} catch (e) {
+  console.log(e.message); // "rate limit exceeded"
+}
+
+const result = await model.invoke([new HumanMessage("retry")]);
+console.log(result.content); // "Recovered!"
+```
+
+#### 每次调用都出错
+
+`.alwaysThrow()` 会让每次调用都抛错，不管队列里有什么。这对于测试错误处理和重试逻辑很有用：
+
+```typescript
+import { fakeModel } from "langchain";
+import { HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel().alwaysThrow(new Error("service unavailable"));
+
+await model.invoke([new HumanMessage("a")]); // throws "service unavailable"
+await model.invoke([new HumanMessage("b")]); // throws "service unavailable"
+```
+
+### 使用工厂函数生成动态响应
+
+`.respond()` 也接受一个基于输入消息计算响应的函数。该函数会接收完整消息数组，并返回一个 [`BaseMessage`](https://reference.langchain.com/javascript/langchain-core/messages/BaseMessage) 或一个 `Error`：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond((messages) => {  // [!code highlight]
+    const last = messages[messages.length - 1].text;  // [!code highlight]
+    return new AIMessage(`You said: ${last}`);  // [!code highlight]
+  });  // [!code highlight]
+
+const result = await model.invoke([new HumanMessage("hello")]);
+console.log(result.content); // "You said: hello"
+```
+
+工厂函数也可以返回错误：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond((messages) => {
+    const content = messages[messages.length - 1].text;
+    if (content.includes("forbidden")) {
+      return new Error("Content policy violation");
+    }
+    return new AIMessage("OK");
+  });
+
+await model.invoke([new HumanMessage("forbidden topic")]); // throws "Content policy violation"
+```
+
+<Note>
+    每个函数都只算一个队列条目，消费一次。如果你想在多轮中复用同样的动态逻辑，就需要排队多个 `respond` 函数调用。
+</Note>
+
+### 结构化输出
+
+对于使用 `.withStructuredOutput()` 的代码，请用 `.structuredResponse()` 配置 fake 返回值：
+
+```typescript
+import { fakeModel } from "langchain";
+import { HumanMessage } from "@langchain/core/messages";
+import { z } from "zod";
+
+const model = fakeModel()
+  .structuredResponse({ temperature: 72, unit: "fahrenheit" });  // [!code highlight]
+
+const structured = model.withStructuredOutput(
+  z.object({
+    temperature: z.number(),
+    unit: z.string(),
+  })
+);
+
+const result = await structured.invoke([new HumanMessage("Weather?")]);
+console.log(result);
+// { temperature: 72, unit: "fahrenheit" }
+```
+
+传给 `.withStructuredOutput()` 的 schema 会被忽略。模型总是返回你通过 `.structuredResponse()` 配置的值。这能让测试聚焦在应用逻辑，而不是解析逻辑上。
+
+### 断言模型收到了什么
+
+`fakeModel` 会记录每次调用，包括传给模型的消息和选项。这就像传统测试框架里的 spy 或 mock：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel()
+  .respond(new AIMessage("first"))
+  .respond(new AIMessage("second"));
+
+await model.invoke([new HumanMessage("question 1")]);
+await model.invoke([new HumanMessage("question 2")]);
+
+console.log(model.callCount); // 2
+
+console.log(model.calls[0].messages[0].content); // "question 1"
+console.log(model.calls[1].messages[0].content); // "question 2"
+```
+
+即使模型抛出错误，调用记录也会保留：
+
+```typescript
+import { fakeModel } from "langchain";
+import { HumanMessage } from "@langchain/core/messages";
+
+const model = fakeModel().respond(new Error("boom"));
+
+try {
+  await model.invoke([new HumanMessage("will fail")]);
+} catch {
+  // 错误已处理
+}
+
+console.log(model.callCount); // 1
+console.log(model.calls[0].messages[0].content); // "will fail"
+```
+
+### 与 `bindTools` 一起使用
+
+LangChain agent 和 LangGraph 这类 agent 框架会在内部调用 `model.bindTools(tools)`。`fakeModel` 会自动处理这一点。绑定后的模型与原始模型共享同一条响应队列和调用记录，因此不需要额外设置：
+
+```typescript
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+
+const searchTool = tool(async ({ query }) => `Results for: ${query}`, {
+  name: "search",
+  description: "Search the web",
+  schema: z.object({ query: z.string() }),
+});
+
+const model = fakeModel()
+  .respondWithTools([{ name: "search", args: { query: "weather" }, id: "1" }])
+  .respond(new AIMessage("The weather is sunny."));
+
+const bound = model.bindTools([searchTool]);
+
+const r1 = await bound.invoke([new HumanMessage("weather?")]);
+console.log(r1.tool_calls[0].name); // "search"
+
+const r2 = await bound.invoke([new HumanMessage("thanks")]);
+console.log(r2.content); // "The weather is sunny."
+
+// 调用记录与原始模型共享。通过原始 model 查看即可。
+console.log(model.callCount); // 2
+```
+
+<Accordion title="完整示例：使用 vitest 测试一个工具调用智能体">
+
+```typescript
+import { describe, test, expect } from "vitest";
+import { fakeModel } from "langchain";
+import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+
+const getWeather = tool(
+  async ({ city }) => `72°F and sunny in ${city}`,
+  {
+    name: "get_weather",
+    description: "Get weather for a city",
+    schema: z.object({ city: z.string() }),
+  }
+);
+
+async function runAgent(
+  model: ReturnType<typeof fakeModel>,
+  input: string
+) {
+  const messages: any[] = [new HumanMessage(input)];
+  const bound = model.bindTools([getWeather]);
+
+  while (true) {
+    const response = await bound.invoke(messages);
+    messages.push(response);
+
+    if (!response.tool_calls?.length) {
+      return { messages, finalResponse: response };
+    }
+
+    for (const tc of response.tool_calls) {
+      const result = await getWeather.invoke(tc.args);
+      messages.push(new ToolMessage({
+        content: result as string,
+        tool_call_id: tc.id!,
+      }));
+    }
+  }
+}
+
+describe("weather agent", () => {
+  test("calls get_weather and returns a final answer", async () => {
+    const model = fakeModel()
+      .respondWithTools([
+        { name: "get_weather", args: { city: "SF" }, id: "call_1" },
+      ])
+      .respond(new AIMessage("It's 72°F and sunny in SF!"));
+
+    const { finalResponse } = await runAgent(model, "Weather in SF?");
+
+    expect(finalResponse.content).toBe("It's 72°F and sunny in SF!");
+    expect(model.callCount).toBe(2);
+
+    const secondCall = model.calls[1].messages;
+    const toolMsg = secondCall.find((m: any) => m._getType() === "tool");
+    expect(toolMsg?.content).toContain("72°F and sunny in SF");
+  });
+
+  test("handles model errors gracefully", async () => {
+    const model = fakeModel()
+      .respond(new Error("rate limit"));
+
+    await expect(
+      runAgent(model, "Weather?")
+    ).rejects.toThrow("rate limit");
+
+    expect(model.callCount).toBe(1);
+  });
+});
+```
+
+</Accordion>
+
+
+
+## 下一步
+
+了解如何在真实模型提供商 API 上测试你的智能体，请参见 [集成测试](/oss/javascript/langchain/test/integration-testing)。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/langchain/test/unit-testing.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

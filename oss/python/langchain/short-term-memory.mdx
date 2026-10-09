@@ -1,0 +1,328 @@
+---
+title: 短期记忆
+---
+
+import ShortTermMemoryUsagePy from '/snippets/python/code-samples/short-term-memory-usage-py.mdx';
+import ShortTermMemoryUsageJs from '/snippets/python/code-samples/short-term-memory-usage-js.mdx';
+
+## 概览
+
+记忆是一种能记住之前交互信息的系统。对于 AI 智能体来说，记忆非常关键，因为它能让智能体记住之前的交互、从反馈中学习，并适应用户偏好。随着智能体处理的任务变得更复杂、用户交互越来越多，这种能力对于效率和用户满意度都变得至关重要。
+
+短期记忆让你的应用能够记住单个线程或对话中的先前交互。
+
+<Note>
+    一个 thread 会把会话中的多次交互组织起来，类似于电子邮件把消息放在同一个对话里。
+</Note>
+
+对话历史是最常见的短期记忆形式。长对话会给今天的 LLM 带来挑战；完整历史可能放不进 LLM 的上下文窗口，从而造成上下文丢失或报错。
+
+即使你的模型支持完整上下文长度，大多数 LLM 在长上下文上仍然表现不佳。它们会被过时或跑题的内容“分心”，同时还会带来更慢的响应和更高的成本。
+
+聊天模型通过 [messages](/oss/python/langchain/messages) 接收上下文，其中包括指令（system message）和输入（human messages）。在聊天应用中，消息会在人类输入和模型响应之间交替，随着时间推移列表会越来越长。由于上下文窗口有限，很多应用都可以从删除或“忘记”过时信息的技术中受益。
+
+<Tip>
+    想要在**不同**对话之间记住信息？请使用 [long-term memory](/oss/python/langchain/long-term-memory)，在不同线程和会话之间存储并回忆用户级或应用级数据。
+</Tip>
+
+## 用法
+
+要给智能体添加短期记忆（线程级持久化），你需要在创建智能体时指定一个 `checkpointer`。
+
+<Info>
+    LangChain 的智能体把短期记忆作为智能体状态的一部分来管理。
+
+    通过把这些内容存进图状态里，智能体就能在保留不同线程隔离的同时，访问某段对话的完整上下文。
+
+    状态会通过 checkpointer 持久化到数据库（或内存），这样线程就能随时恢复。
+
+    短期记忆会在智能体被调用或者某一步（例如工具调用）完成时更新，而状态会在每一步开始时读取。
+</Info>
+
+<ShortTermMemoryUsagePy />
+
+
+
+
+### 在生产环境中
+
+在生产环境中，请使用由数据库支持的 checkpointer：
+
+
+<CodeGroup>
+```bash pip
+pip install -U langgraph-checkpoint-postgres "psycopg[binary]"
+```
+
+```bash uv
+uv add langgraph-checkpoint-postgres "psycopg[binary]"
+```
+</CodeGroup>
+
+<Note>
+默认情况下，`langgraph-checkpoint-postgres` 安装的 `psycopg`（Psycopg 3）不包含任何 extras。上面的安装命令额外添加了 `psycopg[binary]`，这也是大多数用户推荐的选择。关于其他选项，请参见 [Psycopg 安装文档](https://www.psycopg.org/psycopg3/docs/basic/install.html)。
+</Note>
+
+```python
+from langchain.agents import create_agent
+from langgraph.checkpoint.postgres import PostgresSaver  # [!code highlight]
+
+def get_user_info() -> str:
+    """查找当前用户的信息。"""
+    return "No user profile on file."
+
+DB_URI = "postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable"
+with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+    checkpointer.setup() # 在 PostgreSQL 中自动创建表
+    agent = create_agent(
+        "gpt-5.5",
+        tools=[get_user_info],
+        checkpointer=checkpointer,  # [!code highlight]
+    )
+```
+
+
+
+<Note>
+    关于更多 checkpointer 选项，包括 SQLite、Postgres 和 Azure Cosmos DB，请参见 Persistence 文档里的 [checkpointer libraries 列表](/oss/python/langgraph/checkpointers#checkpointer-libraries)。
+</Note>
+
+## 自定义智能体记忆
+
+默认情况下，智能体使用 [`AgentState`](https://reference.langchain.com/python/langchain/agents/middleware/types/AgentState) 来管理短期记忆，具体来说是通过 `messages` 键管理对话历史。
+
+你可以扩展 [`AgentState`](https://reference.langchain.com/python/langchain/agents/middleware/types/AgentState) 来添加更多字段。自定义 state schema 会通过 [`state_schema`](https://reference.langchain.com/python/langchain/middleware/#langchain.agents.middleware.AgentMiddleware.state_schema) 参数传给 [`create_agent`](https://reference.langchain.com/python/langchain/agents/factory/create_agent)。
+
+```python
+from langchain.agents import create_agent, AgentState
+from langgraph.checkpoint.memory import InMemorySaver
+
+
+class CustomAgentState(AgentState):  # [!code highlight]
+    user_id: str  # [!code highlight]
+    preferences: dict  # [!code highlight]
+
+agent = create_agent(
+    "gpt-5.5",
+    tools=[get_user_info],
+    state_schema=CustomAgentState,  # [!code highlight]
+    checkpointer=InMemorySaver(),
+)
+
+# 自定义状态可以在 invoke 时传入
+result = agent.invoke(
+    {
+        "messages": [{"role": "user", "content": "Hello"}],
+        "user_id": "user_123",  # [!code highlight]
+        "preferences": {"theme": "dark"}  # [!code highlight]
+    },
+    {"configurable": {"thread_id": "1"}})
+```
+
+
+
+
+## 常见模式
+
+启用 [短期记忆](#usage) 后，长对话可能会超过 LLM 的上下文窗口。常见解决方案有：
+
+<CardGroup cols={2}>
+    <Card title="裁剪消息" icon="scissors" href="#trim-messages" arrow>
+        在调用 LLM 之前，移除最前或最后的 N 条消息
+    </Card>
+    <Card title="删除消息" icon="trash" href="#delete-messages" arrow>
+        永久从 LangGraph state 中删除消息
+    </Card>
+    <Card title="总结消息" icon="stack-2" href="#summarize-messages" arrow>
+        总结历史中的较早消息，并用摘要替换它们
+    </Card>
+    <Card title="自定义策略" icon="adjustments">
+        自定义策略（例如消息过滤等）
+    </Card>
+</CardGroup>
+
+这样智能体就可以在不超出 LLM 上下文窗口的情况下持续跟踪对话。
+
+### 裁剪消息
+
+大多数 LLM 都有一个最大支持的上下文窗口（以 token 计）。
+
+一种决定何时截断消息的方法，是统计消息历史中的 token，并在接近上限时进行截断。如果你在使用 LangChain，可以用 trim messages 工具，并指定要保留的 token 数量，以及用于处理边界的 `strategy`（例如保留最后 `max_tokens` 个 token）。
+
+
+
+要在智能体中裁剪消息历史，请使用 [`@before_model`](https://reference.langchain.com/python/langchain/agents/middleware/types/before_model) middleware 装饰器：
+
+```python
+from langchain.messages import RemoveMessage
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain.agents import create_agent, AgentState
+from langchain.agents.middleware import before_model
+from langgraph.runtime import Runtime
+from langchain_core.runnables import RunnableConfig
+from typing import Any
+
+
+@before_model
+def trim_messages(state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
+    """只保留最近的几条消息，以适配上下文窗口。"""
+    messages = state["messages"]
+
+    if len(messages) <= 3:
+        return None  # 无需修改
+
+    first_msg = messages[0]
+    recent_messages = messages[-3:] if len(messages) % 2 == 0 else messages[-4:]
+    new_messages = [first_msg] + recent_messages
+
+    return {
+        "messages": [
+            RemoveMessage(id=REMOVE_ALL_MESSAGES),
+            *new_messages
+        ]
+    }
+
+agent = create_agent(
+    "gpt-5.5",
+    tools=[...],
+    middleware=[trim_messages],
+    checkpointer=InMemorySaver(),
+)
+
+config: RunnableConfig = {"configurable": {"thread_id": "1"}}
+
+agent.invoke({"messages": "hi, my name is bob"}, config)
+agent.invoke({"messages": "write a short poem about cats"}, config)
+agent.invoke({"messages": "now do the same but for dogs"}, config)
+final_response = agent.invoke({"messages": "what's my name?"}, config)
+
+final_response["messages"][-1].pretty_print()
+"""
+================================== Ai Message ==================================
+
+Your name is Bob. You told me that earlier.
+If you'd like me to call you a nickname or use a different name, just say the word.
+"""
+```
+
+
+
+### 删除消息
+
+你可以从 graph state 中删除消息，以便管理消息历史。
+
+当你想移除特定消息，或者清空整个消息历史时，这个方法很有用。
+
+要从 graph state 中删除消息，可以使用 `RemoveMessage`。
+
+要让 `RemoveMessage` 生效，你需要使用带 [`add_messages`](https://reference.langchain.com/python/langgraph/graph/message/add_messages) [reducer](/oss/python/langgraph/graph-api#reducers) 的 state key。
+
+默认的 [`AgentState`](https://reference.langchain.com/python/langchain/agents/middleware/types/AgentState) 已经提供了这一点。
+
+要删除特定消息：
+
+```python
+from langchain.messages import RemoveMessage  # [!code highlight]
+
+def delete_messages(state):
+    messages = state["messages"]
+    if len(messages) > 2:
+        # 删除最早的两条消息
+        return {"messages": [RemoveMessage(id=m.id) for m in messages[:2]]}  # [!code highlight]
+```
+
+要删除**所有**消息：
+
+```python
+from langgraph.graph.message import REMOVE_ALL_MESSAGES  # [!code highlight]
+
+def delete_messages(state):
+    return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)]}  # [!code highlight]
+```
+
+
+
+
+<Warning>
+    删除消息时，**务必**确保最终的消息历史仍然有效。请检查你使用的 LLM provider 的限制。例如：
+
+    * 有些 provider 要求消息历史必须以 `user` 消息开始
+    * 大多数 provider 要求带 tool call 的 `assistant` 消息后面必须跟对应的 `tool` result 消息
+</Warning>
+
+```python
+from langchain.messages import RemoveMessage
+from langchain.agents import create_agent, AgentState
+from langchain.agents.middleware import after_model
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.runtime import Runtime
+from langchain_core.runnables import RunnableConfig
+
+
+@after_model
+def delete_old_messages(state: AgentState, runtime: Runtime) -> dict | None:
+    """删除旧消息，让对话更易管理。"""
+    messages = state["messages"]
+    if len(messages) > 2:
+        # 删除最早的两条消息
+        return {"messages": [RemoveMessage(id=m.id) for m in messages[:2]]}
+    return None
+
+
+agent = create_agent(
+    "gpt-5-nano",
+    tools=[...],
+    system_prompt="Please be concise and to the point.",
+    middleware=[delete_old_messages],
+    checkpointer=InMemorySaver(),
+)
+
+config: RunnableConfig = {"configurable": {"thread_id": "1"}}
+
+stream = agent.stream_events(
+    {"messages": [{"role": "user", "content": "hi! I'm bob"}]},
+    config,
+    version="v3",
+)
+for snapshot in stream.values:
+    print([(message.type, message.content) for message in snapshot["messages"]])
+
+stream = agent.stream_events(
+    {"messages": [{"role": "user", "content": "write a short poem about cats"}]},
+    config,
+    version="v3",
+)
+for snapshot in stream.values:
+    print([(message.type, message.content) for message in snapshot["messages"]])
+
+stream = agent.stream_events(
+    {"messages": [{"role": "user", "content": "what's my name?"}]},
+    config,
+    version="v3",
+)
+for snapshot in stream.values:
+    print([(message.type, message.content) for message in snapshot["messages"]])
+```
+
+```
+[('human', "hi! I'm bob")]
+[('human', "hi! I'm bob"), ('ai', 'Hi Bob! Nice to meet you. How can I help you today? I can answer questions, brainstorm ideas, draft text, explain things, or help with code.')]
+[('human', "hi! I'm bob"), ('ai', 'Hi Bob! Nice to meet you. How can I help you today? I can answer questions, brainstorm ideas, draft text, explain things, or help with code.'), ('human', "write a short poem about cats")]
+[('human', "hi! I'm bob"), ('ai', 'Hi Bob! Nice to meet you. How can I help you today? I can answer questions, brainstorm ideas, draft text, explain things, or help with code.'), ('human', "write a short poem about cats"), ('ai', 'There once was a cat on a wall, Who barely moved at all...')]
+[('human', "write a short poem about cats"), ('ai', 'There once was a cat on a wall, Who barely moved at all...')]
+[('human', "write a short poem about cats"), ('ai', 'There once was a cat on a wall, Who barely moved at all...'), ('human', "what's my name?")]
+[('human', "write a short poem about cats"), ('ai', 'There once was a cat on a wall, Who barely moved at all...'), ('human', "what's my name?"), ('ai', "I don't know your name - you haven't told me!")]
+[('human', "what's my name?"), ('ai', "I don't know your name - you haven't told me!")]
+```
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/langchain/short-term-memory.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

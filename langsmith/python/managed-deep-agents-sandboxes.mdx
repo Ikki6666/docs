@@ -1,0 +1,328 @@
+---
+title: 为 Managed Deep Agents 添加 sandbox
+sidebarTitle: Sandboxes
+description: 为 managed deep agent 配置隔离的文件系统和 shell。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/python/langsmith/managed-deep-agents-public-beta-note.mdx';
+
+Sandbox 为 managed deep agent 提供一个隔离的文件系统和 shell，用于处理文件、运行代码和执行命令。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+将 sandbox 声明放在 `sandbox/` 下。只有当你要预置 snapshot 时，才添加 `sandbox/setup.sh`：
+
+```text
+my-agent/
+  agent.py
+  sandbox/
+    __init__.py
+    setup.sh   # optional
+```
+
+
+
+
+完整的项目布局请参见 [Project structure](/langsmith/python/managed-deep-agents-project-structure)。
+
+## 配置 sandbox
+
+当 agent 需要写文件、运行代码或执行 shell 命令时，请使用 sandbox。
+
+`mda init` 会生成 sandbox 声明。只有在 `sandbox/` 目录存在时，Managed Deep Agents 才会启用 sandbox。
+
+`mda init` 不会创建 `setup.sh`。如果 snapshot 需要安装 package、克隆代码树或以其他方式修改镜像，请自行添加该文件。
+
+Managed Deep Agents 使用 [LangSmith Sandboxes](/langsmith/sandboxes) 作为该 backend。复用方式始终是每个 durable thread 一个 sandbox。
+
+使用 `define_sandbox` 声明 sandbox：
+
+```python sandbox/__init__.py
+from managed_deepagents import define_sandbox
+
+sandbox = define_sandbox(
+    idle_ttl_seconds=600,
+    default_timeout=600,
+)
+```
+
+| 选项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `idle_ttl_seconds` | `600` | sandbox 及其内容在闲置多少秒后被删除。删除不可恢复。 |
+| `default_timeout` | `600` | 每条命令允许的秒数。 |
+
+
+
+
+## 配置 sandbox proxy
+
+Sandbox proxy 会向匹配的出站请求注入 headers，并控制 sandbox 可以访问哪些目的地。proxy 运行在 sandbox 之外，因此 sandbox 中的代码可以调用经过身份验证的 API，而无需自行处理凭据。
+
+例如，要从 sandbox 中调用 OpenAI API，请将 `OPENAI_API_KEY` 存储在你的 LangSmith workspace secrets 中，并配置以下 proxy 规则：
+
+```python sandbox/__init__.py
+from managed_deepagents import define_sandbox
+
+sandbox = define_sandbox(
+    proxy_config={
+        "rules": [
+            {
+                "name": "openai-api",
+                "match_hosts": ["api.openai.com"],
+                "headers": [
+                    {
+                        "name": "Authorization",
+                        "type": "workspace_secret",
+                        "value": "Bearer {OPENAI_API_KEY}",
+                    },
+                ],
+            },
+        ],
+    },
+)
+```
+
+
+
+
+配置选项和网络限制请参阅 [Sandbox auth proxy](/langsmith/sandbox-auth-proxy)。
+
+### 在 proxy header 中使用 connections
+
+在 sandbox 中使用 [Connections](/langsmith/python/managed-deep-agents-connections) 来验证 CLI 命令和 API 请求。
+
+例如，要以当前用户身份从 sandbox 中调用 GitHub API，请先创建 `github` connection，然后配置 proxy：
+
+```python sandbox/__init__.py
+from managed_deepagents import bearer, connections, define_sandbox
+
+github = connections.get("github", {"type": "user"})
+
+sandbox = define_sandbox(
+    proxy_config={
+        "rules": [
+            {
+                "name": "github-api",
+                "match_hosts": ["api.github.com"],
+                "headers": [{"name": "Authorization", "value": bearer(github)}],
+            },
+        ],
+        "access_control": {"allow_list": ["api.github.com"]},
+    },
+)
+```
+
+
+
+
+使用 connection 引用作为 header 值，或用 `bearer(ref)` 或 `basic(username, ref)` 对其格式化。对于 connection 值，请省略 header 的 `type`。Managed Deep Agents 会将其设置为 `opaque`。
+
+## 预置 snapshot
+
+如果存在 `sandbox/setup.sh`，`mda deploy` 和 `mda dev` 会运行该脚本一次，并将生成的环境保存为 snapshot。该次运行产生的修改（例如克隆的仓库和安装的 package）会持久保存在 snapshot 中。新 thread 会克隆该 snapshot，而不是运行 `setup.sh`。snapshot 会一直复用，直到 `setup.sh` 发生变化，届时会重新构建。
+
+脚本以 `bash -e` 运行。非零退出码会导致 snapshot 失败，并导致 deploy 或 `mda dev` 会话失败。LangSmith 不会将已上线的 deployment 更新到失败的 snapshot。之前成功的 snapshot 会继续提供服务。
+
+```bash sandbox/setup.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+apt-get update && apt-get install -y jq
+mkdir -p /workspace
+```
+
+deploy 转发的项目 `.env` 值在 `setup.sh` 运行时可用作环境变量，例如用于克隆私有仓库的 token。克隆 snapshot 的 thread sandbox 不会继承这些变量。在 `setup.sh` 运行期间，不要把 secret 写入文件系统；磁盘上的任何内容都会成为每个 thread 镜像的一部分。
+
+编辑 `setup.sh` 并重新部署不会清空已上线 thread 上的 `/workspace`。这些实例会保留它们已有的文件。新 thread 会克隆新的 snapshot。
+
+## 选择 bake base
+
+未设置 bake base 时，以 LangSmith 的默认 sandbox template 为起点。要从其他内容开始，请设置以下选项中的恰好一个：
+
+| 选项 | 用途 |
+| --- | --- |
+| `snapshot_name` | LangSmith snapshot 名称。允许使用 tags。 |
+| `snapshot_id` | LangSmith snapshot id。 |
+| `docker_image` | 已发布的 Docker 镜像。 |
+
+```python sandbox/__init__.py
+from managed_deepagents import define_sandbox
+
+sandbox = define_sandbox(
+    idle_ttl_seconds=600,
+    docker_image="python:3.12-slim",
+)
+```
+
+
+
+
+对于私有镜像，请传入镜像和一个 `registry`。Managed Deep Agents 会在 bake 时创建或更新一个 deployment 拥有的 Host registry。只有变量名会被编译；凭据值不会进入 build 或 snapshot。
+
+在 `password_env` 中指定密码：
+
+```python sandbox/__init__.py
+from managed_deepagents import define_sandbox
+
+sandbox = define_sandbox(
+    docker_image="ghcr.io/acme/agent-base:1",
+    registry={
+        "url": "ghcr.io",
+        "username": "octocat",
+        "password_env": "GHCR_TOKEN",
+    },
+)
+```
+
+
+
+
+将 `GHCR_TOKEN` 放到项目 `.env` 或进程环境中。bake 之后，Managed Deep Agents 不会将该值转发给运行中的 Agent Server。
+
+## agent 如何使用 sandbox
+
+Agent 使用内置的文件系统 tools，例如 [`ls`](/oss/python/deepagents/tools#built-in-harness-tools)、[`read_file`](/oss/python/deepagents/tools#built-in-harness-tools)、[`write_file`](/oss/python/deepagents/tools#built-in-harness-tools)、[`edit_file`](/oss/python/deepagents/tools#built-in-harness-tools)、[`delete`](/oss/python/deepagents/tools#built-in-harness-tools)、[`glob`](/oss/python/deepagents/tools#built-in-harness-tools) 和 [`grep`](/oss/python/deepagents/tools#built-in-harness-tools)，并使用 [`execute`](/oss/python/deepagents/tools#built-in-harness-tools) 运行 shell 命令。使用 [instructions](/langsmith/python/managed-deep-agents-instructions) 指定 agent 应该在哪里工作以及不得修改什么。
+
+## 从代码读写 sandbox 文件
+
+[Authored tools](/langsmith/python/managed-deep-agents-tools) 和 [middleware](/langsmith/python/managed-deep-agents-middleware) 通过 `runtime.backend` 访问 sandbox 文件系统。当你自己的代码需要某个文件时使用它，而不是让 agent 帮你获取。
+
+<Note>
+`runtime.backend` 需要 `managed-deepagents>=0.8.0`。
+</Note>
+
+标注 `runtime` 参数以接收类型化的接口：
+
+```python tools/report.py
+from langchain.tools import tool
+from managed_deepagents import ManagedDeepAgentRuntime
+
+
+@tool(parse_docstring=True)
+def write_report(summary: str, runtime: ManagedDeepAgentRuntime) -> str:
+    """Write a summary to the sandbox and return its path.
+
+    Args:
+        summary: Report body to store.
+    """
+    if runtime.backend is None:
+        raise RuntimeError("write_report requires a sandbox")
+    result = runtime.backend.write("/workspace/report.txt", summary)
+    if result.error:
+        raise RuntimeError(result.error)
+    return "/workspace/report.txt"
+```
+
+
+
+
+每个操作都绑定到处理当前 run 的 thread 的 sandbox，因此两个 thread 读取 `/workspace/report.txt` 时看到的是各自的副本。Backend 是惰性解析的，从不接触它的 tool 永远不会预置 sandbox。
+
+### 可用操作
+
+| 方法 | 用途 |
+| --- | --- |
+| `ls(path)` | 列出目录。 |
+| `read(file_path, offset, limit)` | 读取文本，默认 2000 行。 |
+| `write(file_path, content)` | 写入文本，替换任何已有文件。 |
+| `edit(file_path, old_string, new_string, replace_all)` | 原地替换子串。 |
+| `delete(file_path)` | 删除文件。 |
+| `grep(pattern, path, glob, max_count)` | 搜索文件内容。 |
+| `glob(pattern, path)` | 匹配路径。 |
+| `execute(command, timeout)` | 运行 shell 命令。 |
+| `upload_files(files)` | 从 `(path, bytes)` 对写入原始字节。 |
+| `download_files(paths)` | 读取给定路径的原始字节。 |
+
+每个方法都有一个以 `a` 为前缀的异步对应方法，例如 `aread`、`awrite` 和 `adownload_files`。
+
+
+
+
+参数和返回类型来自 Deep Agents backend 契约。请参见 [Backends](/oss/python/deepagents/backends)。
+
+### 传输二进制文件
+
+`upload_files` 和 `download_files` 移动原始字节，因此适合图像、归档文件以及任何会被文本操作破坏的文件。Download 会返回每个请求路径的字节：
+
+```python tools/checksum.py
+import hashlib
+
+from langchain.tools import tool
+from managed_deepagents import ManagedDeepAgentRuntime
+
+
+@tool(parse_docstring=True)
+def checksum_file(file_path: str, runtime: ManagedDeepAgentRuntime) -> str:
+    """Return the SHA-256 checksum of a sandbox file.
+
+    Args:
+        file_path: Absolute path inside the sandbox.
+    """
+    if runtime.backend is None:
+        raise RuntimeError("checksum_file requires a sandbox")
+    result = runtime.backend.download_files([file_path])[0]
+    if result.error or result.content is None:
+        raise RuntimeError(result.error or "file_not_found")
+    return hashlib.sha256(result.content).hexdigest()
+```
+
+
+
+
+Upload 接收 path 和 content 对，每个文件一个：
+
+```python
+uploaded = runtime.backend.upload_files([("/workspace/logo.png", payload)])
+if uploaded[0].error:
+    raise RuntimeError(uploaded[0].error)
+```
+
+
+
+
+每个结果携带 `path` 和 `error`，download 还会携带 `content`。失败时，`error` 为 `file_not_found`、`permission_denied`、`is_directory` 或 `invalid_path` 之一，并且下载的 `content` 为空。请检查 `error`，而不是假定传输成功。
+
+### 限制
+
+`runtime.backend` 只覆盖 sandbox。它没有通往 [Context Hub](/langsmith/python/managed-deep-agents-context-hub) 的路径，因此 [skills](/langsmith/python/managed-deep-agents-skills)、[instructions](/langsmith/python/managed-deep-agents-instructions) 和 [memory](/langsmith/python/managed-deep-agents-memory) 无法通过它访问。
+
+没有 sandbox 时，`runtime.backend` 为 `None`。在每次调用之前检查它，因为项目可以在 tool 发布之后移除 `sandbox/`。
+
+
+
+
+`delete`、`upload_files` 和 `download_files` 依赖于已安装的 backend，当 backend 未实现它们时会抛出异常。根目录的 `glob` 会返回错误，而不是预置 sandbox。
+
+
+
+
+## 禁用 sandbox
+
+删除 `sandbox/` 目录即可退出，例如对于只需要 prompt、memory 和 tools 的 agent。
+
+对于已有的 deployment，用 `mda delete` 删除 deployment 时，也会删除与其关联的托管 sandbox、`{deployment}--setup-*` recipe snapshot，以及（如果存在）deployment 拥有的 registry。
+
+## Deployment
+
+Managed Deep Agents 负责 sandbox 命名、recipe bake、复用、恢复和清理。每个 durable thread 都会获得自己的 sandbox，从当前 recipe snapshot 克隆而来。平台级的生命周期细节请参阅 [Sandboxes](/langsmith/sandboxes)。
+
+## 何时使用 sandbox
+
+| 目标 | 使用 |
+| --- | --- |
+| 在隔离环境中写文件、运行代码或执行 shell 命令 | Sandbox |
+| 跨 threads 存储 durable 知识 | [Memory](/langsmith/python/managed-deep-agents-memory) |
+| 不需要文件系统的始终生效行为 | [Instructions](/langsmith/python/managed-deep-agents-instructions) |
+
+更多信息请参见 [Project structure](/langsmith/python/managed-deep-agents-project-structure)。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/managed-deep-agents-sandboxes.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

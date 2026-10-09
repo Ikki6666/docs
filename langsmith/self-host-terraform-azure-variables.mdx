@@ -1,0 +1,212 @@
+---
+title: Azure Terraform 变量参考
+sidebarTitle: 变量
+description: LangSmith self-hosted 在 Azure AKS 上的 Terraform 变量完整参考。
+---
+
+这是 [Azure Terraform modules](https://github.com/langchain-ai/terraform/tree/main/modules/azure) 暴露的每个输入变量的完整参考。可在首次填写 `terraform.tfvars` 或调整现有部署时使用。
+
+变量分为两类：
+
+- **非敏感**（region、容量、功能开关）：在 `infra/terraform.tfvars` 中设置。
+- **敏感**（license key、密码、加密密钥）：通过 `make setup-env` 设置，它会把这些值写入 `infra/secrets.auto.tfvars`（被 gitignore，由 Terraform 自动加载）并存储在 Azure Key Vault 中。
+
+端到端安装请参见[部署指南](/langsmith/self-host-terraform-azure-deploy)。各 module 如何协同工作请参见[架构参考](/langsmith/self-host-terraform-azure-architecture)。
+
+## 核心
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `subscription_id` | — | 是 | 该部署的 Azure subscription ID。 |
+| `location` | `eastus` | 否 | 该部署的 Azure region。 |
+| `identifier` | `""` | 否 | 追加到每个资源名称后的后缀，用于区分环境（例如 `-prod`、`-staging`）。必须以连字符开头或为空。 |
+| `environment` | `dev` | 否 | 应用到所有资源的环境标签。 |
+| `owner` | `""` | 否 | 资源所有者的邮箱或团队名称。作为标签应用。 |
+| `cost_center` | `""` | 否 | 成本中心或计费代码。作为标签应用。 |
+
+## 网络
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `create_vnet` | `true` | 否 | 创建新的 VNet。设为 `false` 可使用已有的 VNet 和子网。 |
+| `vnet_id` | `""` | 当 `!create_vnet` 时 | 已有的 VNet 资源 ID。 |
+| `aks_subnet_id` | `""` | 当 `!create_vnet` 时 | AKS 集群已有的子网 ID。 |
+| `postgres_subnet_id` | `""` | 当 `!create_vnet` 时 | PostgreSQL 服务器已有的子网 ID。 |
+| `redis_subnet_id` | `""` | 当 `!create_vnet` 时 | Redis 实例已有的子网 ID。 |
+| `postgres_subnet_address_prefix` | `["10.0.32.0/20"]` | 否 | PostgreSQL 子网的 CIDR 前缀。可以是不连续的范围。 |
+| `redis_subnet_address_prefix` | `["10.0.48.0/20"]` | 否 | Redis 子网的 CIDR 前缀。可以是不连续的范围。 |
+| `aks_authorized_ip_ranges` | `[]` | 否 | 允许访问 AKS API server 的外部 CIDR。留空时 API server 保持公网可达，Terraform 驱动的 Helm 和 `kubectl` 步骤可从任意执行主机运行。生产环境应填入 operator 和 CI 的出站 CIDR。 |
+
+## AKS
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `default_node_pool_vm_size` | `Standard_D8s_v3` | 否 | 默认节点池的 VM 规格。搭配外部 Postgres 和 Redis 时，`Standard_D8s_v3`（8 vCPU / 32 GiB）是核心平台的推荐基线。搭配 in-cluster 数据库的轻量或演示部署，才使用 `Standard_D4s_v3`（4 vCPU / 16 GiB）。 |
+| `default_node_pool_min_count` | `1` | 否 | 默认节点池的最小节点数。autoscaler 不会缩到该下限以下。生产环境设为 3（核心平台约需 14.4 vCPU，三个 `Standard_D8s_v3` 节点即可覆盖）。minimum 或 dev 部署设为 1。 |
+| `default_node_pool_max_count` | `10` | 否 | 默认节点池的最大节点数。核心平台使用 4 到 6 个节点；启用 add-on 时请增加余量（LangSmith Deployment 约 6、Agent Builder 约 8、Insights 10 到 12）。提高该值立即生效，无需节点重启。 |
+| `default_node_pool_max_pods` | `60` | 否 | 默认节点池中每个节点的最大 pods 数。Azure CNI 默认的 30 对 LangSmith 来说太低；60 可让完整部署放进单个节点。不可变：修改它会重建节点池。 |
+| `additional_node_pools` | `large: Standard_D16s_v3, 0–2` | 否 | 附加节点池。默认的 `large` 节点池（`Standard_D16s_v3`，16 vCPU / 64 GiB）是 ClickHouse（请求 3.5 vCPU / 15 GiB）和 LangSmith Deployment agent pods 所必需的。`min_count = 0` 使其在空闲时缩到零。Agent Builder 有多个并发 deployment 时，请把 `max_count` 提高到 3 或更多。 |
+| `aks_service_cidr` | `10.0.64.0/20` | 否 | Kubernetes service CIDR。不得与 VNet 重叠。 |
+| `aks_dns_service_ip` | `10.0.64.10` | 否 | CoreDNS service IP。必须位于 `aks_service_cidr` 内。 |
+| `aks_deletion_protection` | `true` | 否 | 防止意外删除 AKS 集群。dev/test 可设为 `false`。 |
+| `availability_zones` | `["1"]` | 否 | 要部署到的可用区。跨可用区冗余 HA 请使用 `["1", "2", "3"]`。 |
+
+## 数据源
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `postgres_source` | `external` | 否 | `external` 预配 Azure Database for PostgreSQL Flexible Server（私有 VNet）。`in-cluster` 使用 chart 管理的 Postgres pod（仅限 dev/演示）。 |
+| `redis_source` | `external` | 否 | `external` 预配 Azure Managed Redis（私有 VNet）。`in-cluster` 使用 chart 管理的 Redis pod（仅限 dev/演示）。 |
+| `clickhouse_source` | `in-cluster` | 否 | `in-cluster`（仅限 dev/POC）或 `external`（[LangChain Managed ClickHouse](/langsmith/langsmith-managed-clickhouse)，生产环境推荐）。 |
+
+## PostgreSQL
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `postgres_admin_username` | `langsmith` | 否 | PostgreSQL 管理员用户名。 |
+| `postgres_admin_password` | `""` | 外部时 | PostgreSQL 管理员密码。通过 `make setup-env` 设置。 |
+| `postgres_database_name` | `langsmith` | 否 | LangSmith 连接的数据库的名称。必须与服务器上已存在的数据库一致。 |
+| `postgres_deletion_protection` | `true` | 否 | 防止意外删除 PostgreSQL 服务器。dev/test 可设为 `false`。 |
+| `postgres_geo_redundant_backup` | `false` | 否 | 为 PostgreSQL 启用异地冗余备份。 |
+| `postgres_standby_availability_zone` | `""` | 否 | PostgreSQL 跨可用区冗余 HA 的备用可用区。留空禁用 HA 备用节点。 |
+
+## Redis
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `amr_sku` | `Balanced_B0` | 否 | Azure Managed Redis SKU。`Balanced_B0` 是最小的。如果 region 报告 `AllocationFailed`，请向上调整（`Balanced_B1`、`Balanced_B3` 等）。取代旧式的 `redis_capacity`。 |
+
+## Blob storage
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `blob_ttl_enabled` | `true` | 否 | 在 blob container 上启用生命周期 TTL 规则。 |
+| `blob_ttl_short_days` | `14` | 否 | 短生命周期 trace blob 的 TTL（天）。 |
+| `blob_ttl_long_days` | `400` | 否 | 长生命周期 trace blob 的 TTL（天）。 |
+| `storage_allowed_ips` | `[]` | 否 | 允许通过 storage account 默认拒绝防火墙的公网 IP 或 CIDR。AKS pod 流量会通过 `Microsoft.Storage` service endpoint 自动加入 allowlist。只需添加需要 blob data plane 的外部客户端（operator 工作站、CI runner）。 |
+
+## Key Vault
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `keyvault_name` | `""` | 否 | Key Vault 名称。必须全局唯一，3 到 24 个字符。留空时 `main.tf` 会计算 `langsmith-kv<identifier>`。遇到命名冲突时可覆盖。 |
+| `keyvault_purge_protection` | `true` | 否 | 启用清除保护。dev/test 可设为 `false`，以便销毁后立即复用名称。 |
+| `keyvault_default_action` | `Allow` | 否 | Key Vault data-plane 防火墙的默认动作。`Allow` 可保持首次 apply（通过 data plane 创建机密）正常工作。生产环境设置 `Deny` 并填入 `keyvault_allowed_ips`。 |
+| `keyvault_allowed_ips` | `[]` | 否 | 当 `keyvault_default_action = "Deny"` 时允许通过 Key Vault 防火墙的公网 IP 或 CIDR。AKS 子网会通过 `Microsoft.KeyVault` service endpoint 自动加入 allowlist。 |
+
+## Ingress
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `ingress_controller` | `nginx` | 否 | Ingress controller：`nginx`、`istio`（自托管 Helm）、`istio-addon`（Azure 托管的 Istio，Azure 上推荐）、`agic`（Application Gateway Ingress Controller）、`envoy-gateway`（Gateway API）或 `none`。TLS 兼容性矩阵请参见 [`INGRESS_CONTROLLERS.md`](https://github.com/langchain-ai/terraform/blob/main/modules/azure/INGRESS_CONTROLLERS.md)。 |
+| `istio_version` | `1.29.1` | 否 | Istio Helm chart 版本。仅在 `ingress_controller = "istio"` 时使用。 |
+| `istio_addon_revision` | `asm-1-27` | 否 | Azure Service Mesh 版本（`asm-1-<minor>`）。可用版本请用 `az aks mesh get-upgrades` 列出。仅在 `ingress_controller = "istio-addon"` 时使用。 |
+| `agic_subnet_address_prefix` | `["10.0.96.0/24"]` | 否 | Application Gateway 专用子网的 CIDR。必须是 `/24` 或更大。仅在 `ingress_controller = "agic"` 时使用。 |
+| `agw_sku_tier` | `Standard_v2` | 否 | Application Gateway SKU 层级：`Standard_v2` 或 `WAF_v2`（启用 WAF）。仅在 `ingress_controller = "agic"` 时使用。 |
+| `envoy_gateway_version` | `v1.2.0` | 否 | Envoy Gateway Helm chart 版本。仅在 `ingress_controller = "envoy-gateway"` 时使用。 |
+| `ingress_ip` | `""` | 否 | ingress 负载均衡器的公网 IP，DNS module 用它创建 A 记录。可用 `kubectl get svc -n ingress-nginx` 获取。 |
+
+## DNS 与 TLS
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `dns_label` | `""` | 否 | ingress 负载均衡器的 Azure 公网 IP DNS label。结果为 `<label>.<region>.cloudapp.azure.com`。适用于 nginx、istio、istio-addon 和 envoy-gateway。留空则跳过。 |
+| `langsmith_domain` | `""` | 否 | LangSmith 的自定义 hostname（例如 `langsmith.example.com`）。用于 Helm values 和 ingress TLS。优先级高于 `dns_label`。 |
+| `tls_certificate_source` | `letsencrypt` | 否 | `letsencrypt`（经 cert-manager 的 HTTP-01）、`dns01`（经 cert-manager 的 DNS-01）、`existing`（自带证书）或 `none`（仅 HTTP，demo/dev）。 |
+| `letsencrypt_email` | `""` | 当 `letsencrypt` 或 `dns01` 时 | 用于 Let's Encrypt 证书通知的邮箱。 |
+| `create_dns_zone` | `false` | 否 | 为 LangSmith 域名创建 Azure DNS zone 和 A 记录。DNS-01 签发必需。 |
+
+## LangSmith 应用
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `langsmith_namespace` | `langsmith` | 否 | LangSmith 的 Kubernetes namespace。用于限定 blob storage 的 Workload Identity 作用域。 |
+| `langsmith_release_name` | `langsmith` | 否 | Helm release 名称。用于 Workload Identity federated credential 的 subject。 |
+| `langsmith_domain` | `""` | 否 | 参见 [DNS 与 TLS](#dns-and-tls)。 |
+| `langsmith_helm_chart_version` | `""` | 否 | 锁定 chart 版本以获得可复现的部署。部署脚本的优先级是 `CHART_VERSION` 环境变量，其次是该变量，最后是锁定行默认值 `~0.15.1`（最新的 `0.15.x` 补丁版本）。 |
+| `langsmith_admin_email` | `""` | 否 | 初始组织 admin 邮箱（Helm values 中的 `initialOrgAdminEmail`）。通过 `make setup-env` 设置。 |
+
+## 容量与 add-on 开关
+
+`init-values.sh` 和 `deploy.sh` 读取这些开关；Terraform 忽略它们。它们控制脚本生成哪些 Helm overlay。
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `sizing_profile` | `production` | 否 | Helm 容量 overlay：`minimum`、`dev`、`production` 或 `production-large`。 |
+| `enable_deployments` | `false` | 否 | 启用 LangSmith Deployment（host-backend、listener、operator）。 |
+| `enable_agent_builder` | `false` | 否 | 启用 Agent Builder UI。需要 `enable_deployments = true`。 |
+| `enable_insights` | `false` | 否 | 启用 Insights（基于 ClickHouse 的分析）。需要 `enable_deployments = true`。 |
+| `enable_polly` | `false` | 否 | 启用 Polly（AI 评估与监控）。需要 `enable_deployments = true`。 |
+
+## 安全与审计
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `create_waf` | `false` | 否 | 部署 Azure WAF 策略（OWASP 3.2 + bot 防护）。创建后挂载到 Application Gateway 或 Front Door。 |
+| `waf_mode` | `Prevention` | 否 | WAF 执行模式：`Detection`（仅记录日志）或 `Prevention`（拦截）。 |
+| `create_diagnostics` | `false` | 否 | 部署 Log Analytics 工作区，以及 AKS、Key Vault 和 PostgreSQL 的诊断设置。 |
+| `log_retention_days` | `90` | 否 | Log Analytics 工作区的保留天数。 |
+| `create_bastion` | `false` | 否 | 部署跳板 VM，通过 `az ssh vm` 访问私有 AKS。 |
+| `bastion_vm_size` | `Standard_B2s` | 否 | bastion 主机的 VM SKU。 |
+| `bastion_admin_ssh_public_key` | `""` | 否 | 用于紧急访问 bastion 的 SSH 公钥。 |
+| `bastion_allowed_ssh_cidrs` | `["0.0.0.0/0"]` | 否 | 允许 SSH 访问 bastion 的入站 CIDR。生产环境应限制为 VPN 或公司网段。 |
+
+## 敏感变量（通过 `setup-env.sh` 设置）
+
+`make setup-env` 把这些值写入 `secrets.auto.tfvars`，Terraform 将其存储在 Azure Key Vault 中。切勿在 `terraform.tfvars` 中内联设置。
+
+`make setup-env` 还会管理 `postgres_admin_password` 和 `langsmith_admin_email`，它们记录在 [PostgreSQL](#postgresql) 和 [LangSmith 应用](#langsmith-application)章节中。本表只列出本参考中未在其他位置出现的敏感变量。
+
+| 变量 | 描述 |
+|---|---|
+| `langsmith_license_key` | LangSmith enterprise license key。 |
+| `langsmith_admin_password` | 初始组织 admin 密码。 |
+| `langsmith_api_key_salt` | 用于哈希 API key 的 salt。首次部署后必须保持稳定。 |
+| `langsmith_jwt_secret` | 用于 Basic Auth 会话的 JWT secret。必须保持稳定。 |
+| `langsmith_deployments_encryption_key` | LangSmith Deployment 的 Fernet key。绝不能更改。 |
+| `langsmith_agent_builder_encryption_key` | Agent Builder 的 Fernet key。绝不能更改。 |
+| `langsmith_insights_encryption_key` | Insights 的 Fernet key。绝不能更改。 |
+| `langsmith_polly_encryption_key` | Polly 的 Fernet key。绝不能更改。 |
+
+## App module 变量（Terraform 路径）
+
+Terraform 路径（先 `make init-app` 再 `make apply-app`）把 LangSmith Helm release、其 Kubernetes Secret 和 Workload Identity ServiceAccount 纳入 Terraform state 管理，而不是通过 Helm shell 脚本。它的变量位于 `app/terraform.tfvars`。这条路径可作为 `make init-values && make deploy` 的替代方案。路径选择请参见 [Azure 部署指南](/langsmith/self-host-terraform-azure-deploy)。
+
+`make init-app` 会根据 infra module outputs 自动填充基础设施透传变量（`subscription_id`、`resource_group_name`、`cluster_name`、`keyvault_name`、`storage_account_name`、`storage_container_name`、`workload_identity_client_id`、`langsmith_namespace`、`tls_certificate_source`、`ingress_controller` 和 `dns_label`）。每个变量的默认值为 `null`，缺失时会在 plan 阶段因前置条件错误而失败，错误信息会指明缺失的内容。仅当把 app module 运行在你另行预配的基础设施上时才覆盖它们。
+
+在 `app/terraform.tfvars` 中设置以下内容：
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `sizing` | `production` | 否 | 资源容量 profile：`production`、`production-large`、`dev` 或 `none`（chart 默认值）。 |
+| `postgres_source` | `external` | 否 | `external`（Azure Database for PostgreSQL）或 `in-cluster`（Helm）。与 infra 值保持一致。 |
+| `redis_source` | `external` | 否 | `external`（Azure Managed Redis）或 `in-cluster`（Helm）。与 infra 值保持一致。 |
+| `hostname` | `null` | 否 | LangSmith hostname。未设置时从 `dns_label` 自动检测。 |
+| `admin_email` | `admin@example.com` | 否 | 初始组织 admin 邮箱。 |
+| `release_name` | `langsmith` | 否 | Helm release 名称。 |
+| `chart_version` | `""` | 否 | LangSmith Helm chart 版本。留空使用最新版本。 |
+| `helm_timeout` | `1200` | 否 | Helm 安装和升级超时时间（秒）。 |
+| `helm_force_update` | `false` | 否 | 每次 apply 都强制执行 Helm upgrade，即使 values 未变化。 |
+| `enable_agent_deploys` | `false` | 否 | 启用 LangSmith Deployment。 |
+| `enable_agent_builder` | `false` | 否 | 启用 Agent Builder。需要 `enable_agent_deploys = true`。 |
+| `enable_insights` | `false` | 否 | 启用 Insights。需要外部 ClickHouse。 |
+| `enable_polly` | `false` | 否 | 启用 Polly AI 评估与监控。需要 `enable_agent_deploys = true`。 |
+| `enable_usage_telemetry` | `false` | 否 | 启用扩展的使用量 telemetry 上报。 |
+| `tls_enabled_for_deploys` | `null` | 否 | agent deployment endpoint 是否使用 HTTPS。未设置时从 `tls_certificate_source` 自动检测。 |
+| `clickhouse_host` | `""` | 当 `enable_insights` 时 | ClickHouse hostname 或 endpoint。 |
+| `clickhouse_port` | `8123` | 否 | ClickHouse HTTP 端口。 |
+| `clickhouse_database` | `default` | 否 | ClickHouse 数据库名称。 |
+| `clickhouse_username` | `default` | 否 | ClickHouse 用户名。 |
+| `clickhouse_password` | `""` | 否 | ClickHouse 密码。带认证的 ClickHouse 需设置。 |
+| `clickhouse_tls` | `true` | 否 | 为 ClickHouse 连接启用 TLS。 |
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/self-host-terraform-azure-variables.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

@@ -1,0 +1,132 @@
+---
+title: 设置自动化规则
+sidebarTitle: 设置自动化规则
+---
+
+虽然可以手动筛查并处理 LLM 应用的生产日志，但随着应用规模扩大、用户增多，这通常会变得越来越困难。LangSmith 提供了**自动化（Automations）**功能，可基于 trace 数据触发特定操作。通过**条目类型**、**过滤器**、**采样率**和**动作**来定义自动化。
+
+自动化规则可以触发的动作包括：将 traces 添加到数据集、加入标注队列、触发 webhook（例如用于远程评估），或延长数据保留时间。一条规则会根据你选择的条目类型，匹配单个 runs 或整段 [threads](/langsmith/observability-concepts#threads)。下面是一些可设置的自动化示例：
+
+- 将所有带有负面反馈的 traces 发送到标注队列，供人工审核。
+- 将全部 traces 或 threads 中的 10% 发送到标注队列，供人工抽查问题。
+- 将评分较低的所有 traces 发送到你的 webhook endpoint。
+- 将所有发生错误的 traces 升级为延长数据保留。
+
+<Info>
+如需配置在线评估，请访问[在线评估](/langsmith/online-evaluations-llm-as-judge)页面。
+</Info>
+
+<Note>
+如果某条自动化规则启用了保留延长，匹配到的 trace 会自动升级为[延长数据保留](/langsmith/usage-and-billing#data-retention-auto-upgrades)。这会影响 trace 的计费，但能够确保符合自动化条件的 traces（通常也是最值得分析的那些）被保留下来以供调查。每种动作类型都有自己的默认值，详情请参阅[动作级别的保留设置](#create-a-rule)。完整的保留模型请参阅[数据保留自动升级](/langsmith/usage-and-billing#data-retention-auto-upgrades)。
+</Note>
+
+## 自动化规则如何执行
+
+每条自动化规则都按独立的轮询计划运行。如果同一个项目中存在多条规则，webhook 规则可能会先于 evaluator 规则处理某个 run，反之亦然。
+
+在单条规则内，如果配置了多个动作，它们会按以下顺序执行：
+
+1. 添加到标注队列。
+1. 添加到数据集。
+1. 触发 webhook。
+1. 运行在线 evaluator。
+1. 运行自定义代码 evaluator。
+1. 延长数据保留。
+1. 触发告警。
+
+如果工作流要求一条规则产生的数据在另一条规则触发时必须已存在，例如希望 webhook 中带上评估分数，请在下游规则上使用过滤器来显式建立这种依赖。示例请参阅[确保评估在 webhook 触发前完成](/langsmith/webhooks#ensuring-evaluations-complete-before-the-webhook-fires)。
+
+## 将条目类型设置为 runs 或 threads
+
+**Item Type** 控件决定规则匹配什么。将其设置为 **Runs**，规则会在每个匹配的 run 到达时对其进行评估。设置为 **Threads**，规则会等到一段对话完成，然后对整个 thread 应用一次动作。当你希望审核或导出的单位是整段对话而非单个轮次时，请选择 **Threads**。
+
+Thread 规则需要一个能将 traces 分组为 threads 的 tracing 项目或 agent environment。更多信息请参阅[配置 threads](/langsmith/threads)。
+
+### 配置 thread 规则
+
+选择 **Threads** 会改变规则表单的三个部分：
+
+- **Thread Filters**：过滤器构建器会向可用字段中加入 **Trace Count** 和 **Thread ID**。按 **Trace Count** 过滤，可将规则限定为指定长度的对话。其他字段会逐条评估 thread 中的每条 trace，而不是把 thread 当作整体评估，因此只要 thread 中有任一条 trace 匹配，该 thread 就会匹配。例如，按 **Status** 过滤会选择每一个包含出错 trace 的 thread，而不仅仅是最后一条 trace 出错的 thread。
+- **Action**：表单提供 **Add to Annotation Queue**、**Add to Dataset** 或 **Trigger Webhooks**。
+
+三种 thread 动作的行为如下：
+
+- **Add to Annotation Queue**：将 thread 作为 thread 条目加入队列。Thread 条目显示对话 transcript，仅支持 rubric 反馈。关于 run 条目与 thread 条目的差异，请参阅[标注队列能力表](/langsmith/annotation-queues#single-run-annotation-queues)。
+- **Add to Dataset**：为每个匹配的 thread 创建一个数据集 example。每个 example 包含该 thread 的完整对话。
+- **Trigger Webhooks**：发送一个 payload，其顶层 `threads` 数组中包含每个匹配的 thread。更多信息请参阅[读取 thread 规则 payload](/langsmith/webhooks#read-a-thread-rule-payload)。
+
+### 设置 thread 空闲时间
+
+Thread 规则只会在 thread 进入空闲状态后执行。当 thread 中最后一条 trace 被摄取后，LangSmith 会等待该 tracing 项目或 agent environment 配置的空闲时间结束，这会表明对话已经完成。空闲时间默认为 10 分钟，且不能设置为低于 2 分钟。
+
+空闲时间是一项项目级设置，与[多轮在线 evaluators](/langsmith/online-evaluations-multi-turn) 共享。在某个项目上创建第一条 thread 规则时，会应用默认值，而不会覆盖该项目已设置的值；更改该值会影响该项目中的每个 thread evaluator 和 thread 规则。
+
+以下限制约束了 thread 规则能处理的内容：
+
+- **Runs 必须小于一周**：当 thread 进入空闲状态时，只有过去 7 天内的 runs 符合条件。
+- **单次执行最多处理 500 个 threads**：单次执行最多处理 500 个匹配的 threads，按最近的活动排序。
+
+### 为 thread 延长数据保留
+
+[数据保留](/langsmith/usage-and-billing#data-retention-auto-upgrades) 是 trace 的属性，而不是 thread 的属性。当 thread 规则启用了 **Extend Data Retention** 时，它会将**匹配 thread 中的每条 trace** 升级为延长保留，而不仅仅是最近的那条。
+
+由于每条 trace 都会单独升级，因此更长的对话保留成本更高。作为交换，整段对话会被完整保留以供调查，而不是逐轮过期。
+
+## 查看自动化规则
+
+在 [UI](https://smith.langchain.com?utm_source=docs&utm_medium=cta&utm_campaign=langsmith-signup&utm_content=langsmith-rules) 中，前往侧边栏中的 **Tracing** 并选择一个 tracing 项目或 agent environment。要查看该 tracing 项目下已有的自动化规则，请点击 **Automations** 标签页。
+
+## 创建规则
+
+1. 在 [UI](https://smith.langchain.com?utm_source=docs&utm_medium=cta&utm_campaign=langsmith-signup&utm_content=langsmith-rules) 中，前往侧边栏中的 **Tracing** 并选择一个 tracing 项目或 agent environment。点击 tracing 项目页面右上角的 **+ New**，然后点击 **New Automation**。
+1. 为规则命名。
+1. 选择 **Item Type**，即 **Runs** 或 **Threads**。条目类型决定了哪些过滤字段和动作可用，因此请在配置两者之前先设置它。更多信息请参阅[将条目类型设置为 runs 或 threads](#set-the-item-type-to-runs-or-threads)。
+1. 创建过滤器。规则使用 filter builder，其字段和操作符与 [Filter traces (ClickHouse)](/langsmith/filter-traces-in-application) 中描述的相同。
+1. 配置 **Sampling Rate**，用于控制触发自动化动作的已过滤条目百分比。表单接受 0 到 100 的百分比。例如，50% 的采样率会将通过过滤器的条目中的一半发送到该动作。对应的 API 字段 `sampling_rate` 接受从 0 到 1 的小数。
+1. （可选）通过开启 **Apply to Past Runs** 并填写 **Backfill From** 日期，将规则应用到历史 runs。此选项仅在创建规则时可用。
+
+    <Note>
+    回填会作为后台作业处理，因此不会立即看到结果。若要跟踪回填进度，可以[查看自动化日志](#view-logs-for-your-automations)。
+    </Note>
+
+1. 选择规则执行的动作。条目类型为 **Runs** 的规则支持以下所有动作。条目类型为 **Threads** 的规则仅支持 **Add to Annotation Queue**、**Add to Dataset** 和 **Trigger Webhooks**。
+
+    - **Add to Annotation Queue**：将匹配的 run 或 trace 作为 run 条目添加到[标注队列](/langsmith/annotation-queues)。Thread 规则则会改为将整段对话作为 thread 条目添加。若要手动添加 thread，请参阅[Assign runs and threads](/langsmith/annotation-queues#assign-runs-and-threads-to-a-single-run-queue)。
+    - **Add to Dataset**：Run 规则会将 trace 的输入和输出添加到[数据集](/langsmith/evaluation-concepts#datasets)。Thread 规则会为每个匹配的 thread 创建一个 example。每个 example 包含该 thread 的完整对话。
+    - **Trigger Webhooks**：将匹配的条目发送到规则上配置的每个 [webhook](/langsmith/webhooks) URL。
+    - **Extend Data Retention**：延长使用基础保留策略的匹配 traces 的数据保留时间[（更多细节请参阅数据保留文档）](/langsmith/usage-and-billing#data-retention)。
+
+        <Note>
+        每种动作都有独立的 **Extend Data Retention** 开关，用于控制是否将匹配的 traces 升级为延长保留。两种条目类型的默认值相同：
+
+        - **Add to Dataset**：opt-in（默认：关闭）。启用该开关可升级匹配的 traces。
+        - **Add to Annotation Queue**：opt-out（默认：开启）。禁用该开关可跳过对匹配 traces 的升级。
+        - **Trigger Webhooks**：opt-in（默认：关闭）。启用该开关可升级匹配的 traces。
+        - **Extend Data Retention** 动作以及在线/代码 evaluators：保持不变；始终升级匹配的 traces。
+
+        对于 thread 规则，启用该开关会升级匹配 thread 中的每条 trace。更多信息请参阅[为 thread 延长数据保留](#extend-data-retention-for-a-thread)。
+
+        每种动作的保留开关是仅管理员可用的控制项，受 [`rules:configure-retention`](/langsmith/organization-workspace-operations#rules) 权限限制。非管理员的 workspace 成员会看到开关处于禁用状态，无法修改，但仍可创建和编辑规则而不影响保留设置。完整的保留模型请参阅[数据保留自动升级](/langsmith/usage-and-billing#data-retention-auto-upgrades)。
+        </Note>
+
+## 查看自动化日志
+
+日志可以帮助确认规则是否按预期运行。可以进入 tracing 项目或 agent environment 的 **Automations** 标签页，然后点击所创建规则的 **Logs** 按钮来查看自动化日志。
+
+日志标签页允许你：
+
+- 查看所选时间范围内，某条规则处理过的所有 runs。
+- 如果某次规则执行触发了错误，可以将鼠标悬停在错误图标上查看错误信息。
+- 可以通过过滤到规则创建时间戳，监控回填作业的进度。这是因为回填是从规则创建时开始的。
+- 使用 **View run** 按钮检查自动化规则所作用到的 run。对于将 runs 作为示例加入数据集的规则，还可以查看生成的示例。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/rules.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

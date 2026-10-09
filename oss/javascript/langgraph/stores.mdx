@@ -1,0 +1,353 @@
+---
+title: Stores
+description: LangGraph store 提供跨线程的长期记忆，补充每个线程的 checkpointer 持久化。
+---
+
+import StoreListNamespaceSearchPy from '/snippets/javascript/code-samples/store-list-namespace-search-py.mdx';
+import StoreListNamespaceSearchJs from '/snippets/javascript/code-samples/store-list-namespace-search-js.mdx';
+import StoreListNamespacePaginatePy from '/snippets/javascript/code-samples/store-list-namespace-paginate-py.mdx';
+import StoreListNamespacePaginateJs from '/snippets/javascript/code-samples/store-list-namespace-paginate-js.mdx';
+import StoreListNamespaceListPy from '/snippets/javascript/code-samples/store-list-namespace-list-py.mdx';
+import StoreListNamespaceListJs from '/snippets/javascript/code-samples/store-list-namespace-list-js.mdx';
+
+Stores 让智能体可以跨线程保存信息，包括用户偏好、累积知识，以及应该在单次对话之外继续保留的事实。和 [checkpointers](/oss/javascript/langgraph/checkpointers) 不同，checkpointer 会把完整的图状态保存在单个线程范围内，而 store 则保存任何线程都能访问的任意键值数据。
+
+![共享状态模型](/oss/images/shared_state.png)
+
+<Info>
+**Agent Server 会自动处理 store**
+使用 [Agent Server](/langsmith/agent-server) 时，你不需要手动实现或配置 store。API 会在后台为你处理所有存储基础设施。
+</Info>
+
+<Note>
+[InMemoryStore](https://reference.langchain.com/javascript/langchain-core/stores/InMemoryStore) 适合开发和测试。生产环境请使用持久化 store，例如 `PostgresStore`、`MongoDBStore`、`RedisStore` 或 `UpstashStore`。所有实现都继承自 [BaseStore](https://reference.langchain.com/javascript/langchain-core/stores/BaseStore)，这是你在节点函数签名中应使用的类型注解。
+</Note>
+
+<Note>
+可用 provider 的完整列表请参见 [store 集成](/oss/javascript/integrations/long-term-memory/index)。
+</Note>
+
+## 基本用法
+
+下面的代码片段独立展示了 [InMemoryStore](https://reference.langchain.com/javascript/langchain-core/stores/InMemoryStore)，没有使用 LangGraph：
+
+
+
+```typescript
+import { MemoryStore } from "@langchain/langgraph";
+
+const memoryStore = new MemoryStore();
+```
+
+
+记忆会用 `tuple` 命名空间来区分，在下面这个示例里，它是 `(<user_id>, "memories")`。命名空间长度可以是任意的，也可以代表任意含义，不必一定和用户相关。
+
+
+
+```typescript
+const userId = "1";
+const namespaceForMemory = [userId, "memories"];
+```
+
+
+使用 `store.put` 方法把记忆保存到 store 中的某个命名空间。你需要指定上面定义的命名空间，以及这条记忆对应的键值对：key 只是这条记忆的唯一标识符（`memory_id`），value（一个字典）则是记忆本身。
+
+
+
+```typescript
+import { v7 as uuid7 } from "uuid";
+const memoryId = uuid7();
+const memory = { food_preference: "I like pizza" };
+await memoryStore.put(namespaceForMemory, memoryId, memory);
+```
+
+
+使用 `store.search` 方法可以从命名空间中读出记忆，它会针对给定用户返回一个列表，最多返回 `limit` 个结果（默认是 `10`）。对于 `InMemoryStore`，条目按插入顺序返回，所以列表里最后一条就是最新的记忆；其他后端的排序方式可能不同（参见 [在命名空间中列出条目](#listing-items-in-a-namespace)）。
+
+
+
+```typescript
+const memories = await memoryStore.search(namespaceForMemory);
+memories[memories.length - 1];
+
+// {
+//   value: { food_preference: 'I like pizza' },
+//   key: '07e0caf4-1631-47b7-b15f-65515d4c1843',
+//   namespace: ['1', 'memories'],
+//   createdAt: '2024-10-02T17:22:31.590602+00:00',
+//   updatedAt: '2024-10-02T17:22:31.590605+00:00'
+// }
+```
+
+它包含这些属性：
+
+* `value`：这条记忆的值。
+* `key`：这条记忆在该命名空间中的唯一 key。
+* `namespace`：一个字符串元组，表示这条记忆所属的命名空间。
+
+    <Note>
+    虽然它的类型是 `tuple`，但序列化为 JSON 时可能会变成列表（例如 `['1', 'memories']`）。
+    </Note>
+
+* `createdAt`：这条记忆创建的时间戳。
+* `updatedAt`：这条记忆更新的时间戳。
+
+
+
+## 在命名空间中列出条目
+
+
+
+如果不传 `query` 和 `filter`，`store.search` 会返回存储在命名空间前缀下的条目，最多返回 `limit` 个。这个方法适合在不需要语义排序时列出某个命名空间中的全部内容。
+
+
+
+
+<StoreListNamespaceSearchJs />
+
+
+
+需要记住三点行为：
+
+- **`namespace_prefix` 是按前缀匹配，不是精确匹配。** `("alice",)` 也会返回 `("alice", "memories")`、`("alice", "preferences")` 等子命名空间下的条目。若要限制在单层，请传入完整命名空间，或者在客户端根据 `item.namespace` 过滤返回项。
+- **超过 `limit` 的结果会被静默截断。** 不会有溢出信号，因此请把 `limit` 设得高于预期最大值，或者用 `offset` 分页。
+- **默认排序取决于 store 后端。** `PostgresStore` 和 `AsyncPostgresStore` 会按 `updated_at` 降序返回结果（最近更新的排在前面）。`InMemoryStore` 则按插入顺序返回（最近插入的排在最后）。不要在不同实现之间依赖固定顺序；如果顺序重要，请在客户端按 `item.updated_at` 排序。
+
+
+
+要遍历一个较大的命名空间：
+
+<StoreListNamespacePaginateJs />
+
+
+
+
+
+如果你想知道当前存在哪些命名空间（例如在列出某个用户的记忆之前，先遍历每个用户），可以使用 `store.listNamespaces`：
+
+<StoreListNamespaceListJs />
+
+
+
+## 语义搜索
+
+除了简单检索之外，store 还支持语义搜索，让你可以基于含义而不是精确匹配来查找记忆。要启用这一点，请用 embedding 模型配置 store：
+
+
+
+```typescript
+import { OpenAIEmbeddings } from "@langchain/openai";
+
+const store = new InMemoryStore({
+  index: {
+    embeddings: new OpenAIEmbeddings({ model: "text-embedding-3-small" }),
+    dims: 1536,
+    fields: ["food_preference", "$"], // 要嵌入的字段
+  },
+});
+```
+
+
+现在在搜索时，你可以用自然语言查询找到相关记忆：
+
+
+
+```typescript
+// 查找关于饮食偏好的记忆
+// （这可以在把记忆写入 store 之后进行）
+const memories = await store.search(namespaceForMemory, {
+  query: "用户喜欢吃什么？",
+  limit: 3, // 返回前三个匹配
+});
+```
+
+
+你可以通过配置 `fields` 参数，或者在存储记忆时指定 `index` 参数，来控制哪些内容会被嵌入：
+
+
+
+```typescript
+// 使用特定字段进行嵌入
+await store.put(
+  namespaceForMemory,
+  uuid7(),
+  {
+    food_preference: "I love Italian cuisine",
+    context: "Discussing dinner plans",
+  },
+  { index: ["food_preference"] } // 只嵌入 "food_preferences" 字段
+);
+
+import { v7 as uuid7 } from "uuid";
+// 不进行嵌入的存储（仍可检索，但不可用于语义搜索）
+await store.put(
+  namespaceForMemory,
+  uuid7(),
+  { system_info: "Last updated: 2024-01-01" },
+  { index: false }
+);
+```
+
+
+## 在 LangGraph 中使用
+
+
+
+`memoryStore` 和 checkpointer 是配合使用的：checkpointer 会把状态保存到线程中，如上所述；`memoryStore` 则允许你保存任意信息，以便在 _跨线程_ 访问。像下面这样同时带上 checkpointer 和 `memoryStore` 来编译图。
+
+```typescript
+import { MemorySaver } from "@langchain/langgraph";
+
+// 我们需要这个，是因为我们想启用线程（对话）
+const checkpointer = new MemorySaver();
+
+// ... 定义图 ...
+
+// 用 checkpointer 和 store 编译图
+const graph = workflow.compile({ checkpointer, store: memoryStore });
+```
+
+
+然后像之前一样，用 `thread_id` 调用图，同时再传入 `user_id`。`user_id` 会作为这个特定用户记忆的命名空间。
+
+
+
+```typescript
+// 调用图
+const userId = "1";
+const config = { configurable: { thread_id: "1" }, context: { userId } };
+
+// 先和 AI 打个招呼
+for await (const update of await graph.stream(
+  { messages: [{ role: "user", content: "hi" }] },
+  { ...config, streamMode: "updates" }
+)) {
+  console.log(update);
+}
+```
+
+
+
+
+你可以通过 `runtime` 参数在 _任何节点_ 中访问 store 和 `userId`。你可以用它来保存记忆：
+
+```typescript
+import { StateSchema, MessagesValue, Runtime } from "@langchain/langgraph";
+import { v7 as uuid7 } from "uuid";
+
+const MessagesState = new StateSchema({
+  messages: MessagesValue,
+});
+
+const updateMemory: GraphNode<typeof MessagesState> = async (state, runtime) => {
+  // 从 config 里获取 user id
+  const userId = runtime.context?.user_id;
+  if (!userId) throw new Error("User ID is required");
+
+  // 为记忆设置命名空间
+  const namespace = [userId, "memories"];
+
+  // ... 分析对话并创建新记忆
+  const memory = "Some memory content";
+
+  // 创建新的 memory ID
+  const memoryId = uuid7();
+
+  // 我们创建一条新记忆
+  await runtime.store?.put(namespace, memoryId, { memory });
+};
+```
+
+
+你也可以在任何节点中访问 store，并使用 `store.search` 方法获取记忆。记忆会以对象列表的形式返回，它们可以转换为字典。
+
+
+
+```typescript
+memories[memories.length - 1];
+// {
+//   value: { food_preference: 'I like pizza' },
+//   key: '07e0caf4-1631-47b7-b15f-65515d4c1843',
+//   namespace: ['1', 'memories'],
+//   createdAt: '2024-10-02T17:22:31.590602+00:00',
+//   updatedAt: '2024-10-02T17:22:31.590605+00:00'
+// }
+```
+
+
+你可以访问这些记忆，并在模型调用中使用它们。
+
+
+
+```typescript
+const callModel: GraphNode<typeof MessagesState> = async (state, runtime) => {
+  // 从 config 里获取 user id
+  const userId = runtime.context?.user_id;
+
+  // 为记忆设置命名空间
+  const namespace = [userId, "memories"];
+
+  // 根据最近一条消息进行搜索
+  const memories = await runtime.store?.search(namespace, {
+    query: state.messages[state.messages.length - 1].content,
+    limit: 3,
+  });
+  const info = memories.map((d) => d.value.memory).join("\n");
+
+  // ... 在模型调用中使用记忆
+};
+```
+
+
+如果你创建了一个新的线程，只要 `user_id` 相同，仍然可以访问同样的记忆。
+
+
+
+```typescript
+// 调用图
+const config = { configurable: { thread_id: "2" }, context: { userId: "1" } };
+
+// 再打一次招呼
+for await (const update of await graph.stream(
+  { messages: [{ role: "user", content: "hi, tell me about my memories" }] },
+  { ...config, streamMode: "updates" }
+)) {
+  console.log(update);
+}
+```
+
+
+如果你在本地使用 LangSmith（例如在 [Studio](/langsmith/studio) 中），或者使用 [hosted](/langsmith/platform-setup)，基础 store 默认就可用，你不需要在图编译时显式指定它。不过，要启用语义搜索，你**确实**需要在 `langgraph.json` 文件中配置索引设置。例如：
+
+```json
+{
+    ...
+    "store": {
+        "index": {
+            "embed": "openai:text-embeddings-3-small",
+            "dims": 1536,
+            "fields": ["$"]
+        }
+    }
+}
+```
+
+更多细节和配置选项，请参阅 [部署指南](/langsmith/semantic-search)。
+
+
+
+### 下一步
+
+- [为 Agent Server 添加自定义 store](/langsmith/custom-store) - 部署你的实现
+- [Checkpointers](/oss/javascript/langgraph/checkpointers) - 线程范围的状态持久化
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/langgraph/stores.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

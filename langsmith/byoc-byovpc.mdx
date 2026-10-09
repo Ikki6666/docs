@@ -1,0 +1,176 @@
+---
+title: 在 AWS 上自带 VPC
+sidebarTitle: 自带 VPC（AWS）
+description: 为 LangSmith BYOC 创建客户托管的 VPC，配置一个低权限 IAM 角色，并提供你的 VPC 和子网 ID。
+icon: "network"
+---
+
+自带 VPC（BYOVPC）会将 LangSmith BYOC data plane 部署到你创建和管理的现有 VPC 中。在 LangChain 预置和运维 EKS 集群、数据库、存储以及其他工作负载资源的同时，由你掌控网络配置。若要使用 LangChain 预置的 VPC，请遵循标准的 [BYOC 入门指南](/langsmith/byoc-onboarding)。
+
+由你拥有：
+
+- VPC
+- 子网
+- 路由
+- 网关
+- VPC endpoints
+- Flow logs
+- 出口控制
+
+LangChain 保留管理工作负载安全组、用于访问你 data plane 的 EKS API 的 PrivateLink endpoint service，以及 VPC 内其他 LangSmith 基础设施（例如数据库）所需的权限。
+
+## 开始之前
+
+完成 [BYOC 前提条件](/langsmith/byoc#prerequisites)并在你的组织上启用 BYOC。创建 VPC 时：
+
+- 使用与跨账户 IAM role 相同的 AWS 账户，并且
+- 位于计划部署 data plane 的 region。
+
+## 满足网络要求
+
+当你提供一个 VPC（包括使用参考 module 创建的 VPC）时，LangSmith 会检查以下要求。
+
+### 配置 VPC 和子网
+
+- **所有权和 region**：VPC 和每一个提供的子网必须属于包含 IAM role 的 AWS 账户，存在于所请求的 region 中，并且处于 `available` 状态。
+- **VPC 配置**：使用默认 instance tenancy，以及从 `/16` 到 `/18` 的主 RFC 1918 IPv4 CIDR。同时启用 DNS support 和 DNS hostnames。
+- **可用区**：在两个或三个标准区域可用区的每个可用区中，各提供一个 application subnet 和一个 database subnet。如果你提供公共子网，则在相同各可用区中各提供一个。
+- **子网范围**：每个子网必须在 VPC 的主 CIDR 内拥有一个私有 IPv4 CIDR。提供的子网 CIDR 不得重叠。
+- **子网 ID 和 tag**：每个子网 ID 必须在所有层级中唯一。
+
+| 子网层级 | 子网最小大小 | 每个子网最少可用 IPv4 地址 |
+|-------------|---------------------|--------------------------------------------|
+| 私有 application | `/20` 或更大 | 256 |
+| 私有 database | `/26` 或更大 | 16 |
+| 公共（如果提供） | `/26` 或更大 | 16 |
+
+更大的子网具有更短的前缀长度。子网大小和可用地址数量都必须满足要求。
+
+### 配置路由
+
+VPC 必须有一个 main route table。验证会使用每个子网的显式路由表关联；如果没有显式关联，则使用 main route table。
+
+- **私有 application subnets**：每个子网必须有一条指向客户托管出口（例如 NAT gateway 或 transit gateway）的有效 IPv4 默认路由（`0.0.0.0/0`）。直接指向 internet gateway 的路由不满足此要求。
+- **公共子网**：每个提供的公共子网必须有一条指向连接到该 VPC 的 internet gateway 的有效 IPv4 默认路由。
+- **Database subnets**：参考 module 将这些子网保持隔离，没有默认出口路由。
+
+### 配置网络 ACL
+
+每个提供的子网必须有一个关联的网络 ACL，允许以下流量。验证会按优先级顺序评估规则，包括 deny 规则。
+
+| 子网层级 | 方向 | 协议和端口 | 源或目标 |
+|-------------|-----------|--------------------|-----------------------|
+| 所有提供的子网 | 入站和出站 | TCP 和 UDP，端口 1–65535 | VPC 主 CIDR |
+| 私有 application | 出站 | TCP 443 | `0.0.0.0/0` |
+| 私有 application | 入站 | TCP 1024–65535，用于返回流量 | `0.0.0.0/0` |
+| 公共 | 入站 | TCP 443 | `0.0.0.0/0` |
+| 公共 | 出站 | TCP 1024–65535，用于返回流量 | `0.0.0.0/0` |
+
+这些是网络 ACL 要求。工作负载安全组和你的出口控制也会决定哪些连接可以成功。
+
+## 使用 Terraform 创建 VPC
+
+<Note>
+使用 Terraform module 是可选的。你可以使用自己的工具创建 VPC，并将该 module 作为参考来满足[网络要求](#meet-the-network-requirements)。
+</Note>
+
+{/* Publishing dependency: publish modules/byoc/aws/byovpc and the role module's allow_vpc_creation_permissions and vpc_ids inputs in the Terraform repository before publishing this guide. */}
+
+[`byovpc` Terraform module](https://github.com/langchain-ai/terraform/tree/main/modules/byoc/aws/byovpc) 会创建符合 LangSmith data plane 要求的网络。你可以用它创建 VPC，或将现有 VPC 配置为满足[网络要求](#meet-the-network-requirements)。
+
+创建 VPC 的步骤：
+
+1. 为你的目标账户和[受支持的 region](/langsmith/byoc#regions-and-cloud-providers) 配置 AWS provider。
+2. 将该 module 添加到你的 Terraform 配置中。选择一个与你计划建立 VPC peering 的网络不重叠的私有 CIDR 范围。
+3. 初始化 Terraform，检查 plan，然后应用到你的账户。
+
+以下配置使用该 module 的默认子网布局，并启用 AWS service endpoints、control plane PrivateLink 和 flow logs：
+
+```hcl
+provider "aws" {
+  region = "us-west-2"
+}
+
+module "langsmith_byovpc" {
+  source = "github.com/langchain-ai/terraform//modules/byoc/aws/byovpc?ref=main"
+
+  name           = "langsmith-production"
+  vpc_cidr_block = "10.0.0.0/16"
+
+  enable_vpc_endpoints             = true
+  enable_control_plane_privatelink = true
+  enable_vpc_flow_logs             = true
+}
+
+output "langsmith_network_config" {
+  value = module.langsmith_byovpc.langsmith_network_config
+}
+```
+
+`langsmith_network_config` 输出包含创建 data plane 时需要提供的 VPC ID 和子网 ID。
+
+### 配置连接性
+
+该 VPC module 允许你配置：
+
+- AWS service endpoints。
+- Control plane PrivateLink 和私有 DNS。
+- VPC flow logs。
+- 用于面向互联网的 load balancer 的公共子网。
+- NAT 和 internet gateways，或客户托管的集中式出口。
+
+配置选项和要求请参阅 [`byovpc` Terraform module](https://github.com/langchain-ai/terraform/tree/main/modules/byoc/aws/byovpc)。
+
+## 创建低权限 IAM 角色
+
+[`langsmith-byoc-role` Terraform module](https://github.com/langchain-ai/terraform/tree/main/modules/byoc/aws/langsmith-byoc-role) 会创建 LangChain 用于管理 data plane 的跨账户角色。
+
+创建该角色的步骤：
+
+1. 通过 **Settings > Data Planes** 中 **Data Planes** 标题旁的按钮复制 external ID。将它作为 `external_id` 传递。该角色的信任策略必须在 `ExternalId` 条件中使用此值。
+2. 设置 `allow_vpc_creation_permissions = false`，并在 `vpc_ids` 输入中提供 VPC ID。
+3. 如果你需要面向互联网的 load balancer，请设置 `allow_public_ingress = true`。否则，保持禁用。
+4. 检查并应用该角色 module，然后保留用于 data plane 创建的 `crossplane_role_arn` 输出。
+
+禁用 VPC 创建权限后，该角色无法创建或管理基础 VPC、子网、internet 和 NAT gateways、Elastic IPs、路由表和路由、客户侧 VPC endpoints，以及 VPC flow logs。它仍保留工作负载网络方面的权限，包括带 tag 的安全组、VPC endpoint services，以及 Karpenter 所需的权限。安全组创建仅限于 `vpc_ids` 中的 VPC ID。
+
+## 提供 VPC 和子网 ID
+
+创建 data plane 时，请提供来自[入门流程](/langsmith/byoc-onboarding)的名称、AWS region 和 IAM role ARN，以及以下网络值：
+
+| 值 | Terraform module 输出 | Data plane 创建字段 |
+|-------|-------------------------|---------------------------|
+| VPC ID | `vpc_id` | `byovpc_id` |
+| 私有 application 子网 ID | `private_app_subnet_ids` | `byovpc_private_app_subnet_ids` |
+| 私有 database 子网 ID | `private_db_subnet_ids` | `byovpc_private_db_subnet_ids` |
+| 公共子网 ID（公共 load balancer 必需） | `public_subnet_ids` | `byovpc_public_subnet_ids` |
+
+LangSmith 会在预置之前验证网络。修正报告的任何网络或 IAM 权限错误，然后重新提交请求。验证检查的是 AWS 配置；让连接通过自定义路由、DNS、endpoint policies 和出口过滤器正常工作，仍由你负责。
+
+创建完成后，继续[预置和私有连接（Step 4）](/langsmith/byoc-onboarding)。
+
+## 维护网络
+
+在 data plane 的整个生命周期内，保持客户托管的网络可用。路由、网关、endpoints、DNS、网络 ACL 和 flow logs 的变更由你管理。
+
+VPC、可用区和私有子网配置在创建后无法更改。你无法在 LangChain 托管的 VPC 和 BYOVPC 之间转换 data plane。
+
+删除 data plane 会移除 LangChain 托管的资源。你的 VPC 和其他客户托管的网络资源仍在你的控制之下，需要在 data plane 被取消预置后单独进行清理。
+
+## 下一步
+
+- [BYOC 入门](/langsmith/byoc-onboarding)
+- [BYOC 架构](/langsmith/byoc-architecture)
+- [BYOC shared responsibility model](/langsmith/byoc-shared-responsibility)
+- [BYOC FAQ](/langsmith/byoc-faq)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/byoc-byovpc.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

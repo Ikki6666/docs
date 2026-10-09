@@ -1,0 +1,425 @@
+---
+title: 使用 replicas 将 traces 写入多个目的地
+sidebarTitle: Trace replicas
+description: 使用 replicas 将每条 trace 同时发送到多个 projects 或 workspaces，可通过环境变量或运行时配置。
+---
+
+Replicas 让你将每条 trace 同时发送到多个 projects 或 workspaces。[动态路由](/langsmith/log-traces-to-project#set-the-destination-project-dynamically)将每条 trace 发送到一个目的地，而 replicas 会并行地把 trace 复制到所有配置的目的地。
+
+使用 replicas 可以：
+
+- 将生产 traces 镜像到 staging 或个人 project 中进行调试。
+- 写入多个 workspaces 以实现多租户隔离，而无需更改任何应用程序代码。
+- 在同一服务器下以不同 projects 发送 traces，并支持每个 replica 的 metadata 覆盖。
+
+## 通过环境变量配置 replicas
+
+将 `LANGSMITH_RUNS_ENDPOINTS` 环境变量设置为 JSON 值。支持两种格式：
+
+- **Object 格式**：将每个 endpoint URL 映射到它的 API key。每个 URL 只出现一次，因此当两个 replicas 共用一个 URL 时，请使用 array 格式：
+
+    ```bash
+    export LANGSMITH_RUNS_ENDPOINTS='{
+    "https://api.smith.langchain.com": "ls__key_us_workspace",
+    "https://eu.api.smith.langchain.com": "ls__key_eu_workspace"
+    }'
+    ```
+
+- **Array 格式**：replica 对象的列表，适用于需要多个 replicas 指向同一个 URL，或希望为每个 replica 设置 `project_name` 的情况：
+
+    ```bash
+    export LANGSMITH_RUNS_ENDPOINTS='[
+    {"api_url": "https://api.smith.langchain.com", "api_key": "ls__key1", "project_name": "project-prod"},
+    {"api_url": "https://api.smith.langchain.com", "api_key": "ls__key2", "project_name": "project-staging"}
+    ]'
+    ```
+
+<Warning>
+不能将 `LANGSMITH_RUNS_ENDPOINTS` 与 `LANGSMITH_ENDPOINT` 同时使用。如果两者都设置，LangSmith 会抛出错误。只使用其中一个来配置你的 endpoint。
+</Warning>
+
+## 在运行时配置 replicas
+
+你也可以直接在代码中传入 replicas，这在目的地因请求或租户而异时非常有用。
+
+<CodeGroup>
+
+```python Python
+from langsmith import traceable, tracing_context
+from langsmith.run_trees import WriteReplica, ApiKeyAuth
+
+@traceable
+def my_pipeline(query: str) -> str:
+    # Your application logic here
+    return f"Answer to: {query}"
+
+replicas = [
+    WriteReplica(
+        api_url="https://api.smith.langchain.com",
+        auth=ApiKeyAuth(api_key="ls__key_workspace_a"),
+        project_name="project-prod",
+    ),
+    WriteReplica(
+        api_url="https://api.smith.langchain.com",
+        auth=ApiKeyAuth(api_key="ls__key_workspace_b"),
+        project_name="project-staging",
+        # Optionally override fields on the replicated run
+        updates={"metadata": {"environment": "staging"}},
+    ),
+]
+
+with tracing_context(replicas=replicas):
+    my_pipeline("What is LangSmith?")
+```
+
+```typescript TypeScript
+import { traceable } from "langsmith/traceable";
+
+const myPipeline = traceable(
+  async (query: string): Promise<string> => {
+    // Your application logic here
+    return `Answer to: ${query}`;
+  },
+  {
+    name: "my_pipeline",
+    replicas: [
+      {
+        apiUrl: "https://api.smith.langchain.com",
+        apiKey: "ls__key_workspace_a",
+        projectName: "project-prod",
+      },
+      {
+        apiUrl: "https://api.smith.langchain.com",
+        apiKey: "ls__key_workspace_b",
+        projectName: "project-staging",
+        // Optionally override fields on the replicated run
+        updates: { metadata: { environment: "staging" } },
+      },
+    ],
+  }
+);
+
+await myPipeline("What is LangSmith?");
+```
+
+</CodeGroup>
+
+你还可以使用 `updates` 字段，仅为某个特定 replica 将额外字段（例如 [metadata 或 tags](/langsmith/ls-metadata-parameters)）合并到 run 中，而保持主 trace 不变。Replica 错误是非致命的：如果某个 replica endpoint 不可用，LangSmith 会记录该错误，而不会影响主 trace。
+
+<Warning>
+Auth 不会在分布式 traces 中传播。当一条 trace 跨越多个服务时，LangSmith 会自动将 replica 的 `project_name` 和 `updates` 转发给下游服务，但不会转发 API keys 或凭据。每个服务必须为 replica 目的地配置自己的凭据。
+</Warning>
+
+## 在同一服务器内复制（仅 project 的 replicas）
+
+如果你的所有 replicas 都使用同一个 LangSmith 服务器，可以省略 `api_url` 和 `auth`，只指定 `project_name`。SDK 会复用默认的 client 凭据：
+
+<CodeGroup>
+
+```python Python
+from langsmith import traceable, tracing_context
+from langsmith.run_trees import WriteReplica
+
+@traceable
+def my_pipeline(query: str) -> str:
+    return f"Answer to: {query}"
+
+with tracing_context(
+    replicas=[
+        WriteReplica(project_name="project-prod"),
+        WriteReplica(project_name="project-staging", updates={"metadata": {"env": "staging"}}),
+    ]
+):
+    my_pipeline("What is LangSmith?")
+```
+
+```typescript TypeScript
+import { traceable } from "langsmith/traceable";
+
+const myPipeline = traceable(
+  async (query: string) => `Answer to: ${query}`,
+  {
+    name: "my_pipeline",
+    replicas: [
+      { projectName: "project-prod" },
+      { projectName: "project-staging", updates: { metadata: { env: "staging" } } },
+    ],
+  }
+);
+
+await myPipeline("What is LangSmith?");
+```
+
+</CodeGroup>
+
+## 为所有 replica 实例提交 feedback
+
+使用 replicas 时，每个 replica 都会收到每条 run 的副本。要为某个特定 replica 上的 run 提交 feedback，你需要该 replica 的 run ID。在 Python SDK 0.10.8 或更高版本以及 JS SDK 0.8.5 或更高版本中，你可以将一个 replica 指定为 **primary**，并使用 `compute_run_id_for_secondary_replica` 确定性地计算所有其他 replicas 的 run IDs。
+
+**Primary** replica 保持原始 run ID 不变。每个 **secondary** replica 会收到一个由原始 run ID 和该 secondary replica 的 project name 派生的确定性 run ID。使用 `compute_run_id_for_secondary_replica(original_run_id, project_name)` 计算 secondary run ID，并在调用 `create_feedback` 时传入它。如果 run ID 不是 UUID v7，或 project name 为空，两个 SDK 都会抛出错误。
+
+<CodeGroup>
+
+```python Python
+from langsmith import (
+    Client,
+    compute_run_id_for_secondary_replica,
+    trace,
+    tracing_context,
+)
+
+primary_client = Client(api_key="primary-key")
+secondary_client = Client(api_key="secondary-key")
+
+primary_project = "production"
+secondary_project = "backup-project"
+
+with tracing_context(
+    replicas=[
+        {
+            "project_name": primary_project,
+            "primary": True,
+            "client": primary_client,
+        },
+        {
+            "project_name": secondary_project,
+            "primary": False,
+            "client": secondary_client,
+        },
+    ]
+):
+    with trace("answer-question", inputs={"question": "Capital of France?"}) as run:
+        run.outputs = {"answer": "Paris"}
+
+# Compute the secondary replica's run ID from the original run ID and project name
+secondary_run_id = compute_run_id_for_secondary_replica(
+    run.id,
+    secondary_project,
+)
+
+# Each replica has its own project; resolve the corresponding project UUIDs
+primary_session_id = primary_client.create_project(project_name=primary_project, upsert=True).id
+secondary_session_id = secondary_client.create_project(project_name=secondary_project, upsert=True).id
+
+# Submit feedback to the primary replica using the original run ID
+primary_client.create_feedback(
+    trace_id=run.id,
+    key="user-rating",
+    score=1,
+    session_id=primary_session_id,
+)
+
+# Submit feedback to the secondary replica using the computed run ID
+secondary_client.create_feedback(
+    trace_id=secondary_run_id,
+    key="user-rating",
+    score=1,
+    session_id=secondary_session_id,
+)
+```
+
+```typescript TypeScript
+import { Client } from "langsmith";
+import { traceable, getCurrentRunTree } from "langsmith/traceable";
+import { computeRunIdForSecondaryReplica } from "langsmith";
+
+const primaryClient = new Client({ apiKey: "primary-key" });
+const secondaryClient = new Client({ apiKey: "secondary-key" });
+
+const primaryProject = "production";
+const secondaryProject = "backup-project";
+
+let primaryRunId: string | undefined;
+
+const answerQuestion = traceable(
+  async (question: string) => {
+    primaryRunId = getCurrentRunTree()?.id;
+    return { answer: "Paris" };
+  },
+  {
+    name: "answer-question",
+    client: primaryClient,
+    replicas: [
+      {
+        projectName: primaryProject,
+        primary: true,
+        client: primaryClient,
+      },
+      {
+        projectName: secondaryProject,
+        primary: false,
+        client: secondaryClient,
+      },
+    ],
+  }
+);
+
+await answerQuestion("Capital of France?");
+
+if (primaryRunId) {
+  // Compute the secondary replica's run ID
+  const secondaryRunId = computeRunIdForSecondaryReplica(
+    primaryRunId,
+    secondaryProject
+  );
+
+  // Each replica has its own project; resolve the corresponding project UUIDs
+  const { id: primarySessionId } = await primaryClient.createProject({
+    projectName: primaryProject,
+    upsert: true,
+  });
+  const { id: secondarySessionId } = await secondaryClient.createProject({
+    projectName: secondaryProject,
+    upsert: true,
+  });
+
+  // Submit feedback to the primary replica using the original run ID
+  await primaryClient.createFeedback({
+    runId: primaryRunId,
+    sessionId: primarySessionId,
+    key: "user-rating",
+    score: 1,
+  });
+
+  // Submit feedback to the secondary replica using the computed run ID
+  await secondaryClient.createFeedback({
+    runId: secondaryRunId,
+    sessionId: secondarySessionId,
+    key: "user-rating",
+    score: 1,
+  });
+}
+```
+
+</CodeGroup>
+
+<Note>
+`compute_run_id_for_secondary_replica` / `computeRunIdForSecondaryReplica` 辅助函数在 Python SDK 0.10.8 或更高版本以及 JS SDK 0.8.5 或更高版本中可用。如果你使用的是更早的 SDK 版本，请升级后使用此功能。
+</Note>
+
+## 在 LangSmith 和 OpenTelemetry 目的地之间路由
+
+你可以在运行时决定某次调用是将 traces 发送到 LangSmith、发送到 OpenTelemetry（OTel）backend，还是两者都发送，而无需重新部署或修改应用程序逻辑。当你希望按环境甚至按请求在可观测性 backend 之间切换，并在运行时做出决策时，这非常有用。
+
+使用 `tracing_mode` 构造参数或 `LANGSMITH_TRACING_MODE` 环境变量设置 tracing 模式。两者接受相同的值；显式的 `tracing_mode` 参数始终优先于环境变量：
+
+- **`"langsmith"`（默认）**：以 LangSmith 原生格式发送 traces。
+- **`"otel"`**：将 traces 作为 OpenTelemetry spans 导出到配置的 OTel backend。
+- **`"hybrid"`（仅 Python）**：从单个 replica 同时发送到 LangSmith 和 OTel backend。
+
+<Note>
+如果你在 `Client` 上使用已弃用的 `otel_enabled` 参数（仅 Python），请迁移到 `tracing_mode`：`Client(otel_enabled=True)` → `Client(tracing_mode="hybrid")`。传入 `otel_enabled` 仍然有效，但会发出 `FutureWarning`。
+</Note>
+
+直接将配置好的 `Client` 传入 replica，即可在运行时应用所需的模式：
+
+<CodeGroup>
+
+```python Python expandable wrap
+from langsmith import Client, traceable, tracing_context
+from langsmith.run_trees import WriteReplica
+from langsmith.wrappers import wrap_openai
+import openai
+
+# Create clients with different tracing modes
+ls_client = Client()                            # tracing_mode="langsmith" (default)
+otel_client = Client(tracing_mode="otel")       # tracing_mode="otel"
+hybrid_client = Client(tracing_mode="hybrid")   # tracing_mode="hybrid" (both)
+
+openai_client = wrap_openai(openai.Client())
+
+@traceable()
+def joke():
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "Tell me a short joke."}],
+    )
+    return response.choices[0].message.content
+
+# Mix tracing modes across replicas in a single invocation:
+# one replica sends via LangSmith's native format, another as OTel spans.
+with tracing_context(replicas=[
+    WriteReplica(client=ls_client),    # tracing_mode="langsmith"
+    WriteReplica(client=otel_client),  # tracing_mode="otel"
+]):
+    joke()
+
+# Alternatively, a single hybrid replica sends to both simultaneously.
+with tracing_context(replicas=[WriteReplica(client=hybrid_client)]):
+    joke()
+
+# Swap replica lists at runtime, for example based on a feature flag or environment.
+def get_replicas(send_to_otel: bool):
+    replicas = [WriteReplica(client=ls_client)]
+    if send_to_otel:
+        replicas.append(WriteReplica(client=otel_client))
+    return replicas
+
+with tracing_context(replicas=get_replicas(send_to_otel=True)):   # LangSmith + OTel
+    joke()
+
+with tracing_context(replicas=get_replicas(send_to_otel=False)):  # LangSmith only
+    joke()
+```
+
+```typescript TypeScript expandable wrap
+import { Client } from "langsmith";
+import { traceable } from "langsmith/traceable";
+import { wrapOpenAI } from "langsmith/wrappers";
+import OpenAI from "openai";
+
+// Note: tracingMode: "otel" requires OTel SDK initialization
+// (TracerProvider, SpanProcessor, etc.) before creating the client.
+// See the OpenTelemetry integration guide for setup details.
+
+// Create clients with different tracing modes
+const lsClient = new Client();                           // tracingMode: "langsmith" (default)
+const otelClient = new Client({ tracingMode: "otel" });  // tracingMode: "otel"
+
+const openaiClient = wrapOpenAI(new OpenAI());
+
+async function jokeImpl() {
+  const response = await openaiClient.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "Tell me a short joke." }],
+  });
+  return response.choices[0].message.content;
+}
+
+// Mix tracing modes across replicas in a single traceable call:
+// the primary client sends via LangSmith, the replica sends as OTel spans.
+const joke = traceable(jokeImpl, {
+  name: "joke",
+  client: lsClient,                    // tracingMode: "langsmith" (default)
+  replicas: [{ client: otelClient }],  // tracingMode: "otel"
+});
+await joke();
+
+// Build replicas dynamically for runtime switching, for example based on a feature flag.
+function buildReplicas(sendToOtel: boolean) {
+  return sendToOtel ? [{ client: otelClient }] : [];
+}
+
+const sendToOtel = process.env.ROUTE_TO_OTEL === "true";
+const jokeDynamic = traceable(jokeImpl, {
+  name: "joke",
+  client: lsClient,
+  replicas: buildReplicas(sendToOtel),
+});
+await jokeDynamic();
+```
+
+</CodeGroup>
+
+每个 `Client` 上的 `tracing_mode` 决定了该 replica 的导出路径。在 Python 中，`"hybrid"` 模式在单个 replica 内处理两个目的地。在 TypeScript 中，"同时发送"的情况使用两个独立的 replicas，每个 client 一个，因为没有 `"hybrid"` 模式。由于每个 replica 独立解析自己的 client，你也可以在单个 `tracing_context` 中混用多种模式，例如让一个 replica 发送到 LangSmith，同时通过第二个 replica 将同一条 trace 转发到 OTel collector。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/trace-replicas.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

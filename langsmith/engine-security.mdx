@@ -1,0 +1,108 @@
+---
+title: LangSmith Engine 安全性
+sidebarTitle: Security
+description: LangSmith Engine 如何处理你的数据、管理其 GitHub 和模型访问的 subprocessor 控制措施，以及其合规状态。
+---
+
+LangSmith Engine 是内置于 LangSmith 中的一个 AI agent，用于改进你构建的 agents。Engine 会审查 LangSmith 中已有的 trace 数据，发现并排列 issue 的优先级，并打开带有建议修复方案、prompt 变更建议和 evaluations 的 pull requests。产品概览请参阅 [Engine](/langsmith/engine-overview)。
+
+Engine 是可选加入的、仅提供建议的，并且从不在你的数据上训练；它运行在 LangSmith 的 SOC 2 Type II 和 ISO 27001 控制之下。本页介绍 Engine 如何处理你的数据、管理其 GitHub 和模型访问的控制措施，以及 Engine 在 LangSmith Cloud 中的合规姿态。关于 Engine 在 self-hosted deployment 中如何运行，请参阅 [Engine on self-hosted](/langsmith/engine-self-hosted)。
+
+Engine 作为 LangSmith 的一部分交付，继承 LangSmith 的安全与合规姿态，并带有覆盖 AI 推理层的额外控制措施，在以下各节中说明。Engine 默认永不开启，只能由 [Organization Admin](/langsmith/rbac#organization-admin) 启用，适用于任何 plan 上的组织。关于 LangSmith 的平台级控制，包括数据加密和区域处理，请参阅 [Regions FAQ](/langsmith/regions-faq) 和 [LangChain Trust Center](https://trust.langchain.com/)。
+
+## Engine 使用哪些数据
+
+在 LangSmith Cloud 中，Engine 运行在你已经选择与 LangChain 共享的数据上：你发送到 LangSmith 的 trace 数据，以及单独地、你通过 LangChain 管理的 GitHub App 授予的 GitHub repository 内容（请参阅 [GitHub integration](#github-integration)）。启用 Engine 不会引入其他客户数据源。下表总结了 Engine 读取什么、数据存放在哪里，以及它带来什么。
+
+| **数据源** | **Engine 读取什么** | **存储与持久化** | **带来什么** |
+|---|---|---|---|
+| LangSmith workspace 内容 | 你存储在 LangSmith 中的 trace 数据和其他 workspace 内容，例如 prompts 和 evaluators。 | 在你的 LangSmith tenant 内。截至 2026 年 9 月 14 日，SaaS 客户的 [trace retention](/langsmith/usage-and-billing#data-retention) 为 14 天（基础）或最长 180 天（扩展），按 project 选择。 | Issue 检测、优先级排序和 evaluation 提案。 |
+| GitHub repository | 你连接的 repositories 中的源码和 repository 上下文（请参阅 [GitHub integration](#github-integration)）。 | 在每次分析运行期间，在一个隔离的、LangChain 管理的 sandbox 内处理，然后丢弃。 | 带有建议代码修复方案的 pull request 撰写。 |
+| 模型提供商（推理） | 仅每次分析任务所需的内容。 | 与每个 Engine model provider 配置为零数据保留（请参阅 [Model subprocessors](#model-subprocessors)）。 | Engine 的推理与生成。 |
+
+<Note>
+  Engine 的读取范围可能随时间扩展。本页会更新以反映实质性变化。上次审阅于 2026 年 9 月 16 日。
+</Note>
+
+发送到 Engine 的 trace 内容可能包含用户消息、tool 输出和 PII，这些内容会在零数据保留下发送给 model subprocessors 以用于每次分析任务。要在 traces 到达 LangSmith 之前移除敏感字段，请使用 [client-side masking](/langsmith/mask-inputs-outputs)。
+
+Engine 的输出仅提供建议。它发现并跟踪 issues、提出 pull requests，并推荐用于 offline evaluation 的 dataset examples。你的工程师以及你的分支保护和审核策略决定什么可以发布。
+
+## GitHub integration
+
+在 LangSmith Cloud 中，Engine 通过一个 LangChain 管理的 GitHub App 连接到 GitHub.com。Self-hosted deployments 使用[针对其 GitHub 环境的操作员管理 App](/langsmith/engine-github#self-hosted-configuration)。GitLab、Bitbucket 和其他版本控制提供商尚不支持。
+
+该 App 的权限范围限定为：
+
+- 在安装时你所选 repositories 上的**读取权限**。
+- 用于从它创建的新分支打开 pull requests 的**写入权限**。对已有分支的推送由你的分支保护规则管理。
+
+访问使用 GitHub 的标准 App 模型：每个操作都通过一个短暂有效的 installation token 运行，该 token 在一小时后过期，不能超过安装时授予的权限，也无法触及你没有选择的 repositories。Token 按分析运行铸造，而不是作为长期凭证持有。
+
+源码只被 Engine 的自动化分析读取，正常操作中 LangChain 人员不会浏览它。对于每次运行，所选的 repository 会被克隆到一个隔离的、网络受限的 sandbox 中，仅用于该次运行，并在运行完成时删除（运行被中断时最长一小时内）。Engine 自身关于分析的操作 traces 默认被掩码。
+
+你可以随时通过从你的 GitHub organization 卸载该 App 来撤销 Engine 对 GitHub 的访问。
+
+## Model subprocessors
+
+在 LangSmith Cloud 中，Engine 的 model subprocessors（当前为 OpenAI、Anthropic、Fireworks 和 Baseten）配置为零数据保留，并且根据其与 LangChain 的协议，被禁止使用客户数据训练或微调其模型。[LangChain Trust Center](https://trust.langchain.com/) 发布权威的 subprocessor 列表。
+
+在 self-hosted deployments 中，每个组织自行选择 Engine 如何运行其模型：
+
+- **LangSmith Intelligence (LSI):** Engine 通过 LSI 使用 Amazon Bedrock，受本页承诺约束。
+- **你自己的 model providers：** Engine 使用你的凭证调用 Anthropic、OpenAI、Amazon Bedrock、Google Vertex AI 或 Azure AI Foundry。这些提供商根据你与它们的协议处理 Engine 的请求，LangChain 只接收使用元数据。
+
+请参阅 [Choose how Engine runs its models](/langsmith/engine-self-hosted#choose-how-engine-runs-its-models)。
+
+## 关键安全控制
+
+在 LangSmith Cloud 中，Engine 在 LangSmith 的基线之上添加了以下控制措施：
+
+- **显式选择加入**：Engine 默认永不开启，只能由 Organization Admin 启用。
+- **建议性输出，由人掌舵**：Engine 不会自动合并、自动部署，也不会对你的系统采取破坏性操作。每个提议的变更都是一个遵循你的分支保护、审核和合并策略的 pull request。提议的 prompt 变更会写入 LangSmith 中的一个单独提案记录，在得到授权用户明确应用之前，不会修改任何 prompt。在两条路径中，都由人来决定什么可以发布。
+- **与每个 Engine model provider 配置零数据保留**：推理供应商不会在请求之后持久化 prompts 和 completions。
+- **不使用客户数据训练或微调任何模型**：每个提供商都受协议约束，不得将客户内容用于训练。
+- **逻辑租户隔离**：Engine 对你的数据的访问范围限定在你的 LangSmith tenant 内。跨租户访问由应用层控制阻止，与 LangSmith Cloud 的租户模型一致。每次分析运行都在它自己的隔离 sandbox 内执行。
+- **可审计性**：Engine 将其工作呈现为 GitHub pull requests，并在 [Engine 标签页](/langsmith/engine)的 issue 列表中提供支持性上下文。代码变更流经你的分支保护、审核和自动化构建控制，因此你的软件开发生命周期仍然是发布内容的记录系统。
+- **客户端 PII 清理**：LangSmith 的 [client libraries](/langsmith/mask-inputs-outputs) 可以在 traces 发送到 LangSmith 之前移除敏感内容。推荐给处理受监管数据的客户。
+- **由 LangChain 管理模型选择**：LangChain 在这些 subprocessors 中为每个 Engine 任务选择具体使用的模型，并可以在该集合内更改选择，无需单独通知。添加任何新的 subprocessor 都遵循标准的 subprocessor 变更通知流程。
+- **撤销与删除**：你可以随时通过卸载该 App 撤销 GitHub 访问，并在 [Engine settings](/langsmith/engine#pause-engine-or-delete-its-issues) 中使用 **Delete all issues** 移除 Engine 的发现结果。Trace 数据遵循你的 LangSmith [retention and purging](/langsmith/data-purging-compliance) 设置。
+
+## 合规姿态
+
+Engine 运行在 LangSmith 的控制环境之下，该环境每年接受 SOC 2 Type II 审计，并通过 ISO 27001 认证。Engine 的 model subprocessors 列在 [LangChain Trust Center](https://trust.langchain.com/) 上，它是采购和数据保护影响评估的权威来源。
+
+## 固有的 AI 风险与缓解措施
+
+以下风险是 AI 辅助代码生成所固有的。LangChain 在产品中针对每一项进行缓解，你的代码审核工作流提供了第二层防御。
+
+- **错误或幻觉的建议**：所有 Engine 输出都会经过你正常的 pull request 审核和自动化检查，之后任何代码才会合入。
+- **通过 trace 内容进行的 prompt injection**：Trace 数据可能包含从外部来源反映的对抗性内容，例如 web-tool 输出。Engine 从此类 traces 产生的任何建议仍然会在代码合入前经过人工 pull request 审核。请谨慎对待来自不受信任来源的 traces。
+- **超出范围的决策**：Engine 只对 traces 和已连接的 repositories 进行推理。依赖 Engine 无法看到的上下文的 issues，例如工单系统中的业务规则变更，仍然是人的责任。
+
+## 继续阅读
+
+- [Engine](/langsmith/engine-overview)
+- [Configure Engine](/langsmith/engine)
+- [Engine on self-hosted](/langsmith/engine-self-hosted)
+- [Engine notifications](/langsmith/engine-notifications)
+- [Prevent logging of sensitive data in traces](/langsmith/mask-inputs-outputs)
+- [Data purging for compliance](/langsmith/data-purging-compliance)
+- [Audit logs](/langsmith/audit-logs)
+- [Regions FAQ](/langsmith/regions-faq)
+- [LangChain Trust Center](https://trust.langchain.com/)
+
+## 联系方式
+
+关于安全问题，请联系 [trust@langchain.dev](mailto:trust@langchain.dev)。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/engine-security.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

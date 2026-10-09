@@ -1,0 +1,217 @@
+---
+title: 将自托管 LangSmith 连接到 Slack
+sidebarTitle: Slack
+description: 为自托管 LangSmith 上的 Engine 和 alert 通知配置你自己的 Slack app。
+---
+
+自托管 LangSmith 使用由你的 operator 创建和配置的 Slack app。operator 是管理你 LangSmith deployment 的人。deployment 直接向 Slack 交换 OAuth codes 并发送 [Engine notifications](/langsmith/engine-notifications) 和 [alert notifications](/langsmith/alerts)。LangSmith 将 app 凭据和加密的 workspace bot tokens 存储在你的 deployment 中。
+
+如果你的实例上尚未配置 Slack，请联系你的 operator。此提示会出现在 organization settings 以及每个 Engine project 的 **Notifications** 设置下的 **Slack** 标签页中。operator 按照下方的设置说明操作。设置完成后，用户通过 Slack authorization 连接 workspace，无需自行提供 app 凭据。
+
+<Note>
+此连接要求 LangSmith 自托管 v0.17 或更高版本。
+</Note>
+
+开始之前，请确保你拥有：
+
+- **Deployment 访问权限：** 配置并重启你的 LangSmith platform backend 的权限。对于 Kubernetes，是 LangSmith 运行所在 namespace 的访问权限。
+- **Slack 访问权限：** 在接收通知的 Slack workspace 中创建并安装 app 的权限。如果你的 workspace 限制 app 安装，请获得管理员批准。
+- **LangSmith 访问权限：** 连接或断开 Slack workspace 所需的 `organization:manage` 权限。operator 配置好 deployment 后，organization 管理员可以完成此步骤。
+- **网络访问：** 到 Slack 的后端 HTTPS 访问，以及到你的 deployment 的 HTTPS callback 的浏览器访问。请参阅[允许网络访问](#允许网络访问)。
+
+## 创建你的 Slack app
+
+你的 operator 为 deployment 创建一个 Slack app。[App manifest](https://docs.slack.dev/reference/app-manifest/) 是一个 JSON 配置，用于创建 bot 并设置其权限。用户在连接 workspace 时复用此 app；他们不会为每个用户或项目创建单独的 app。
+
+创建该 app 的步骤：
+
+1. 复制下方 JSON 并替换 `oauth_config.redirect_urls` 中的 URL。对于标准 ingress，在你用于打开 LangSmith 的 URL 后面追加 `/api/v1/platform/slack/callback`。例如，`https://langsmith.example.com` 会变成 `https://langsmith.example.com/api/v1/platform/slack/callback`。如果 LangSmith 运行在 `https://langsmith.example.com/langsmith`，则使用 `https://langsmith.example.com/langsmith/api/v1/platform/slack/callback`。对于自定义 ingress 或独立的 API host，请使用能到达你的 deployment 的 Slack callback 的 HTTPS URL。
+2. 打开 [Your Apps](https://api.slack.com/apps) 并选择 **Create New App**。选择 **From a manifest**，然后点击 **Continue**。
+3. 选择 **JSON** 标签页，粘贴你编辑过的 manifest，并选择你的 Slack workspace。点击 **Next**。
+4. 审查五项权限并点击 **Create and Install**。完成任何 Slack authorization 或管理员批准提示。
+5. 打开新 app 的 **Basic Information** > **App Credentials**。复制 **Client ID** 和 **Client Secret**，使用 **Show** 显示 secret。将它们存储在你的 deployment 的 secret manager 中。使用 Client ID，而不是 App ID 或 Signing Secret。你不需要将这些凭据发送给 LangChain。
+
+```json
+{
+  "display_information": {
+    "name": "LangSmith Notifications",
+    "description": "Engine and alert notifications from your LangSmith deployment"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "LangSmith Notifications",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "redirect_urls": [
+      "https://langsmith.example.com/api/v1/platform/slack/callback"
+    ],
+    "scopes": {
+      "bot": [
+        "chat:write",
+        "channels:read",
+        "channels:join",
+        "groups:read",
+        "reactions:write"
+      ]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
+```
+
+manifest 包含的是配置，而不是凭据。Slack 会在创建后生成 app 凭据。它配置自托管 LangSmith 请求的五个 bot scopes：
+
+- **`chat:write`**：发送通知消息。
+- **`channels:read`**：在 channel picker 中列出公共 channels。
+- **`channels:join`**：在需要时，投递通知时加入所选的公共 channel。
+- **`groups:read`**：列出 bot 被邀请加入的私有 channels。
+- **`reactions:write`**：添加和移除 emoji reactions。通知投递目前不使用此权限。
+
+保持 token rotation 处于禁用状态。此集成会存储 bot tokens，不会刷新轮换的 tokens。保持 Socket Mode 禁用；通知投递不需要 Event Subscriptions 和 app-level token。
+
+在 Slack 中创建或安装 app 并不会将其连接到 LangSmith。配置好 deployment 后，请完成[连接 Slack workspace](#连接-slack-workspace)。LangSmith 通过该 authorization 流程获取并存储 workspace bot token；你不需要将 bot token 复制到 deployment 中。
+
+## 配置你的 deployment
+
+使用你的 deployment 的 [environment variable configuration](/langsmith/self-host-environment-variables)，在 LangSmith platform backend 上配置以下变量：
+
+| Variable | Value |
+| --- | --- |
+| `LANGSMITH_SLACK_CLIENT_ID` | 你的 Slack app 的 Client ID。 |
+| `LANGSMITH_SLACK_CLIENT_SECRET` | 你的 Slack app 的 Client Secret，通过 secret 提供。 |
+| `LANGSMITH_SLACK_REDIRECT_URI` | 保存在 Slack 中的确切 HTTPS callback URL。 |
+| `LANGSMITH_URL` | 你的 deployment 的面向浏览器的 URL。通知链接和 authorization 之后的返回都使用此 URL。 |
+
+对于 Helm deployments（包括 EKS 上的 deployments），通过 `platformBackend.deployment.extraEnv` 配置 app 凭据。
+
+首先，在 LangSmith 运行所在的 namespace 中创建一个 Kubernetes Secret。如果你使用 secrets operator，请通过该 operator 提供 `slack-app-credentials`，其中包含 `client-id` 和 `client-secret` 两个 key。若要手动创建，请将以下内容保存为 `slack-app-secret.yaml`，并替换全部三个占位符。将包含凭据的文件排除在版本控制之外。
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slack-app-credentials
+  namespace: "<your-langsmith-namespace>"
+type: Opaque
+stringData:
+  client-id: "<your-slack-client-id>"
+  client-secret: "<your-slack-client-secret>"
+```
+
+应用 Secret：
+
+```bash
+kubectl apply -f slack-app-secret.yaml
+```
+
+接下来，将这些条目合并到你现有的 Helm values 文件中。保留任何已有的 `platformBackend.deployment.extraEnv` 条目。将 callback URL 替换为你在 manifest 中使用的同一个 URL：
+
+```yaml
+platformBackend:
+  deployment:
+    extraEnv:
+      - name: LANGSMITH_SLACK_CLIENT_ID
+        valueFrom:
+          secretKeyRef:
+            name: slack-app-credentials
+            key: client-id
+      - name: LANGSMITH_SLACK_CLIENT_SECRET
+        valueFrom:
+          secretKeyRef:
+            name: slack-app-credentials
+            key: client-secret
+      - name: LANGSMITH_SLACK_REDIRECT_URI
+        value: "https://langsmith.example.com/api/v1/platform/slack/callback"
+```
+
+chart 会根据其 hostname 配置设置 `LANGSMITH_URL`。根据需要配置 `config.hostname`、`config.frontendHostname`（如果 UI 使用独立主机）和 `config.basePath`。避免通过 `extraEnv` 或 `commonEnv` 添加重复的 `LANGSMITH_URL`。
+
+通过你的 deployment 流程应用更新后的 values。如果你直接管理 Helm，请使用你现有的 release name、namespace、chart version 和完整的 values 文件：
+
+```bash
+helm upgrade <release-name> langchain/langsmith \
+  --namespace <your-langsmith-namespace> \
+  --version <your-chart-version> \
+  --values <path-to-your-existing-values-file> \
+  --wait
+```
+
+使用包含受支持 LangSmith release 的 chart 版本。升级前置条件请参阅[升级自托管 deployment](/langsmith/self-host-upgrades)。
+
+保持现有的 `API_KEY_SALT` 加密 secret 在 API 和 notification workers 之间一致。它们使用它来加密和解密存储的 bot tokens。请参阅[使用已有 secret](/langsmith/self-host-using-an-existing-secret)。
+
+等待 platform backend 的 rollout 完成，然后重新加载 LangSmith。如果你更改了 Secret 但没有更改 Helm values，请重启 platform backend，以便它加载新的凭据。在你的 organization 的 **General** 设置下，配置完成后 **Slack** 部分会显示 **Connect Slack**。
+
+后端会检查 app 凭据是否存在以及 callback URL 是否有效。Slack 会在 authorization 期间验证凭据。不正确的凭据仍可能显示 **Connect Slack**，但在你尝试连接时会失败。
+
+更改或移除 app 凭据不会删除已存储的 workspace 连接或通知目标。之前存储的 bot tokens 可以继续投递通知。要停止投递，请断开 workspace 或删除其通知目标。
+
+## 允许网络访问
+
+对于此集成，请允许以下连接：
+
+- **后端：** 到 `slack.com` 的 Slack Web API 的出站 HTTPS，用于 OAuth 交换、channel 查询和通知。
+- **浏览器：** 访问 Slack、你的 deployment 的 callback URL 和 UI。
+
+Slack 会将浏览器重定向到你的 callback。通知投递不需要 Slack 入站访问你的 deployment。
+
+## 连接 Slack workspace
+
+Slack workspace 连接属于你的 LangSmith organization，因此你可以在各个项目间复用它：
+
+1. 打开你的 LangSmith 实例，进入 **Settings** > 你的 organization 的 **General** 设置。
+2. 在 **Slack** 下，点击 **Connect Slack**。你也可以在配置 Engine 或 alert notification 时从 channel selector 中连接。
+3. 选择 Slack workspace，审查你的 app 请求的权限，然后点击 **Allow**。如有需要，完成管理员批准。
+4. 确认浏览器返回到你的 LangSmith 实例，并且 workspace 显示为 **Connected**。在你的通知设置中选择该 workspace 和一个 channel。对于私有 channel，先邀请你配置的 Slack app 加入该 channel，然后刷新 picker。LangSmith 在首次投递消息时按需加入所选的公共 channel。
+5. 使用你需要的事件类型和最低 issue severity 保存该目标。请参阅[配置 Engine notifications](/langsmith/engine-notifications#notify-a-slack-channel) 或[配置 alert notifications](/langsmith/alerts#step-4-configure-notification-channel)。
+
+## 验证投递
+
+保存目标不会发送测试消息。Engine 目标会为匹配其事件类型和最低 issue severity 的新事件发送通知。保存目标时，已有 issues 不会发出新的通知。
+
+验证 Engine 目标的步骤：
+
+1. 在测试项目上为 `issue.created` 保存一个 Slack 目标。在 **Notify when** 下，选择 **Issue created**。测试期间将 **Minimum issue severity** 设置为 **All severities**。
+2. 为测试项目[启用 Engine](/langsmith/engine#turn-on-engine-for-a-tracing-project)，并让它分析新的 traces。等待 Engine 创建一个新 issue。如果 Engine 没有发现新 issue，就没有 `issue.created` 通知可发送。
+3. 检查所选 channel 中是否有消息到达，以及 **View issue** 是否会打开你的自托管实例。
+
+如果不想等待新的 Engine issue 来验证 Slack 投递，可以在测试项目的 alert 设置中配置一个 Slack 目标。点击 **Send Test Notification** 并检查所选 channel。请参阅[测试 alert 集成](/langsmith/alerts#2-test-the-integration)。这检查的是 Slack 连接，而不是 Engine 的事件生成。
+
+Slack 通知会将内容从你的 deployment 发送到所选 workspace。Engine 消息可能包含 issue 标题、描述、severity、项目信息、链接和 recurrence charts。Alert 消息包含 alert 和 workspace 名称、metric 值、阈值和链接。选择具有适合该内容的访问权限的 channel。请参阅 [Engine notification format](/langsmith/engine-notifications#notify-a-slack-channel) 和 [Alert notification format](/langsmith/alerts#notification-format)。
+
+## 连接故障排查
+
+- **Slack 未配置：** 联系你的 operator。确认你的 release 支持此连接，并且所有三个 Slack 环境变量都已设置。重启后端后重新加载 UI。
+- **Slack 配置不可用：** UI 无法加载后端的配置。重新加载页面，并让你的 operator 检查后端；此消息并不表示 app 凭据缺失。
+- **后端 pod 无法启动：** 检查 `slack-app-credentials` 是否存在于 LangSmith 所在的同一 namespace 中，并且同时包含 `client-id` 和 `client-secret`。
+- **Slack 拒绝 app 凭据：** 从同一个 Slack app 复制 Client ID 和 Client Secret。更新 deployment Secret，重启 platform backend，然后再次启动 **Connect Slack**。
+- **Authorization 无法开始：** 确认该 app 有 bot user、所有列出的 scopes，以及在所选 workspace 中安装的权限。
+- **Slack 报告 redirect 不匹配：** 确保 `LANGSMITH_SLACK_REDIRECT_URI` 与保存的 Slack Redirect URL 一致，包括 scheme、host、port 和 path。
+- **返回后 authorization 失败：** 再次启动 **Connect Slack**。Authorization 状态在 10 分钟后过期。检查到 callback 的浏览器访问、到 Slack 的后端访问，以及配置的 app 凭据。保持 token rotation 禁用。
+- **私有 channel 缺失：** 邀请你配置的 Slack app 加入该 channel，然后刷新 picker。
+- **消息未到达：** 确认 Slack Web API 访问、API 和 workers 上匹配的加密 secrets，以及目标的事件和 severity 过滤条件。如果有人从 Slack 中移除了该 app，请重新连接 workspace。
+- **链接打开错误的主机：** 修正你的 deployment 的面向浏览器的 URL 配置。
+
+## 另请参阅
+
+- [Engine on self-hosted LangSmith](/langsmith/engine-self-hosted)
+- [Engine notifications](/langsmith/engine-notifications)
+- [Alerts](/langsmith/alerts)
+- [Configure egress](/langsmith/self-host-egress)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/self-host-slack.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

@@ -1,0 +1,135 @@
+---
+title: 如何为你的应用添加 TTL
+sidebarTitle: 为你的应用添加 TTL
+---
+
+<Tip>
+**Prerequisites**
+本指南假设你已经熟悉 [LangSmith](/langsmith/observability)、[Persistence](/oss/python/langgraph/persistence) 和 [Cross-thread persistence](/oss/python/langgraph/stores) 的相关概念。
+</Tip>
+
+LangSmith 会持久化 [checkpoints](/oss/python/langgraph/checkpointers#checkpoints)（thread state）和 [cross-thread memories](/oss/python/langgraph/stores)（store items）。你可以在 [`langgraph.json`](/langsmith/application-structure#configuration-file) 中配置 Time-to-Live (TTL) 策略，自动管理这些数据的生命周期，防止其无限积累。
+
+## 配置 thread 和 checkpoint TTL
+
+Checkpoints 用于捕获会话 thread 的状态。设置 TTL 后，过期的数据会被自动删除或清理。
+
+在你的 `langgraph.json` 文件中添加 `checkpointer.ttl` 配置：
+
+```json
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./agent.py:graph"
+  },
+  "checkpointer": {
+    "ttl": {
+      "strategy": "delete",
+      "sweep_interval_minutes": 60,
+      "default_ttl": 43200
+    }
+  }
+}
+```
+
+- `strategy`：指定过期后执行的动作。默认值为 `"delete"`。
+    - `"delete"`：TTL 到期后，删除整个 thread 及其关联的所有 run 和 checkpoint 数据。
+    - `"keep_latest"`：保留 thread 以及最新 checkpoint，但删除后续 runs 不再需要的旧 checkpoint 数据。
+- `sweep_interval_minutes`：定义系统多久检查一次过期 checkpoints，单位为分钟。默认值为 5 分钟。
+- `default_ttl`：设置默认的 TTL 时间窗口，单位为分钟（例如 43200 分钟 = 30 天）。`delete` 策略的时间窗口从 TTL 生效时开始计时，不会因活动而刷新。`keep_latest` 策略的时间窗口会在 run 结束或 thread 状态更新时刷新。如果省略，则 threads 默认不会过期。
+- `sweep_limit`：(_Agent server v0.8+_) 设置 sweeper 单次迭代中处理的 thread 数量。默认值在 Agent server v0.12+ 中为 `10000`，在 Agent server v0.8-0.11 中为 `1000`。
+
+<Note>
+全局 TTL 配置仅作用于新创建的 threads。`delete` 策略不会追溯应用到已有 threads。`keep_latest` 策略会在已有 thread 上某次 run 结束或其状态更新后生效；不活跃的已有 threads 不会被修改。
+</Note>
+
+## 配置 store item TTL
+
+Store items 用于跨 thread 持久化数据。为 store items 配置 TTL 有助于清理过期 memory。
+
+在你的 `langgraph.json` 文件中添加 `store.ttl` 配置：
+
+```json
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./agent.py:graph"
+  },
+  "store": {
+    "ttl": {
+      "refresh_on_read": true,
+      "sweep_interval_minutes": 120,
+      "default_ttl": 10080
+    }
+  }
+}
+```
+
+- `refresh_on_read`：（可选，默认 `true`）如果为 `true`，通过 `get` 或 `search` 访问某个 item 时，会重置其过期计时器。如果为 `false`，TTL 只会在 `put` 时刷新。
+- `sweep_interval_minutes`：（可选，默认 `5`）定义系统多久检查一次过期 items，单位为分钟。
+- `default_ttl`：（可选）设置 store items 的默认生命周期，单位为分钟（例如 10080 分钟 = 7 天）。仅作用于该配置部署之后创建的新 items，已有 items 不会被修改。如果你需要清理旧 items，请手动删除。若省略，则 items 默认不会过期。
+
+## 组合 TTL 配置
+
+你可以在同一个 `langgraph.json` 文件中同时为 checkpoints 和 store items 配置 TTL，并为两类数据分别设置不同策略。例如：
+
+```json
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./agent.py:graph"
+  },
+  "checkpointer": {
+    "ttl": {
+      "strategy": "delete",
+      "sweep_interval_minutes": 60,
+      "default_ttl": 43200
+    }
+  },
+  "store": {
+    "ttl": {
+      "refresh_on_read": true,
+      "sweep_interval_minutes": 120,
+      "default_ttl": 10080
+    }
+  }
+}
+```
+
+## 为单个 thread 配置 TTL
+
+你也可以按 thread 单独应用 [TTL configurations](https://reference.langchain.com/python/langsmith/deployment/sdk/#langgraph_sdk.client.ThreadsClient.create)。
+
+```python
+thread = await client.threads.create(
+    ttl={
+        "strategy": "delete",
+        "ttl": 43200  # 30 days in minutes
+    }
+)
+```
+
+<Note>
+Thread 级别的 TTL 会覆盖该 thread 的默认 TTL，并使用上述策略行为。
+</Note>
+
+## 运行时覆盖
+
+对于 store items，可以在 `put` 中传入 `ttl` 来覆盖默认生命周期。在 `get` 或 `search` 中传入 `refresh_ttl` 可以控制读取时是否刷新过期时间。
+
+## 部署流程
+
+在 `langgraph.json` 中配置 TTL 之后，请重新部署或重启你的 LangGraph application，使更改生效。对于本地开发，可使用 [`langgraph dev`](/langsmith/local-dev-testing#langgraph-dev)；对于 Docker 部署，可使用 [`langgraph up`](/langsmith/local-dev-testing#langgraph-up)。
+
+如需了解其他可配置项，请参阅 [LangGraph CLI reference page](/langsmith/cli#configuration-file)。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/configure-ttl.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

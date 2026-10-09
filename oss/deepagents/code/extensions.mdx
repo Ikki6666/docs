@@ -1,0 +1,204 @@
+---
+title: Python extensions
+sidebarTitle: Python extensions
+description: 使用 Python 工具、middleware 和存储路由自定义 dcode
+---
+
+Python extensions 可以在不修改 dcode 本身的情况下自定义 dcode agent server。使用它们注册模型工具、LangChain middleware、虚拟存储路由。
+
+<Note>
+    Python extensions 需要 `DEEPAGENTS_CODE_EXPERIMENTAL=1`。这个实验性 API 可能会在不另行通知的情况下更改或移除。
+</Note>
+
+<Warning>
+    Extensions 会以你的用户账户权限运行任意 Python。只从你信任的来源加载 extensions。Extension 工具不会自动添加到人工批准映射中，因此执行敏感工作的 extensions 必须通过 middleware 强制执行自己的批准或策略。
+</Warning>
+
+## 创建 extension
+
+Extension 入口文件必须暴露一个异步的 `extension` 设置函数。dcode 会传入一个 `ExtensionAPI` registrar，它带有只读会话上下文和用于添加能力的方法。
+
+以下 extension 会让一个 LangGraph store 在 agent 的文件工具中通过 `/memories/` 可用：
+
+```python extension.py
+from deepagents.backends import StoreBackend
+
+from deepagents_code.extensions import ExtensionAPI
+
+
+async def extension(d: ExtensionAPI) -> None:
+    d.register_backend_route(
+        "/memories/",
+        StoreBackend(namespace=lambda _runtime: ("filesystem",)),
+    )
+```
+
+以实验性开关启动 dcode 并为单次运行加载该文件：
+
+```bash
+DEEPAGENTS_CODE_EXPERIMENTAL=1 dcode --extension ./extension.py
+```
+
+重复 `-e` 或 `--extension` 可以加载多个文件或目录。目录扫描会包括直接的 `*.py` 文件和包含 `__init__.py` 或 `extension.py` 的直接子目录。加载还要求 extension 发现保持启用（`[extensions].enabled` 或 `DEEPAGENTS_CODE_EXTENSIONS`）；当发现被禁用时，Deep Agents Code 会跳过每个来源，包括 CLI 路径。
+
+## 注册能力
+
+Extension API 支持以下方法：
+
+| 方法 | 签名 | 用途 |
+|---|---|---|
+| `register_middleware` | `(class_or_instance)` | 添加 LangChain `AgentMiddleware`。middleware 类必须具有零参数构造函数；否则请传入实例。 |
+| `register_tool` | `(function_or_tool)` | 向模型暴露一个可调用对象或 `BaseTool`。dcode 会通过 LangChain 工具 schema 推断来转换普通可调用对象。 |
+| `register_backend_route` | `(prefix, backend)` | 让一个 `BackendProtocol` 存储提供程序在虚拟路径下可用。 |
+| `on_shutdown` | `(callback)` | 当 agent server 停止时释放会话资源。支持同步和异步回调。 |
+
+Registrar 还暴露以下只读上下文：
+
+- `d.cwd`：会话的工作目录。
+- `d.mode`：`interactive` 或 `headless`。
+- `d.has_ui`：会话是否具有交互式终端 UI。
+- `d.path`：extension 的入口文件。
+
+不要在模块导入期间打开长连接或启动后台任务。如果设置打开了一个会话资源，请注册一个幂等的 `on_shutdown` 回调来释放它。
+
+### 注册 middleware
+
+注册 LangChain middleware 可以为 agent 添加模型或工具行为。dcode 在构建 agent 图时加载 middleware。
+
+```python
+from langchain.agents.middleware import AgentMiddleware
+
+from deepagents_code.extensions import ExtensionAPI
+
+
+class ExampleMiddleware(AgentMiddleware):
+    name = "example-middleware"
+
+
+async def extension(d: ExtensionAPI) -> None:
+    d.register_middleware(ExampleMiddleware())
+```
+
+当构造需要配置时，请使用 `AgentMiddleware` 实例。你也可以传入具有零参数构造函数的 middleware 类。
+
+### 注册工具
+
+注册一个可调用对象或 `BaseTool`，使其对模型可用。
+
+```python
+from deepagents_code.extensions import ExtensionAPI
+
+
+async def extension(d: ExtensionAPI) -> None:
+    def current_directory() -> str:
+        """Return the working directory for the current dcode session."""
+        return str(d.cwd)
+
+    d.register_tool(current_directory)
+```
+
+dcode 会通过从函数签名和 docstring 推断 schema，将普通可调用对象转换为 LangChain 工具。Extension 工具可以替换同名的内置工具。在多个 extensions 之间，某个工具名称的第一个注册生效。
+
+### 路由虚拟存储
+
+Backend 路由前缀必须是小写的绝对路径，且带有前导和尾随斜杠，例如 `/memories/` 或 `/company/knowledge/`。dcode 会拒绝无效路径，以及与其内部 artifact 或对话历史存储重叠的路由。
+
+路由内容可以通过模型的文件工具访问。shell `execute` 仍连接到默认的本地或 sandbox 存储，因此 shell 命令无法访问虚拟路由内容。使用 sandbox 的 agent 还会拒绝直接由 `FilesystemBackend` 支持的路由，因为那样会在 shell 执行仍在 sandbox 中的情况下暴露宿主存储。
+
+Extension 工具和 middleware 会替换同名的内置项。在多个 extensions 之间，某个路由前缀或单元名称的第一个注册生效。
+
+### 应用运行时更改
+
+在启动之后注册的工具会出现在下一次模型请求中。Middleware 和 backend 路由会改变 agent 图的构建，需要 `/reload`。运行 `/extensions` 可以列出注册项、它们的源路径和作用域、加载失败情况，以及是否需要重启。
+
+单独管理的远程 agent server 必须由其操作者重启或重新部署。
+
+## 选择 extension 来源
+
+dcode 按此顺序加载已授权的 extension 来源，并忽略后面的重复入口路径：
+
+1. `~/.deepagents/extensions/` 中的 Python 文件。
+2. `[extensions].extra_paths` 中的文件和目录。
+3. 通过 `-e` 或 `--extension` 传入的文件和目录。
+4. 来自已启用、带版本的 plugins 的 Python extensions。
+5. 通过 `dcode.extensions` Python entry-point 组暴露的模块。
+6. `<project>/.deepagents/extensions/` 中受信任的项目 extensions。
+
+使用 `~/.deepagents/extensions/` 快速进行用户级扩展。使用 [plugin](#package-an-extension-in-a-plugin) 进行带版本的分发和更新。使用项目 extension 管理与一个仓库一起维护的代码。
+
+## 信任项目 extensions
+
+`<project>/.deepagents/extensions/` 中的项目 extensions 只有在项目信任被授予之后才会执行。在交互式模式下，dcode 会提示你：允许当前文件一次、为未来的会话和编辑记住规范的项目路径，或跳过它们。取消提示（例如按 Esc）会中止启动。
+
+对于 headless 或 CI 运行，为该次调用授予信任：
+
+```bash
+DEEPAGENTS_CODE_EXPERIMENTAL=1 \
+  dcode --trust-project-extensions -n "Run the project checks"
+```
+
+使用 `[extensions].trust` 或 `DEEPAGENTS_CODE_EXTENSIONS_TRUST` 将默认项目策略设置为 `ask`、`always` 或 `never`。只有当你打开的每个项目都受信任时才使用 `always`。
+
+## 配置 extensions
+
+在 `~/.deepagents/config.toml` 中配置发现：
+
+```toml title="~/.deepagents/config.toml"
+[extensions]
+enabled = true
+trust = "ask"
+extra_paths = [
+    "extensions/policy.py",
+    "~/src/company-extensions",
+]
+```
+
+| 设置 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 为每个来源启用 extension 发现，包括 `-e` / `--extension`。实验性环境变量仍然是必需的。 |
+| `trust` | `"ask"` | 将项目 extension 信任设置为 `ask`、`always` 或 `never`。 |
+| `extra_paths` | `[]` | 添加用户授权的 Python 文件或目录。相对路径从 dcode profile 目录解析；`~` 展开为你的主目录。 |
+
+`DEEPAGENTS_CODE_EXTENSIONS` 覆盖 `enabled`，`DEEPAGENTS_CODE_EXTENSIONS_TRUST` 覆盖 `trust`。两者仍然需要 `DEEPAGENTS_CODE_EXPERIMENTAL=1`。当 `enabled` 为 `false` 时，Deep Agents Code 会跳过每个 extension 来源。
+
+## 将 extension 打包进 plugin
+
+带版本的 [plugin](/oss/deepagents/code/plugins) 是分发 extension 的首选方式。在 plugin manifest 中的 Deep Agents Code 命名空间下声明一个入口文件或一个列表：
+
+```json title=".claude-plugin/plugin.json"
+{
+  "name": "shared-memory",
+  "version": "1.0.0",
+  "extensions": {
+    "com.langchain.deepagents.code": {
+      "pythonExtensions": "./extension.py"
+    }
+  }
+}
+```
+
+每个入口必须以 `./` 开头，并位于已安装的 plugin 快照内。dcode 会拒绝绝对路径、父目录遍历、symlink 逃逸、缺失文件和非 Python 入口。声明 `pythonExtensions` 的 plugin 还必须声明非空的 `version`。安装并启用该 plugin 即授权了它的 extension 代码。
+
+在会话期间安装、启用、禁用、更新或移除一个 plugin extension 之后，运行 `/restart` 重建 agent 图。
+
+## 处理失败
+
+每个 extension 设置都是事务性的。如果导入或初始化失败，Deep Agents Code 会移除该 extension 的部分注册，将失败记录在 debug log 和 `/extensions` 中，并继续加载后面的 extensions。Shutdown 回调失败也不会阻止其他回调运行。
+
+## See also
+
+- [Plugins and marketplaces](/oss/deepagents/code/plugins)
+- [Command reference](/oss/deepagents/code/cli-reference)
+- [Config file](/oss/deepagents/code/config-file)
+- [Approval modes](/oss/deepagents/code/approval-modes)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/deepagents/code/extensions.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

@@ -1,0 +1,214 @@
+---
+title: 使用 MongoDB Atlas 的长期记忆
+sidebarTitle: MongoDB 长期记忆
+description: 使用 MongoDBStore 和 MongoDB Atlas 持久化 agent 长期记忆。
+---
+
+[长期记忆](/oss/python/langchain/long-term-memory)让你的 agent 能够跨不同对话和会话存储与召回信息。本指南展示如何使用 [MongoDB Atlas](https://www.mongodb.com/docs/atlas/) 作为持久化 store 后端。
+
+MongoDB 将记忆作为文档存储在 collection 中。借助 Atlas Vector Search index，同一个 store 还可以对存储的记忆运行语义搜索。
+
+<Tip>
+要深入了解记忆类型以及写入记忆的策略，请参见 [Memory 概念指南](/oss/python/concepts/memory#long-term-memory)。
+</Tip>
+
+## 设置
+
+### 安装
+
+安装 store 包（`langgraph-store-mongodb`）：
+
+<CodeGroup>
+```bash pip
+pip install -U langgraph-store-mongodb pymongo
+```
+
+```bash uv
+uv add langgraph-store-mongodb pymongo
+```
+</CodeGroup>
+
+### 凭证
+
+设置你的 Atlas 连接字符串：
+
+```python
+import getpass
+import os
+
+if not os.environ.get("MONGODB_ATLAS_URI"):
+    os.environ["MONGODB_ATLAS_URI"] = getpass.getpass("Enter your MongoDB Atlas URI: ")
+```
+
+如果你希望对模型调用启用自动 tracing，请设置 [LangSmith](/langsmith/home) API key：
+
+```python
+if not os.environ.get("LANGSMITH_API_KEY"):
+    os.environ["LANGSMITH_API_KEY"] = getpass.getpass("Enter your LangSmith API key: ")
+os.environ["LANGSMITH_TRACING"] = "true"
+```
+
+## 用法
+
+创建一个 `MongoDBStore` 并把它传给 `create_agent`。`from_conn_string` 上下文管理器在打开时会创建所需的 index。你无需调用单独的 `setup()` 方法。
+
+```python
+import os
+
+from langchain.agents import create_agent
+from langgraph.store.mongodb import MongoDBStore
+
+MONGODB_ATLAS_URI = os.environ["MONGODB_ATLAS_URI"]
+
+with MongoDBStore.from_conn_string(MONGODB_ATLAS_URI) as store:
+    agent = create_agent(
+        "anthropic:claude-sonnet-4-6",
+        tools=[],
+        store=store,
+    )
+```
+
+## 记忆存储
+
+LangGraph 将记忆作为 JSON 文档存储，按 `namespace` 和 `key` 组织。namespace 通常包含用户或组织 ID，以保持记忆的作用域。
+
+下面的示例配置了向量索引，使 `store.search` 可以运行语义查询。使用 `create_vector_index_config` 并把它作为 `index_config` 传入：
+
+```python
+import os
+from collections.abc import Sequence
+
+from langgraph.store.mongodb import MongoDBStore, create_vector_index_config
+
+def embed(texts: Sequence[str]) -> list[list[float]]:
+    # Replace with an embeddings model or LangChain Embeddings instance
+    return [[1.0, 2.0] for _ in texts]
+
+MONGODB_ATLAS_URI = os.environ["MONGODB_ATLAS_URI"]
+
+with MongoDBStore.from_conn_string(
+    MONGODB_ATLAS_URI,
+    index_config=create_vector_index_config(embed=embed, dims=2),
+) as store:
+    user_id = "my-user"
+    application_context = "chitchat"
+    namespace = (user_id, application_context)
+    store.put(
+        namespace,
+        "a-memory",
+        {
+            "rules": [
+                "User likes short, direct language",
+                "User only speaks English and Python",
+            ],
+            "my-key": "my-value",
+        },
+    )
+    item = store.get(namespace, "a-memory")
+    items = store.search(
+        namespace, filter={"my-key": "my-value"}, query="language preferences"
+    )
+```
+
+关于 store 操作的更多信息，请参见 [Stores](/oss/python/langgraph/stores) 指南。
+
+## 在工具中读取长期记忆
+
+工具可以使用 `runtime` 参数从 store 中读取，该参数由 LangGraph 自动注入：
+
+```python
+import os
+from dataclasses import dataclass
+
+from langchain.agents import create_agent
+from langchain.tools import ToolRuntime, tool
+from langgraph.store.mongodb import MongoDBStore
+
+@dataclass
+class Context:
+    user_id: str
+
+MONGODB_ATLAS_URI = os.environ["MONGODB_ATLAS_URI"]
+
+with MongoDBStore.from_conn_string(MONGODB_ATLAS_URI) as store:
+    store.put(("users",), "user_123", {"name": "John Smith", "language": "English"})
+
+    @tool
+    def get_user_info(runtime: ToolRuntime[Context]) -> str:
+        """Look up user info."""
+        assert runtime.store is not None
+        user_info = runtime.store.get(("users",), runtime.context.user_id)
+        return str(user_info.value) if user_info else "Unknown user"
+
+    agent = create_agent(
+        "anthropic:claude-sonnet-4-6",
+        tools=[get_user_info],
+        store=store,
+        context_schema=Context,
+    )
+
+    agent.invoke(
+        {"messages": [{"role": "user", "content": "look up user information"}]},
+        context=Context(user_id="user_123"),
+    )
+```
+
+## 从工具中写入长期记忆
+
+工具也可以使用 `runtime.store.put` 写入 store，持久化跨线程存活的数据：
+
+```python
+import os
+from dataclasses import dataclass
+
+from langchain.agents import create_agent
+from langchain.tools import ToolRuntime, tool
+from langgraph.store.mongodb import MongoDBStore
+from typing_extensions import TypedDict
+
+@dataclass
+class Context:
+    user_id: str
+
+class UserInfo(TypedDict):
+    name: str
+
+@tool
+def save_user_info(user_info: UserInfo, runtime: ToolRuntime[Context]) -> str:
+    """Save user info."""
+    assert runtime.store is not None
+    runtime.store.put(("users",), runtime.context.user_id, dict(user_info))
+    return "Successfully saved user info."
+
+MONGODB_ATLAS_URI = os.environ["MONGODB_ATLAS_URI"]
+
+with MongoDBStore.from_conn_string(MONGODB_ATLAS_URI) as store:
+    agent = create_agent(
+        "anthropic:claude-sonnet-4-6",
+        tools=[save_user_info],
+        store=store,
+        context_schema=Context,
+    )
+
+    agent.invoke(
+        {"messages": [{"role": "user", "content": "My name is John Smith"}]},
+        context=Context(user_id="user_123"),
+    )
+```
+
+## 另请参阅
+
+- [长期记忆](/oss/python/langchain/long-term-memory)
+- [存储集成](/oss/python/integrations/long-term-memory)
+- [使用 MongoDB Atlas 的短期记忆](/oss/python/integrations/memory/mongodb-short-term-memory)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/python/integrations/memory/mongodb-long-term-memory.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

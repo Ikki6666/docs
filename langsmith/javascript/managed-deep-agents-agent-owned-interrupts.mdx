@@ -1,0 +1,252 @@
+---
+title: 使用 agent-owned interrupts 向 Slack 用户提问
+sidebarTitle: Agent-owned interrupts
+description: 从 Managed Deep Agents tool 发送 Slack 表单，暂停 run，并在用户提交表单后恢复。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/javascript/langsmith/managed-deep-agents-public-beta-note.mdx';
+
+Agent-owned interrupt 是由你自己的代码创建的暂停。一个 tool 发送你在 [Block Kit](https://api.slack.com/block-kit) 中设计的 Slack 消息或 modal，然后调用 `interrupt()`。当用户按下按钮或提交 modal 时，Managed Deep Agents 将答案作为 `user_prompt_response` channel 事件投递到 deployment，并用它恢复暂停的 run。你可以在 run 中途向用户请求结构化输入，例如一个批准、一个选择或一组表单字段，而无需自己构建 Slack app 或 webhook。
+
+这与 `interrupt_on` 创建的 platform-owned interrupts 不同。后者在 tool 调用之前暂停，由 Slack 或 Studio 为你渲染批准卡片。使用 agent-owned interrupt 时，blocks、表单状态以及答案到达后的处理都由你负责。平台只负责把答案带回。关于 platform-owned interrupts，请参见 [Human-in-the-loop](/langsmith/javascript/managed-deep-agents-tools#human-in-the-loop)。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+<Note>
+Agent-owned interrupts 要求 `managed-deepagents>=0.8.0`，并且 deployed agent 上要有 [Slack channel](/langsmith/javascript/managed-deep-agents-channels-slack)。表单只在 Slack 中渲染。LangSmith Studio 显示原始的 interrupt 值。
+</Note>
+
+## 工作原理
+
+1. Run 从一条 Slack 消息开始。你的 tool 从 `runtime.channel` 读取会话，并使用 deployment 的 bot token 将 Block Kit 消息发送到同一个 Slack thread 中。
+2. Tool 调用 `interrupt()` 并传入携带 correlation ID 的值。Thread 停在 checkpoint 上。
+3. 用户按下按钮或提交 modal。Slack 将交互发送给 Managed Deep Agents，后者将其作为 `user_prompt_response` 事件转发到 deployment。
+4. SDK 将该事件与停放的 interrupt 匹配并恢复 run。`interrupt()` 返回用户的响应，tool 继续执行。
+
+以这种方式暂停的 tool 在 run 恢复时会从头重新运行，这是标准的 LangGraph interrupt 行为。请对发送操作加防护，使其只发生一次。参见 [Post a form and pause](#post-a-form-and-pause)。
+
+## 发送表单并暂停
+
+Tool 需要三样东西：要发送到的 Slack 会话、bot token，以及将表单与 interrupt 关联起来的 correlation ID。
+
+
+
+- **会话**：`runtime.channel.rawEvent` 是启动这次 run 的 Slack 事件。它携带 `channel`、`ts`，对于 thread 中的消息还携带 `thread_ts`。发送到该 thread，答案才能路由回同一个 agent thread。
+- **Bot token**：`connections.get("mda/slack-bot-token", { type: "agent" })` 解析 Managed Deep Agents 为 deployment 预置的 Slack app 的 token。该 slug 是保留的，无法用 `mda connections create` 创建。
+- **Correlation ID**：在每个按钮的 `value`（以 JSON 形式）和传给 `interrupt()` 的值中，把同一个字符串放在 `INTERRUPT_CORRELATION_KEY` 下。
+
+
+内置 Slack channel 的 `runtime.channel.post` 只发送文本，因此请直接通过 Slack Web API 发送 Block Kit。
+
+
+
+```ts tools/approval.ts expandable
+import { randomUUID } from "node:crypto";
+
+import { interrupt } from "@langchain/langgraph";
+import { tool } from "langchain";
+import {
+  INTERRUPT_CORRELATION_KEY,
+  connections,
+  type ManagedDeepAgentRuntime,
+  type PromptResponse,
+} from "managed-deepagents";
+import * as z from "zod";
+
+type SlackEvent = { channel: string; ts: string; thread_ts?: string };
+
+export const requestApproval = tool(
+  async ({ amount }, runtime: ManagedDeepAgentRuntime) => {
+    const channel = runtime.channel;
+    if (!channel || channel.provider !== "slack") {
+      return "Approval forms are available only in Slack.";
+    }
+
+    const correlationId = randomUUID();
+    // The tool runs again when the interrupt resumes. Post only on the first pass.
+    if (channel.event.type !== "user_prompt_response") {
+      await postApprovalForm(channel.rawEvent as SlackEvent, amount, correlationId);
+    }
+
+    const response: PromptResponse = interrupt({
+      [INTERRUPT_CORRELATION_KEY]: correlationId,
+      amount,
+    });
+    return `The requester chose ${response.action} for ${amount}.`;
+  },
+  {
+    name: "request_approval",
+    description: "Ask the requester to approve or decline a spend.",
+    schema: z.object({
+      amount: z.string().describe('The spend to approve, such as "$1,200".'),
+    }),
+  }
+);
+
+async function postApprovalForm(
+  event: SlackEvent,
+  amount: string,
+  correlationId: string
+): Promise<void> {
+  const botToken = await connections.get("mda/slack-bot-token", { type: "agent" });
+  const value = JSON.stringify({ [INTERRUPT_CORRELATION_KEY]: correlationId });
+  const button = (actionId: string, label: string) => ({
+    type: "button",
+    action_id: actionId,
+    text: { type: "plain_text", text: label },
+    value,
+  });
+  const result = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${botToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      channel: event.channel,
+      thread_ts: event.thread_ts ?? event.ts,
+      text: `Approve a spend of ${amount}?`,
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: `Approve a spend of *${amount}*?` },
+        },
+        {
+          type: "actions",
+          elements: [
+            button("approve_spend", "Approve"),
+            button("decline_spend", "Decline"),
+          ],
+        },
+      ],
+    }),
+  });
+  const body = (await result.json()) as { ok: boolean; error?: string };
+  if (!body.ok) {
+    throw new Error(`Slack rejected the form: ${body.error}`);
+  }
+}
+```
+
+
+像注册其他任何 [custom tool](/langsmith/javascript/managed-deep-agents-tools) 一样，在 agent definition 中注册这个 tool。Interrupt 继承托管 checkpointer，因此不需要额外的持久化设置。
+
+消息中的按钮可以使用任何 `action_id`，但以 `mda_modal::` 开头的除外。该前缀会改为打开一个 modal。参见 [Open a modal](#open-a-modal)。
+
+## 读取响应
+
+`interrupt()` 返回归一化后的响应。它只包含所有 provider 共有的字段：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `provider` | `"slack"` | 投递答案的 channel provider。 |
+| `action` | `string` | 按钮的 `action_id`，或 modal 的 `callback_id`。 |
+| `value` | JSON，可选 | 按钮的 `value` 字符串，或 modal 的 `state.values` 对象。对平台不透明。 |
+| `correlation_id` | `string`，可选 | 当按钮的 `value` 是带有 `mda_correlation_id` key 的 JSON 时存在。Modal 提交不会携带它。 |
+
+
+
+同一个响应也可以在 run context 上通过 `runtime.channel.event` 获取，其中 `type` 为 `user_prompt_response`。Slack 原样的交互 payload 位于 `runtime.channel.rawEvent`。对于消息内带有输入的表单，用户的填写内容位于 `rawEvent.state.values`，按 block ID 和 action ID 作为 key。
+
+
+Managed Deep Agents 只读取 Slack 交互 payload 中的第一个 action，因此一次点击必须只代表一个事件。
+
+## 响应如何找到对应的 interrupt
+
+Slack 不知道按钮属于哪个 interrupt，因此 SDK 会读取停放在 thread 上的 interrupts 并做出决定：
+
+| 停放的 interrupts | 响应中的 `correlation_id` | 结果 |
+| --- | --- | --- |
+| 一个 | 缺失 | 恢复该 interrupt。 |
+| 一个或多个 | 存在且恰好匹配一个 | 恢复匹配的 interrupt。 |
+| 多个 | 缺失 | 什么都不运行。SDK 记录歧义并确认该事件。 |
+| 一个或多个 | 存在但不匹配任何 interrupt，或匹配多个 | 什么都不运行。启动新回合会放弃停放的 checkpoints。 |
+| 没有 | 任意 | 启动一个没有新消息的全新 run。该响应只能在 `runtime.channel.event` 上获取。 |
+
+只要 agent 可能在同一个 thread 上停放多个 interrupt，就应携带 correlation ID。没有它，thread 只有在恰好一个 interrupt 待处理时才能被应答。
+
+## 打开 modal
+
+Modal 比消息提供更多空间，并支持全部 Block Kit 输入元素。Slack 将 modal 称为 view。你编写 view，Managed Deep Agents 负责打开它。
+
+Slack 为每次点击发放一个单次使用的 `trigger_id`，大约三秒后过期，而它是打开 modal 的唯一授权。将点击转发到 deployment 并等待 run 会错过这个窗口，因此 Managed Deep Agents 会自己从点击中已有的内容打开 view。Agent 不会被告知这次点击。
+
+要打开 modal，发送一个 `action_id` 以 `mda_modal::` 开头、`value` 为完整 view（JSON 形式）的按钮：
+
+```json
+{
+  "type": "button",
+  "action_id": "mda_modal::approve_spend",
+  "text": { "type": "plain_text", "text": "Review" },
+  "value": "{\"type\":\"modal\",\"title\":{\"type\":\"plain_text\",\"text\":\"Approve spend\"},\"submit\":{\"type\":\"plain_text\",\"text\":\"Submit\"},\"blocks\":[...]}"
+}
+```
+
+当用户按下提交时，deployment 收到一个 `user_prompt_response`，其中 `action` 为 view 的 `callback_id`（等于按钮的 `action_id`），`value` 为 view 的 `state.values`。随后 modal 关闭。
+
+View 上有两个字段属于平台：
+
+- **`callback_id`**：设置为按钮的 `action_id`，以便识别提交。
+- **`private_metadata`**：保存加密的 channel 和 thread，即 modal 打开时所在的会话。Modal 提交不携带 channel 或 thread，因此这是回到会话的唯一路径。如果你的 view 已设置 `private_metadata`，modal 将不会打开。
+
+其余每个字段都按你编写的内容原样传给 Slack。Managed Deep Agents 不校验 view，因此被 Slack 拒绝的 view 不会向用户显示任何内容。
+
+Modal 提交永远不会携带 `correlation_id`。只有恰好一个 interrupt 停放时，modal 才能应答一个 thread。
+
+整个 view 必须装进按钮的 `value`，而 Slack 将其限制在 2000 个字符。当 tool 发送消息时，Slack 会拒绝超大的按钮，因此失败会在 tool 调用中暴露，而不是在点击时。
+
+## 不暂停地发送
+
+Tool 可以发送一个表单并让 run 结束，而不调用 `interrupt()`。此时提交会启动一个没有新消息的全新 run，你的代码从 `runtime.channel.event` 读取答案。平台上没有任何东西追踪某个 prompt 是否有待处理，因此待处理表单的状态、过期时间，以及表单打开期间后续聊天消息的含义都由你的应用负责。
+
+当用户的下一个动作预期是回答该 prompt 时，优先使用 `interrupt()`。
+
+## 限制和保留名称
+
+平台保留的名称：
+
+| 名称 | 位置 | 含义 |
+| --- | --- | --- |
+| `mda_modal::` 前缀 | 按钮 `action_id` | 点击会打开一个 modal，永远不会到达 agent。 |
+| `mda_correlation_id` | 按钮 `value` 中的 key | 将一次点击匹配到一个停放的 interrupt。导出为 `INTERRUPT_CORRELATION_KEY`。 |
+| `callback_id` | App 定义的 view | 设置为按钮的 `action_id`。 |
+| `private_metadata` | App 定义的 view | 由平台设置。提供它会阻止 modal 打开。 |
+| `mda/slack-bot-token` | Connection slug | Deployment 的 Slack bot token。无法通过 CLI 创建或覆盖。 |
+
+Managed Deep Agents 在转发 view 之前不检查的 Slack 限制：
+
+| 限制 | 值 |
+| --- | --- |
+| 按钮 `value` | 2000 个字符 |
+| Modal 标题 | 24 个字符 |
+| 每个 view 的 blocks | 100 |
+| `callback_id` | 255 个字符 |
+
+超出后三项会导致 modal 无法打开，且用户看不到任何提示。
+
+## 理解失败模式
+
+- **Modal 未打开。** View JSON 格式错误、超出某项 Slack 限制，或 `trigger_id` 已过期。按钮点击在 Slack 中没有任何可见反应。失败会记录在平台上。
+- **用户关闭了 modal。** Interrupt 保持停放。没有取消路径，也没有过期时间。
+- **用户在 thread 中回复而不是使用表单。** 该消息走普通消息路径，不会查询 interrupt 状态。Run 以新消息启动，停放的 checkpoint 被放弃，而卡片上的按钮仍然可用。
+- **两个人按了同一个按钮。** 两个交互都会被转发。第一个恢复 interrupt，第二个启动一个新回合。没有去重机制。
+- **多个 interrupt 停放且响应没有 correlation ID。** 什么都不运行。由于 modal 提交从不携带 correlation ID，一个 modal 无法应答带有两个停放 interrupt 的 thread。
+- **提交无法返回 `response_action`。** 没有按字段校验错误、没有链式 modal，也没有就地 modal 更新。
+
+## 另请参阅
+
+- [Human-in-the-loop](/langsmith/javascript/managed-deep-agents-tools#human-in-the-loop)：在选定的 tool 调用之前暂停，并使用平台渲染的批准卡片。
+- [Connect a Managed Deep Agent to Slack](/langsmith/javascript/managed-deep-agents-channels-slack)：添加投递表单响应的 Slack channel。
+- [Manage connections](/langsmith/javascript/managed-deep-agents-connections)：`connections.get(...)` 如何解析 agent 拥有的 credentials。
+- [Add custom tools](/langsmith/javascript/managed-deep-agents-tools)：注册发送表单的 tool。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/managed-deep-agents-agent-owned-interrupts.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

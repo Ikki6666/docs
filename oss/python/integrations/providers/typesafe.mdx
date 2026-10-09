@@ -1,0 +1,269 @@
+---
+title: "TypeSafe 集成"
+description: "使用 LangChain 集成 TypeSafe"
+---
+
+[Jev](https://docs.typesafe.ai/models) 是一个 [System One model](https://docs.typesafe.ai/concepts/system-one)，它读取自然语言，但返回带类型的答案和经过校准的概率，而不是生成的文本。
+
+`TypeSafeClassifier` 将这些决策以 LangChain `Runnable` 的形式暴露出来，因此你可以调用它们、批量处理，或与其他 runnable 组合。它接受字符串、结构化 JSON 和 [LangChain 消息对象](/oss/python/langchain/messages)，并在 LangSmith 中记录 traces 和 token usage。可以用它处理聚焦的决策，例如路由请求、选择模型，或检查某个工具调用是否可以安全运行。
+
+在 LangChain middleware 中使用 TypeSafe 决策，可以在特定的生命周期节点控制 `create_agent` 行为，包括使用对 agent 状态进行分类的自定义 middleware。示例请参见 [Agent middleware](#agent-middleware)。
+
+## 设置
+
+<CodeGroup>
+```bash uv
+uv add langchain-typesafe
+```
+
+```bash pip
+pip install langchain-typesafe
+```
+</CodeGroup>
+
+在 [TypeSafe console](https://console.typesafe.ai/settings/keys) 中创建 API key 并导出：
+
+```bash
+export TYPESAFE_API_KEY=...
+```
+
+<Note>
+可选：设置 `TYPESAFE_BASE_URL` 以使用兼容的 gateway、测试服务器或私有部署。默认值为 `https://api.typesafe.ai`。
+
+```bash
+export TYPESAFE_BASE_URL=https://gateway.example.com
+```
+</Note>
+
+## 快速开始
+
+创建一个 `TypeSafeClassifier`，然后在每次调用时把 state 和命名的问题一起传入。共享同一个 state 的问题会在一次请求中独立并行地评估：
+
+<Note>
+早期版本在 `TypeSafeClassifier` 上配置 `questions`，而只把 state 传给 `invoke`。现在请把 `state` 和 `questions` 都传给 `invoke`。
+</Note>
+
+```python
+from langchain_typesafe import Choice, Noul, Score, TypeSafeClassifier
+
+classifier = TypeSafeClassifier()
+
+response = classifier.invoke(
+    {
+        "state": (
+            "The deploy failed twice and customers are seeing 500s. "
+            "Can someone look now?"
+        ),
+        "questions": {
+            "urgent": Noul(instructions="Does this need attention right now?"),
+            "team": Choice(
+                instructions="Which team should pick this up?",
+                criteria={
+                    "infra": "Deploys, availability, and on-call incidents.",
+                    "billing": "Payments, invoices, and subscriptions.",
+                },
+            ),
+            "severity": Score(
+                instructions="How severe is the impact?",
+                criteria=["Cosmetic.", "Degraded for some users.", "Full outage."],
+            ),
+        },
+    }
+)
+
+print(response.nouls["urgent"].noul)
+print(response.choices["team"].choice, response.choices["team"].confidence)
+print(response.scores["severity"].score)
+```
+
+答案以你提供的问题 ID 为键，并按类型分组到 `nouls`、`choices` 和 `scores` 上。响应还携带做出回答的 `model`、token `usage`，以及 TypeSafe 的 `request_id`。
+
+请求的 `state` 可以是字符串、JSON 对象或数组，也可以是 LangChain 消息。`BaseMessage` 或消息序列会被转换为 role/content JSON，包括嵌套在更大对象中的情况。
+
+## 决策类型
+
+每个问题都是三种[原语](https://docs.typesafe.ai/primitives)之一：
+
+| Primitive | 提问 | 返回 | 何时使用 |
+|---|---|---|---|
+| [`Noul`](https://docs.typesafe.ai/primitives/noul) | 这是否为真？ | `noul`，即回答为 yes 的概率 | 你的代码基于 `if` 分支 |
+| [`Choice`](https://docs.typesafe.ai/primitives/choice) | 这些选项中的哪一个？ | `choice`，外加 `probabilities` 和 `confidence` | 选项对应不同的代码路径 |
+| [`Score`](https://docs.typesafe.ai/primitives/score) | 哪个级别？ | `score`，外加 `legend`、`probabilities` 和 `confidence` | 答案是一个需要与阈值比较的连续谱 |
+
+`Noul` 是唯一没有 `confidence` 的，因为概率本身就是答案。对于连续谱请使用 `Score` 而不是 `Noul`：`Noul` 为 `0.5` 表示 yes 和 no 均势对半，而不是“中等”。
+
+## Agent middleware
+
+该包包含两个实验性的 [middleware](/oss/python/langchain/middleware/overview)，它们把分类器放到 agent 的决策点上。请从 `langchain_typesafe.experimental.middleware` 导入。
+
+<Note>
+这些 middleware 是实验性的，需要 `langchain-typesafe[experimental]`。它们的 API 可能会在没有通知的情况下变化。
+</Note>
+
+下面的示例使用 OpenAI 模型。使用之前，请安装 experimental extra 和 OpenAI 集成：
+
+<CodeGroup>
+```bash uv
+uv add "langchain-typesafe[experimental]" langchain-openai
+```
+
+```bash pip
+pip install "langchain-typesafe[experimental]" langchain-openai
+```
+</CodeGroup>
+
+| Middleware | Hook | 决策 |
+|---|---|---|
+| [`ModelRouterMiddleware`](#model-routing) | `before_agent`, `wrap_model_call` | 由哪个模型处理本次运行 |
+| [`AutoModeMiddleware`](#tool-risk-gating) | `wrap_tool_call` | 某个工具调用是否风险过高而不应运行 |
+
+### 模型路由
+
+对你命名的模型对最新的人类消息进行分类，并在本次运行中的每次模型调用时使用所选模型。每个 `ModelChoice` 将一个模型与选择它的判据配对：
+
+```python
+from langchain.agents import create_agent
+from langchain_typesafe.experimental.middleware import (
+    ModelChoice,
+    ModelRouterMiddleware,
+)
+
+router = ModelRouterMiddleware(
+    choices={
+        "fast": ModelChoice(
+            model="openai:gpt-5.6-terra",
+            criteria="Direct lookups, extraction, and localized changes with explicit targets.",
+        ),
+        "powerful": ModelChoice(
+            model="openai:gpt-6-astra",
+            criteria="Architecture, novel root-cause reasoning, and high-stakes decisions.",
+        ),
+    },
+    instructions="Choose the least costly model that can complete the task safely.",
+)
+
+agent = create_agent("openai:gpt-5.6-terra", middleware=[router])
+
+result = agent.invoke(
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Prove that there are infinitely many prime numbers.",
+            }
+        ]
+    }
+)
+print(result["model_route"].choice)
+```
+
+### 工具风险门控
+
+询问某个工具调用有风险或授权不足的概率。被判定为有风险的调用会返回一个错误 `ToolMessage`，而不是运行该工具。只有你列出的工具才会被分类。传入它们的名称或工具对象：
+
+```python
+from langchain.agents import create_agent
+from langchain.messages import ToolMessage
+from langchain.tools import tool
+from langchain_typesafe import NoulCriteria
+from langchain_typesafe.experimental.middleware import AutoModeMiddleware
+
+
+@tool
+def delete_all_backups() -> str:
+    """Delete every backup. This action cannot be undone."""
+    return "Backups deleted."
+
+
+agent = create_agent(
+    "openai:gpt-6-astra",
+    tools=[delete_all_backups],
+    middleware=[AutoModeMiddleware(tools=[delete_all_backups])],
+)
+
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "Delete all backups."}]}
+)
+print(result["messages"][-1].content)
+```
+
+可以覆盖 `instructions`，或传入 `criteria=NoulCriteria(true=..., false=...)`，以描述你自己的工具的风险。
+
+<Warning>
+除非可以接受把密钥发送给 TypeSafe，否则不要把密钥放在工具参数或对话状态中。该 middleware 会拒绝有风险的调用。它不会请求批准。当你希望由人来批准这些调用时，请将它与 [human-in-the-loop middleware](/oss/python/langchain/middleware/built-in) 搭配使用。
+</Warning>
+
+### 自定义 middleware
+
+`TypeSafeClassifier` 直接接受 LangChain 消息对象，因此自定义 middleware hook 可以直接对 agent 的对话状态进行分类，而无需先做转换。下面的示例在每次运行开始时对对话进行一次分类，并把完整的 `ChoiceAnswer` 存入 agent 状态：
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware, AgentState, Runtime
+from langchain_typesafe import Choice, ChoiceAnswer, TypeSafeClassifier
+from typing_extensions import NotRequired
+
+
+class TriageState(AgentState):
+    triage: NotRequired[ChoiceAnswer]
+
+
+class TriageMiddleware(AgentMiddleware[TriageState]):
+    state_schema = TriageState
+
+    def __init__(self) -> None:
+        self.classifier = TypeSafeClassifier()
+
+    def before_agent(
+        self, state: TriageState, runtime: Runtime
+    ) -> dict[str, ChoiceAnswer]:
+        response = self.classifier.invoke(
+            {
+                "state": state["messages"],
+                "questions": {
+                    "triage": Choice(
+                        instructions="Which team should handle this conversation?",
+                        criteria={
+                            "billing": "Payments, invoices, and subscriptions.",
+                            "infra": "Deploys, availability, and incidents.",
+                            "other": "Requests that belong to another team.",
+                        },
+                    )
+                },
+            }
+        )
+        return {"triage": response.choices["triage"]}
+
+
+agent = create_agent(
+    "openai:gpt-5.6-terra",
+    middleware=[TriageMiddleware()],
+)
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "Customers are seeing 500 errors."}]}
+)
+print(result["triage"].choice, result["triage"].confidence)
+```
+
+可以使用任何匹配你决策点的生命周期 hook。例如，使用 `before_model` 在每个工具结果之后重新分类，或使用 `wrap_tool_call` 对提议的操作进行分类。所有 hook 和状态模式请参见 [Custom middleware](/oss/python/langchain/middleware/custom)。
+
+## Tracing
+
+TypeSafe 分类会在 [LangSmith](/langsmith/home) 中被追踪，因此你可以检查决策、token usage 和花费，以及 agent 的其余部分。
+
+## 另请参阅
+
+- [TypeSafe documentation](https://docs.typesafe.ai/)
+- [TypeSafe confidence guidance](https://docs.typesafe.ai/confidence)
+- [LangChain TypeSafe API reference](https://reference.langchain.com/python/langchain-typesafe)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/python/integrations/providers/typesafe.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

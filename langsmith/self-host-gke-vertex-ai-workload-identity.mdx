@@ -1,0 +1,107 @@
+---
+title: 使用 GKE workload identity 对 Vertex AI 进行认证
+sidebarTitle: Vertex AI workload identity
+description: 为运行在 GKE 上的自托管 LangSmith 配置 Playground、Chat 和 Insights 的无密钥 Vertex AI 认证。
+---
+
+GKE Workload Identity Federation 让以下自托管 LangSmith 服务无需长期有效的 service account key 即可调用 Vertex AI：
+
+- Playground
+- Chat（在 Helm 中为 `polly`）
+- Insights
+
+每个 workload 都使用其 Kubernetes service account（KSA），通过 Application Default Credentials（ADC）模拟一个 Google service account（GSA）。
+
+<Note>
+Chat 和 Insights 的无密钥认证要求 Helm chart 版本 0.17.0 或更高，以及 LangSmith application 版本 0.17.29 或更高。
+</Note>
+
+配置无密钥认证的步骤如下：
+
+1. **启用 GKE Workload Identity Federation。** 在运行 LangSmith 的 cluster 和 node pools 上启用它。请参阅 [Workload Identity Federation for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity)。
+1. **授予 GSA Vertex AI 访问权限。** 为这些模型调用创建或选择一个 GSA。在托管模型的项目中，仅授予它 `roles/aiplatform.user`：
+
+   ```bash
+   gcloud projects add-iam-policy-binding "<vertex-project-id>" \
+     --member="serviceAccount:<gsa-name>@<gsa-project-id>.iam.gserviceaccount.com" \
+     --role="roles/aiplatform.user"
+   ```
+
+1. **允许每个 KSA 模拟 GSA。** 在 GSA 上为每个调用方 KSA 授予 `roles/iam.workloadIdentityUser`。将五个 KSA 占位符替换为你的 Helm release 渲染出的名称：
+
+   ```bash
+   for ksa in \
+     "<playground-ksa>" \
+     "<polly-api-ksa>" \
+     "<polly-queue-ksa>" \
+     "<insights-api-ksa>" \
+     "<insights-queue-ksa>"; do
+     gcloud iam service-accounts add-iam-policy-binding \
+       "<gsa-name>@<gsa-project-id>.iam.gserviceaccount.com" \
+       --role="roles/iam.workloadIdentityUser" \
+       --member="serviceAccount:<cluster-project-id>.svc.id.goog[<namespace>/${ksa}]"
+   done
+   ```
+
+   只绑定这些特定的 KSA subjects。如果 workloads 使用不同的 namespaces，请为每个 KSA 的 namespace 分别运行该命令。
+
+1. **为每个 KSA 添加注解。** 通过你的 Helm values 添加 GSA 注解。Chat 和 Insights 的 API 与 queue identities 是独立的调用方。每个 API 和 queue identity 都需要注解和 IAM binding：
+
+   ```yaml Helm
+   # Playground
+   playground:
+     deployment:
+       extraEnv:
+         - name: GOOGLE_CLOUD_PROJECT
+           value: "<vertex-project-id>"
+     serviceAccount:
+       annotations:
+         iam.gke.io/gcp-service-account: "<gsa-name>@<gsa-project-id>.iam.gserviceaccount.com"
+
+   # Chat
+   polly:
+     apiServer:
+       serviceAccount:
+         annotations:
+           iam.gke.io/gcp-service-account: "<gsa-name>@<gsa-project-id>.iam.gserviceaccount.com"
+     queue:
+       serviceAccount:
+         annotations:
+           iam.gke.io/gcp-service-account: "<gsa-name>@<gsa-project-id>.iam.gserviceaccount.com"
+
+   # Insights
+   engineInsightsAgent:
+     apiServer:
+       serviceAccount:
+         annotations:
+           iam.gke.io/gcp-service-account: "<gsa-name>@<gsa-project-id>.iam.gserviceaccount.com"
+       deployment:
+         extraEnv:
+           - name: CLIO_VERTEX_AI_ADC_ENABLED
+             value: "true"
+           - name: GOOGLE_CLOUD_PROJECT
+             value: "<vertex-project-id>"
+     queue:
+       serviceAccount:
+         annotations:
+           iam.gke.io/gcp-service-account: "<gsa-name>@<gsa-project-id>.iam.gserviceaccount.com"
+       deployment:
+         extraEnv:
+           - name: CLIO_VERTEX_AI_ADC_ENABLED
+             value: "true"
+           - name: GOOGLE_CLOUD_PROJECT
+             value: "<vertex-project-id>"
+   ```
+
+1. **使用 ADC 而不是显式凭据。** 在每个 Vertex AI 或 Gemini provider 配置中，将 **Service Account JSON** 留空。保持 `GOOGLE_VERTEX_AI_WEB_CREDENTIALS` 和 `GOOGLE_APPLICATION_CREDENTIALS` 不设置。当两者同时存在时，LangSmith 会使用显式 JSON 凭据而不是 ADC。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/self-host-gke-vertex-ai-workload-identity.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

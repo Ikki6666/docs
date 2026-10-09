@@ -1,0 +1,455 @@
+---
+title: GCP Terraform 故障排查
+sidebarTitle: 故障排查
+description: 使用 LangChain Terraform modules 部署的 LangSmith self-hosted 在 GKE 上的常见问题、修复方法和诊断命令。
+---
+
+本页记录使用 [GCP Terraform modules](https://github.com/langchain-ai/terraform/tree/main/modules/gcp) 预配的 LangSmith 部署的常见问题、修复方法和诊断命令。
+
+<Tip>
+升级之前，先查看 [LangSmith self-hosted changelog](/langsmith/self-hosted-changelog) 了解破坏性变更和需要更新的变量。运行任何 `kubectl` 命令之前，先运行 `gcloud container clusters get-credentials <cluster-name> --region <region> --project <project-id>`。
+</Tip>
+
+本页用到的 `kubectl`、`helm` 和 `gcloud` 调用的可复制参考，可直接跳到[诊断命令](#diagnostic-commands)。
+
+## 自动诊断
+
+在逐条运行命令之前，先试试随附的脚本：
+
+```bash
+# Full deployment health check + next-step guidance
+make status
+
+# Secret Manager validation
+make secrets    # → manage-secrets.sh validate
+```
+
+## 已知问题
+
+### terraform apply 失败：GCP API 未启用
+
+**症状**
+
+```
+Error 403: ... has not been used in project <project-id> before or it is disabled.
+```
+
+**原因：** 所需的 GCP API 未启用。Terraform 会通过 `google_project_service` 启用它们，但 `cloudresourcemanager.googleapis.com` 必须已经启用，Terraform 才能启用其余 API。
+
+**修复**
+
+```bash
+gcloud services enable cloudresourcemanager.googleapis.com --project <project-id>
+cd modules/gcp/infra
+terraform apply -var-file=terraform.tfvars
+```
+
+### apply 后 GKE 集群 API server 不可访问
+
+**症状**
+
+```
+Error: Get "https://<cluster-endpoint>/api/v1/namespaces": dial tcp: connection refused
+```
+
+**原因：** GKE control plane 需要 10 到 15 分钟才能完全就绪。Terraform 等待 `RUNNING` 状态后再加上 90 秒缓冲。较慢项目上的冷启动 API 激活可能超出这个窗口。
+
+**修复：** 等待 `RUNNING` 状态，然后重新运行：
+
+```bash
+gcloud container clusters describe <cluster-name> \
+  --region <region> --project <project-id> --format="value(status)"
+
+terraform apply -var-file=terraform.tfvars
+```
+
+### GKE 节点未加入（NotReady）
+
+**症状：** `kubectl get nodes` 显示没有节点，或节点卡在 `NotReady` 状态。
+
+**原因：** node pool 的 service account 缺少 `roles/container.nodeServiceAccount`，或 VPC 防火墙规则阻止了节点到 control plane 的通信。
+
+**修复**
+
+```bash
+gcloud container node-pools describe <pool-name> \
+  --cluster <cluster-name> --region <region> \
+  --format="value(config.serviceAccount)"
+
+gcloud projects add-iam-policy-binding <project-id> \
+  --member="serviceAccount:<node-sa-email>" \
+  --role="roles/container.nodeServiceAccount"
+
+gcloud compute firewall-rules list --filter="network:<vpc-name>"
+```
+
+### GKE pods 连接 Cloud SQL 被拒绝
+
+**症状：** Backend 日志中对 Cloud SQL 私有 IP 显示 `connection refused` 或 `no route to host`。
+
+**原因：** 私有服务连接（VPC peering）未建立，或分配的 IP 范围太小。常见于 networking module 运行前未启用 `servicenetworking.googleapis.com` 的情况。
+
+**修复**
+
+```bash
+gcloud services vpc-peerings list --network <vpc-name> --project <project-id>
+gcloud sql instances describe <instance-name> --format="value(ipAddresses)"
+gcloud compute networks peerings list --network <vpc-name>
+```
+
+如果缺少 peering，确认 `enable_private_service_connection = true` 并重新 apply：
+
+```bash
+terraform apply -var-file=terraform.tfvars -target=module.networking
+terraform apply -var-file=terraform.tfvars
+```
+
+### Memorystore Redis 连接超时
+
+**症状：** Pods 无法连接 Redis。日志显示 `dial tcp: connection timed out` 或 `redis: connection refused`。
+
+**原因：** Memorystore 的 `authorized_network` 与 GKE VPC 不匹配，或 Redis 私有 IP 所在的范围无法从 GKE subnet 路由到达。
+
+**修复**
+
+```bash
+gcloud redis instances describe <instance-name> --region <region> \
+  --format="value(host,authorizedNetwork)"
+
+kubectl run redis-test --rm -it --image=redis:7 -n langsmith -- \
+  redis-cli -h <redis-private-ip> ping
+# Expected: PONG
+```
+
+### cert-manager 无法签发 Let's Encrypt 证书
+
+**症状：** `kubectl get certificate -n langsmith` 显示 `READY=False`。HTTP01 challenge 失败。
+
+**原因：** DNS A record 未指向 Envoy Gateway IP，或 load balancer 上的 80 端口被阻断。
+
+**修复**
+
+```bash
+kubectl get svc -n envoy-gateway-system \
+  -l gateway.envoyproxy.io/owning-gateway-name=langsmith-gateway \
+  -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}'
+
+kubectl describe certificate <cert-name> -n langsmith
+kubectl get challenges -n langsmith
+kubectl describe challenge -n langsmith
+
+dig +short <your-langsmith-domain>
+```
+
+在 DNS A record 解析到 Gateway IP 之前，证书无法签发。cert-manager 的 HTTP01 solver 需要能从互联网访问 80 端口。
+
+### LangSmith pods 访问 GCS bucket 被拒绝
+
+**症状：** Backend 日志在写入 GCS 时显示 `AccessDeniedException: 403 Insufficient Permission` 或 `403 Forbidden`。
+
+**原因：** 在原生 GCS 模式（随附的默认值）下，通过 Workload Identity 绑定的 GCP service account 缺少 bucket 上的 `roles/storage.objectAdmin`，或 pod 的 Kubernetes ServiceAccount 缺少 `iam.gke.io/gcp-service-account` annotation。在可选的 S3 兼容模式下，传给 Helm 的 HMAC 凭证不正确，或其 service account 缺少 `roles/storage.objectAdmin`。
+
+**修复**
+
+```bash
+# Confirm the bucket and its IAM bindings
+helm get values langsmith -n langsmith | grep bucketName
+gcloud storage buckets get-iam-policy gs://<bucket-name>
+
+# Native GCS mode: verify the Workload Identity annotation on the pod ServiceAccount
+kubectl get serviceaccount langsmith-backend -n langsmith \
+  -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}'
+```
+
+GCP service account 必须拥有 bucket 上的 `roles/storage.objectAdmin`。如果 annotation 本身缺失，请采用下方 Workload Identity 一节的修复方法。对于 S3 兼容模式，在 Cloud Storage → Settings → Interoperability 下创建 HMAC key；其 service account 也需要 bucket 上的 `roles/storage.objectAdmin`。
+
+### Envoy Gateway webhook 阻塞 GKE 操作
+
+**症状**
+
+```
+Error from server (InternalError): failed calling webhook "validate.gateway.envoyproxy.io"
+```
+
+**原因：** Envoy Gateway admission webhook 未就绪，或其 `caBundle` 已过期。
+
+**修复**
+
+```bash
+kubectl get pods -n envoy-gateway-system
+
+kubectl rollout restart deployment/envoy-gateway -n envoy-gateway-system
+kubectl rollout status deployment/envoy-gateway -n envoy-gateway-system
+```
+
+### 重新 apply 后 Envoy Gateway external IP 变化
+
+**症状：** Terraform 重新 apply 后 DNS 不再解析到正确的 IP，或现有防火墙白名单失效。
+
+**原因：** Envoy Gateway 的 external IP 绑定在由 Terraform 管理的 `Gateway` Kubernetes 资源上。如果该资源被删除并重建（`terraform taint`、强制替换的 module 变更，或 `terraform destroy` + 重新 apply），GCP 会分配新的 IP。除非预先分配静态 regional 地址，否则无法保留原 IP。
+
+**预防措施**
+
+- 不要 `terraform taint` 或手动删除 `Gateway` 资源。
+- 仅在完整拆除和重建时使用 `make destroy` + `make apply`。
+- 在任何可能重建 Gateway 的操作之前，记录当前 IP。
+
+**恢复：** 将你的 DNS A record 更新为新 IP：
+
+```bash
+kubectl get gateway -n langsmith -o jsonpath='{.items[0].status.addresses[0].value}'
+
+gcloud dns record-sets update <your-domain>. \
+  --type=A --ttl=300 \
+  --rrdatas=<new-ip> \
+  --zone=<zone-name> \
+  --project=<project-id>
+```
+
+### terraform destroy 失败：启用了删除保护
+
+**症状**
+
+```
+Error: googleapi: Error 409: The instance is protected from deletion.
+```
+
+**原因：** `gke_deletion_protection = true`（默认）或 `postgres_deletion_protection = true` 阻止 Terraform 销毁资源。
+
+**修复**
+
+```hcl
+# terraform.tfvars
+gke_deletion_protection      = false
+postgres_deletion_protection = false
+```
+
+```bash
+terraform apply -var-file=terraform.tfvars
+terraform destroy
+```
+
+### Workload Identity 不生效（GCS 权限被拒绝）
+
+**症状**
+
+```
+AccessDeniedException: 403 <pod-sa>@<project>.iam.gserviceaccount.com
+  does not have storage.objects.create access to the Google Cloud Storage bucket.
+```
+
+**原因：** LangSmith pods 使用的 Kubernetes ServiceAccount 缺少 Workload Identity annotation，或 GCP SA 缺少 GCS IAM 绑定。
+
+**诊断**
+
+```bash
+kubectl get serviceaccount langsmith-backend -n langsmith \
+  -o jsonpath='{.metadata.annotations}' | python3 -m json.tool
+
+BUCKET=$(terraform -chdir=infra output -raw storage_bucket_name)
+gsutil iam get gs://$BUCKET | grep -A3 "serviceAccount"
+
+GSA=$(terraform -chdir=infra output -raw workload_identity_service_account_email)
+gcloud projects get-iam-policy <project-id> \
+  --flatten="bindings[].members" --filter="bindings.members:$GSA"
+```
+
+**修复**
+
+```bash
+terraform -chdir=infra apply -target=module.iam
+make init-values
+make deploy
+```
+
+### `langsmith-ksa` 缺少 Workload Identity annotation
+
+**症状：** operator 拉起的 agent pods 无法启动或卡在 `Pending` 状态。日志显示权限错误，或 agent bootstrap job 挂起。
+
+**原因：** `langsmith-ksa` 由 LangSmith operator（而非 Helm）创建，在 namespace 拆除或全新集群重建后不会保留。`deploy.sh` 会在部署后重新添加 annotation；如果上一次部署被中断，annotation 可能缺失。
+
+**诊断**
+
+```bash
+kubectl get serviceaccount langsmith-ksa -n langsmith \
+  -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}'
+```
+
+**修复**
+
+```bash
+# Re-run deploy; idempotently creates and annotates langsmith-ksa
+make deploy
+
+# Or annotate manually
+WI=$(terraform -chdir=infra output -raw workload_identity_annotation)
+kubectl create serviceaccount langsmith-ksa -n langsmith --dry-run=client -o yaml \
+  | kubectl apply -f -
+kubectl annotate serviceaccount langsmith-ksa -n langsmith \
+  iam.gke.io/gcp-service-account="$WI" --overwrite
+```
+
+### Helm release 卡在 `pending-upgrade`
+
+**症状**
+
+```
+Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress
+```
+
+**原因：** 上一次 `helm upgrade` 被中断（在 `--wait` 期间按 Ctrl+C）。Helm 将 release 留在了锁定状态。
+
+**修复：** `deploy.sh` 会检测并自动恢复该状态。如果手动运行：
+
+```bash
+helm rollback langsmith -n langsmith --wait --timeout 5m
+make deploy
+```
+
+### Secret Manager 访问被拒绝
+
+**症状**
+
+```
+ERROR: PERMISSION_DENIED: Permission 'secretmanager.versions.access'
+  denied on resource 'projects/.../secrets/...'
+```
+
+**原因：** `secretmanager.googleapis.com` 未启用，或操作账号缺少 `roles/secretmanager.admin`。
+
+**修复**
+
+```bash
+gcloud services enable secretmanager.googleapis.com --project <project-id>
+
+gcloud projects add-iam-policy-binding <project-id> \
+  --member="user:$(gcloud config get account)" \
+  --role="roles/secretmanager.admin"
+```
+
+### `langsmith-postgres-credentials` 或 `langsmith-redis-credentials` Secret 缺失
+
+**症状：** 部署后 pods 立即因数据库连接错误崩溃，或 `kubectl get secrets -n langsmith` 中未列出 `langsmith-postgres-credentials` / `langsmith-redis-credentials`。
+
+**原因：** 这些 Secrets 由 `k8s-bootstrap` module 创建。如果未运行 `terraform apply`、apply 中途失败，或 namespace 被带外删除，它们就会缺失。
+
+**修复**
+
+```bash
+terraform -chdir=infra apply -target=module.k8s_bootstrap
+
+kubectl get secret langsmith-postgres-credentials -n langsmith
+kubectl get secret langsmith-redis-credentials -n langsmith
+```
+
+## 诊断命令
+
+### 集群访问
+
+```bash
+gcloud container clusters get-credentials <cluster-name> --region <region> --project <project-id>
+kubectl config current-context
+kubectl get nodes -o wide
+```
+
+### Pods
+
+```bash
+kubectl get pods -n langsmith
+kubectl get pods -n langsmith -w
+kubectl describe pod <pod-name> -n langsmith
+kubectl logs <pod-name> -n langsmith --tail=50
+kubectl logs <pod-name> -n langsmith --previous --tail=50
+kubectl logs -n langsmith deploy/langsmith-backend --tail=100 -f
+```
+
+### TLS 与证书
+
+```bash
+kubectl get certificate -n langsmith
+kubectl describe certificate <cert-name> -n langsmith
+kubectl get challenges -n langsmith
+kubectl get clusterissuer
+```
+
+### Gateway 与 load balancer
+
+```bash
+kubectl get gateway -n langsmith
+kubectl get httproute -n langsmith
+kubectl get svc -n envoy-gateway-system -o wide
+kubectl get pods -n envoy-gateway-system
+```
+
+### Helm
+
+```bash
+helm status langsmith -n langsmith
+helm history langsmith -n langsmith
+helm get values langsmith -n langsmith
+```
+
+### LangSmith Deployment
+
+```bash
+kubectl get pods -n langsmith | grep -E "host-backend|listener|operator"
+kubectl get lgp -n langsmith
+kubectl get crd | grep langchain
+```
+
+### Workload Identity 与 IAM
+
+```bash
+kubectl get serviceaccount langsmith-backend -n langsmith \
+  -o jsonpath='{.metadata.annotations}' | python3 -m json.tool
+
+kubectl get serviceaccount langsmith-ksa -n langsmith \
+  -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}'
+
+BUCKET=$(terraform -chdir=infra output -raw storage_bucket_name 2>/dev/null)
+gsutil iam get gs://$BUCKET
+
+gcloud iam service-accounts list --project <project-id> --filter="displayName:langsmith"
+```
+
+### Secrets 与 bootstrap
+
+```bash
+kubectl get secrets -n langsmith
+kubectl get secret langsmith-postgres-credentials -n langsmith
+kubectl get secret langsmith-redis-credentials -n langsmith
+
+kubectl get secret langsmith-postgres-credentials -n langsmith \
+  -o jsonpath='{.data.connection_url}' | base64 --decode
+
+gcloud secrets list --project <project-id> --filter="name:langsmith"
+
+gcloud secrets versions access latest \
+  --secret=langsmith-<prefix>-<env>-postgres-password \
+  --project <project-id>
+
+make secrets
+```
+
+### 快速健康检查
+
+```bash
+echo "=== Context ===" && kubectl config current-context
+echo "=== Nodes ===" && kubectl get nodes
+echo "=== Pods ===" && kubectl get pods -n langsmith
+echo "=== Certificate ===" && kubectl get certificate -n langsmith
+echo "=== Gateway ===" && kubectl get gateway -n langsmith
+echo "=== Secrets ===" && kubectl get secrets -n langsmith | grep -E "langsmith-postgres-credentials|langsmith-redis-credentials"
+echo "=== Helm ===" && helm status langsmith -n langsmith 2>/dev/null | grep -E "STATUS|LAST DEPLOYED"
+```
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/self-host-terraform-gcp-troubleshooting.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

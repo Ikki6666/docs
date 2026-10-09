@@ -1,0 +1,739 @@
+---
+title: 管理 connections
+sidebarTitle: Connections
+description: 存储 API keys 和 OAuth grants，让 Managed Deep Agents 在运行时向外部服务完成认证。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/python/langsmith/managed-deep-agents-public-beta-note.mdx';
+import MdaOauthCatalog from '/snippets/python/langsmith/mda-oauth-catalog.mdx';
+
+Connection 将 managed deep agent 链接到 GitHub、Notion 或 Tavily 之类的外部服务。凭据保存在你的 LangSmith workspace 中。在你编写的 tool 或 MCP 服务器定义中使用 `connections.get(...)` 在运行时解析它。
+
+Connections 可以让你：
+
+- **把凭据留在项目之外**：`mda deploy` 在每次部署时收集 `.env` 值作为 deployment secrets。Connection 值则保存在 workspace 中。
+- **给每个调用方自己的身份**：user-owned connection 解析发起请求者的凭据，因此 agent 读取的是该用户的文档，并以该用户的名义执行操作。环境变量只能为所有人保存同一个值。
+- **跳过 OAuth 管道**：Managed Deep Agents 运行授权往返，因此项目不需要 callback 路由、token store 或同意页面。这些流程由你的 Managed Deep Agent 自动处理。
+- **在多个 agent 之间复用同一个 slug**：Connections 属于 workspace，因此多个 deployment 可以解析同一个 slug。每个 deployment 在该 slug 下保存自己的凭据：从每个项目根目录运行一次 `mda connections create <slug>`。轮换某个 deployment 的值会在它的下一次 run 生效，无需重新部署。
+
+在 LangSmith 中存储一个供你的 Managed Deep Agents 使用的凭据只需一条命令：
+
+```bash
+uv run mda connections create organization-tavily --secret-from-env TAVILY_API_KEY
+```
+而读取它只需一行：
+
+```python
+api_key = await connections.get("organization-tavily", {"type": "agent"})
+```
+
+
+
+
+本页其余部分介绍围绕这些步骤的两个选择：谁拥有凭据，以及服务如何认证。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+## 选择凭据 owner
+
+每个 `connections.get(...)` 调用都会指明它解析的凭据归谁所有：
+
+| Owner | 解析为 | 适用场景 |
+| --- | --- | --- |
+| `agent` | 属于 deployment 的一个凭据。每个调用方都使用它。 | 每个调用方都需要相同的能力：用 Tavily 进行 web 搜索、共享知识库，或发布到一个团队 channel。 |
+| `user` | 调用者本人的凭据。每个人授权自己的账号。 | Agent 以发起请求者的身份行动：只搜索他们可见的 Notion 页面、以他们的名义提交 issue，或以他们的身份发送邮件。 |
+
+```python
+tavily_key = await connections.get("organization-tavily", {"type": "agent"})
+notion_token = await connections.get("engineering-notion", {"type": "user"})
+```
+
+
+
+
+`connections.get(...)` 以字符串形式解析出凭据值。
+
+Connection 是一个容器，它属于 workspace 而不属于某个 owner。其中的凭据才有 owner。没有 `--owner` flag：你使用的[创建模式](#choose-a-create-mode)决定了 owner。
+
+`connections.get(...)` 选择一个 owner。它不会创建凭据。对 `agent` 而言，请求一个没有自己凭据的 owner 会让 run 失败；对 `user` 而言，会引发一个 [`credential_authorization_required` interrupt](#handle-the-authorization-interrupt)。同一 slug 下为不同 owner 存储的凭据无法满足这次查找。
+
+Agent 拥有的凭据属于项目的 deployment，因此请在至少一次成功的 [`mda deploy`](/langsmith/python/managed-deep-agents-deploy) 之后创建它们。Deployment 只读取自己拥有的凭据。要在第二个 deployment 中解析同一个 slug，请从那个项目根目录再次运行 `mda connections create <slug>`：对已存在的 slug，该命令会附加一个新的 agent 拥有的凭据，而不是失败。
+
+### 识别调用方
+
+User-owned connection 依据 Managed Deep Agents 附加到 run 上的调用方身份进行解析。该身份来自哪里取决于 agent 如何被调用：
+
+| 调用入口 | 调用方身份 |
+| --- | --- |
+| [Slack channel](/langsmith/python/managed-deep-agents-channels-slack) | 发送消息的 Slack 用户。 |
+| LangSmith Studio | 登录中的 LangSmith 用户。 |
+| SDK client 或自定义前端 | 项目的 [identity 声明](/langsmith/python/managed-deep-agents-identity)所认证的身份。 |
+
+默认的 identity 声明验证 LangSmith API key。该 key 认证的是调用的 client，而不是具体的某个人，因此出示它的每个调用方都解析到同一个身份。要给每个登录者自己的凭据，请声明 [Supabase identity](/langsmith/python/managed-deep-agents-identity#configure-identity-with-supabase)。
+
+代码永远不会把用户 ID 传给 `connections.get(...)`。运行时解析调用方并返回该用户的凭据。
+
+<Note>
+Slack 和 Studio 会为调用方完成授权往返。对自定义 channel 的一流支持正在开发中。今天要针对调用方身份构建自定义前端，请参见 [Handle the authorization interrupt](#handle-the-authorization-interrupt)，并联系 [LangChain 团队](https://forum.langchain.com/c/help/langsmith/)。
+</Note>
+
+## 选择创建模式
+
+Ownership 决定 agent 如何使用凭据。创建模式决定该凭据如何进入 workspace，取决于外部服务如何认证：
+
+| 模式 | 适用场景 | 创建方式 | 凭据 owner |
+| --- | --- | --- | --- |
+| **Opaque secret** | 服务使用固定的 API key 或其他静态 secret。 | `--secret-from-env`、`--secret-from-file`、stdin 或交互式提示 | Agent |
+| **General OAuth** | 你注册自己的 OAuth app（BYOT），例如 GitHub 或 Google。 | 目录中的 `--oauth <service>`，或自定义 provider 的 `--authorize-url` 和 `--token-url` | 每个调用方，或通过 [`--authorize`](#authorize-an-agent-owned-oauth-account) 或 [client credentials](#create-a-client-credentials-connection) 由 agent 持有 |
+| **MCP OAuth** | MCP server 声明支持 OAuth 并自动注册 client。 | `--mcp <url>`，或当项目已声明该 user-owned MCP 服务器时仅用 slug | 每个调用方，或通过 [`--authorize`](#authorize-an-agent-owned-oauth-account) 由 agent 持有 |
+
+例如：
+```bash
+# Opaque secret: store a fixed API key for the agent
+uv run mda connections create organization-tavily --secret-from-env TAVILY_API_KEY
+
+# General OAuth: register your own app, and let each caller authorize
+uv run mda connections create frontend-github --oauth github \
+  --client-id "********" --secret-from-env GITHUB_CLIENT_SECRET
+
+# MCP OAuth: let the MCP server register a client for you
+uv run mda connections create engineering-notion --mcp https://mcp.notion.com/mcp
+```
+
+
+
+
+不要在一条命令中混用模式。例如，`--mcp` 不能与 `--oauth`、自定义 endpoint、`--client-id` 或 secret 值组合。
+
+### 为 connection 命名
+
+`mda connections create` 的第一个参数是 slug：你对 connection 的命名，也是代码传给 `connections.get(...)` 的名称。它不是 provider 名称，后者传给 `--oauth`：
+
+```bash
+mda connections create frontend-github --oauth github
+#                      ^ your slug      ^ catalog provider
+```
+
+Slug 在 workspace 内唯一。使用小写字母、数字和单个连字符，并选择一个能标识 connection 指向哪个账户的名称，例如 `organization-tavily` 或 `engineering-notion`。
+
+## 创建 opaque secret
+
+为 agent 存储一个固定的 secret。从环境变量、文件、stdin 或提示中读取值。这种模式适合自定义 tools 的 API key，例如 Tavily 搜索 key。用 CLI 创建的 opaque secrets 归 agent 所有。
+
+把源值放入 shell 环境或项目 `.env` 文件，然后从该变量创建 connection。从项目根目录运行命令。CLI 需要 LangSmith API key 和 workspace ID。
+
+```bash
+uv run mda connections create organization-tavily --secret-from-env TAVILY_API_KEY
+```
+
+
+
+
+这会把 `TAVILY_API_KEY` 的值存储为 agent 拥有的 secret。运行时代码用 `connections.get(...)` 解析它。
+
+提供该值的其他方式：
+
+- **`--secret-from-file PATH`**：从只包含该 secret 的文件中读取一个值。
+- **stdin**：通过管道或重定向传入值，例如 `printf '%s' "$ACME_API_KEY" | mda connections create acme-api`。
+- **交互式提示**：在 TTY 上省略值 flag。CLI 会隐藏输入，secret 不会出现在屏幕或 shell 历史中。
+
+用 CLI 创建的 opaque secrets 始终归 agent 所有。每个调用方各自的凭据请使用 [OAuth connection](#create-a-general-oauth-connection)。
+
+为 agent 发放专属 key，而不是复用个人 key。专用 key 可以单独设置作用域、轮换和吊销，而不影响共享它的其他任何东西。
+
+### 在自定义 tool 中使用 opaque secret
+
+下面的 tool 为 agent 解析 `organization-tavily` connection，然后把它发送给 Tavily API：
+
+```python tools/search_web.py
+import httpx
+from langchain.tools import tool
+from managed_deepagents import connections
+
+
+@tool(parse_docstring=True)
+async def search_web(query: str) -> str:
+    """
+    Search the web.
+
+    Args:
+        query: Search query.
+    """
+    api_key = await connections.get("organization-tavily", {"type": "agent"})
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://api.tavily.com/search",
+            json={"api_key": api_key, "query": query, "max_results": 5},
+        )
+        response.raise_for_status()
+        return response.text
+```
+
+
+
+
+将该 tool 添加到 agent 请参见 [Custom tools](/langsmith/python/managed-deep-agents-tools)。
+
+## 创建 general OAuth connection
+
+注册 bring-your-own-app（BYOT）OAuth client，让调用方可以授权 agent 访问 provider API。适用于你自己拥有 OAuth app 注册的 REST 或 GraphQL API。对于自动发现并注册 client 的 MCP 服务器，请改用 [MCP OAuth](#create-an-mcp-oauth-connection)。
+
+### 使用 OAuth 目录
+
+每个 OAuth provider 都需要相同的五项设置：authorization URL、token URL、token endpoint 认证方法、authorization 参数和默认 scopes。目录条目提供全部五项，因此 `--oauth <service>` 加上你自己的 client ID 和 secret 就是全部配置。
+
+目录不是你能使用哪些 provider 的门槛。对于它没有覆盖的服务，请[自行传入 endpoints](#register-a-provider-with-custom-endpoints)。
+
+列出目录：
+
+```bash
+uv run mda connections catalog
+```
+
+
+
+
+该命令打印每个服务的默认 scopes 和你注册 app 的页面。它不会调用 LangSmith，因此不需要 workspace ID 或 API key。把第一列的值传给 `--oauth`。
+
+<MdaOauthCatalog />
+
+没有默认 scopes 的服务需要 `--scope`。
+
+<Accordion title="有些服务为它们的 API 和 MCP 服务器运行独立的 OAuth app">
+Notion 就是其中之一。`--oauth notion-api` 针对 Notion 的 REST API 注册一个 app，而这个 app 不能授权 Notion 的 MCP 服务器。要使用 MCP 服务器，请改用 [MCP OAuth connection](#create-an-mcp-oauth-connection)。当服务两者都提供时，请查看该 provider 的文档。
+</Accordion>
+
+GitHub 需要 OAuth client ID 和 client secret。设置 `GITHUB_CLIENT_SECRET`，然后创建 connection。把 `********` 替换为 client ID：
+
+```bash
+uv run mda connections create frontend-github \
+  --oauth github \
+  --client-id "********" \
+  --secret-from-env GITHUB_CLIENT_SECRET
+```
+
+
+
+
+创建时，CLI 会打印要向 provider 注册的 redirect URI。在调用方授权之前，在 provider 的 app 设置页面注册该 URI。URI 跟随你的 LangSmith host，例如生产环境为 `https://api.smith.langchain.com/v1/agent-auth/oauth/callback`。
+
+可选 flags：
+
+- **`--scope SCOPE`**：替换目录默认值。每个 scope 重复一次。
+- **`--allowed-scope SCOPE`**：后续任何授权可请求的上限。默认为 `--scope` 的值，且必须覆盖每一个 `--scope`。
+- **`--authorization-param KEY=VALUE`**：额外的 authorization 查询参数。每个参数重复一次。
+- **`--auth-method METHOD`**：client 向 token endpoint 认证的方式：`client_secret_basic`、`client_secret_post`，或公开 client 的 `none`。默认为目录服务的方法。
+
+### 使用自定义 endpoints 注册 provider
+
+对于目录没有覆盖的服务，传入两个 endpoint 以及 client ID 和 scopes：
+
+```bash
+uv run mda connections create acme \
+  --authorize-url https://auth.acme.com/authorize \
+  --token-url https://auth.acme.com/token \
+  --client-id "********" \
+  --secret-from-env ACME_CLIENT_SECRET \
+  --scope read
+```
+
+
+
+
+大多数 provider 会拒绝没有 `scope` 参数的授权请求。手动注册时请传入 `--scope`，或当目录覆盖该 provider 时使用 `--oauth <service>`。
+
+对于在 token endpoint 需要自定义请求头的 provider（例如 Stripe），请在 `mda connections create` 中添加 `--token-request-header KEY=VALUE`。每个请求头重复一次该 flag。此选项同时支持 authorization code 和 client credentials 授权。请求头的值是只写的。
+
+### 创建 client credentials connection
+
+OAuth client credentials 授权以应用程序（而不是某个人的身份）认证 agent。传入 `--grant-type client_credentials`，CLI 会在创建 connection 的同时请求 token。没有人通过浏览器登录，也没有调用方看到授权提示。
+
+当 provider 发放机器对机器的 OAuth 凭据时使用这种模式。当 provider 的 API 只能以个人身份认证时，请改用[授权一个 agent 拥有的账户](#authorize-an-agent-owned-oauth-account)。
+
+Client credentials connection 需要 token URL、client ID 和 client secret。设置 `ACME_CLIENT_SECRET`，然后创建 connection。把 `********` 替换为 client ID：
+
+```bash
+uv run mda connections create acme-api \
+  --grant-type client_credentials \
+  --token-url https://auth.acme.com/oauth/token \
+  --client-id "********" \
+  --secret-from-env ACME_CLIENT_SECRET \
+  --scope read
+```
+
+
+
+
+CLI 会打印它存储的 slug、grant type 和 scopes。请从项目目录运行它，因为 token 属于该项目的 deployment。当 token 请求失败时，CLI 会删除该 connection，而不是留下一个不可用的。
+
+`--oauth <service>` 也可用于携带 token URL 的目录条目。目录的默认 scopes 和 authorization 参数不适用于这种授权，因此需要 scopes 的 provider 请传入 `--scope`。
+
+可选 flags：
+
+- **`--scope SCOPE`**：请求一个 scope。每个 scope 重复一次。
+- **`--auth-method METHOD`**：以 `client_secret_basic` 或 `client_secret_post` 发送 client secret。默认为 `client_secret_basic`。公开 client（`none`）不能使用这种授权。
+- **`--token-param KEY=VALUE`**：向 token 请求添加一个参数，例如 `--token-param audience=https://api.acme.com`。每个参数重复一次。该授权会自己设置 `grant_type`、`client_id`、`client_secret` 和 `scope`，因此这四个 key 会被拒绝。
+
+这种授权会拒绝 authorization code 的 flags：`--authorize-url`、`--authorization-param` 和 `--allowed-scope`。
+
+Client credentials connection 始终归 agent 所有，因此每个调用方都以应用程序身份行动。运行时代码像其他任何 agent 拥有的凭据一样解析它：
+
+```python
+access_token = await connections.get("acme-api", {"type": "agent"})
+```
+
+
+
+
+### 授权一个 agent 拥有的 OAuth 账户
+
+当 provider 发放自己的应用程序凭据时，例如 Slack bot token、GitHub App installation token 或 Notion internal integration token，优先选择把该凭据存储为 [agent 拥有的 secret](#create-an-opaque-secret)。应用程序凭据限定在应用程序范围内，可以单独吊销，且不依赖任何人的账户。当 provider 通过 OAuth 发放该应用程序身份时，请创建一个 [client credentials connection](#create-a-client-credentials-connection)。
+
+当 provider 不提供应用程序身份、且其 API 只能以个人身份认证时，使用 `--authorize`。
+
+默认情况下，OAuth connection 在运行时向每个调用方收集授权。传入 `--authorize` 让你自己登录一次，并为 deployment 存储授权。此后每个调用方都以该账户行动，没有人看到授权提示：
+
+```bash
+uv run mda connections create support-linear \
+  --oauth linear \
+  --client-id "********" \
+  --secret-from-env LINEAR_CLIENT_SECRET \
+  --scope read --scope write \
+  --authorize
+```
+
+
+
+
+CLI 会为你登录的账户启动授权流程，并为 deployment 存储得到的授权。运行时代码将其解析为 agent 拥有的凭据：
+
+```python
+access_token = await connections.get("support-linear", {"type": "agent"})
+```
+
+
+
+
+`--authorize` 只适用于 OAuth connections。可以与 `--oauth`、自定义 endpoint 或 `--mcp` 组合。请从项目目录运行它，因为授权属于该项目的 deployment。
+
+当每个调用方都应该以一个共享账户而不是自己的身份行动时，使用 agent 拥有的 OAuth 账户。一个授予只读访问权限给问答 agent 的公司 Notion 账户就是一个例子。
+
+<Tip>
+授权一个你团队拥有的专用账户，而不是你自己的账户。你登录的账户会成为 agent 采取的每个动作背后的身份，对所有调用方都是如此。使用个人账户会让你付出三样东西：
+
+- Agent 会获得你在该 provider 的全部访问权限。
+- Provider 的 audit log 会以你的名字显示 agent 做的事。
+- 当你自己的访问权限变化时，agent 会停止工作。
+
+以这种方式获得的授权始终绑定到授权它的账户，即使是专用账户也一样。密码重置、被吊销的会话或被停用的账户都会结束该授权，因此请把该账户当作生产基础设施对待。
+
+给专用账户的 `--scope` 值设为 agent 所需的最小范围。设置 `--allowed-scope` 来限制后续任何授权可请求的范围。
+</Tip>
+
+### 在自定义 tool 中访问 OAuth token
+
+这个 tool 解析经过认证的调用方的 GitHub connection 并调用 GitHub REST API：
+
+```python tools/get_github_user.py
+import httpx
+from langchain.tools import tool
+from managed_deepagents import connections
+
+
+@tool
+async def get_github_user() -> str:
+    """Get the authenticated caller's GitHub login."""
+    # Replace `frontend-github` with the name of your connection.
+    access_token = await connections.get("frontend-github", {"type": "user"})
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            "https://api.github.com/user",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        response.raise_for_status()
+        return response.json()["login"]
+```
+
+
+
+
+## 创建 MCP OAuth connection
+
+对于支持 OAuth client 注册的远程 MCP 服务器，Managed Deep Agents 会发现服务器的 OAuth 元数据并自动注册一个 client。你不需要提供 client ID 或 client secret。
+
+### 先声明 MCP 服务器
+
+在 `tools/mcp.py` 中添加该服务器并引用 connection slug。
+
+```python tools/mcp.py
+from managed_deepagents import connections, define_mcp
+
+mcp = define_mcp(
+    servers={
+        "notion": {
+            "transport": "http",
+            "url": "https://mcp.notion.com/mcp",
+            "connection": connections.get("engineering-notion", {"type": "user"}),
+        },
+    },
+)
+```
+
+
+
+
+更多信息请参见 [Connect to MCP servers](/langsmith/python/managed-deep-agents-mcp-connectors)。
+
+### 从项目声明创建
+
+当 slug 恰好匹配项目中的一个 user-owned MCP connection 时，只传 slug 即可创建。CLI 会从 MCP 声明中读取服务器 URL：
+
+```bash
+uv run mda connections create engineering-notion
+```
+
+
+
+
+### 从显式的 MCP URL 创建
+
+当你想显式指明服务器 URL，或 slug 尚未在项目中声明时，传入 `--mcp`：
+
+```bash
+uv run mda connections create engineering-notion --mcp https://mcp.notion.com/mcp
+```
+
+
+
+
+不带协议的值例如 `mcp.notion.com/mcp` 会被存储为 `https://mcp.notion.com/mcp`。
+
+如果服务器无法自动注册 client，CLI 会说明这一点，并指引你改用 general OAuth（`--oauth` 或手动 endpoint）。
+
+`mda deploy` 对缺失的 user-owned MCP connections 应用同样的推断。它会保持已有 connection 不变，通过 OAuth 发现创建每个缺失的唯一 MCP connection，并在发现或注册不可用时在部署前失败。
+
+## 处理授权 interrupt
+
+Managed Deep Agents 为你运行 OAuth 往返。项目不需要 callback 路由、token store、刷新逻辑或同意页面。Run 暂停，调用方授予访问权限，run 以该用户的凭据恢复。
+
+在第一个模型回合之前，Managed Deep Agents 会检查这次 run 需要的每个 user-owned connection。如果调用方缺失一个或多个授权，credential gate 会引发一个 LangGraph interrupt。Slack 和 LangSmith Studio 会替调用方处理该 interrupt。自定义前端从 LangChain frontend SDK 读取相同的 payload，并在调用方连接后恢复。
+
+User-owned connections 需要经过认证的调用方。匿名或仅 agent 的 run 无法完成 credential gate。关于该身份来自哪里，请参见 [Identify the caller](#identify-the-caller)。
+
+### Interrupt payload
+
+使用 [`useStream`](/oss/python/langchain/frontend/human-in-the-loop#setting-up-usestream)（`@langchain/react`、`@langchain/vue`、`@langchain/svelte`）或 `injectStream`（`@langchain/angular`）时，待处理的 interrupt 位于 `stream.interrupt`。Credential gate payload 为 `stream.interrupt.value`。
+
+对于缺失的 OAuth 授权，`credentials` 中的每个条目都带有调用方完成同意的 URL：
+
+```json
+{
+  "type": "credential_authorization_required",
+  "message": "Connect the following integrations to continue.",
+  "credentials": [
+    {
+      "slug": "engineering-notion",
+      "kind": "oauth2",
+      "connect_url": "https://api.smith.langchain.com/v1/agent-auth/...",
+      "auth_id": "sess_abc123"
+    }
+  ]
+}
+```
+
+一个 interrupt 列出所有缺失的授权。恢复前请处理每个条目。`"kind": "secret"` 的条目代表 user-owned API key 而不是 OAuth 授权。Slack 和 Studio 不会收集它们。更多信息请参见 [Review current limitations](#review-current-limitations)。
+
+| 字段 | 何时出现 | 含义 |
+| --- | --- | --- |
+| `type` | 始终 | 判别器。必须是 `credential_authorization_required`。 |
+| `message` | 始终 | 显示在待处理授权上方的、人类可读的摘要。 |
+| `credentials` | 始终 | 每个缺失授权一个条目。 |
+| `credentials[].slug` | 始终 | 要授权的 connection slug。 |
+| `credentials[].kind` | 始终 | `secret` 表示密码式 API key，`oauth2` 表示 OAuth。 |
+| `credentials[].connect_url` | `oauth2` | 调用方完成同意的 HTTPS URL。 |
+| `credentials[].auth_id` | `oauth2` | 用于轮询状态的授权会话 ID。 |
+
+### 在 UI 中读取 interrupt
+
+渲染该 interrupt 的前端是 web 应用，因此无论 agent 是用 Python 还是 TypeScript 编写的，这些示例都是 TypeScript。
+
+在 `stream.interrupt` 上检测 credential gate payload，渲染一个连接卡片，然后在每个授权存储完成后用 `stream.respond` 恢复：
+
+<CodeGroup>
+```tsx React
+import { useStream } from "@langchain/react";
+
+type CredentialAuthorizationRequired = {
+  type: "credential_authorization_required";
+  message?: string;
+  credentials: Array<{
+    slug: string;
+    kind: "oauth2" | "secret";
+    connect_url?: string;
+    auth_id?: string;
+  }>;
+};
+
+function isCredentialAuthorization(
+  value: unknown
+): value is CredentialAuthorizationRequired {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    value.type === "credential_authorization_required"
+  );
+}
+
+export function Chat() {
+  const stream = useStream({
+    apiUrl: "https://your-deployment.example",
+    assistantId: "agent",
+  });
+
+  const payload = stream.interrupt?.value;
+  const credentialAuth = isCredentialAuthorization(payload) ? payload : null;
+
+  return (
+    <div>
+      {/* messages … */}
+      {credentialAuth && (
+        <ConnectCard
+          payload={credentialAuth}
+          onComplete={async (connectedSlugs) => {
+            await stream.respond(
+              {
+                type: "credential_authorization_completed",
+                connected_slugs: connectedSlugs,
+              },
+              { interruptId: stream.interrupt?.id }
+            );
+          }}
+        />
+      )}
+    </div>
+  );
+}
+```
+
+```vue Vue
+<script setup lang="ts">
+import { computed } from "vue";
+import { useStream } from "@langchain/vue";
+
+const stream = useStream({
+  apiUrl: "https://your-deployment.example",
+  assistantId: "agent",
+});
+
+const credentialAuth = computed(() => {
+  const value = stream.interrupt.value?.value;
+  return value?.type === "credential_authorization_required" ? value : null;
+});
+
+async function onComplete(connectedSlugs: string[]) {
+  await stream.respond(
+    {
+      type: "credential_authorization_completed",
+      connected_slugs: connectedSlugs,
+    },
+    { interruptId: stream.interrupt.value?.id }
+  );
+}
+</script>
+
+<template>
+  <div>
+    <!-- messages … -->
+    <ConnectCard
+      v-if="credentialAuth"
+      :payload="credentialAuth"
+      @complete="onComplete"
+    />
+  </div>
+</template>
+```
+
+```svelte Svelte
+<script lang="ts">
+  import { useStream } from "@langchain/svelte";
+
+  const stream = useStream({
+    apiUrl: "https://your-deployment.example",
+    assistantId: "agent",
+  });
+
+  $: payload = stream.interrupt?.value;
+  $: credentialAuth =
+    payload?.type === "credential_authorization_required" ? payload : null;
+
+  async function onComplete(connectedSlugs: string[]) {
+    await stream.respond(
+      {
+        type: "credential_authorization_completed",
+        connected_slugs: connectedSlugs,
+      },
+      { interruptId: stream.interrupt?.id }
+    );
+  }
+</script>
+
+<div>
+  <!-- messages … -->
+  {#if credentialAuth}
+    <ConnectCard payload={credentialAuth} onComplete={onComplete} />
+  {/if}
+</div>
+```
+
+```ts Angular
+import { Component, computed } from "@angular/core";
+import { injectStream } from "@langchain/angular";
+
+@Component({
+  selector: "app-chat",
+  template: `
+    <!-- messages … -->
+    @if (credentialAuth(); as auth) {
+      <app-connect-card
+        [payload]="auth"
+        (complete)="onComplete($event)"
+      />
+    }
+  `,
+})
+export class ChatComponent {
+  stream = injectStream({
+    apiUrl: "https://your-deployment.example",
+    assistantId: "agent",
+  });
+
+  credentialAuth = computed(() => {
+    const value = this.stream.interrupt()?.value;
+    return value?.type === "credential_authorization_required" ? value : null;
+  });
+
+  async onComplete(connectedSlugs: string[]) {
+    await this.stream.respond(
+      {
+        type: "credential_authorization_completed",
+        connected_slugs: connectedSlugs,
+      },
+      { interruptId: this.stream.interrupt()?.id }
+    );
+  }
+}
+```
+</CodeGroup>
+
+关于 interrupt 的通用生命周期（`stream.interrupt`、恢复、checkpoints），请参见 [Human-in-the-loop](/oss/python/langchain/frontend/human-in-the-loop)。
+
+### 处理 OAuth 授权（`kind: "oauth2"`）
+
+对每个 OAuth 条目：
+
+1. 显示 `slug` 和一个打开 `connect_url` 的 Connect 控件（仅限 HTTPS；拒绝内嵌凭据的 URL）。
+2. 长轮询 Agent Auth 直到会话完成：
+
+```http
+GET /v1/agent-auth/oauth-authorization-sessions/{auth_id}?wait_seconds=25
+```
+
+响应的 `status` 为 `pending`、`completed`、`failed` 或 `expired`。状态为 `pending` 时保持轮询。`completed` 时将该 slug 标记为已连接。`failed` 或 `expired` 时，请调用方启动一个新 run 以获取新的连接链接。
+
+不要把 access token 放进你的 UI。Agent Auth 会为调用方存储授权；agent 在恢复时通过 `connections.get(...)` 读取它。
+
+### 恢复 run
+
+在 `credentials` 中的每个条目都连接完成后，用以下内容恢复：
+
+```json
+{
+  "type": "credential_authorization_completed",
+  "connected_slugs": ["engineering-notion"]
+}
+```
+
+如上所示，将该对象传给 `stream.respond(resume, { interruptId: stream.interrupt?.id })`。如果仍有授权缺失时就恢复，gate 会用新的 payload 再次中断。
+
+### 内置的 Slack 处理
+
+当 agent 通过 Slack channel 运行时，Slack 会渲染包含 HTTPS `connect_url` 的 OAuth 条目。调用方打开链接，完成同意，Slack 会恢复 run，因此没有人需要打开 LangSmith 来连接服务。
+
+<Frame caption="Slack OAuth authorization prompt">
+  **Screenshot placeholder:** Add the Slack OAuth authorization prompt screenshot here.
+</Frame>
+
+## 检查和删除 connections
+
+使用 `list` 或 `get` 检查 connection 元数据。`list` 显示 workspace 中的每个 connection，而不仅是本项目使用的那些：
+
+```bash
+uv run mda connections list
+uv run mda connections get organization-tavily
+uv run mda connections delete organization-tavily
+```
+
+
+
+
+给 `list` 或 `get` 传入 `--json` 可获得机器可读的输出。给 `delete` 传入 `--yes` 可跳过确认提示。
+
+## 本地开发
+
+对于 `mda dev`，agent 拥有的 opaque connection 读取 `MDA_DEV_<SLUG>`。CLI 会将 slug 转为大写，并把连字符替换为下划线。例如，`organization-tavily` 读取 `MDA_DEV_ORGANIZATION_TAVILY`。
+
+User-owned connections 需要经过认证的调用方和 Agent Auth。请部署 agent，以端到端地演练 [authorization interrupt](#handle-the-authorization-interrupt)。
+
+## 了解当前限制
+
+Connections 是 Managed Deep Agents 公开 beta 的一部分。当前版本存在以下缺口：
+
+- **User-owned API keys**：user-owned connection 保存的是 OAuth 授权。Slack 和 Studio 不会收集每个调用方各自的 API key，CLI 也不会为它创建空位。请改用 agent 拥有的 secret，或按照下一节所述在自定义前端中收集 key。
+- **自定义 channels**：Slack 和 Studio 会解析调用方身份并替调用方完成授权。自定义前端需要自己处理 [authorization interrupt](#handle-the-authorization-interrupt)。
+- **Workspace UI**：LangSmith 不会在 UI 中列出 connections。请使用 `mda connections list` 和 `mda connections get` 查看 connection 元数据。
+- **授权可见性**：`mda connections list` 以 workspace 为范围，不会报告哪些 deployment 在某个 slug 下持有凭据。当 run 以 `no agent connection is set for slug '<slug>'` 失败时，表示该 deployment 没有为它持有凭据，即使 `list` 显示了这个 slug。请从项目根目录运行 `mda connections create <slug>` 来创建一个。
+
+<Accordion title="通过 Agent Auth 存储 user-owned API key">
+`"kind": "secret"` 的 interrupt 条目没有 `connect_url`。要在自定义前端中收集一个，请用隐藏输入框提示输入值，然后针对已有的 connection slug 创建凭据：
+
+```http
+POST /v1/agent-auth/connections
+```
+
+```json
+{
+  "slug": "organization-tavily",
+  "display_name": "organization-tavily",
+  "credential": {
+    "kind": "secret",
+    "owner_type": "user",
+    "owner_id": "<caller-identity-id>",
+    "value": "<api-key>"
+  }
+}
+```
+
+Agent Auth 会复用该 slug 已有的 connection 并附加调用方的 secret。Secret 材料是只写的。创建成功后，将该 slug 标记为已连接并恢复 run。更多信息请参见 [Set up Agent Auth](/langsmith/agent-auth)。
+</Accordion>
+
+## 另请参阅
+
+- [Managed Deep Agents CLI reference](/langsmith/python/managed-deep-agents-cli)
+- [Connect to MCP servers](/langsmith/python/managed-deep-agents-mcp-connectors)
+- [Add custom tools](/langsmith/python/managed-deep-agents-tools)
+- [Add identity to Managed Deep Agents](/langsmith/python/managed-deep-agents-identity)
+- [Deploy an agent](/langsmith/python/managed-deep-agents-deploy)
+- [Human-in-the-loop](/oss/python/langchain/frontend/human-in-the-loop)
+- [Set up Agent Auth](/langsmith/agent-auth)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/managed-deep-agents-connections.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

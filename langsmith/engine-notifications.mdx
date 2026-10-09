@@ -1,0 +1,361 @@
+---
+title: LangSmith Engine 通知
+sidebarTitle: Notifications
+description: 将 LangSmith Engine 通知发送到 Slack、Jira Automation 和 webhook endpoints。
+---
+
+import WebhookSignatureVerification from '/snippets/python/langsmith/webhook-signature-verification.mdx';
+
+[LangSmith Engine](/langsmith/engine) 可以在它打开一个新 issue、将一条新 trace 关联到已有 issue，或未能完成一个 run 时通知你。将这些通知投递到 **Slack channel**、**Jira Automation incoming webhook** 或 **HTTP webhook endpoint**。每个目的地都有各自的事件类型和最低优先级，因此你可以把紧急 issues 路由到 paging webhook，同时把所有 issues 发送到 Slack channel。
+
+## 添加目的地
+
+Notification destinations 按 tracing project 或 agent environment 配置。在 **Engine** 页面上，点击 **Configure Engine**，然后在 **Notifications** 下点击 **Add**。如果尚无目的地，编辑器会自动打开。为每个目的地选择：
+
+- **Destination type**：选择 **Slack**、**Jira** 或 **Webhook** 标签页。请参阅 [Notify a Slack channel](#notify-a-slack-channel)、[Create Jira work items](#create-jira-work-items) 和 [Send to a webhook](#send-to-a-webhook)。
+- **Notify when**：触发通知的[事件类型](#event-types)。
+- **Minimum issue severity**：决定发送哪些通知的 issue [severity 过滤器](#severity-filtering)。
+
+要在[受监视的 issue](/langsmith/engine#watch-an-issue) 复发时收到提醒，请在该 issue 上点击 **Alert me via Slack**，它会打开同一个 **Notifications** 部分。
+
+## 事件类型
+
+| 事件 | 发送时机 |
+| --- | --- |
+| [`issue.created`](#issue-created) | Engine 打开一个新 issue。 |
+| [`issue.trace.added`](#issue-trace-added) | Engine 将一条新 trace 关联到已有 issue。 |
+| [`issue.agent_run.failed`](#issue-agent_run-failed) | 一个 Engine run 未能完成。 |
+
+对于新目的地，**Notify when** 选择器提供 `issue.created` 和 `issue.trace.added`。已有订阅还可以接收 `issue.agent_run.failed`。创建时未显式指定事件类型列表的目的地只接收 `issue.created`。
+
+## Severity 过滤
+
+**Minimum issue severity** 设置存储为从 `0` 到 `3` 的 `severity_threshold`。对于 issue 事件，只有当 issue 的 `severity` 小于或等于阈值时才投递通知。数字越小越紧急。
+
+| Severity | 含义 |
+| --- | --- |
+| `0` | Urgent |
+| `1` | High |
+| `2` | Medium |
+| `3` | Low |
+
+选择器提供 **High severity only** (`1`)、**Medium and high severity** (`2`) 和 **All severities** (`3`)。例如，`severity_threshold: 1` 的目的地只接收 `URGENT` (0) 和 `HIGH` (1) issue 的事件。
+
+Severity 阈值不适用于 [`issue.agent_run.failed`](#issue-agent_run-failed)，因为 run 失败事件是以 Engine 会话为范围，而不是针对特定 issue。
+
+## 通知 Slack channel
+
+如果你的 self-hosted 实例上未配置 Slack，**Slack** 标签页会显示 **Contact your operator to enable Slack notifications**。操作员[创建一个 Slack app 并配置其凭证](/langsmith/self-host-slack)。然后你通过 Slack 授权连接一个 workspace。
+
+要添加 Slack 目的地：
+
+<Steps>
+  <Step title="Connect a Slack workspace">
+    连接 Slack workspace 是一次性的组织级操作，不是按 project 进行。连接或断开 workspace 需要 `organization:manage` 权限。在你的 LangSmith 实例中，打开 **Settings**，前往你组织的 **General** 设置，并在 **Slack** 下点击 **Connect Slack**。在 Slack 中授权已配置的 app。你可以将多个 Slack workspace 连接到一个组织。
+  </Step>
+  <Step title="Add a Slack destination">
+    在 **Engine** 页面上，点击 **Configure Engine**。在 **Notifications** 下，如果编辑器尚未打开，点击 **Add**。选择 **Slack** 标签页，然后使用 channel 选择器选择一个 workspace 和 channel。如果没有 workspace 已连接，在 channel 选择器中点击 **Connect Slack** 并完成授权。
+  </Step>
+  <Step title="Choose events and severity">
+    在 **Notify when** 下，选择哪些[事件类型](#event-types)会向 channel 发送消息。在 **Minimum issue severity** 下，选择哪些 issue severities 会触发通知。点击 **Add** 保存。
+  </Step>
+</Steps>
+
+LangSmith 在第一次投递消息时会加入所选的公开 channel（如有需要）。要发布到 private channel，请先在 Slack 中将已配置的 Slack app 邀请到该 channel，然后刷新 channel 选择器。
+
+每条 Slack 消息都包含 issue 的标题、描述和 severity、一个返回 LangSmith 的 **View issue** 链接，以及（对 issue 事件而言）issue 随时间复发的图表。如果某个 workspace 的连接失效，例如 app 从 Slack 中被移除，它的目的地会停止投递，直到你从组织的 **General** 设置中重新连接它。
+
+Slack 目的地使用已配置的 Slack app 发布消息。它们不发送 [webhook payload](#webhook-payload-reference)，因此 webhook signing secrets 和自定义 headers 不适用。
+
+## 创建 Jira work items
+
+**Jira** 目的地将 Engine 事件发送到 Jira Automation incoming webhook。配置一个 Jira rule，将新的 Engine issues 转换为 Jira work items。LangSmith 发送 [webhook payload](#webhook-payload-reference) 时带有 `X-Automation-Webhook-Token` header。Jira 目的地使用该 token 进行身份验证，没有 HMAC signing secret。
+
+请使用最终的 incoming-webhook URL。Jira 投递不跟随重定向，包括同一主机上的重定向。`3xx` 响应是永久性投递错误，不会重试。这样可以将 token 和 payload 保留在已配置的 endpoint 上。
+
+你需要管理 Jira automation rules 的权限，以及一个该 rule 可以创建 work items 的 project。Jira Cloud 在 Atlassian 的基础设施上托管 incoming webhook。对于 Jira Data Center，请验证你安装版本的 endpoint 是否接受所需的 token header。LangSmith 的 deployment 类型并不决定你使用 Jira Cloud 还是 Data Center。
+
+要为每个新的 Engine issue 创建一个 work item：
+
+<Steps>
+  <Step title="Configure the incoming webhook in Jira">
+    创建一个带 **Incoming webhook** 触发器的 Jira Automation rule。如果 Jira 要求先保存 rule 才能生成 URL，请先保存而不启用它。
+
+    选择 **No work items from the webhook**，在较旧的界面中称为 **No issues from the webhook**。Engine 发送自己的事件 payload，而不是 Jira issue keys。
+
+    生成触发器的 secret/token。保存之前复制 webhook URL 和 token。不要把 token 放在 URL 中；LangSmith 会在身份验证 header 中发送它。
+  </Step>
+  <Step title="Add the Jira creation action">
+    将 rule 限制到目标 project。添加一个 **Create work item** 操作，在较旧的界面中称为 **Create issue**。选择一个已有的 project 和 issue 类型，并配置 Jira 要求的所有字段。
+
+    对于 Jira Cloud，将 **Summary** 设置为 `{{webhookData.object.name}}`。将 **Description** 设置为：
+
+    ```text
+    {{webhookData.object.description}}
+
+    Severity: {{webhookData.object.severity}}
+    LangSmith issue: {{webhookData.object.url}}
+    ```
+
+    Jira Cloud 将 envelope 的 `data` 成员暴露为 `webhookData`。issue 字段使用 `webhookData.object.*`。`webhookData.data.object.name` 中额外的 `.data` 会解析为空的 summary。在 Jira Data Center 上使用这些映射之前，请先在已安装版本中验证 payload 处理。
+  </Step>
+  <Step title="Add the Jira destination in LangSmith">
+    在 **Engine** 页面上，点击 **Configure Engine**。在 **Notifications** 下，点击 **Add** 并选择 **Jira**。输入来自触发器的 **Jira Webhook URL** 和 **Jira webhook token**。
+
+    在 **Notify when** 下，为这个创建 rule 只选择 `issue.created`。选择 **Minimum issue severity**，然后点击 **Add**。在 Jira 中启用该 rule。
+  </Step>
+  <Step title="Verify Jira created the work item">
+    在 Engine 创建一个匹配你 severity 过滤器的 issue 之后，检查 Jira 的 automation audit log。确认该 rule 成功，并创建了一个带预期 summary、description、severity 和 LangSmith issue 链接的 work item。
+
+    HTTP 成功只意味着 Jira 接受了 webhook，而不是它创建了一个 work item。Rule 条件、必填字段、actor 权限和 automation 用量限制都可能阻止创建。
+  </Step>
+</Steps>
+
+LangSmith 存储 Jira token 后不会再次显示它。要替换它，请输入一个新 token。更改 webhook URL 也需要为替换的 URL 输入 token。如果你丢失了 token，请在 Jira 中轮换它并更新 LangSmith 目的地。
+
+### 访问私有 Jira endpoint
+
+私有 Jira endpoints 需要从你的 LangSmith deployment 出发的网络访问。在 self-hosted 和 hybrid deployments 中，webhook 投递在客户 data plane 中运行。在添加目的地之前，配置以下内容：
+
+- **网络访问**：允许从 LangSmith API 和 webhook 投递进程到 Jira 的 DNS 解析和出站连通性。在 Jira 的防火墙中放行它们的源地址。
+- **私有地址**：如果 endpoint 解析到私有 IP，请为两个进程设置 `SSRF_ALLOW_PRIVATE_IPS_WEBHOOKS=true`。Kubernetes 内部 hostname 还需要 `SSRF_ALLOW_K8S_INTERNAL=true`。其他 webhook URL 保护保持激活。配置请参阅 [Set self-hosted environment variables](/langsmith/self-host-environment-variables)。
+- **TLS 信任**：如果 Jira 使用私有证书颁发机构，请将其 CA 添加到 webhook 投递进程的受信任根中。使用系统根证书或 `SSL_CERT_FILE`，保留其他所需的根证书，并保持 TLS 验证启用。
+
+## 发送到 webhook
+
+将 Engine 事件转发到你自己的 incident-management、paging 或 chat 工具。添加一个目的地并选择 **Webhook** 标签页。输入一个 URL，以及（可选）[自定义 headers](#custom-headers)。每次投递都会[签名](#signing-secret)，因此你可以验证其真实性。
+
+### 投递
+
+LangSmith 向你的 webhook URL 发送一个带 JSON body 的 `POST` 请求。请求使用 `Content-Type: application/json`，并包含你附加到目的地的所有自定义 headers。
+
+| 属性 | 值 |
+| --- | --- |
+| Method | `POST` |
+| Body | JSON，见下方的[通用 envelope](#event-envelope) |
+| Scheme | 接受 `http://` 和 `https://`。强烈建议使用 `https://` |
+| Signature | `X-LangSmith-Signature` header，使用目的地的 signing secret 签名 |
+| Timeout | 每次尝试 20 秒 |
+| Attempts | 最多 4 次尝试（1 次初始加 3 次指数退避重试），针对传输错误、HTTP `408`、`425`、`429` 和任何 HTTP `5xx`。其他 `4xx` 响应视为永久性错误，不会重试 |
+| Response | 成功仅由状态码决定。响应体会被忽略。 |
+
+<Note>
+重试投递字节完全相同的 payload，包括相同的 `id`。请按 `id` 去重，这样重试的投递不会产生重复的下游影响。
+</Note>
+
+### 自定义 headers
+
+你可以为每个目的地附加任意 headers（例如 `Authorization: Bearer …`），以便在你的 endpoint 处对调用方进行身份验证。`Content-Type` 始终由 LangSmith 设置，不能被覆盖。
+
+### Signing secret
+
+每个 **Webhook** 目的地都有一个 signing secret。LangSmith 使用该 secret 对原始 webhook 请求体签名，并将结果放在 `X-LangSmith-Signature` header 中发送。Jira 目的地改用其 token header。
+
+header 值的格式如下：
+
+```text
+sha256=<hex-encoded HMAC-SHA256 digest>
+```
+
+在解析 payload 或对其采取行动之前验证签名。HMAC 的输入是原始请求体的确切字节，HMAC 的 key 是目的地的 signing secret。不要在验证之前解析并重新序列化 JSON body。
+
+<WebhookSignatureVerification />
+
+### 轮换 signing secret
+
+当 signing secret 可能已经暴露，或你的组织凭证轮换策略要求新 secret 时，轮换它。
+
+要轮换 secret，在 **Engine settings** 面板中打开目的地所在行，点击 **Roll signing secret**，然后确认。LangSmith 会生成一个新的 signing secret，并立即将其用于未来的 webhook 投递。轮换完成后，之前的 secret 立即停止为投递签名。
+
+轮换 secret 之后，请用新值更新每一个验证 `X-LangSmith-Signature` 的消费方。
+
+### 测试你的 endpoint
+
+在将真实目的地指向你的 endpoint 之前，发送一个示例 payload，验证它能在 20 秒超时内接受并确认：
+
+```bash
+curl -X POST https://your-endpoint.example.com/webhook \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $WEBHOOK_SECRET" \
+  -d @sample-issue-created.json
+```
+
+使用 [`issue.created`](#issue-created) 的示例 body 作为 `sample-issue-created.json`。请验证：
+
+- 自定义 `Authorization` header 到达，并且与你为目的地上配置的 secret 匹配。
+- handler 按 `id` 为 key 持久化事件，从而对重试去重。
+- handler 在启动缓慢的下游工作之前返回 `2xx`。
+
+### 安全
+
+- Webhook URLs 在目的地创建时验证，并在投递时再次验证。SaaS 中会封锁私有和 metadata IP 段。`http://` 和 `https://` 都被接受；请使用 `https://`，这样 payload 和任何自定义 headers 不会以明文发送。
+- LangSmith 使用目的地的 signing secret 对 webhook body 签名。在处理 payload 之前请验证 `X-LangSmith-Signature`。
+- 你还可以在目的地上设置自定义 headers，例如 `Authorization: Bearer …`，用于在你的 endpoint 处路由或额外的身份验证。
+- 按事件 `id` 去重，这样重试的投递不会造成重复通知。
+
+### 最佳实践
+
+- **快速确认。** 一旦持久化了事件就用 `2xx` 响应。将缓慢的工作（fan-out、paging、下游 API 调用）移到队列上，让 handler 保持在 20 秒超时之内。
+- **容忍未知的事件类型。** 忽略你的 handler 无法识别的 `type` 值。新的事件类型可能在未通知的情况下添加。
+- **容忍新字段。** 以宽松的 schema 解析 payload。新字段可能在未通知的情况下添加到已有事件类型中。
+
+## Webhook payload reference
+
+Webhook 和 Jira 目的地会接收下方的 JSON payloads。Slack 目的地不会。
+
+### Event envelope
+
+投递到你 endpoint 的每个事件都使用相同的外层 JSON 形状。
+
+| 字段 | 类型 | 描述 |
+| --- | --- | --- |
+| `id` | UUID | 本次投递的唯一标识符。在重试中保持稳定。用它来去重。 |
+| `type` | string | 事件类型。为 [`issue.created`](#issue-created)、[`issue.trace.added`](#issue-trace-added) 或 [`issue.agent_run.failed`](#issue-agent_run-failed) 之一。 |
+| `created` | integer | 事件入队时的 Unix 秒数（UTC）。 |
+| `request_id` | UUID | 由同一上游动作触发的所有事件共享。请参阅 [Batch coalescing](#batch-coalescing)。 |
+| `data` | object | 事件 payload。始终包含 `data.object`。仅在 [`issue.trace.added`](#issue-trace-added) 事件中包含 [`data.trace`](#data-trace)。 |
+
+### Issue `data.object`
+
+对于 [`issue.created`](#issue-created) 和 [`issue.trace.added`](#issue-trace-added)，`data.object` 是 issue 的快照。将它视为事件生成时该 issue 的权威状态。
+
+| 字段 | 类型 | 描述 |
+| --- | --- | --- |
+| `id` | UUID | Issue ID。 |
+| `name` | string | issue 的简短标题。 |
+| `description` | string | 人类可读的描述。 |
+| `severity` | integer | 从 `0`（urgent）到 `3`（low）。请参阅 [Severity 过滤](#severity-filtering)。 |
+| `tenant_id` | UUID | 该 issue 所属的 workspace。 |
+| `tenant_name` | string | Workspace 的显示名称。 |
+| `session_id` | UUID | 该 issue 所属的 tracing project。 |
+| `session_name` | string | Tracing project 名称。 |
+| `url` | string | 指向 LangSmith UI 中该 issue 的 deep link。 |
+
+### Run failure `data.object`
+
+对于 [`issue.agent_run.failed`](#issue-agent_run-failed)，`data.object` 描述失败的 Engine run。
+
+| 字段 | 类型 | 描述 |
+| --- | --- | --- |
+| `tenant_id` | UUID | 该 run 所属的 workspace。 |
+| `tenant_name` | string | Workspace 的显示名称。 |
+| `session_id` | UUID | 该 run 所属的 tracing project。 |
+| `session_name` | string | Tracing project 名称。 |
+| `url` | string | 指向 UI 中该 LangSmith project 的 deep link。 |
+| `thread_id` | string | Engine thread ID。 |
+| `run_id` | string | Engine run ID。不可用时省略。 |
+| `status` | string | 最终 run 状态。 |
+| `error_message` | string | 来自失败 run 的错误文本。不可用时省略。 |
+| `occurred_at` | string | 失败发生时间的 RFC 3339 时间戳。 |
+
+### `data.trace`
+
+`data.trace` 仅包含在 [`issue.trace.added`](#issue-trace-added) 事件中。
+
+| 字段 | 类型 | 描述 |
+| --- | --- | --- |
+| `run_id` | UUID | 被关联到该 issue 的 run 的 ID。 |
+| `trace_id` | UUID | 包含该 run 的 trace 的 ID。 |
+| `start_time` | string | run 开始时间的 RFC 3339 时间戳。 |
+| `comment` | string \| null | 关联 trace 时记录的可选备注。为空时省略。 |
+
+### Batch coalescing
+
+单个上游动作可以产生多个 webhook 事件。当 Engine 打开一个新 issue 并将五条 traces 附加到它上面时，你会收到一个 [`issue.created`](#issue-created) 事件和五个 [`issue.trace.added`](#issue-trace-added) 事件，它们共享同一个 `request_id`。使用 `request_id` 将它们归并为一个下游通知。
+
+
+### `issue.created`
+
+在 LangSmith Engine 创建新 issue 时发送。省略 `data.trace`。
+
+```json
+{
+  "id": "b91c1f0e-7c4a-4f53-9d3e-9f1c8e7a2b10",
+  "type": "issue.created",
+  "created": 1747238400,
+  "request_id": "0d2f4f6a-2a3a-4b6e-9b87-5d5b6e8c9a01",
+  "data": {
+    "object": {
+      "id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
+      "name": "Tool selection inconsistency",
+      "description": "Agent repeatedly calls the search tool with identical arguments before terminating.",
+      "severity": 1,
+      "tenant_id": "11111111-2222-3333-4444-555555555555",
+      "tenant_name": "Acme Workspace",
+      "session_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+      "session_name": "prod-api",
+      "url": "https://smith.langchain.com/o/11111111-2222-3333-4444-555555555555/projects/p/66666666-7777-8888-9999-aaaaaaaaaaaa?tab=5&issue=9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d"
+    }
+  }
+}
+```
+
+### `issue.trace.added`
+
+在一条新 trace 关联到已有 issue 时发送。`data.trace` 描述被关联的 trace。
+
+```json
+{
+  "id": "c02e3a4b-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+  "type": "issue.trace.added",
+  "created": 1747238410,
+  "request_id": "0d2f4f6a-2a3a-4b6e-9b87-5d5b6e8c9a01",
+  "data": {
+    "object": {
+      "id": "9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
+      "name": "Tool selection inconsistency",
+      "description": "Agent repeatedly calls the search tool with identical arguments before terminating.",
+      "severity": 1,
+      "tenant_id": "11111111-2222-3333-4444-555555555555",
+      "tenant_name": "Acme Workspace",
+      "session_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+      "session_name": "prod-api",
+      "url": "https://smith.langchain.com/o/11111111-2222-3333-4444-555555555555/projects/p/66666666-7777-8888-9999-aaaaaaaaaaaa?tab=5&issue=9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d"
+    },
+    "trace": {
+      "run_id": "f1e2d3c4-b5a6-9788-6655-44332211ffee",
+      "trace_id": "abcdefab-1234-5678-9abc-def012345678",
+      "start_time": "2026-05-14T12:30:00Z",
+      "comment": "Reproduces the same tool-loop pattern."
+    }
+  }
+}
+```
+
+### `issue.agent_run.failed`
+
+在 LangSmith Engine 未能完成一个 run 时发送。此事件以会话为范围，因此不包含 `data.trace`，也不使用 severity 过滤。
+
+```json
+{
+  "id": "4d0e8db2-81e6-4491-b8e5-b13a8f5afc0d",
+  "type": "issue.agent_run.failed",
+  "created": 1747238500,
+  "request_id": "f6bbd48a-0386-403d-9344-31051264b45f",
+  "data": {
+    "object": {
+      "tenant_id": "11111111-2222-3333-4444-555555555555",
+      "tenant_name": "Acme Workspace",
+      "session_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+      "session_name": "prod-api",
+      "url": "https://smith.langchain.com/o/11111111-2222-3333-4444-555555555555/projects/p/66666666-7777-8888-9999-aaaaaaaaaaaa",
+      "thread_id": "thread-123",
+      "run_id": "run-456",
+      "status": "error",
+      "error_message": "RuntimeError: missing API key",
+      "occurred_at": "2026-05-14T12:45:00Z"
+    }
+  }
+}
+```
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/engine-notifications.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

@@ -1,0 +1,256 @@
+---
+title: 启用 LLM Gateway
+sidebarTitle: LLM Gateway
+description: 使用 Helm chart 在自托管 LangSmith 安装上启用 agent-gateway 服务，然后发起你的第一个 gateway 调用。
+---
+
+import LLMGatewayBetaNote from '/snippets/python/langsmith/llm-gateway-beta-note.mdx';
+
+<LLMGatewayBetaNote />
+
+LLM Gateway（`agent-gateway` 服务）把来自 agents 和 coding agents 的模型调用代理到上游 LLM providers。gateway 会在细粒度范围内应用策略，用于可靠性、支出限制以及 PII 和 secrets 脱敏。你也可以把 LangSmith deployment 的模型调用路由到 gateway。
+
+本指南使用 Helm chart 在自托管 Kubernetes 安装上启用它。SaaS 版本请参见 [LLM Gateway](/langsmith/llm-gateway)。
+
+<Note>
+启用 gateway 需要 Helm chart 版本 0.17.1 或更高，它附带的 LangSmith 版本为 0.17.30。
+</Note>
+
+<Info>
+[Spend Monitoring 仪表板](/langsmith/llm-gateway-monitoring)可用于 SmithDB，但不能用于 ClickHouse。
+</Info>
+
+## 启用 gateway
+
+<Steps>
+
+<Step title="添加 Helm values" icon="settings">
+
+<Note>
+`agent-gateway` 服务需要访问 Postgres 和 Redis，以及到其他 LangSmith pods 的网络访问，与 `backend` 和 `platform-backend` 类似。你可能需要配置 network policies、Kubernetes service accounts 和 pod annotations 来启用此访问。
+</Note>
+
+把以下 values 添加到你的 Helm values 文件：
+
+```yaml
+agentGateway:
+  enabled: true
+
+  # Defaults shown for reference—override only if you have a reason.
+  # containerPort: 8083
+  # deployment:
+  #   replicas: 1
+  #   resources:
+  #     limits:   { cpu: 2, memory: 2Gi }
+  #     requests: { cpu: 1, memory: 1Gi }
+  # autoscaling:
+  #   enabled: true
+  #   minReplicas: 1
+  #   maxReplicas: 5
+  #   targetCPUUtilizationPercentage: 50
+  #   targetMemoryUtilizationPercentage: 70
+  # service:
+  #   type: ClusterIP
+  #   port: 8083
+```
+
+Autoscaling 默认开启。在测试中，使用默认资源时，每个 replica 在 N2 实例或类似实例上可处理约 100 个并发流，prompt 长度约 40 到 7,500 tokens。
+
+</Step>
+
+<Step title="应用并验证" icon="rocket">
+
+使用 chart 版本 0.17.1 或更高应用 chart。其他说明请参见[升级安装](/langsmith/self-host-upgrades)。
+
+```bash
+helm search repo langchain/langsmith --versions
+
+helm upgrade --install langsmith langchain/langsmith \
+  --version <chart-version> \
+  -f values.yaml --timeout=20m
+```
+
+验证 deployment 是否健康。Deployment 名为 `<release-fullname>-agent-gateway`，对于名为 `langsmith` 的 release 就是 `langsmith-agent-gateway`：
+
+```bash
+kubectl get deploy langsmith-agent-gateway
+kubectl rollout status deploy/langsmith-agent-gateway
+```
+
+</Step>
+
+</Steps>
+
+## 启用 Presidio PII 检测（可选）
+
+[Presidio Analyzer](https://microsoft.github.io/presidio/) 是一个由 Microsoft 维护的 NER 服务，gateway 可以调用它在 prompt 到达上游 providers 之前检测 PII。
+
+```yaml
+presidioAnalyzer:
+  enabled: true
+```
+
+启用后，chart 会向 gateway pod 注入 `PRESIDIO_ANALYZER_URL`，使其在集群内发现该 analyzer。无需进一步的应用配置。
+
+## 对外暴露 gateway
+
+gateway 使用与 LangSmith UI 和 API 相同的 Ingress。如果你的 Helm values 中已设置 `ingress.enabled=true`，那么一旦设置 `agentGateway.enabled=true`，gateway 即可在 `https://<your-hostname>/gateway/` 访问。不需要单独的 Ingress、LoadBalancer 或 DNS 记录。如果你设置了 `config.basePath`，路由会移动到 `https://<your-hostname>/<basePath>/gateway/`，本页的每个 gateway URL 都需要相同的前缀。
+
+从任何能访问你的 Ingress 的主机检查：
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' https://<your-hostname>/gateway/health
+# Expected: 200
+```
+
+chart 不会为 `langsmith-agent-gateway` 创建专用的 Ingress，且 Service 默认为 `ClusterIP`。直接暴露端口 `8083`（通过单独的 Ingress、`service.type: LoadBalancer` 或 `hostNetwork`）由 chart 的 service 块支持（`agentGateway.service.type`、`loadBalancerIP`、`loadBalancerSourceRanges`），但这不是预期的路径。除非有特定原因，否则请使用前端的 `/gateway/` 路由。
+
+## 回滚
+
+禁用 gateway 会移除 Deployment 和 Service，并在 UI 中禁用 gateway 功能。路由到 gateway 的模型调用会失败。
+
+```yaml
+agentGateway:
+  enabled: false
+```
+
+## 发起第一次调用
+
+这里镜像了 [SaaS quickstart](/langsmith/llm-gateway-quickstart)，只是 base URL 按自托管调整。继续之前请先完成上述步骤（gateway 已部署、Ingress 已就绪）。
+
+<Info>
+组织管理员必须先为你要访问的模型，把 provider API keys 添加到工作区或组织 model provider secrets，然后为用户授予具有 `gateway:invoke` 和 `workspaces:read` [权限](/langsmith/organization-workspace-operations)的角色，并[分发工作区范围的 API key](/langsmith/llm-gateway-admin-setup#4-distribute-api-keys-to-users)。请参见 [Admin setup](/langsmith/llm-gateway-admin-setup)。
+</Info>
+
+<Steps>
+
+<Step title="设置环境变量" icon="terminal">
+
+```bash
+# Replace with your Ingress hostname.
+export LANGSMITH_GATEWAY_BASE_URL="https://<your-hostname>/gateway/v1"
+export LANGSMITH_API_KEY="lsv2_..."
+```
+
+对于 LangChain 和 Deep Agents，这些便捷变量的工作方式与 SaaS 文档描述一致：如果你使用 OpenAI 模型，它们会在你设置的值后面附加 `/openai/v1`。
+
+```bash
+export LANGSMITH_GATEWAY="https://<your-hostname>/gateway"
+export LANGSMITH_GATEWAY_API_KEY="$LANGSMITH_API_KEY"
+```
+
+</Step>
+
+<Step title="发起调用" icon="send">
+
+两种 header 都可以：`Authorization: Bearer <key>` 或 `X-Api-Key: <key>`。以下示例使用 `Authorization` header。你也可以通过 LLM Gateway 主页的 simulator 测试调用。
+
+<CodeGroup>
+
+```bash cURL
+curl "$LANGSMITH_GATEWAY_BASE_URL/chat/completions" \
+    -H "Authorization: Bearer $LANGSMITH_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"ping"}]}'
+```
+
+```python Python (OpenAI SDK)
+import os
+
+from openai import OpenAI
+
+client = OpenAI(
+    base_url=os.environ["LANGSMITH_GATEWAY_BASE_URL"],
+    api_key=os.environ["LANGSMITH_API_KEY"],
+)
+response = client.chat.completions.create(
+    model="openai/gpt-4o-mini",
+    messages=[{"role": "user", "content": "ping"}],
+)
+print(response.choices[0].message.content)
+```
+
+```typescript TypeScript (OpenAI SDK)
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: process.env.LANGSMITH_GATEWAY_BASE_URL,
+  apiKey: process.env.LANGSMITH_API_KEY,
+});
+const response = await client.chat.completions.create({
+  model: "openai/gpt-4o-mini",
+  messages: [{ role: "user", content: "ping" }],
+});
+console.log(response.choices[0].message.content);
+```
+
+```python Python (LangChain)
+import os
+
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
+
+model = init_chat_model(
+    model="openai/gpt-4o-mini",
+    model_provider="openai",
+    base_url=os.environ["LANGSMITH_GATEWAY_BASE_URL"],
+    api_key=os.environ["LANGSMITH_API_KEY"],
+)
+agent = create_agent(model=model, system_prompt="You are a helpful assistant.")
+result = agent.invoke({"messages": [{"role": "user", "content": "ping"}]})
+print(result["messages"][-1].content)
+```
+
+</CodeGroup>
+
+返回 `200` 即确认 gateway、API key 和 provider secret 都已正确接通。
+
+</Step>
+
+<Step title="查看 trace" icon="activity">
+
+在 LangSmith UI 中，前往与你的 API key 关联的工作区中名为 `gateway` 的 tracing project。如果启用了 tracing contents，每个经 gateway 路由的调用都会出现在那里，带有 input、output、延迟和 token 用量。
+
+</Step>
+
+<Step title="设置 spend policy（可选）" icon="shield">
+
+前往 **LLM Gateway** 并选择 **Cost Controls**，为每个工作区或每个 API key 设置支出上限。一旦请求超出上限，gateway 会返回 `402`，消息中会指明拦截该请求的策略：
+
+```json
+{"type": "error", "error": {"message": "request blocked by gateway policies: R&D Spend Cap"}}
+```
+
+完整指南请参见 [Spend policies](/langsmith/llm-gateway-spend-policies)。
+
+</Step>
+
+</Steps>
+
+## 故障排查
+
+- **升级后 gateway pod 立即出现 `CrashLoopBackOff`**：检查 `kubectl logs deploy/langsmith-agent-gateway`。
+- **模型调用失败，到 `agent-gateway` 的连接被拒绝或超时**：确认 gateway pod 处于 `Running` 状态，并且集群中没有 NetworkPolicy 阻止 LangSmith namespace 内 pods 之间的端口 `8083`。
+
+## 安全说明
+
+- gateway 会向 provider LLM endpoints 发起出站 HTTP 调用。你配置的任何自定义 provider URL 都必须符合你的 egress policy；该服务对自定义和已配置的 provider URL 使用 LangSmith 的 SSRF 防护库。内置 providers 解析为固定的、provider 持有的 hostname，不属于用户可控 URL 的路径。
+- 外部 client 应通过前端的 `/gateway/` path 访问 gateway，这样请求会继承与 LangSmith API 其余部分相同的 TLS 终止、认证和速率限制。创建直接指向端口 `8083` 的第二个 Ingress 或 LoadBalancer 会绕过这些控制。
+- `AGENT_GATEWAY_URL` 由 Helm release fullname 和 chart 的 `agentGateway.name`、`agentGateway.service.port`、`namespace`、`clusterDomain` 值派生。在已有安装上覆盖其中任何一个，都需要对所有读取该值的 pods 进行滚动重启。
+
+## 下一步
+
+- [Quickstart](/langsmith/llm-gateway-quickstart)：上述步骤的 SaaS 版本。
+- [Admin setup](/langsmith/llm-gateway-admin-setup)：为工作区用户授予 gateway 访问权限并配置 provider secrets。
+- [Spend policies](/langsmith/llm-gateway-spend-policies)：在组织、工作区、API key 或用户级别设置支出上限。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/llm-gateway-self-hosted.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

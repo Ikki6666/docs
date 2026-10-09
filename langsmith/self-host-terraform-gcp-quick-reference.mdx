@@ -1,0 +1,263 @@
+---
+title: GCP Terraform 速查表
+sidebarTitle: 速查表
+description: LangSmith self-hosted 在 GKE 上的 make targets、Terraform、kubectl、gcloud 和 Helm 命令。
+---
+
+针对使用 [GCP Terraform modules](https://github.com/langchain-ai/terraform/tree/main/modules/gcp) 预配的 GCP LangSmith 部署进行日常运维的命令速查表。所有 `make` targets 都在 `modules/gcp/` 中运行。运行 `make help` 查看内联摘要。
+
+## 部署概览
+
+| 阶段 | 部署内容 | 命令 |
+|---|---|---|
+| Infrastructure | VPC + GKE + Cloud SQL + Memorystore + GCS + IAM + cert-manager + KEDA + Envoy Gateway | `make apply` |
+| Cluster credentials | 关联到新 GKE 集群的 kubeconfig | `make kubeconfig` |
+| LangSmith base | Frontend、backend、ingest、queue、ClickHouse | `make init-values && make deploy` |
+| Fleet add-on（standalone） | standalone-fleet-* API server、tool server、trigger server、queue | `make apply && make init-values && make deploy` |
+| LangSmith Deployment add-on | host-backend、listener、operator | `make apply && make init-values && make deploy` |
+| Agent Builder add-on（已弃用） | tool-server、trigger-server + agent-builder LGP | `make init-values && make deploy` |
+| Insights + Polly add-on | Clio analytics、Polly eval agent | `make init-values && make deploy` |
+
+每个阶段都建立在前一阶段之上。启用下一阶段之前，先确认 pods 处于健康状态。
+
+## 首次设置
+
+```bash
+cd terraform/modules/gcp
+
+# Interactive wizard — generates terraform.tfvars
+make quickstart
+
+# Set up secrets in Secret Manager (auto-generates passwords + Fernet keys)
+# Must be sourced so it can export TF_VAR_* into your shell
+source infra/scripts/setup-env.sh
+
+# Verify secrets are stored correctly
+make secrets
+
+# Deploy infrastructure
+make init
+make plan
+make apply
+
+# Generate Helm values from Terraform outputs
+make init-values
+
+# Deploy LangSmith
+make deploy
+```
+
+`make deploy-all` 将 `apply`、`init-values` 和 `deploy` 串联在一条命令中。
+
+要将 Helm release 交给 Terraform 管理而不是部署脚本，使用 `app` 层：
+
+```bash
+make init-values  # generate the layered values files
+make init-app     # pull infra outputs into app/infra.auto.tfvars.json
+make apply-app    # terraform apply the Helm release (make destroy-app to remove)
+```
+
+`app` 层使用自己的变量名：`sizing`（不是 `sizing_profile`）和 `enable_agent_deploys`（不是 `enable_deployments`）。
+
+## Day-2 运维
+
+```bash
+# Check deployment state and next-step guidance
+make status              # full check
+make status-quick        # skip Secret Manager and K8s queries
+
+# Re-deploy after changing Helm values or upgrading chart version
+make deploy
+
+# Re-generate Helm values after Terraform changes
+make init-values
+
+# Manage Secret Manager secrets interactively
+make secrets
+
+# Update kubeconfig for the GKE cluster
+make kubeconfig
+```
+
+## Add-on
+
+在 `terraform.tfvars` 中设置开关，然后运行 `make init-values && make deploy`。`init-values.sh` 会自动把匹配的示例文件复制到 `helm/values/`。
+
+```hcl
+# terraform.tfvars
+enable_deployments   = true
+enable_fleet         = true   # Fleet (formerly Agent Builder), standalone (chart v0.15+); no enable_deployments required
+enable_agent_builder = false  # deprecated, superseded by enable_fleet; mutually exclusive with it
+enable_insights      = true
+enable_polly         = true   # requires enable_deployments = true + Polly license
+enable_usage_telemetry = true # extended usage telemetry
+```
+
+如果要在初始安装后添加 add-on 而不重新运行 `init-values.sh`，可以手动复制：
+
+```bash
+cp helm/values/examples/langsmith-values-agent-deploys.yaml helm/values/
+cp helm/values/examples/langsmith-values-fleet.yaml         helm/values/
+cp helm/values/examples/langsmith-values-insights.yaml      helm/values/
+cp helm/values/examples/langsmith-values-polly.yaml         helm/values/
+
+make deploy
+```
+
+## 规格档位
+
+在 `terraform.tfvars` 中设置 `sizing_profile`，然后重新运行 `make init-values && make deploy`。
+
+```hcl
+sizing_profile = "production"   # default | minimum | dev | production | production-large
+```
+
+| 档位 | 适用场景 |
+|---|---|
+| `default` | Chart 默认值，快速测试，不应用任何 overlay |
+| `minimum` | 绝对下限；适配 `e2-standard-4`；用于成本占位或 CI 冒烟测试 |
+| `dev` | 单副本，最小资源 |
+| `production` | 多副本加 HPA；推荐用于真实工作负载 |
+| `production-large` | 高内存和高 CPU；50+ 用户或 1000+ traces/秒 |
+
+## kubectl
+
+```bash
+# Pod health
+kubectl get pods -n langsmith
+kubectl get pods -n langsmith -w
+kubectl describe pod <pod-name> -n langsmith
+kubectl logs <pod-name> -n langsmith --tail=100 -f
+kubectl logs <pod-name> -n langsmith --previous --tail=50
+
+# Backend logs (live)
+kubectl logs -n langsmith deploy/langsmith-backend --tail=100 -f
+
+# Gateway and HTTPRoute
+kubectl get gateway -n langsmith
+kubectl get httproute -n langsmith
+kubectl get svc -n envoy-gateway-system
+
+# TLS
+kubectl get certificate -n langsmith
+kubectl get challenges -n langsmith
+kubectl describe certificate <cert-name> -n langsmith
+kubectl get clusterissuer
+
+# Workload Identity
+kubectl get serviceaccount langsmith-ksa -n langsmith -o yaml | grep annotation -A5
+
+# Helm
+helm status langsmith -n langsmith
+helm history langsmith -n langsmith
+helm get values langsmith -n langsmith
+
+# LangSmith Deployment
+kubectl get lgp -n langsmith
+kubectl get crd | grep langchain
+```
+
+## gcloud
+
+```bash
+# Re-auth if you hit oauth2 invalid_grant / invalid_rapt errors
+gcloud auth login
+gcloud auth application-default login
+
+# Cluster credentials
+gcloud container clusters get-credentials <cluster-name> --region <region> --project <project-id>
+
+# List clusters
+gcloud container clusters list --project <project-id>
+
+# Cluster status
+gcloud container clusters describe <cluster-name> --region <region> --format="value(status)"
+
+# Cloud SQL
+gcloud sql instances list --project <project-id>
+gcloud sql instances describe <instance-name> --format="value(ipAddresses)"
+
+# Memorystore Redis
+gcloud redis instances list --region <region>
+gcloud redis instances describe <instance-name> --region <region> --format="value(host)"
+
+# GCS bucket
+gsutil ls gs://<bucket-name>
+gsutil iam get gs://<bucket-name>
+
+# Workload Identity binding
+gcloud iam service-accounts get-iam-policy <gsa-email> --project <project-id>
+
+# Enabled APIs
+gcloud services list --enabled --project <project-id>
+
+# VPC peering
+gcloud services vpc-peerings list --network <vpc-name> --project <project-id>
+
+# Secret Manager
+gcloud secrets list --project <project-id> --filter="name:langsmith"
+gcloud secrets versions access latest --secret=<secret-id> --project <project-id>
+```
+
+## Terraform
+
+```bash
+cd modules/gcp/infra
+
+terraform init
+terraform plan -var-file=terraform.tfvars
+terraform apply -var-file=terraform.tfvars
+
+# Target a specific module
+terraform apply -var-file=terraform.tfvars -target=module.networking
+
+# Outputs
+terraform output
+terraform output -raw cluster_name
+terraform output -raw storage_bucket_name
+
+# State
+terraform state list
+terraform state show module.gke_cluster
+terraform refresh -var-file=terraform.tfvars
+```
+
+## 关键约束
+
+- 在 `terraform destroy` 之前先卸载 Helm。Envoy Gateway load balancer 引用了 VPC；不卸载会阻塞网络删除。务必先运行 `make uninstall`。
+- `config.deployment.url` 必须包含 `https://`。缺少协议时，operator 拉起的 agent 会一直卡在 `DEPLOYING` 状态。
+- LangSmith Deployment add-on 需要 `config.deployment.enabled: true`。只设置 URL 而不设置 `enabled: true`，会静默跳过 `listener` 和 `operator`。
+- 加密 key 在首次启用后绝不能更改。轮换 `insights_encryption_key` 或 `polly_encryption_key` 会永久破坏现有加密数据。
+- 首次启用 Polly 后要重启 frontend。`agentBootstrap` 在注册之后才创建 `langsmith-polly-config` ConfigMap；更早启动的 frontend pods 不会加载它。
+- Envoy Gateway IP 在拆除时会变化。删除 Gateway 后 GCP 会释放 external IP。`terraform destroy` 并重新 apply 之后，需要更新你的 DNS A record。
+- `langsmith-ksa` annotation 不是永久的。operator 在运行时创建该 ServiceAccount，namespace 删除后它不会保留。`deploy.sh` 会以幂等方式重新添加 annotation。
+
+## 拆除
+
+```bash
+# 1. Remove LangSmith Deployment resources (if the add-on was enabled)
+kubectl delete lgp --all -n langsmith 2>/dev/null || true
+
+# 2. Uninstall LangSmith
+make uninstall
+
+# 3. Set deletion protection = false in terraform.tfvars, then:
+make destroy
+```
+
+```hcl
+# terraform.tfvars
+gke_deletion_protection      = false
+postgres_deletion_protection = false
+```
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/self-host-terraform-gcp-quick-reference.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

@@ -1,0 +1,714 @@
+---
+title: Sandbox mounts
+sidebarTitle: Mounts
+description: 将 S3 buckets、GCS buckets、公开 Git 仓库和 Context Hub 仓库挂载到 LangSmith sandboxes 中。
+---
+
+Sandbox mounts 会在 sandbox 创建时，把外部数据源挂载到 sandbox 文件系统中。当 sandbox 内的代码需要直接访问对象存储 bucket、公开 Git 仓库或 [Context Hub](/langsmith/use-the-context-hub) 仓库中的文件，而你又不想把这些数据拷贝进 sandbox 镜像时，就可以使用 mounts。
+
+Mounts 在 Python 中通过 `mount_config` 配置，在 TypeScript 中通过 `mountConfig` 配置。SDK 会把 mount 规格发送给 LangSmith，并为 provider 凭据自动组合所需的 [auth proxy](/langsmith/sandbox-auth-proxy) 规则。
+
+<Note>
+Sandbox mounts 要求 Python 使用 `langsmith[sandbox]>=0.8.16`，或 TypeScript 使用 `langsmith>=0.7.10`。Context Hub 挂载要求 Python 使用 `langsmith[sandbox]>=0.11.0`，或 TypeScript 使用 `langsmith>=0.8.11`。
+</Note>
+
+<Warning>
+使用静态 AWS keys 或 GCP service account 时，请在创建 sandbox 之前先把云凭据存成 LangSmith workspace secrets。通过 IAM 角色认证的 S3 挂载不需要存储 AWS access keys。不要把真实云凭据作为 sandbox 环境变量、命令参数或文件直接传入。
+</Warning>
+
+## 配置挂载路径
+
+每个 mount 都有一个 `id`、一个 `type`，以及一个 `mount_path` / `mountPath`。Bucket 和 Git 挂载必须使用 `/mnt/mounts` 下的绝对路径。Context Hub 挂载路径可以是系统目录之外的任何绝对路径，这样 agent 就能从它原本期望的位置读取上下文。
+
+建议使用能描述挂载来源的稳定路径：
+
+| Source | Example path |
+|--------|--------------|
+| S3 bucket prefix | `/mnt/mounts/customer-data` |
+| GCS bucket prefix | `/mnt/mounts/eval-datasets` |
+| Git repository | `/mnt/mounts/repo` |
+| Context Hub repo | `/memories` |
+
+Mount ID 可以包含 ASCII 字母、数字、下划线和连字符。在同一个 sandbox 内，不要复用同一个 ID 或 mount path。
+
+## 挂载一个 S3 bucket
+
+S3 mounts 需要 AWS 认证。当你的 deployment 和 SDK 支持角色认证时，可以使用静态 access keys 或 IAM 角色。LangSmith UI 也支持角色设置。两种方法都能让真实 AWS 凭据保持在 sandbox 之外。
+
+### 使用静态 access keys 进行认证
+
+SDK 会根据 `aws_auth` / `awsAuth` 创建一条 AWS auth proxy 规则，这样 sandbox 就能访问 bucket，而不会直接看到真实 access keys。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import (
+    SandboxClient,
+    aws_auth,
+    mount_config,
+    s3_mount,
+    workspace_secret,
+)
+
+client = SandboxClient()
+
+mount_cfg = mount_config(
+    auth=[
+        aws_auth(
+            access_key_id=workspace_secret("SANDBOX_AWS_ACCESS_KEY_ID"),
+            secret_access_key=workspace_secret("SANDBOX_AWS_SECRET_ACCESS_KEY"),
+        )
+    ],
+    mounts=[
+        s3_mount(
+            id="customer_data",
+            mount_path="/mnt/mounts/customer-data",
+            bucket="example-bucket",
+            prefix="datasets/customer-data",
+            region="us-east-1",
+            path_style=False,
+            read_only=True,
+        )
+    ],
+)
+
+with client.sandbox(name="s3-mount-sandbox", mount_config=mount_cfg) as sb:
+    result = sb.run("ls /mnt/mounts/customer-data")
+    print(result.stdout)
+```
+
+```ts TypeScript
+import {
+  SandboxClient,
+  awsAuth,
+  mountConfig,
+  s3Mount,
+  workspaceSecret,
+} from "langsmith/sandbox";
+
+const client = new SandboxClient();
+
+const mountCfg = mountConfig({
+  auth: [
+    awsAuth({
+      accessKeyId: workspaceSecret("SANDBOX_AWS_ACCESS_KEY_ID"),
+      secretAccessKey: workspaceSecret("SANDBOX_AWS_SECRET_ACCESS_KEY"),
+    }),
+  ],
+  mounts: [
+    s3Mount({
+      id: "customer_data",
+      mountPath: "/mnt/mounts/customer-data",
+      bucket: "example-bucket",
+      prefix: "datasets/customer-data",
+      region: "us-east-1",
+      pathStyle: false,
+      readOnly: true,
+    }),
+  ],
+});
+
+const sandbox = await client.createSandbox({
+  name: "s3-mount-sandbox",
+  mountConfig: mountCfg,
+});
+
+try {
+  const result = await sandbox.run("ls /mnt/mounts/customer-data");
+  console.log(result.stdout);
+} finally {
+  await sandbox.delete();
+}
+```
+
+</CodeGroup>
+
+### 使用 IAM 角色进行认证
+
+IAM 角色认证让 [AWS auth proxy](/langsmith/sandbox-auth-proxy#authenticate-with-an-iam-role) 可以在你的 AWS 账户中承担一个角色。S3 挂载使用的认证与 sandbox 中其他受支持的 AWS 请求相同。LangSmith 会获取并续期临时 AWS 凭据，因此你不需要在 workspace secrets 中存储或轮换 access keys。
+
+<Note>
+此选项要求你的 LangSmith deployment 启用 AWS proxy 角色认证。为 ECR registries 启用 IAM 角色并不会为 auth proxy 启用它。如果 AWS 认证选项中没有 **AWS IAM role**，请使用静态 access keys 或联系你的 LangSmith 管理员。基于角色的 SDK 示例要求一个包含 Python 的 `aws_auth(role_arn=...)` 和 `mount_config(proxy_config=...)`、或 TypeScript 的 `awsAuth({ roleArn })` 和 `mountConfig({ proxyConfig })` 的版本。本页顶部列出的 mount 版本并不能确立对这些较新选项的支持。
+</Note>
+
+你需要有配置客户 IAM 角色的 trust 和 access policies 的权限。一条 AWS auth 规则会作用于 sandbox 的 AWS 请求，包括所有 S3 挂载。请选择静态 access keys 或 IAM 角色之一，不要同时配置两者。角色认证在创建时配置。要添加、移除、禁用或更改其角色，请创建一个新的 sandbox。
+
+LangSmith principal 也需要有承担客户角色的权限。对于自托管部署，由你的管理员配置该权限以及任何所需的角色标签。跨账户的 S3 bucket 可能还需要一条允许客户角色的 bucket policy。
+
+要配置角色并创建 sandbox：
+
+1. 打开 **Sandboxes > Create sandbox**，在 **Mounts** 部分添加一个 **S3 bucket**，并配置其 bucket、区域、prefix、挂载路径和只读设置。
+2. 前往 **Network** 部分，启用 AWS 认证，并选择 **AWS IAM role**。要在不使用挂载的情况下使用该角色，请跳过步骤 1 中的挂载配置。
+3. 在你的 IAM 角色的 trust policy 中使用 **AWS role ARN** 下方显示的两个值：
+   - **Principal**：该 LangSmith deployment 用于承担客户角色的确切 AWS role ARN。请使用显示的 principal，而不是从其他环境或 ECR registry 复制的 ARN。
+   - **External ID**：你当前的 LangSmith workspace UUID。LangSmith 在承担该角色时会提供这个值；你无需单独选择一个 external ID。
+4. 展开 **AWS role setup**，选择 **Copy trust policy**，并将该策略应用到 AWS IAM 中的客户角色上。它仅允许显示的 principal 在 `sts:ExternalId` 匹配的情况下执行 `sts:AssumeRole`。
+5. 为 sandbox 所需的 AWS 服务和资源附加一个最小权限的 permissions policy。对于已配置的 S3 挂载，**Copy S3 permissions** 会提供一个起始策略。附加之前请先审阅；LangSmith 不会自动应用它。
+6. 在 **AWS role ARN** 中输入客户角色的 ARN。这是你在自己的账户中配置的角色，而不是设置说明中显示的 LangSmith principal。
+7. 选择 **Create Sandbox**，然后验证 sandbox 代码可以读取挂载路径，并且对于可写挂载，可以写入它。
+
+生成的 trust policy 具有以下结构。请将占位符替换为表单中显示的 principal 和 external ID，或直接从表单复制完整的策略：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "<LANGSMITH_AWS_PROXY_PRINCIPAL_ARN>"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "<LANGSMITH_WORKSPACE_ID>"
+        }
+      }
+    }
+  ]
+}
+```
+
+不要把 principal 替换为 `*`，也不要移除 external ID 条件。在 LangSmith 中输入客户角色 ARN 并不会创建该角色或更新其 AWS policies。
+
+#### 限制 S3 访问
+
+可选的 S3 permissions 示例会根据挂载设置授予访问权限：
+
+- **所有 S3 挂载**：bucket 所在位置的访问、按 prefix 限定的列出，以及对象读取。
+- **可写挂载**：额外的对象写入、删除和 multipart 上传权限。
+- **空 prefix**：整个 bucket 范围内的对象访问。请使用 prefix 将访问限制到某个子树。
+
+该角色的有效 AWS 权限会控制所有受支持的 AWS proxy 请求。LangSmith 不会把通用的 AWS 角色会话限制到已配置的挂载上。请将该角色的 IAM policy 限制到所需的 bucket、prefix、操作和其他 AWS 资源。
+
+<Warning>
+只读挂载会拒绝文件系统写入，但不会阻止该角色被允许的直接 S3 API 写入。请使用该角色的 IAM policy 来强制执行只读的 AWS 访问。
+</Warning>
+
+请使用商业 AWS 角色和受支持的 AWS HTTPS endpoints。S3 permissions 示例不包含 KMS 权限；请检查你的 bucket 加密设置所需的权限。
+
+#### 在 SDK 中使用共享角色
+
+共享的 AWS proxy 角色会同时认证 S3 挂载和受支持的应用请求，与上面的 UI 设置一样。先配置 trust 和 permissions policies，然后把示例中的角色 ARN 和 bucket 替换为你自己的值。
+
+将相同的 proxy 配置同时传给 mount helper 和 sandbox 创建。mount helper 不会把它复制进 mount 专属的认证中：
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import (
+    SandboxClient,
+    aws_auth,
+    mount_config,
+    proxy_config,
+    s3_mount,
+)
+
+proxy_cfg = proxy_config(
+    rules=[aws_auth(role_arn="arn:aws:iam::123456789012:role/LangSmithSandbox")]
+)
+mount_cfg = mount_config(
+    proxy_config=proxy_cfg,
+    mounts=[
+        s3_mount(
+            id="customer_data",
+            mount_path="/mnt/mounts/customer-data",
+            bucket="example-bucket",
+            prefix="datasets/customer-data",
+            region="us-east-1",
+            read_only=True,
+        )
+    ],
+)
+
+client = SandboxClient()
+sandbox = client.create_sandbox(
+    name="shared-role-mount-sandbox",
+    mount_config=mount_cfg,
+    proxy_config=proxy_cfg,
+)
+```
+
+```ts TypeScript
+import {
+  SandboxClient,
+  awsAuth,
+  mountConfig,
+  proxyConfig,
+  s3Mount,
+} from "langsmith/sandbox";
+
+const proxyCfg = proxyConfig({
+  rules: [
+    awsAuth({ roleArn: "arn:aws:iam::123456789012:role/LangSmithSandbox" }),
+  ],
+});
+const mountCfg = mountConfig({
+  proxyConfig: proxyCfg,
+  mounts: [
+    s3Mount({
+      id: "customer_data",
+      mountPath: "/mnt/mounts/customer-data",
+      bucket: "example-bucket",
+      prefix: "datasets/customer-data",
+      region: "us-east-1",
+      readOnly: true,
+    }),
+  ],
+});
+
+const client = new SandboxClient();
+const sandbox = await client.createSandbox({
+  name: "shared-role-mount-sandbox",
+  mountConfig: mountCfg,
+  proxyConfig: proxyCfg,
+});
+```
+
+</CodeGroup>
+
+共享规则会保留其有效 IAM 权限。本例中的只读挂载不会阻止该角色允许的直接 S3 API 写入。共享 proxy 认证支持 S3 挂载，不支持 GCS 挂载；GCS 仍需要显式的挂载认证。
+
+#### 将角色限制到 S3 挂载范围
+
+Mount 专属的角色认证会添加一个 session policy，将 AWS 访问限制到已配置的 S3 bucket、prefix 和只读设置。当 sandbox 的 AWS 访问必须保持在这些挂载范围内时，请使用这个 API 替代方案。客户角色仍然需要上述的 trust 和 permissions policies。
+
+把角色传入 `auth`，它会被序列化为 `mount_config.auth.aws.role_arn`。不要同时传入 AWS proxy 规则：
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import SandboxClient, aws_auth, mount_config, s3_mount
+
+mount_cfg = mount_config(
+    auth=[aws_auth(role_arn="arn:aws:iam::123456789012:role/LangSmithSandbox")],
+    mounts=[
+        s3_mount(
+            id="customer_data",
+            mount_path="/mnt/mounts/customer-data",
+            bucket="example-bucket",
+            prefix="datasets/customer-data",
+            region="us-east-1",
+            read_only=True,
+        )
+    ],
+)
+
+client = SandboxClient()
+sandbox = client.create_sandbox(
+    name="mount-scoped-role-sandbox",
+    mount_config=mount_cfg,
+)
+```
+
+```ts TypeScript
+import { SandboxClient, awsAuth, mountConfig, s3Mount } from "langsmith/sandbox";
+
+const mountCfg = mountConfig({
+  auth: [
+    awsAuth({ roleArn: "arn:aws:iam::123456789012:role/LangSmithSandbox" }),
+  ],
+  mounts: [
+    s3Mount({
+      id: "customer_data",
+      mountPath: "/mnt/mounts/customer-data",
+      bucket: "example-bucket",
+      prefix: "datasets/customer-data",
+      region: "us-east-1",
+      readOnly: true,
+    }),
+  ],
+});
+
+const client = new SandboxClient();
+const sandbox = await client.createSandbox({
+  name: "mount-scoped-role-sandbox",
+  mountConfig: mountCfg,
+});
+```
+
+</CodeGroup>
+
+Mount 专属的 `mount_config.auth.aws` API 接受 `role_arn` 或静态的 `access_key_id` 和 `secret_access_key` 对，不接受两者。它不能与 AWS proxy 规则组合使用。本页前面给出的静态 key 示例可以继续按原样工作。
+
+#### 续期凭据
+
+LangSmith 会在 AWS 请求需要时续期临时凭据，包括在 sandbox 停止并恢复之后。你不需要提供保存的 STS token，也不需要手动续期。要持续访问，请保持该角色的 trust 和 access permissions 有效。
+
+如果续期暂时不可用，挂载只能使用缓存的凭据，直到它们过期。授权被拒绝或凭据过期会导致经过认证的 S3 请求失败；挂载不会回退到静态 keys。
+
+## 挂载一个 GCS bucket
+
+GCS mounts 需要 GCP 认证。OAuth scope 由后端根据 mounts 自身派生提供：只读挂载会得到 `devstorage.read_only`，可写挂载会得到 `devstorage.read_write`。
+
+由于单个 `mount_config` 会解析为同一个 scope，因此其中所有的 GCS mounts 必须保持一致：在一个 config 中混用只读和可写 GCS mounts 会被拒绝。请统一使用可写挂载，或创建独立的 sandboxes。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import (
+    SandboxClient,
+    gcp_auth,
+    gcs_mount,
+    mount_config,
+    workspace_secret,
+)
+
+client = SandboxClient()
+
+mount_cfg = mount_config(
+    auth=[
+        gcp_auth(
+            service_account_json=workspace_secret(
+                "SANDBOX_GCP_SERVICE_ACCOUNT_JSON"
+            ),
+        )
+    ],
+    mounts=[
+        gcs_mount(
+            id="eval_datasets",
+            mount_path="/mnt/mounts/eval-datasets",
+            bucket="example-bucket",
+            prefix="datasets/evals",
+            read_only=False,
+        )
+    ],
+)
+
+with client.sandbox(name="gcs-mount-sandbox", mount_config=mount_cfg) as sb:
+    result = sb.run("ls /mnt/mounts/eval-datasets")
+    print(result.stdout)
+```
+
+```ts TypeScript
+import {
+  SandboxClient,
+  gcpAuth,
+  gcsMount,
+  mountConfig,
+  workspaceSecret,
+} from "langsmith/sandbox";
+
+const client = new SandboxClient();
+
+const mountCfg = mountConfig({
+  auth: [
+    gcpAuth({
+      serviceAccountJson: workspaceSecret("SANDBOX_GCP_SERVICE_ACCOUNT_JSON"),
+    }),
+  ],
+  mounts: [
+    gcsMount({
+      id: "eval_datasets",
+      mountPath: "/mnt/mounts/eval-datasets",
+      bucket: "example-bucket",
+      prefix: "datasets/evals",
+      readOnly: false,
+    }),
+  ],
+});
+
+const sandbox = await client.createSandbox({
+  name: "gcs-mount-sandbox",
+  mountConfig: mountCfg,
+});
+
+try {
+  const result = await sandbox.run("ls /mnt/mounts/eval-datasets");
+  console.log(result.stdout);
+} finally {
+  await sandbox.delete();
+}
+```
+
+</CodeGroup>
+
+## 挂载一个公开 Git 仓库
+
+公开 Git mounts 不需要 AWS 或 GCP 认证。请使用 HTTPS remote URL，并可按需固定到某个 branch 或 tag。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import SandboxClient, git_mount, mount_config
+
+client = SandboxClient()
+
+mount_cfg = mount_config(
+    mounts=[
+        git_mount(
+            id="repo",
+            mount_path="/mnt/mounts/repo",
+            remote_url="https://github.com/langchain-ai/langsmith-sdk.git",
+            ref={"type": "branch", "name": "main"},
+            refresh_interval_seconds=60,
+        )
+    ],
+)
+
+with client.sandbox(name="git-mount-sandbox", mount_config=mount_cfg) as sb:
+    result = sb.run("ls /mnt/mounts/repo")
+    print(result.stdout)
+```
+
+```ts TypeScript
+import { SandboxClient, gitMount, mountConfig } from "langsmith/sandbox";
+
+const client = new SandboxClient();
+
+const mountCfg = mountConfig({
+  mounts: [
+    gitMount({
+      id: "repo",
+      mountPath: "/mnt/mounts/repo",
+      remoteUrl: "https://github.com/langchain-ai/langsmith-sdk.git",
+      ref: { type: "branch", name: "main" },
+      refreshIntervalSeconds: 60,
+    }),
+  ],
+});
+
+const sandbox = await client.createSandbox({
+  name: "git-mount-sandbox",
+  mountConfig: mountCfg,
+});
+
+try {
+  const result = await sandbox.run("ls /mnt/mounts/repo");
+  console.log(result.stdout);
+} finally {
+  await sandbox.delete();
+}
+```
+
+</CodeGroup>
+
+私有 Git 仓库在 remote 需要通过 proxy 管理认证时，可以使用底层 `proxy_config` / `proxyConfig` 规则。目前还没有高层的私有 Git 认证 helper。
+
+## 挂载一个 Context Hub 仓库
+
+Context Hub 挂载会把一个 agent 或 skill 仓库的最新 commit 镜像到 sandbox 文件系统中。可以用它为 sandbox 代码提供与你的生产 agents 相同的 instructions、skills 和 tools，而无需把它们打包进 sandbox 镜像或在启动时拷贝进去。
+
+使用 `owner/repo` 标识仓库。对于当前 workspace 中的仓库，owner 使用 `-`，例如 `-/my-agent`。调用者的 API key 必须对该仓库有读取权限。对于另一个 workspace 私有的仓库，LangSmith 会拒绝 sandbox 创建，并且不会区分仓库不存在与不可访问。Context Hub 挂载不需要 AWS 或 GCP 认证。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import SandboxClient, context_hub_mount, mount_config
+
+client = SandboxClient()
+
+mount_cfg = mount_config(
+    mounts=[
+        context_hub_mount(
+            id="memories",
+            mount_path="/memories",
+            repo="-/my-agent",
+        )
+    ],
+)
+
+with client.sandbox(
+    name="context-hub-mount-sandbox", mount_config=mount_cfg
+) as sb:
+    result = sb.run("ls /memories")
+    print(result.stdout)
+```
+
+```ts TypeScript
+import { SandboxClient, contextHubMount, mountConfig } from "langsmith/sandbox";
+
+const client = new SandboxClient();
+
+const mountCfg = mountConfig({
+  mounts: [
+    contextHubMount({
+      id: "memories",
+      mountPath: "/memories",
+      repo: "-/my-agent",
+    }),
+  ],
+});
+
+const sandbox = await client.createSandbox({
+  name: "context-hub-mount-sandbox",
+  mountConfig: mountCfg,
+});
+
+try {
+  const result = await sandbox.run("ls /memories");
+  console.log(result.stdout);
+} finally {
+  await sandbox.delete();
+}
+```
+
+</CodeGroup>
+
+挂载内容是该仓库最新 commit 的扁平化文件树。从另一个 agent 或 skill 仓库链接的文件会出现在父仓库引用它的路径上，因此挂载的 agent 也会携带它组合的 skills。关于组合仓库的更多信息，请参阅[使用 SDK 管理上下文](/langsmith/manage-contexts-sdk)。
+
+### 在仓库变化时读取
+
+Context Hub 挂载是只读的，且同步是单向的。在 sandbox 内写在挂载路径下的文件永远不会被推送回仓库，下一次刷新会覆盖它们。把 sandbox 输出写到挂载之外的路径，并在它属于仓库时使用 Context Hub SDK 推送。
+
+LangSmith 会在 sandbox 的生命周期内保持挂载同步。新的 commit 会在大约 30 秒内到达运行中的 sandbox。请将该节奏视为尽力而为，而不是新鲜度保证。刷新会一次性替换整棵树，因此读取者看到的要么是上一个 commit，要么是新 commit，绝不会是混合体。
+
+挂载总是跟踪最新 commit。要读取固定版本，请使用 Context Hub SDK 拉取你想要的 commit 或 environment tag，而不是挂载仓库。
+
+传入 `initial_pull_only` / `initialPullOnly` 可以在启动时同步一次，然后停止轮询：
+
+<CodeGroup>
+
+```python Python
+context_hub_mount(
+    id="memories",
+    mount_path="/memories",
+    repo="-/my-agent",
+    initial_pull_only=True,
+)
+```
+
+```ts TypeScript
+contextHubMount({
+  id: "memories",
+  mountPath: "/memories",
+  repo: "-/my-agent",
+  initialPullOnly: true,
+});
+```
+
+</CodeGroup>
+
+对于必须从头到尾读取同一个 commit 的运行，请使用单次拉取，例如评估结果需要与某个特定版本的 agent 进行对比的场景。
+
+### 处理启动和失败
+
+sandbox 就绪后挂载目录立即存在，但对其下的读取会阻塞，直到第一棵 commit 树到达。在启动时立即读取挂载的代码会等待初始同步，而不会看到空目录。
+
+LangSmith 会重试失败的刷新，并继续提供它发布的最后一个 commit，因此瞬时错误不会清空一个正常工作的挂载。有两种情况会显现到 sandbox 代码：
+
+- **请求被拒绝**：读取会以 `EIO` 失败。在 sandbox 启动后撤销调用者对该仓库的访问会拒绝后续的拉取，因为 LangSmith 会在每次拉取时重新检查访问权限。
+- **仓库超出同步限制**：挂载不会提供任何树。一个同步的 commit 最多可以包含 2,500 个文件和 25 MiB 的文件内容，计算仓库链接的所有内容。
+
+## 组合多个 mounts
+
+一个 sandbox 可以同时挂载多个来源，包括 Context Hub 仓库与 bucket 和 Git 挂载并存。构造一个包含全部 mount 规格的 `mount_config` / `mountConfig`，并为这些 mount 所用到的每种 bucket provider 一并提供认证配置。
+
+<CodeGroup>
+
+```python Python
+from langsmith.sandbox import (
+    aws_auth,
+    git_mount,
+    gcp_auth,
+    gcs_mount,
+    mount_config,
+    s3_mount,
+    workspace_secret,
+)
+
+mount_cfg = mount_config(
+    auth=[
+        aws_auth(
+            access_key_id=workspace_secret("SANDBOX_AWS_ACCESS_KEY_ID"),
+            secret_access_key=workspace_secret("SANDBOX_AWS_SECRET_ACCESS_KEY"),
+        ),
+        gcp_auth(
+            service_account_json=workspace_secret(
+                "SANDBOX_GCP_SERVICE_ACCOUNT_JSON"
+            ),
+        ),
+    ],
+    mounts=[
+        s3_mount(
+            id="s3_data",
+            mount_path="/mnt/mounts/s3-data",
+            bucket="example-s3-bucket",
+        ),
+        gcs_mount(
+            id="gcs_data",
+            mount_path="/mnt/mounts/gcs-data",
+            bucket="example-gcs-bucket",
+        ),
+        git_mount(
+            id="repo",
+            mount_path="/mnt/mounts/repo",
+            remote_url="https://github.com/langchain-ai/langsmith-sdk.git",
+        ),
+    ],
+)
+```
+
+```ts TypeScript
+import {
+  awsAuth,
+  gitMount,
+  gcpAuth,
+  gcsMount,
+  mountConfig,
+  s3Mount,
+  workspaceSecret,
+} from "langsmith/sandbox";
+
+const mountCfg = mountConfig({
+  auth: [
+    awsAuth({
+      accessKeyId: workspaceSecret("SANDBOX_AWS_ACCESS_KEY_ID"),
+      secretAccessKey: workspaceSecret("SANDBOX_AWS_SECRET_ACCESS_KEY"),
+    }),
+    gcpAuth({
+      serviceAccountJson: workspaceSecret("SANDBOX_GCP_SERVICE_ACCOUNT_JSON"),
+    }),
+  ],
+  mounts: [
+    s3Mount({
+      id: "s3_data",
+      mountPath: "/mnt/mounts/s3-data",
+      bucket: "example-s3-bucket",
+    }),
+    gcsMount({
+      id: "gcs_data",
+      mountPath: "/mnt/mounts/gcs-data",
+      bucket: "example-gcs-bucket",
+    }),
+    gitMount({
+      id: "repo",
+      mountPath: "/mnt/mounts/repo",
+      remoteUrl: "https://github.com/langchain-ai/langsmith-sdk.git",
+    }),
+  ],
+});
+```
+
+</CodeGroup>
+
+## 故障排查
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| Mount path is empty | The mounted prefix has no objects, or the service cannot list the bucket | Verify the bucket name, prefix, and credentials |
+| `Permission denied` when writing | The mount is read-only or the cloud IAM role lacks write access | Set `read_only=False` / `readOnly: false` and grant the write scope or permission |
+| Sandbox creation fails with auth proxy errors | The workspace secret name is wrong or the provider auth block is missing | Confirm the secret names and include the matching `aws_auth` / `gcp_auth` block |
+| Git mount does not refresh | The repo ref is pinned and the remote has not changed, or the refresh interval has not elapsed | Wait for the interval or recreate the sandbox |
+
+## 限制
+
+- Mounts 在 sandbox 创建时挂载。要更改 mounts，请创建一个新的 sandbox。
+- 在每个 sandbox 单独的一个认证界面中配置各云 provider 的凭据。如果挂载认证提供了 AWS 或 GCP 凭据，就不要再为同一 provider 添加 auth proxy 规则。
+- Git ref 可以省略，或设置为 branch 或 tag。不支持 commit ref。
+- Git 挂载不支持 `read_only` / `readOnly` 或缓存设置。
+- Context Hub 挂载始终只读，且不支持缓存设置。
+- Context Hub 挂载接受 agent 和 skill 仓库。LangSmith 会拒绝其他类型的仓库以及没有 commit 的仓库。
+- Context Hub 挂载路径不能是文件系统根目录，也不能位于系统目录（例如 `/etc`、`/usr` 或 `/var`）内或其下。
+- 恢复 sandbox 时，每个 Context Hub 挂载都会在其配置的路径上重新连接。在挂载内部持有打开文件或工作目录的恢复进程必须重新打开它。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/sandbox-mounts.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

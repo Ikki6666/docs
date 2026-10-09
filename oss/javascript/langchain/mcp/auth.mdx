@@ -1,0 +1,299 @@
+---
+title: 身份验证
+description: 在 LangChain 中使用 Bearer 令牌、OAuth 2.1 或按用户凭证对 MCP 连接进行身份验证。
+---
+
+import McpAuthBearerPy from '/snippets/javascript/code-samples/mcp-auth-bearer-py.mdx';
+import McpAuthOauthPy from '/snippets/javascript/code-samples/mcp-auth-oauth-py.mdx';
+import McpAuthPerServerPy from '/snippets/javascript/code-samples/mcp-auth-per-server-py.mdx';
+import McpAuthPerUserPy from '/snippets/javascript/code-samples/mcp-auth-per-user-py.mdx';
+
+
+
+大多数远程 MCP 服务器都需要身份验证。`servers` 下的每个 HTTP 或 SSE 服务器都有自己的 `authProvider` 和 `headers`，`MCPAdapter` 会将 provider 对象原样交给 MCP SDK transport，并在每个请求中发送 headers。Stdio 服务器两者都不使用。对于你的应用管理的凭证，使用 [header 或令牌 provider](#bearer-token)；对于 OAuth 2.1，使用 [OAuth 客户端 provider](#oauth-authentication)。当每次运行都应该以调用者身份访问服务器时，使用[按用户身份验证](#per-user-authentication)。
+
+<Note>
+本页需要 `@langchain/mcp-adapters` 2.0 或更高版本。如果你正在从 1.x 升级，参见[迁移指南](/oss/javascript/migrate/langchain-mcp-adapters#authentication)。
+</Note>
+
+## Bearer 令牌
+
+对于固定的 API key，发送静态 `Authorization` 头。对于你的应用发放或轮换的令牌，将一个 `AuthProvider`（`{ token, onUnauthorized? }`）作为 `authProvider` 传入。
+
+示例使用应用提供的 `tokenStore`。实现 `current()` 来读取令牌，实现 `refresh()` 来保存更新的令牌并报告是否成功。
+
+```typescript
+import { MCPAdapter, UnauthorizedError } from "@langchain/mcp-adapters";
+
+const adapter = new MCPAdapter({
+  servers: {
+    // A fixed API key, sent as a header.
+    search: {
+      url: "https://search.example.com/mcp",
+      headers: { Authorization: `Bearer ${process.env.SEARCH_API_KEY}` },
+    },
+    // A token your app issues and rotates.
+    crm: {
+      url: "https://crm.example.com/mcp",
+      authProvider: {
+        token: async () => tokenStore.current(),
+        onUnauthorized: async () => {
+          // Throw when no newer token exists: over SSE, the SDK calls this
+          // again every time a reconnect is rejected.
+          if (!(await tokenStore.refresh())) {
+            throw new UnauthorizedError("No newer token for the CRM server");
+          }
+        },
+      },
+    },
+  },
+});
+```
+
+- **`token()`**：在每个请求之前运行，并返回当前令牌。
+- **`onUnauthorized()`**：可选。在 401 时运行，然后请求重试一次。在 SSE 上，每次重连被拒绝时 SDK 都会再次调用它，没有上限。当你没有更新的令牌时抛出 `UnauthorizedError`。
+
+没有 `onUnauthorized` 时，401 会让连接以 SDK 的 `UnauthorizedError` 失败。参见 [处理身份验证错误](#handle-authentication-errors)。
+
+每个命名的服务器都会打开自己的连接，因此一个 adapter 中的各个服务器可以独立进行身份验证，就像本示例中的两个服务器一样。
+
+adapter 重新导出了 `AuthProvider` 和 `OAuthClientProvider` 类型，因此无需导入 SDK 就可以为 provider 标注类型。
+
+## OAuth 身份验证
+
+OAuth 让用户授权你的应用程序访问 MCP 服务器。将一个 `OAuthClientProvider` 作为 `authProvider` 传入。SDK 处理发现、客户端注册、code 交换和令牌刷新。你的应用程序提供 provider 的存储、浏览器重定向和回调处理器。
+
+将 `@modelcontextprotocol/client` 2.2.0 或更高版本添加为直接依赖。adapter 依赖相同的版本范围，因此你的应用和 adapter 共享一份 SDK。回调 transport、`SdkHttpError` 和 `SseError` 都来自它。使用 SDK 的 [OAuth 客户端指南](https://github.com/modelcontextprotocol/typescript-sdk/blob/main/docs/clients/oauth.md)实现你的 provider。为你的回调路由配置它的 `redirectUrl`，并存储客户端信息、令牌、PKCE verifier 和发现状态。包含 `invalidateCredentials()`，这样被拒绝的刷新凭证可以触发新的登录。
+
+为每个用户和 MCP 服务器分别保留每个 provider 及其存储。下例还将每个待处理的登录绑定到一个经过身份验证的应用 session。从你的应用的 session 中间件中读取用户和 session ID，永远不要从回调查询参数中读取。
+
+下面的 `createMcpSession()` 辅助函数连接了以下步骤：
+
+1. 调用 `listTools()` 发现工具。如果需要登录，将用户的浏览器重定向到返回的 `authorizationUrl`。
+2. 在你的回调路由中，在同一个 session 上调用 `completeLogin()`。它会在交换 code 之前检查调用者并消费待处理的 `state`。
+3. 使用返回的工具。交换完成后，辅助函数会使用保存的令牌重试发现。
+
+<Accordion title="Session 辅助函数">
+此示例将待处理的登录状态保存在单个 Node.js 进程中。对于多进程或重启的情况，使用带过期时间的共享存储。检查 state、用户、session 和服务器，并在一次原子操作中消费该记录。SDK 不会验证 `state`。
+
+```typescript
+import { randomUUID } from "node:crypto";
+import {
+  MCPAdapter,
+  MCPClientError,
+  UnauthorizedError,
+  type OAuthClientProvider,
+} from "@langchain/mcp-adapters";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+
+function createMcpSession(
+  serverUrl: string,
+  userId: string,
+  sessionId: string,
+  authProvider: OAuthClientProvider,
+) {
+  let pendingState: string | undefined;
+  let authorizationUrl: URL | undefined;
+
+  authProvider.state = () => (pendingState = randomUUID());
+  authProvider.redirectToAuthorization = (url) => {
+    authorizationUrl = url;
+  };
+
+  const adapter = new MCPAdapter({
+    servers: { crm: { url: serverUrl, authProvider } },
+  });
+
+  function causedByUnauthorized(error: unknown): boolean {
+    // Discovery wraps UnauthorizedError in MCPClientError, and wraps it
+    // again when an HTTP connection falls back to SSE. Walk a few hops.
+    let current: unknown = error;
+    for (let depth = 0; depth <= 3; depth += 1) {
+      if (UnauthorizedError.isInstance(current)) return true;
+      if (!(current instanceof Error)) return false;
+      current = current.cause;
+    }
+    return false;
+  }
+
+  async function listTools() {
+    // Reuse the pending login instead of starting another redirect.
+    if (authorizationUrl) return { authorizationUrl };
+    try {
+      return { tools: await adapter.listTools() };
+    } catch (error) {
+      if (
+        MCPClientError.isInstance(error) &&
+        causedByUnauthorized(error) &&
+        authorizationUrl
+      ) {
+        return { authorizationUrl };
+      }
+      throw error;
+    }
+  }
+
+  async function completeLogin(
+    callbackUrl: URL,
+    callbackUserId: string,
+    callbackSessionId: string,
+  ) {
+    const params = callbackUrl.searchParams;
+    if (
+      callbackUserId !== userId ||
+      callbackSessionId !== sessionId ||
+      !pendingState ||
+      params.get("state") !== pendingState
+    ) {
+      throw new Error("Invalid OAuth callback");
+    }
+    // No await between checking and consuming state: only one callback wins.
+    pendingState = undefined;
+
+    const transport = new StreamableHTTPClientTransport(new URL(serverUrl), {
+      authProvider,
+    });
+    try {
+      await transport.finishAuth(params);
+    } catch {
+      // SDK errors can contain text supplied by the authorization server.
+      throw new Error("OAuth login failed");
+    } finally {
+      authorizationUrl = undefined;
+      await transport.close();
+    }
+    return listTools();
+  }
+
+  return { listTools, completeLogin, close: () => adapter.close() };
+}
+```
+</Accordion>
+
+要开始发现，传入你的 provider 和经过身份验证的调用者身份：
+
+```typescript
+const crm = createMcpSession(
+  "https://crm.example.com/mcp",
+  userId,
+  sessionId,
+  authProvider,
+);
+const result = await crm.listTools();
+// If result.authorizationUrl is present, redirect the browser there.
+// Otherwise, pass result.tools to your agent.
+```
+
+在回调完成之前，让 `crm` 对该应用的 session 保持可用。不要与其他 session 共享它的 provider。
+
+### 完成重定向
+
+用户登录后，授权服务器会重定向到你的 provider 的 `redirectUrl`。在该路由中，取出同一个 `crm` 实例以及调用者验证后的用户和 session ID，然后完成登录：
+
+```typescript
+const result = await crm.completeLogin(new URL(req.url, "http://localhost"), userId, sessionId);
+// The helper exchanges the code and retries discovery using saved tokens.
+// Pass result.tools to your agent, or redirect if another login is required.
+```
+
+辅助函数将完整的查询传给 `finishAuth()`，这样 SDK 可以验证授权服务器的 `iss` 参数。它在交换之前会拒绝缺失、不匹配或已被消费的 state。在使用工具期间保持 adapter 打开，然后在应用 session 结束时调用 `await crm.close()`。
+
+对于配置了 `transport: "sse"` 的服务器，在回调辅助函数中使用 `SSEClientTransport`。对于没有用户的机器对机器访问，使用 SDK 的 `ClientCredentialsProvider` 代替浏览器登录。
+
+## 处理身份验证错误
+
+因凭证被拒绝的连接会抛出 `MCPClientError`。SDK 错误位于其 `cause` 链的下一层，或者当 HTTP 连接回退到 SSE 时位于下两层。本示例遍历几层，并处理带有以下两种原因之一的 HTTP 身份验证失败：
+
+- **`UnauthorizedError`**：SDK 无法自行恢复。需要进行 OAuth 登录，或者令牌 provider 没有 `onUnauthorized`。
+- **一个 HTTP 401**（一个 `status: 401` 的 `SdkHttpError`，或在 SSE 上一个 `code: 401` 的 `SseError`）：服务器拒绝凭证，或没有提供凭证。
+
+```typescript
+import { MCPClientError, UnauthorizedError } from "@langchain/mcp-adapters";
+import { SdkHttpError, SseError } from "@modelcontextprotocol/client";
+
+function authFailure(error: unknown): "login" | "rejected" | undefined {
+  if (!MCPClientError.isInstance(error)) return undefined;
+
+  let current: unknown = error;
+  for (let depth = 0; depth <= 3; depth += 1) {
+    if (UnauthorizedError.isInstance(current)) return "login";
+    if (SdkHttpError.isInstance(current) && current.status === 401)
+      return "rejected";
+    if (SseError.isInstance(current) && current.code === 401)
+      return "rejected";
+    if (!(current instanceof Error)) return undefined;
+    current = current.cause;
+  }
+  return undefined;
+}
+```
+
+adapter 重新导出了 `UnauthorizedError`。从 `@modelcontextprotocol/client` 导入 `SdkHttpError` 和 `SseError`。`MCPClientError` 的消息包含 SDK 的错误文本，因此应记录它而不是展示给用户。
+
+当服务器在工具调用期间拒绝凭证时，工具会改为以 `ToolException` 失败。在 `createAgent` 下，模型将其视为错误消息，运行继续。
+
+即使 `onConnectionError` 跳过了失败的服务器，由 `UnauthorizedError` 或 HTTP 401 引起的发现失败也会在下一次调用时重试。后续的登录无需重新创建 adapter 即可恢复。来自 `token()` 或 `onUnauthorized()` 的其他错误（例如令牌存储请求失败）不计为身份验证失败。当 `onConnectionError` 在这些错误之一后跳过某个连接时，该连接会保持阻塞，直到 `close()` 清除它。
+
+## Header 优先级
+
+一旦 provider 拿到令牌，它就会替换配置的 `Authorization` 头。在此之前会发送该头，因此静态 API key 可以回退到 OAuth。
+
+SDK 还会将静态 `Authorization` 头转发给授权服务器的发现、注册和令牌端点，而不仅仅是 MCP 服务器。不要将机密的 API key 与授权服务器位于另一个 origin 的 OAuth provider 搭配使用。
+
+## 按用户身份验证
+
+在部署中，每次运行应该以发起该运行的用户身份访问 MCP 服务器，而不是使用一个共享凭证。在 `listTools()`、`listToolsets()`、`getClient()` 或资源方法（`listResources()`、`listResourceTemplates()` 和 `readResource()`）的选项中传入 `authProvider` 或 `headers`：
+
+```typescript
+import { MCPAdapter, type AuthProvider } from "@langchain/mcp-adapters";
+
+// A single-server adapter, because each user brings a different credential.
+const crm = new MCPAdapter({
+  servers: { crm: { url: "https://crm.example.com/mcp" } },
+});
+
+// Reuse one provider object per user: each object opens its own connection.
+const providers = new Map<string, AuthProvider>();
+
+function providerFor(userId: string): AuthProvider {
+  let provider = providers.get(userId);
+  if (!provider) {
+    provider = { token: async () => tokenFor(userId) };
+    providers.set(userId, provider);
+  }
+  return provider;
+}
+
+const tools = await crm.listTools(["crm"], {
+  authProvider: providerFor(userId),
+});
+```
+
+在此示例中，实现 `tokenFor(userId)` 来为经过身份验证的用户获取令牌。
+
+返回的工具通过该用户的连接调用服务器。以下规则适用于方法级身份验证：
+
+- **Adapter 级覆盖**：方法选项中的 `authProvider` 或 `headers` 适用于 adapter 持有的每个 HTTP 和 SSE 服务器，而不仅是你指定的那个。当不同用户需要不同凭证时，使用单服务器 adapter。
+- **Header 优先级**：服务器配置的 headers 优先于同名的方法级 headers，与大小写无关。传入按用户的 `Authorization` 头时，请从服务器配置中省略该头。provider 的令牌仍然优先于任一 header。
+- **每个 provider 对象一个连接**：每个不同的 provider 对象都有自己的连接，并保持到 `close()` 为止。为每个用户复用一个 provider 对象，而不是每次调用创建一个。
+- **隔离的目录**：目录以 provider 对象和 headers 为键，因此任何用户都不会收到其他用户缓存的工具列表。当同一个 provider 对象背后的账户发生变化时，重新创建 adapter。
+
+从传入请求中解析用户，例如在 LangGraph 服务器上使用[自定义 auth 处理器](/langsmith/auth)。
+
+## 另请参阅
+
+- [迁移到 `@langchain/mcp-adapters` 2.0](/oss/javascript/migrate/langchain-mcp-adapters)
+- [MCP authorization specification](https://modelcontextprotocol.io/specification/draft/basic/authorization)
+- [MCP TypeScript SDK OAuth client guide](https://github.com/modelcontextprotocol/typescript-sdk/blob/main/docs/clients/oauth.md)
+- [LangGraph 服务器的自定义身份验证](/langsmith/auth)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/langchain/mcp/auth.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

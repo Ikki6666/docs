@@ -1,0 +1,109 @@
+---
+title: LLM Gateway 工作原理
+sidebarTitle: 工作原理
+description: 了解 LLM Gateway 会对每个请求做什么、上游凭证如何解析，以及 gateway 在哪些环境下可用。
+---
+
+import LLMGatewayBetaNote from '/snippets/python/langsmith/llm-gateway-beta-note.mdx';
+
+<LLMGatewayBetaNote />
+
+LLM Gateway 位于你的应用与工作区所配置的 model providers 之间。它会认证调用者、选择上游路由、应用治理策略、在 API 格式之间进行转换，并追踪结果。
+
+## Gateway 提供什么
+
+- **一把 key，多个 providers：** 开发者使用 LangSmith API key 进行认证，无需在本地保存 provider keys。
+- **一种请求格式，多个模型：** 使用 Chat Completions、Messages 或 Responses 调用已配置 providers 上的模型。
+- **内置 observability：** 每次 gateway 调用都会出现在 gateway tracing projects 中，可见性由 [Traces and access control](/langsmith/llm-gateway-access) 控制。
+- **集中治理：** 应用 [spend limits](/langsmith/llm-gateway-spend-policies)、[rate limits](/langsmith/llm-gateway-rate-limit-policies) 和 [data policies](/langsmith/llm-gateway-data-policy)。
+
+## 跟随请求穿过 gateway
+
+对于发往标准 endpoint 的每个请求，gateway 会执行以下步骤：
+
+1. **根据 LangSmith API key 认证并授权调用者**，包括 `gateway:invoke` 权限检查。
+2. **解析路由**，依据 endpoint 和 model ID，包括已配置的 [fallback candidates](/langsmith/llm-gateway-fallbacks)。
+3. **加载上游凭证**，可以是工作区 [Provider Secret](/langsmith/llm-gateway-admin-setup#1-add-provider-secrets)，也可以是 [Gateway Credits](/langsmith/llm-gateway-credits) 凭证。
+4. **评估请求前策略。** [Spend](/langsmith/llm-gateway-spend-policies)、[rate](/langsmith/llm-gateway-rate-limit-policies) 和 [model-access](/langsmith/llm-gateway-model-access-policies) 限制可以拦截请求。[Data-protection policies](/langsmith/llm-gateway-data-policy) 会针对请求体运行，并在配置后对请求体进行脱敏。
+5. **转换请求**，当所选 provider 使用不同的 API 格式时。详细信息请参见[理解转换行为](/langsmith/llm-gateway-api-formats#understand-translation-behavior)。
+6. **向上游发送请求**，并接收或流式接收 provider 响应。
+7. **转换响应**，转换回 client 所请求的 API 格式，并在适用时恢复脱敏占位符。
+8. **返回响应**给调用者，同时记录用量、成本、路由和策略 metadata，以及 LangSmith trace。
+
+[Direct model access](/langsmith/llm-gateway-direct-model-access) 会跳过第 5 步和第 7 步。gateway 仍然会认证、解析凭证、评估策略并追踪调用，但会以 provider 的原生格式透传请求和响应。
+
+## 选择凭证管理方式
+
+gateway 会为每次调用解析一个上游凭证。一个工作区可以使用自己的 provider accounts、Gateway Credits，或两者兼用：
+
+| 选项 | 上游凭证 | 设置与计费 |
+| --- | --- | --- |
+| 自带 provider account | 由管理员把 provider key 存入工作区 [Provider Secrets](/langsmith/llm-gateway-admin-setup#1-add-provider-secrets)。 | provider 会把用量计入你的 provider account。 |
+| [Gateway Credits](/langsmith/llm-gateway-credits) | LangChain 持有上游凭证。 | 不需要 provider secret。调用会计入你的 LangSmith account。 |
+
+## 检查可用性
+
+gateway 运行在：
+
+- LangSmith Cloud 的每个 LangSmith region
+- [BYOC](/langsmith/byoc)，它运行在你的 data plane 内，因此模型请求及其 traces 都留在你的 VPC 中
+- [Self-hosted](/langsmith/self-hosted) LangSmith
+
+这三种环境使用相同的 API 格式、model IDs、策略和 tracing；只有 hostname 和 path prefix 不同。
+
+### 使用区域 gateway
+
+把 `gateway.smith.langchain.com` 替换为你所在 LangSmith region 的 hostname，并保留你所使用的 API 格式对应的 path：
+
+| Region | Gateway hostname |
+| --- | --- |
+| GCP US | `gateway.smith.langchain.com` |
+| GCP EU | `eu.gateway.smith.langchain.com` |
+| GCP APAC | `apac.gateway.smith.langchain.com` |
+| AWS US | `aws.gateway.smith.langchain.com` |
+
+### 使用 BYOC data plane
+
+在 BYOC 上，把 gateway hostname 替换为你的 [data plane endpoint](/langsmith/byoc-usage#find-your-data-plane-endpoint)，并在 path 前加上 `/gateway`：
+
+| API 格式 | Base URL | Prompt endpoint |
+| --- | --- | --- |
+| OpenAI Chat Completions | `https://<data_plane_host>/gateway/v1` | `POST /chat/completions` |
+| Anthropic Messages | `https://<data_plane_host>/gateway` | `POST /v1/messages` |
+| OpenAI Responses | `https://<data_plane_host>/gateway/v1` | `POST /responses` |
+
+使用范围限定为该 data plane 中某个 workspace 的 API key 进行认证，以 `Authorization: Bearer` token 或 provider API key 的形式传入。Provider secrets、model IDs、策略和 tracing 的行为与 Cloud 上相同。
+
+<Warning>
+Data planes 默认以 private endpoint 预配，因此你需要私有连接才能访问 base URL，例如 Tailscale、AWS PrivateLink 或 VPC peering。
+</Warning>
+
+### 使用自托管安装
+
+在自托管 LangSmith 上，管理员需要先[在 Helm chart 中启用 gateway](/langsmith/llm-gateway-self-hosted)。然后把 gateway hostname 替换为你的 LangSmith hostname，并在 path 前加上 `/gateway`：
+
+| API 格式 | Base URL | Prompt endpoint |
+| --- | --- | --- |
+| OpenAI Chat Completions | `https://<your-hostname>/gateway/v1` | `POST /chat/completions` |
+| Anthropic Messages | `https://<your-hostname>/gateway` | `POST /v1/messages` |
+| OpenAI Responses | `https://<your-hostname>/gateway/v1` | `POST /responses` |
+
+使用范围限定为你安装中某个 workspace 的 API key 进行认证，以 `Authorization: Bearer` token 或 `X-Api-Key` header 的形式传入。
+
+## 另请参阅
+
+- [Quickstart](/langsmith/llm-gateway-quickstart)：发起第一个请求、查看它的 trace，并设置一个支出限制。
+- [Admin setup](/langsmith/llm-gateway-admin-setup)：启用 gateway、添加 provider 凭证，并授予开发者访问权限。
+- [API 格式](/langsmith/llm-gateway-api-formats)：通过标准 endpoint 使用 Chat Completions、Messages 或 Responses。
+- [Traces、Engine 与访问控制](/langsmith/llm-gateway-access)：了解 gateway traces 出现在哪里，以及谁可以查看它们。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/llm-gateway-how-it-works.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

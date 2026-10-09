@@ -1,0 +1,181 @@
+---
+title: 启用 TTL 和数据保留
+sidebarTitle: 启用 TTL 和数据保留
+---
+
+LangSmith Self-Hosted 支持为 traces 启用自动 TTL 和数据保留。使用它来满足数据隐私法规，或通过自动清理旧 traces 来减少存储占用。run rules 和其他符合条件的操作也可以自动延长 trace 的保留期。
+
+<Note>
+**自托管 [Enterprise](/langsmith/pricing-plans) 客户：** 你可以通过 UI 在 workspace 级别配置 extended data retention，无需修改环境变量。参见 [Customize extended retention policy](/langsmith/data-purging-compliance#customize-extended-retention-policy)。本页介绍的系统级 TTL 配置仍然受支持。
+</Note>
+
+## TTL 配置优先级
+
+LangSmith 通过两个步骤决定 trace 的保留时长：trace 属于哪个保留层级，以及该层级适用什么保留期。
+
+LangSmith 按以下顺序分配层级，优先级从高到低：
+
+1. **Trace upgrade**：run rule 或其他符合条件的操作会将单条 trace 升级为 `longlived`，覆盖原本会适用的层级。
+2. **Project 层级**：为 tracing project 配置的层级。
+3. **Workspace 默认值**：新 project 会继承该层级。更改它只影响新 project，除非你将其应用到所有现有 project。
+4. **Organization 默认值**：适用于没有自身默认值的 workspace。
+5. **`shortlived`**：未设置任何默认值时的回退值。
+
+随后 LangSmith 会为分配到的层级解析保留期：
+
+- **`longlived`**：workspace 扩展保留期（如果通过 UI 设置过），否则为 [Helm 配置](#requirements) 中的 `longlived` 值。
+- **`shortlived`**：[Helm 配置](#requirements) 中的 `shortlived` 值。
+
+Helm chart 默认 `shortlived` 为 14 天，`longlived` 为 400 天。
+
+## Requirements
+
+通过 Helm 或环境变量设置来配置保留策略：
+
+- **Enabled**：启用或禁用自动数据保留。启用后，通过 UI 设置默认的 organization 和 project TTL tiers（参见 [data retention guide](/langsmith/usage-and-billing#data-retention)）。
+- **Retention periods**：为 `shortlived` 和 `longlived` traces 设置系统级保留时长。设置完成后，在 project 级别管理保留级别，或为新 project 设置 organization 级默认值。
+
+```yaml Helm
+config:
+  ttl:
+    enabled: true
+    ttl_period_seconds:
+      # -- 400 day longlived and 14 day shortlived
+      longlived: "34560000"
+      shortlived: "1209600"
+```
+
+## ClickHouse TTL cleanup job
+
+从版本 0.11 开始，系统会在周末运行一个 cron job，删除那些可能没有被 ClickHouse 内建 TTL 机制清理干净的过期数据。
+
+<Warning>
+这个 job 会使用 **mutations**（`ALTER TABLE DELETE`），这是开销较大的操作，可能会影响 ClickHouse 性能。请只在离峰时段（夜间和周末）执行。在测试中，当并发 active mutation 数为 **1**（默认值）时，没有产生明显的 CPU、内存或延迟上升。
+</Warning>
+
+### 默认调度
+
+默认情况下，这个 cleanup job 会在以下时间运行：
+
+- **Saturday**: UTC 时间 8pm 和 10pm。
+- **Sunday**: UTC 时间 12am、2am 和 4am。
+
+### 禁用该 job
+
+如果你想完全禁用该 cleanup job：
+
+```yaml
+queue:
+  deployment:
+    extraEnv:
+      - name: "ENABLE_CLICKHOUSE_TTL_CLEANUP_CRON"
+        value: "false"
+```
+
+### 配置调度时间
+
+通过修改 cron 表达式来自定义 cleanup job 的运行时间：
+
+```yaml
+queue:
+  deployment:
+    extraEnv:
+      # UTC: Sunday 12am/2am/4am
+      - name: "CLICKHOUSE_TTL_CLEANUP_CRON_WEEKEND_MORNING"
+        value: "0 0,2,4 * * 0"
+      # UTC: Saturday 8pm/10pm
+      - name: "CLICKHOUSE_TTL_CLEANUP_CRON_WEEKEND_EVENING"
+        value: "0 20,22 * * 6"
+```
+
+<Tip>
+要使用单个 cron schedule，可以把 `CLICKHOUSE_TTL_CLEANUP_CRON_WEEKEND_EVENING` 和 `CLICKHOUSE_TTL_CLEANUP_CRON_WEEKEND_MORNING` 都设为同一个值。Job locking 会阻止重叠执行。
+</Tip>
+
+### 配置每个 part 最小过期行数
+
+这个 job 会逐张表处理。在每张表内，它会扫描 parts，并从包含至少最小过期行数的 part 中删除数据。这个阈值需要在效率和彻底性之间取得平衡：
+
+- **太低**：job 会扫描整个 part，却只清除很少的数据，效率较低。
+- **太高**：job 会跳过那些已经积累了不少过期数据的 parts。
+
+```yaml
+queue:
+  deployment:
+    extraEnv:
+      - name: "CLICKHOUSE_TTL_CRON_MIN_EXPIRED_ROWS_PER_PART"
+        value: "100000" # 100k expired rows
+```
+
+#### 查看过期行数
+
+运行以下查询来查看每个表 part 的过期行数，然后据此调整最小值：
+
+```sql
+-- Query for Runs table. For other tables, replace 'ttl_seconds' with 'trace_ttl_seconds'
+SELECT
+    _part,
+    count() AS expired_rows
+FROM runs
+WHERE trace_first_received_at IS NOT NULL
+AND ttl_seconds IS NOT NULL
+AND toDateTime(assumeNotNull(trace_first_received_at) + toIntervalSecond(assumeNotNull(ttl_seconds))) < now()
+GROUP BY _part
+ORDER BY expired_rows DESC
+```
+
+### 配置最大 active mutations 数量
+
+删除操作可能比较耗时（100 GB 的 part 大约需要 50 分钟）。可以提高并发 mutations 数来加快清理：
+
+```yaml
+queue:
+  deployment:
+    extraEnv:
+      - name: "CLICKHOUSE_TTL_CRON_MAX_ACTIVE_MUTATIONS"
+        value: "1"
+```
+
+<Warning>
+更多的并发 `DELETE` 操作会明显拖慢插入和读取。只在你能够容忍更慢的插入和读取延迟时才提高这个值，并在调整后监控系统。
+</Warning>
+
+### 紧急情况：停止正在运行的 mutation
+
+如果你看到延迟飙升，并且需要停止一个正在运行的 mutation：
+
+1. **查找 active mutations**：
+
+   ```sql
+   SELECT * FROM system.mutations WHERE is_done = 0;
+   ```
+
+   找到 `command` 列中包含 `DELETE` 语句的那条记录的 `mutation_id`。
+
+2. **Kill 这个 mutation**：
+
+   ```sql
+   KILL MUTATION WHERE mutation_id = '<mutation_id>';
+   ```
+
+### 备份与数据保留
+
+如果 job 运行后磁盘空间没有下降，或者仍在持续增长，问题可能出在备份上。备份过程会创建文件系统 hard links，阻止 ClickHouse 释放数据。
+
+请检查 ClickHouse pod 中的以下目录：
+
+- `/var/lib/clickhouse/backup`
+- `/var/lib/clickhouse/shadow`
+
+如果这些目录中存在备份，请把它们复制到外部存储（例如 S3），然后清空这些目录。磁盘空间应该会在几分钟内开始释放。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/self-host-ttl.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

@@ -1,0 +1,172 @@
+---
+title: 将 MCP client 连接到 Managed Deep Agent
+sidebarTitle: MCP endpoint
+description: 将已部署的 Managed Deep Agent 暴露为供 Claude Code 等 MCP client 调用的 tool。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/python/langsmith/managed-deep-agents-public-beta-note.mdx';
+
+Managed Deep Agents deployment 运行在 [LangSmith Agent Server](/langsmith/agent-server-overview) 上，因此每个 deployment 都会提供 Agent Server 的 [Model Context Protocol](https://modelcontextprotocol.io/introduction) (MCP) endpoint `/mcp`。任何支持 Streamable HTTP 传输方式的 MCP client 都可以把已部署的 agent 作为 tool 调用，因此其他 assistant 或 agent 可以将工作委派给它，而无需直接调用 deployment API。
+
+本页介绍如何找到 Managed Deep Agents 的 URL 以及如何进行身份验证。协议行为和通用的 Agent Server client 设置请参阅 [MCP endpoint in Agent Server](/langsmith/server-mcp)。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+该 endpoint 是出站方向。[MCP connector](/langsmith/python/managed-deep-agents-mcp-connectors) 则指向另一个方向：它把远程 MCP 服务器中的 tool 添加到你的 agent。一个 deployment 可以同时使用两者。
+
+## 查找 endpoint URL
+
+该 endpoint 是 deployment API URL 上的 `/mcp`：
+
+```text
+<DEPLOYMENT_API_URL>/mcp
+```
+
+`mda deploy` 打印的是 LangSmith deployment 仪表盘 URL，而不是 API URL。打开该仪表盘，从 deployment 详情视图中复制 **API URL**，然后附加 `/mcp`。
+
+[`mda dev`](/langsmith/python/managed-deep-agents-local-development) 启动的本地服务器提供相同的 endpoint。在 CLI 打印的本地服务器 URL 后附加 `/mcp` 即可。
+
+## 请求身份验证
+
+MCP endpoint 使用该 deployment 的 [identity](/langsmith/python/managed-deep-agents-identity) 配置，与 deployment 上的其他所有 route 相同。发送与所配置模式匹配的凭据：
+
+| Identity 模式 | Header |
+| --- | --- |
+| LangSmith API key（默认） | `x-api-key: <LANGSMITH_API_KEY>` |
+| Supabase | `Authorization: Bearer <access_token>` |
+
+使用默认的 LangSmith API key 模式时，key 必须归属于拥有该 deployment 的 workspace。对其他 workspace 有效的 key 会被拒绝。
+
+身份验证失败会返回以下三种响应之一：
+
+| 状态码 | 响应体 | 原因 |
+| --- | --- | --- |
+| 401 | `{"detail":"missing x-api-key"}` | 请求中没有凭据 header。 |
+| 403 | `{"detail":"API key is forbidden"}` | key 无效、已撤销或已过期。 |
+| 403 | `{"detail":"API key tenant mismatch"}` | key 有效，但归属于 deployment 之外的另一个 workspace。 |
+
+`mda dev` 启动的本地服务器不需要任何凭据。它会授予每个调用者一个无 scope 的本地 service principal，因此机器上的任何 client 都可以调用 `/mcp` 以及其他所有 route。只有 deployment 才会强制校验 header。
+
+<Warning>
+任何持有 LangSmith API key 的人都可以访问该 deployment，而 MCP client 会把 header 存储在自己的配置中。请把添加到 client 配置中的 key 视为整个 workspace 的共享 secret。
+</Warning>
+
+<Note>
+Supabase identity 期望的是一个人通过登录你的应用获得的 access token。仅存储静态 header 的 MCP client 无法生成这样的 token，因此对于会被 MCP client 调用的 deployment，请使用默认的 LangSmith API key 模式。
+</Note>
+
+## 理解 agent 暴露的内容
+
+Agent Server 会将 agent 暴露为一个 MCP tool：
+
+- **Tool 名称**：在 [agent 定义](/langsmith/python/managed-deep-agents-agent-definition#parameters)中设置的 agent `name`。
+- **Tool 输入 schema**：该 agent 的输入 schema。
+
+传输方式细节和 Agent Server MCP 的其他行为请参阅 [MCP endpoint in Agent Server](/langsmith/server-mcp)。
+
+## 将 agent 添加到 Claude Code
+
+将该 endpoint 注册为 HTTP MCP 服务器：
+
+```bash
+claude mcp add --transport http research-assistant \
+  <DEPLOYMENT_API_URL>/mcp \
+  --header "x-api-key: $LANGSMITH_API_KEY"
+```
+
+服务器连接成功后，Claude Code 会将该 agent 列为一个 tool。
+
+在 JSON 配置中，Claude Code 会展开 header 值中的 `${VAR}`，因此 key 保留在环境变量中，而不是配置文件里：
+
+```json
+"headers": { "x-api-key": "${LANGSMITH_API_KEY}" }
+```
+
+## 将 agent 添加到其他 MCP client
+
+读取 `mcpServers` 配置的 client 可以直接使用该 endpoint 和 header：
+
+```json
+{
+  "mcpServers": {
+    "research-assistant": {
+      "type": "http",
+      "url": "<DEPLOYMENT_API_URL>/mcp",
+      "headers": {
+        "x-api-key": "<LANGSMITH_API_KEY>"
+      }
+    }
+  }
+}
+```
+
+只接受 URL 并协商 OAuth 的 client 无法向该 endpoint 进行身份验证，因为该 endpoint 要求 header 凭据。请显式配置 header。否则，client 可能回退到 OAuth 并报告 Dynamic Client Registration 失败，而不是报告缺少 header，从而掩盖真正的原因。
+
+## 从代码调用 endpoint
+
+通过 MCP client 库加载该 agent 的 tool，然后将这些 tool 传给模型或另一个 agent：
+
+```python
+import os
+
+from fastmcp.client import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from langchain.mcp import MCPAdapter
+
+async with MCPAdapter(
+    Client(
+        StreamableHttpTransport(
+            "<DEPLOYMENT_API_URL>/mcp",
+            headers={"x-api-key": os.environ["LANGSMITH_API_KEY"]},
+        )
+    )
+) as adapter:
+    tools = await adapter.list_tools()
+```
+
+
+
+
+请从环境变量读取凭据。不要在 client 代码中硬编码。
+
+## 理解 session 行为
+
+Agent Server MCP 请求是[无状态的](/langsmith/server-mcp#session-behavior)：多次调用之间不共享 thread 状态。
+
+要在多次调用之间保留知识，请[启用 durable memory](/langsmith/python/managed-deep-agents-memory)。Durable memory 是可选的，并由该 deployment 的所有调用者共享。当 MCP client 不应相互影响时，请不要启用它。
+
+## 何时使用 MCP endpoint
+
+| 概念 | 类型 | 如何作用于 agent |
+| --- | --- | --- |
+| **MCP endpoint** | Deployment API | 将 agent 暴露为供 MCP client 调用的 tool |
+| **[MCP connectors](/langsmith/python/managed-deep-agents-mcp-connectors)** | 托管配置 | 把远程 MCP 服务器托管的 tool 添加到 agent |
+| **[Channels](/langsmith/python/managed-deep-agents-channels)** | 托管配置 | 接收来自外部消息服务的消息以启动 run，并投递响应 |
+
+## 下一步
+
+<CardGroup cols={2}>
+  <Card title="Agent Server" icon="server" href="/langsmith/agent-server-overview">
+    探索托管每个 Managed Deep Agents deployment 的运行时。
+  </Card>
+  <Card title="Agent Server MCP" icon="protocol" href="/langsmith/server-mcp">
+    阅读 Agent Server MCP 协议参考。
+  </Card>
+  <Card title="MCP connectors" icon="plug" href="/langsmith/python/managed-deep-agents-mcp-connectors">
+    将远程 MCP 服务器中的 tool 添加到 agent。
+  </Card>
+  <Card title="Identity" icon="fingerprint" href="/langsmith/python/managed-deep-agents-identity">
+    对 deployment 的调用者进行身份验证。
+  </Card>
+</CardGroup>
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/managed-deep-agents-mcp-endpoint.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

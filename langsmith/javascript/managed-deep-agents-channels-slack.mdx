@@ -1,0 +1,313 @@
+---
+title: 将 Managed Deep Agent 连接到 Slack
+sidebarTitle: Slack
+description: 从 Slack 消息启动 Managed Deep Agents runs，并将响应发送到 Slack 会话。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/javascript/langsmith/managed-deep-agents-public-beta-note.mdx';
+
+Slack channel 让人们可以通过 app mention、私信（DM）和活跃 Slack thread 中的回复来调用 managed deep agent。Managed Deep Agents 验证 Slack 事件，把每个会话映射到一个 thread，以解析出的调用方身份运行 agent，并将响应发送回 Slack。
+
+Managed Deep Agents 会创建并配置把 Slack 连接到 deployed agent 所需的资源。在 agent 项目中添加一个 channel 声明，然后部署即可。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+## 项目结构
+
+
+
+```text
+my-agent/
+  agent.ts
+  channels/
+    slack.ts
+```
+
+
+## 添加 Slack channel
+
+一个 managed deep agent deployment 只支持一个 Slack channel。
+
+
+
+Channel 声明位于 `channels/slack.ts`。
+
+
+要在创建项目时包含 Slack，请传入 `--channel slack`：
+
+
+
+<CodeGroup>
+    ```bash npm
+    npx managed-deepagents init my-agent --channel slack
+    ```
+
+    ```bash pnpm
+    pnpm dlx managed-deepagents init my-agent --channel slack
+    ```
+
+    ```bash bun
+    bunx managed-deepagents init my-agent --channel slack
+    ```
+</CodeGroup>
+
+
+要将 Slack 添加到现有项目，请从项目根目录运行 channel 初始化命令：
+
+
+
+<CodeGroup>
+    ```bash npm
+    npx mda channels init slack
+    ```
+
+    ```bash pnpm
+    pnpm exec mda channels init slack
+    ```
+
+    ```bash bun
+    bunx mda channels init slack
+    ```
+</CodeGroup>
+
+
+
+
+```ts channels/slack.ts
+import { channels } from "managed-deepagents";
+
+export const channel = channels.slack();
+```
+
+
+## 配置 agent 在 Slack 中的外观
+
+编辑 channel 声明来控制 agent 在 Slack 中的显示方式。
+
+<ParamField path="name" type="string">
+  Agent 在 Slack 中的名称。名称必须包含 1–35 个字符，可以包含字母、数字、空格、下划线、连字符和句点。不能以空格或连字符开头或结尾。
+</ParamField>
+
+<ParamField path="description" type="string">
+  Agent 功能的描述。描述最多可包含 139 个字符。
+</ParamField>
+
+<ParamField path="icon" type="string">
+  Slack 中显示的 agent 图标的路径，相对于 `channels/` 目录。图标必须是 512×512 像素、不超过 1 MB 的 PNG 文件。如果省略该参数，Managed Deep Agents 会为你生成一个图标。
+</ParamField>
+
+
+
+<ParamField path="backgroundColor" type="string">
+  Agent 图标背后的背景色，为六位十六进制颜色，例如 `#1d4ed8`。
+</ParamField>
+
+
+例如，把图标放在 channel 声明旁边：
+
+
+
+```text
+my-agent/
+  agent.ts
+  channels/
+    slack.ts
+    support-agent.png
+```
+
+```ts channels/slack.ts
+import { channels } from "managed-deepagents";
+
+export const channel = channels.slack({
+  name: "Support Agent",
+  description: "Answers customer questions about orders and returns",
+  icon: "support-agent.png",
+  backgroundColor: "#1d4ed8",
+});
+```
+
+
+### 配置哪些消息可以启动 runs
+
+
+
+<ParamField path="triggerOnAllMessages" type="boolean" default="false">
+  是否每条新的 channel 消息都可以启动 agent run。为 `false` 时，channel 消息只有在 mention agent 时才会启动 runs；DM 仍会启动 runs。
+</ParamField>
+
+<ParamField path="allowBotTriggers" type="boolean" default="false">
+  来自其他 Slack bot 的消息是否可以启动 agent runs。
+</ParamField>
+
+
+## 对启动 run 的消息做出反应
+
+当 run 接收一条入站消息时，agent 会用 emoji 对它做出反应，让发送者在 agent 有话要说之前就知道消息已被看到。该反应不会阻塞或延迟回复。
+
+默认情况下每条消息使用相同的 emoji。传入一个函数来逐条消息选择 emoji：
+
+
+
+<ParamField path="reactions" type="false | string | function" default='"eyes"'>
+  传入 `false` 关闭反应，传入 Slack emoji 短名称以改用该 emoji，或传入一个接收 `{ text }` 并返回短名称的函数。该函数可以返回 promise。
+</ParamField>
+
+```typescript
+import { channels } from "managed-deepagents";
+
+export const channel = channels.slack({
+  name: "Support Bot",
+  reactions: ({ text }) => (text.includes("broken") ? "bug" : "eyes"),
+});
+```
+
+
+返回不带两侧冒号的 Slack 短名称。Slack 无法识别的名称会被选中但永远不会出现，因此反应只是缺失。抛出异常的 chooser、耗时超过五秒的 chooser，或返回其他任何内容的 chooser 都会回退到默认 emoji，无论如何 run 都会继续。
+
+### 使用 decision model 选择 emoji
+
+[Decision model](/langsmith/llm-gateway-decision-models) 对一组固定的选项打分并用其中一个 key 回答，因此反应能反映消息内容，而且没有需要解析的回复。答案始终是你提供的选项之一。`TypeSafeClassifier`（[Python](/oss/python/integrations/providers/typesafe)、[JavaScript](/oss/javascript/integrations/providers/typesafe)）将其暴露为一个 `Runnable`，并在 LangSmith 中记录 traces 和 token 用量。
+
+
+
+```bash
+npm install @langchain/typesafe
+```
+
+```typescript
+import { TypeSafeClassifier } from "@langchain/typesafe";
+import { channels } from "managed-deepagents";
+
+// The description is what the model matches on, so describe the situation
+// rather than the picture. Keep an option for anything unremarkable.
+const VOCABULARY = {
+  bug: "A defect or incorrect behaviour.",
+  rotating_light: "A declared incident or outage.",
+  mag: "A code review, pull request, or diff to look at.",
+  hourglass: "Waiting on someone or something else; blocked.",
+  speech_balloon: "A question, or a request to explain something.",
+  wave: "A greeting or hello.",
+  eyes: "Anything that does not clearly fit another option.",
+};
+
+let cached: TypeSafeClassifier | undefined;
+const classifier = () =>
+  (cached ??= new TypeSafeClassifier({
+    model: "typesafe/jev-latest",
+    timeout: 5_000,
+    questions: {
+      emoji: {
+        type: "choice",
+        instructions: "Which emoji best acknowledges this message?",
+        criteria: VOCABULARY,
+      },
+    },
+  }));
+
+export const channel = channels.slack({
+  name: "Support Bot",
+  reactions: async ({ text }) => {
+    const { emoji } = (await classifier().invoke(text.slice(0, 2000))).choices;
+    // Below this the model has no real view, so prefer a generic reaction.
+    return emoji.confidence >= 0.25 ? emoji.choice : "eyes";
+  },
+});
+```
+
+
+两者都在首次使用时构建 classifier，而不是在 import 时构建，因为部署会 import 这个模块来读取 channel 声明，而 classifier 构造时需要 key。
+
+在 deployment 上设置 `TYPESAFE_API_KEY`。要改为通过 LangSmith gateway 路由，请设置 `TYPESAFE_BASE_URL=https://gateway.smith.langchain.com`，并使用 workspace 范围的 LangSmith API key，其中 `TYPESAFE_API_KEY` 存放在你 workspace 的 [provider secrets](/langsmith/llm-gateway-admin-setup#1-add-provider-secrets) 中。
+
+## 部署 agent
+
+部署时，Managed Deep Agents 会根据 channel 声明在 Slack 中预置你的 agent。
+
+<Steps>
+  <Step title="部署你的 agent">
+    从项目根目录运行部署命令：
+
+
+
+    <CodeGroup>
+        ```bash npm
+        npx mda deploy
+        ```
+
+        ```bash pnpm
+        pnpm exec mda deploy
+        ```
+
+        ```bash bun
+        bunx mda deploy
+        ```
+    </CodeGroup>
+
+
+    Managed Deep Agents 会部署 agent，并设置它在 Slack 中显示所需的资源。
+  </Step>
+  <Step title="在收到提示时授权 Slack">
+    如果你之前没有授权过 LangSmith，CLI 会显示一个 HTTPS 授权链接。打开该链接，选择 Slack workspace，并批准所请求的访问。
+
+    返回终端并按 Enter。CLI 会再次检查授权并继续预置。如果 Slack workspace 需要管理员批准，请先完成该批准再继续。
+  </Step>
+  <Step title="在 Slack 中使用 agent">
+    首次部署后，你的 agent 会在 Slack 中向你发送一条私信。回复该消息即可启动 agent run。最终响应会出现在 Slack 会话中。
+  </Step>
+</Steps>
+
+<Note>
+Slack 中的人工介入请求只支持 `approve` 和 `reject` 两种 [decision types](/langsmith/javascript/managed-deep-agents-tools#human-in-the-loop)。
+</Note>
+
+如果 Slack 已授权，部署会完成，而不会出现授权提示。
+
+在 Slack channel 声明中更改 agent 的 name、description、icon 或 background color 后，请重新部署 agent，以将更改应用到 Slack。
+
+## 与 Slack 交换文件
+
+Slack channel 支持双向传输文件。上传的文件会落入 agent 的 sandbox 中的 `/workspace/attachments/`，agent 通过调用 `attach_file` 并传入 `/workspace` 下的路径把文件发回。声明一个 Slack channel 和一个 [sandbox](/langsmith/javascript/managed-deep-agents-sandboxes) 就是全部设置。
+
+<Note>
+Slack 文件传输要求 `managed-deepagents>=0.8.0` 和一个 sandbox。没有 sandbox 时，传入的文件不会被保存，`attach_file` 也不会提供给模型。
+</Note>
+
+Managed Deep Agents 在 run 之前将传入消息上的文件暂存，同一 Slack thread 中较早共享的文件也会一并暂存。Agent 读取一条 attachment 状态消息来获知路径，然后用它的 sandbox tools 打开文件。该状态和文件内容会被标记为数据，而不是 instructions。
+
+文件附加永远不会自动发生，因此当某个文件应包含在回复中时，请在 agent 的 [instructions](/langsmith/javascript/managed-deep-agents-instructions) 中说明：
+
+```markdown instructions.md
+When someone asks for a report, write the report to a file under `/workspace`,
+then call `attach_file` with that path so the file arrives in Slack.
+```
+
+文件的作用域限定在它们到达的 Slack thread 内，因为每个 thread 有自己的 sandbox。一条 DM 和一个 channel thread 永远不会共享附件。在同一个 thread 内，任何人都能访问其他人上传的文件，因为传输使用的是 bot 的 Slack 访问权限，而不是调用方的。
+
+### 了解传输限制
+
+- **文件大小**：每个方向 200 MiB。
+- **路径**：`attach_file` 只接受 `/workspace` 下的路径。
+- **Thread 历史**：扫描覆盖 thread 中最近的消息。当扫描不完整时，attachment 状态会报告较早的文件可能缺失。
+- **跳过的文件**：存储在 Slack 之外的文件，以及已从 Slack 删除的文件。
+- **Slack scopes**：因缺少 `files:read`、`files:write` 或历史 scope 而被阻塞的传输，会提示你需要重新连接 Slack。
+
+## 另请参阅
+
+- [Channels overview](/langsmith/javascript/managed-deep-agents-channels)：了解 channels 如何将消息服务连接到 agent。
+- [Decision models](/langsmith/llm-gateway-decision-models)：配置为 reaction emoji 打分的模型。
+- [LLM Gateway setup](/langsmith/llm-gateway-admin-setup)：启用 gateway 并添加反应所需的 provider secret。
+- [Agent-owned interrupts](/langsmith/javascript/managed-deep-agents-agent-owned-interrupts)：从 tool 发送 Slack 表单并在提交时恢复 run。
+- [Sandboxes](/langsmith/javascript/managed-deep-agents-sandboxes)：为 agent 提供文件传输读写的文件系统。
+- [Deploy an agent](/langsmith/javascript/managed-deep-agents-deploy)：配置并部署 managed deep agent。
+- [CLI reference](/langsmith/javascript/managed-deep-agents-cli)：查看 Managed Deep Agents 的命令和 flags。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/managed-deep-agents-channels-slack.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

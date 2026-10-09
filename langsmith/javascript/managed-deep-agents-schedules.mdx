@@ -1,0 +1,359 @@
+---
+title: Add schedules to Managed Deep Agents
+sidebarTitle: Schedules
+description: 为 Managed Deep Agents deployments 声明托管 cron schedules，或在运行时创建它们。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/javascript/langsmith/managed-deep-agents-public-beta-note.mdx';
+import ManagedDeepAgentsTestAndDeploy from '/snippets/javascript/langsmith/managed-deep-agents-test-and-deploy.mdx';
+
+Managed Deep Agents 可以按 cron schedule 运行 agent。部署项目时，`mda deploy` 会在 deployment 可用后把每个 schedule 配置成 LangSmith cron。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+## 项目结构
+
+Schedule 声明放在项目级别的 `schedules/` 目录中，每个文件一个 schedule：
+
+
+
+```text
+my-agent/
+  agent.ts
+  schedules/
+    daily-digest.ts
+```
+
+
+## 添加 schedule
+
+文件名会成为托管 schedule 名称。
+
+
+
+Schedule 模块必须导出一个命名的 `schedule` 声明。
+
+
+
+
+```ts schedules/daily-digest.ts
+import { defineSchedule } from "managed-deepagents";
+
+export const schedule = defineSchedule({
+  cron: "0 8 * * 1-5",
+  timezone: "America/Los_Angeles",
+  prompt: "Write the daily digest.",
+});
+```
+
+
+## 配置 schedule 输入
+
+每个 schedule 必须且只能定义以下其中一种：
+
+- `prompt`：自然语言 prompt。Managed Deep Agents 会在 cron 触发时把它转成一条 user message。
+- `input`：结构化的 LangGraph input 对象。当你需要传递自定义 graph input，而不是单条 prompt 时使用。
+
+
+
+```ts schedules/nightly-sweep.ts
+import { defineSchedule } from "managed-deepagents";
+
+export const schedule = defineSchedule({
+  cron: "30 2 * * *",
+  input: {
+    messages: [
+      { role: "user", content: "Sweep stale tickets and summarize changes." },
+    ],
+  },
+});
+```
+
+
+`cron` 必须是标准五段式 cron 表达式，依次为分钟、小时、每月日期、月份和星期几。如果省略 `timezone`，LangSmith crons 会使用 UTC。
+
+## 选择 thread 行为
+
+Schedules 默认使用 ephemeral threads。Managed Deep Agents 会为每次 run 创建一个新的 thread，并在 run 完成后要求 LangSmith 删除该临时 thread。
+
+只有当你希望 schedule runs 在多次触发之间持续累积 thread state 时，才应使用 persistent thread。
+
+persistent thread ID 必须是 deployment 上已存在 thread 的 UUID。Managed Deep Agents 会把该值直接传给 Agent Server，任何不是 UUID 的 ID 都会被拒绝。
+
+### 创建 persistent thread
+
+在部署 schedule 之前先创建该 thread。在 [LangSmith Studio](/langsmith/studio) 中打开 deployment，创建一个新 thread，并复制其 thread ID。`mda deploy` 会输出 deployment URL，LangSmith 也会在 deployment 页面上列出它。
+
+Managed Deep Agents 和 `mda` CLI 都不会创建该 thread，因此这是每个 persistent schedule 的一次性手动步骤。
+
+### 声明 persistent schedule
+
+在 schedule 声明中使用该 thread ID。
+
+<Note>
+以下示例需要[持久 memory](/langsmith/javascript/managed-deep-agents-memory)。
+</Note>
+
+
+
+```ts schedules/nightly-memory.ts
+import { defineSchedule } from "managed-deepagents";
+
+export const schedule = defineSchedule({
+  cron: "0 3 * * *",
+  prompt: "Review the current project memory and list follow-up tasks.",
+  thread: { mode: "persistent", id: "<thread-uuid>" },
+});
+```
+
+
+## 将结果投递到 Slack
+
+
+
+设置 `deliverTo`，通过已配置的 [Slack channel](/langsmith/javascript/managed-deep-agents-channels-slack) 投递最终响应。
+
+
+使用 Slack channel ID，因为 schedule runs 没有发起它的原始 thread。
+
+<Note>
+
+
+Schedule 投递需要 `managed-deepagents` 0.4.0 或更高版本。
+
+</Note>
+
+
+
+```ts schedules/monday-greeting.ts
+import { defineSchedule } from "managed-deepagents";
+
+export const schedule = defineSchedule({
+  cron: "0 9 * * 1",
+  prompt: "Send a Monday greeting to the team.",
+  deliverTo: { slack: { channelId: "C1234567890" } },
+});
+```
+
+
+Slack bot 必须有权访问目标。
+
+## 使用静态声明
+
+Schedule 声明会在编译时提取，因此配置必须是静态可序列化的：
+
+
+
+- 可以使用 literals、arrays、objects，以及对顶层 literal constants 的引用。
+- 不要读取环境变量、调用函数、spread objects，或动态计算 schedule 值。
+
+
+- 需要动态行为时，请把逻辑放到 agent、tools、middleware 或 runtime context 中。
+
+## 本地测试 schedules
+
+`mda dev` 会编译 `schedules/` 并在其启动横幅中列出每个 schedule，但不会创建它们。Schedules 只在 deployment 上运行。
+
+<Warning>
+Schedules 在 `mda dev` 下永远不会触发。本地服务器不会报告任何错误，因此启动时列出的 schedule 仍然处于非活动状态。
+</Warning>
+
+要测试 schedule 触发的 agent 行为，可以在本地 Studio 中直接把该 schedule 的 `prompt` 或 `input` 发送给 agent。要测试 schedule 本身，请把项目部署到一个开发 deployment。
+
+## 部署 schedules
+
+<ManagedDeepAgentsTestAndDeploy />
+
+当 deployment 进入 `DEPLOYED` 状态后，`mda deploy` 会删除更早的 `schedules/` 声明创建的 cron jobs，并根据当前声明创建新的 cron jobs。删除本地 schedule 文件并重新部署，就会移除对应的托管 cron。在运行时创建的 schedules 不受影响。
+
+<Warning>
+如果你使用 `--no-wait` 进行部署，CLI 会在远程 build 触发后立即退出，而不会等待 deployment 进入 `DEPLOYED`，因此这次调用不会对 schedules 执行 reconcile。添加、修改或删除 schedules 时，请使用不带 `--no-wait` 的 `mda deploy`。
+</Warning>
+
+## 在运行时创建 schedules
+
+<Note>
+运行时 schedules 需要 `managed-deepagents` 0.9.0 或更高版本。
+</Note>
+
+`schedules/` 中的声明在部署时就固定了。`schedules` API 会在 agent 运行时创建 schedules，因此 agent 可以在对话中设置定期或一次性工作。可以从 tool 或 [middleware](/langsmith/javascript/managed-deep-agents-middleware) 中调用它。每个 schedule 属于当前用户或 agent。
+
+agent 只能通过你编写的 tools 访问这个 API。只暴露 agent 需要的调用，把它不应该访问的留在外面。
+
+当 tool 在一次 [channel](/langsmith/javascript/managed-deep-agents-channels) run（例如 Slack 对话）期间创建 schedule 时，该 schedule 会继承该 channel。每次 run 都会把它的最终回答投递回去。新 thread 会发送一条新的 Slack 消息，当前 thread 则在已有的 Slack thread 中回复。
+
+
+
+`newThread` 决定 schedule 使用这两者中的哪一个。
+
+
+### 创建定期 schedule
+
+`remind_me` 为 agent 提供一种方式，为正在交谈的人设置定期提醒。agent 传入要运行的 prompt 和一个表示运行频率的 cron 表达式。每次 cron 触发时，都会以该 prompt 作为用户消息启动一个新的 run。agent 决定每个 schedule run 被要求做什么。
+
+
+
+```ts tools/schedules.ts
+import { tool } from "langchain";
+import { z } from "zod";
+import { schedules } from "managed-deepagents";
+
+export const remindMe = tool(
+  async ({ prompt, cron, timezone }) => {
+    const item = await schedules.create({
+      owner: { type: "user" },
+      cron,
+      timezone,
+      prompt,
+    });
+    return `Created schedule ${item.id}.`;
+  },
+  {
+    name: "remind_me",
+    description: "Run a prompt for the current user on a cron schedule.",
+    schema: z.object({
+      prompt: z.string(),
+      cron: z.string(),
+      timezone: z.string().default("UTC"),
+    }),
+  },
+);
+```
+
+
+在 Slack 中被要求每个工作日发送 standup 提醒时，agent 会调用 `remind_me`。它传入自己措辞的 prompt 和 cron 表达式 `0 9 * * 1-5`。每个工作日的 run 都会把回答作为新消息投递到那个 Slack 对话，因为 `cron` schedule 默认使用新 thread。
+
+### 创建一次性 schedule
+
+对于只运行一次的工作，用 `at` 代替 `cron`。`follow_up_later` 为 agent 提供设置单个后续任务的方式，例如在部署完成后进行检查。
+
+
+
+```ts tools/follow-up.ts
+import { tool } from "langchain";
+import { z } from "zod";
+import { schedules } from "managed-deepagents";
+
+export const followUpLater = tool(
+  async ({ prompt, hours }) => {
+    const item = await schedules.create({
+      owner: { type: "user" },
+      at: new Date(Date.now() + hours * 60 * 60_000),
+      prompt,
+    });
+    return `Scheduled a one-time follow-up: ${item.id}.`;
+  },
+  {
+    name: "follow_up_later",
+    description: "Run a prompt once, a number of hours from now.",
+    schema: z.object({
+      prompt: z.string(),
+      hours: z.number(),
+    }),
+  },
+);
+```
+
+
+一次性 schedule 默认使用当前 thread，因此它的 run 会继续创建它的那个对话，并在同一个 Slack thread 中回复。
+
+### 创建选项
+
+<ParamField path="owner" type="object" required>
+  `{ type: "user" }` 选择当前 run 中经过认证的人，schedule 会以该人身份运行。可选的 `id` 必须与该人匹配。`{ type: "agent" }` 选择 agent 拥有的 schedules，它们以 agent 的服务身份运行。
+</ParamField>
+
+<ParamField path="cron" type="string">
+  用于定期 schedule 的五段式 cron 表达式。`cron` 和 `at` 只能给一个。
+</ParamField>
+
+
+
+<ParamField path="at" type="Date | string">
+  一个 `Date`，或以 `Z` 或 UTC 偏移量结尾的 ISO 8601 时间戳。schedule 只运行一次。运行时会将其向上取整到下一个整分钟。它必须至少在 1 分钟后、至多在 365 天内。
+</ParamField>
+
+
+<ParamField path="timezone" type="string" default="UTC">
+  `cron` 使用的 IANA 时区，例如 `America/Los_Angeles`。不要与 `at` 一起传入。
+</ParamField>
+
+<ParamField path="prompt" type="string">
+  每次 run 作为用户消息收到的 prompt。`prompt` 和 `input` 只能给一个。
+</ParamField>
+
+<ParamField path="input" type="object | object[]">
+  每次 run 使用的结构化 LangGraph 输入。
+</ParamField>
+
+
+
+<ParamField path="newThread" type="boolean">
+  `true` 让每次 run 在新 thread 上启动。`false` 继续当前 thread。使用 `cron` 时默认为 `true`，使用 `at` 时默认为 `false`。
+</ParamField>
+
+
+<ParamField path="paused" type="boolean" default="false">
+  创建 schedule 但不运行它。
+</ParamField>
+
+<ParamField path="metadata" type="object">
+  供你自己使用的 JSON metadata。以 `mda_` 开头的 keys 是保留的。
+</ParamField>
+
+### 管理 schedules
+
+`list`、`get`、`update` 和 `delete` 覆盖 schedule 生命周期的其余部分。当 agent 应该管理它创建的 schedules 时，把它们暴露为 tools。拥有 `list` 和 `delete` 的 agent 可以回答"我有哪些提醒？"并按请求取消一个。当对方以后还想要某个提醒时，用 `update` 暂停 schedule 而不是删除它。
+
+
+
+```ts
+const owner = { type: "user" } as const;
+
+const page = await schedules.list({ owner, limit: 20 });
+const item = await schedules.get(page.items[0].id, { owner });
+await schedules.update(item.id, { paused: true }, { owner });
+await schedules.delete(item.id, { owner });
+```
+
+
+
+
+`update` 接受 `cron`、`at`、`timezone`、`prompt`、`input`、`paused` 和 `metadata`。channel 和 thread 选择在创建时就固定了。除非传入 `includeExpired: true`，否则 `list` 会隐藏已过期的一次性 schedules。对于 agent owner，`list` 和 `get` 还会返回 `schedules/` 中的 schedules，这些你在代码中更改。
+
+
+## 排查 schedules 问题
+
+
+
+- `must export a named schedule declaration`：请在 `schedules/` 中的每个文件里导出顶层 `schedule`。
+
+
+- `must define exactly one of prompt or input`：请只设置 `prompt` 或 `input` 其中之一，不能同时设置。
+- `cron must be a standard 5-field expression`：请使用五段式 cron，而不是带 seconds 的 cron 语法。
+- `schedule is not static`：请把计算值替换为 literals 或顶层 literal constants。
+- `failed to create cron for schedule`：请在 LangSmith 中打开 deployment URL，确认部署后的 Agent Server 处于健康状态。
+- `Invalid thread ID: must be a UUID (HTTP 422)`：persistent schedule 声明的 thread ID 不是 UUID。请替换为一个已有 thread 的 UUID。参见[选择 thread 行为](#选择-thread-行为)。
+- **schedule 在本地开发期间不运行**：`mda dev` 不会创建 schedules。参见[本地测试 schedules](#本地测试-schedules)。
+
+## 下一步
+
+<CardGroup cols={2}>
+  <Card title="Deploy an agent" icon="upload" href="/langsmith/javascript/managed-deep-agents-deploy">
+    部署 agent 并对 schedule 变更执行 reconcile。
+  </Card>
+  <Card title="CLI reference" icon="terminal" href="/langsmith/javascript/managed-deep-agents-cli">
+    查看 `mda deploy` flags 和故障排查信息。
+  </Card>
+</CardGroup>
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/managed-deep-agents-schedules.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

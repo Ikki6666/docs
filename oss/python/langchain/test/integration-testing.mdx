@@ -1,0 +1,305 @@
+---
+title: 集成测试
+description: 通过组织测试、管理密钥、处理不稳定性和控制成本，使用真实 LLM API 测试智能体。
+---
+
+集成测试会验证你的智能体是否能和模型 API 以及外部服务正确协作。不同于使用 fake 和 mock 的 [unit tests](/oss/python/langchain/test/unit-testing)，集成测试会发起真实网络调用，以确认各组件能协同工作、凭据有效，并且延迟可接受。
+
+由于 LLM 响应并非确定性的，集成测试需要和传统软件测试不同的策略。本指南介绍如何组织、编写和运行智能体的集成测试。关于贡献 LangChain 本身时的一般测试基础设施，请参见 [Contributing to code](/oss/python/contributing/code#running-tests)。
+
+## 分离单元测试和集成测试
+
+集成测试更慢，而且需要 API 凭据，所以要把它们和单元测试分开。这样你就能在每次改动时运行快速的单元测试，而把集成测试留给 CI 或预发布检查。
+
+使用 pytest marker 给集成测试打标签：
+
+```python
+import pytest
+from langchain.agents import create_agent
+from langchain.messages import HumanMessage
+
+@pytest.mark.integration
+def test_agent_with_real_model():
+    agent = create_agent("claude-sonnet-4-6", tools=[get_weather])
+    result = agent.invoke({
+        "messages": [HumanMessage(content="What's the weather in SF?")]
+    })
+    assert len(result["messages"]) > 1
+```
+
+配置 pytest 识别这个 marker，并把集成测试排除在默认运行之外：
+
+<CodeGroup>
+```ini pytest.ini
+[pytest]
+markers =
+    integration: tests that call real LLM APIs
+addopts = -m "not integration"
+```
+```toml pyproject.toml
+[tool.pytest.ini_options]
+markers = [
+  "integration: tests that call real LLM APIs"
+]
+addopts = "-m 'not integration'"
+```
+</CodeGroup>
+
+显式运行集成测试：
+
+```bash
+pytest -m integration
+```
+
+
+
+
+## 管理 API 密钥
+
+集成测试需要真实的 API 凭据。请从环境变量加载它们，避免把密钥放进源码控制。
+
+使用 `conftest.py` fixture 来检查所需密钥是否可用：
+
+```python
+import os
+import pytest
+
+@pytest.fixture(autouse=True)
+def check_api_keys():
+    if not os.environ.get("OPENAI_API_KEY"):
+        pytest.skip("OPENAI_API_KEY not set")
+```
+
+在本地开发时，把密钥存进 `.env` 文件，并用 [`python-dotenv`](https://pypi.org/project/python-dotenv/) 加载：
+
+```bash .env
+OPENAI_API_KEY=sk-...
+```
+
+```python conftest.py
+from dotenv import load_dotenv
+
+load_dotenv()
+```
+
+
+
+
+<Warning>
+    把 `.env` 加进 `.gitignore`，避免提交凭据。在 CI 中，请通过你所用平台的密钥管理功能注入 secrets（例如 GitHub Actions secrets）。
+</Warning>
+
+## 断言结构，而不是内容
+
+LLM 响应每次运行都可能不同。与其断言精确输出字符串，不如验证响应的结构属性：消息类型、工具调用名称、参数形状和消息数量。
+
+```python
+from langchain.agents import create_agent
+from langchain.messages import AIMessage, HumanMessage
+
+def test_agent_calls_weather_tool():
+    agent = create_agent("claude-sonnet-4-6", tools=[get_weather])
+    result = agent.invoke({
+        "messages": [HumanMessage(content="What's the weather in SF?")]
+    })
+
+    messages = result["messages"]
+    tool_calls = [
+        tc
+        for msg in messages
+        if hasattr(msg, "tool_calls")
+        for tc in (msg.tool_calls or [])
+    ]
+
+    assert any(tc["name"] == "get_weather" for tc in tool_calls)
+    assert isinstance(messages[-1], AIMessage)
+    assert len(messages[-1].content) > 0
+```
+
+
+
+
+<Tip>
+    如果你需要更严格的轨迹断言，请使用 [AgentEvals](/oss/python/langchain/test/evals) evaluators，它们支持像 `unordered` 和 `superset` 这样的模糊匹配模式。
+</Tip>
+
+js
+```ts
+const response = await agent.invoke({
+  messages: [new HumanMessage("Weather in SF and NYC?")]
+});
+const aiMsg = response.messages.find(
+  (m) => AIMessage.isInstance(m) && m.tool_calls?.length
+);
+
+// 检查是否包含特定工具调用（不要求顺序）
+expect(aiMsg).toHaveToolCalls([
+  { name: "get_weather", args: { city: "San Francisco" } },
+  { name: "get_weather", args: { city: "New York" } },
+]);
+
+// 只检查数量
+expect(aiMsg).toHaveToolCallCount(2);
+
+// 检查是否至少包含一个匹配的 tool call（支持 .not）
+expect(aiMsg).toContainToolCall({ name: "get_weather" });
+expect(aiMsg).not.toContainToolCall({ name: "send_email" });
+```
+
+### 断言工具消息
+
+`toHaveToolMessages()` 会接收完整的消息数组，并按顺序检查其中的 [`ToolMessage`](https://reference.langchain.com/javascript/langchain-core/messages/ToolMessage) 实例：
+
+```ts
+expect(response.messages).toHaveToolMessages([
+  { content: "San Francisco 的天气是 72°F 且晴朗" },
+  { content: "New York 的天气是 68°F 且多云" },
+]);
+```
+
+### 断言中断和结构化响应
+
+`toHaveBeenInterrupted()` 会检查 [LangGraph interrupt](/oss/python/langchain/human-in-the-loop) 结果中是否存在 `__interrupt__` 字段。你可以传入一个值来匹配中断 payload：
+
+```ts
+const result = await graph.invoke(input);
+
+expect(result).toHaveBeenInterrupted();
+expect(result).toHaveBeenInterrupted("confirm_action");
+```
+
+`toHaveStructuredResponse()` 会检查结果中是否存在 `structuredResponse` 字段。你可以传入对象来匹配特定字段：
+
+```ts
+expect(result).toHaveStructuredResponse();
+expect(result).toHaveStructuredResponse({ name: "Alice", age: 30 });
+```
+
+### Matcher 参考
+
+| Matcher | 说明 |
+| --- | --- |
+| `toBeHumanMessage(expected?)` | 检查值是否为 `HumanMessage`。可选地匹配内容（字符串）或字段（对象）。 |
+| `toBeAIMessage(expected?)` | 检查值是否为 `AIMessage`。可选地匹配内容或字段。 |
+| `toBeSystemMessage(expected?)` | 检查值是否为 `SystemMessage`。可选地匹配内容或字段。 |
+| `toBeToolMessage(expected?)` | 检查值是否为 `ToolMessage`。可选地匹配内容或诸如 `tool_call_id` 之类的字段。 |
+| `toHaveToolCalls(expected)` | 检查 `AIMessage` 是否恰好包含给定的 tool call（不要求顺序）。 |
+| `toHaveToolCallCount(n)` | 检查 `AIMessage` 是否恰好包含 `n` 个 tool call。 |
+| `toContainToolCall(expected)` | 检查 `AIMessage` 是否至少包含一个匹配的 tool call。支持 `.not`。 |
+| `toHaveToolMessages(expected)` | 检查消息数组是否按顺序包含给定的 `ToolMessage`。 |
+| `toHaveBeenInterrupted(value?)` | 检查结果是否具有 `__interrupt__`。可选地匹配中断值。 |
+| `toHaveStructuredResponse(expected?)` | 检查结果是否具有 `structuredResponse`。可选地匹配特定字段。 |
+
+:::
+
+## 降低成本和延迟
+
+调用 LLM API 的集成测试会产生真实成本。下面这些做法可以帮助你让测试套件更快、更省钱：
+
+- **使用更小的模型**：比如 `gemini-3.1-flash-lite`，或其他只需要验证工具调用和响应结构的等价模型。
+- **设置 `maxTokens`**：限制输出长度，避免生成又长又贵的完成结果。
+- **缩小测试范围**：每个测试只验证一个行为。只要单轮测试就能说明问题，就不要写要串很多 LLM 调用的端到端场景。
+- **选择性运行**：使用上面的测试分离方式，让集成测试只在 CI 或发布前运行，而不是每次保存文件都跑。
+
+```python
+from langchain.agents import create_agent
+
+agent = create_agent(
+    "gemini-3.1-flash-lite",
+    tools=[get_weather],
+    model_kwargs={"max_tokens": 256},
+)
+```
+
+
+
+
+## 记录和回放 HTTP 调用
+
+对于在 CI 中高频运行的测试，你可以在第一次运行时录制 HTTP 交互，然后在后续运行中直接回放，而不再发起真实 API 调用。这样在初次录制后就能消除成本和延迟。
+
+[`vcrpy`](https://pypi.org/project/vcrpy/1.5.2/) 会把 HTTP 请求/响应对记录到 YAML “cassette” 文件中。[`pytest-recording`](https://pypi.org/project/pytest-recording/) 插件可以把它集成到 pytest 里。
+
+在 `conftest.py` 中配置对 cassette 的敏感信息过滤：
+
+```py conftest.py
+import pytest
+
+@pytest.fixture(scope="session")
+def vcr_config():
+    return {
+        "filter_headers": [
+            ("authorization", "XXXX"),
+            ("x-api-key", "XXXX"),
+        ],
+        "filter_query_parameters": [
+            ("api_key", "XXXX"),
+            ("key", "XXXX"),
+        ],
+    }
+```
+
+在项目里配置 `vcr` marker：
+
+<CodeGroup>
+```ini pytest.ini
+[pytest]
+markers =
+    vcr: record/replay HTTP via VCR
+addopts = --record-mode=once
+```
+```toml pyproject.toml
+[tool.pytest.ini_options]
+markers = [
+  "vcr: record/replay HTTP via VCR"
+]
+addopts = "--record-mode=once"
+```
+</CodeGroup>
+
+<Info>
+    `--record-mode=once` 会在第一次运行时录制 HTTP 交互，后续运行则直接回放。
+</Info>
+
+给测试加上 `vcr` marker：
+
+```python
+import pytest
+from langchain.agents import create_agent
+from langchain.messages import HumanMessage
+
+@pytest.mark.vcr()
+def test_agent_trajectory():
+    agent = create_agent("claude-sonnet-4-6", tools=[get_weather])
+    result = agent.invoke({
+        "messages": [HumanMessage(content="What's the weather in SF?")]
+    })
+    assert any(
+        tc["name"] == "get_weather"
+        for msg in result["messages"]
+        if hasattr(msg, "tool_calls")
+        for tc in (msg.tool_calls or [])
+    )
+```
+
+第一次运行会发起真实网络调用，并在 `tests/cassettes/` 中生成 cassette 文件。后续运行会回放这些已记录的响应。
+
+<Warning>
+    当你修改 prompt、添加新工具，或者改变预期轨迹时，保存下来的 cassette 会过期，你现有的测试**会失败**。删除对应的 cassette 文件并重新运行测试，录制新的交互即可。
+</Warning>
+
+
+## 下一步
+
+了解如何在 [Evals](/oss/python/langchain/test/evals) 中使用确定性匹配或 LLM-as-judge evaluator 来评估智能体轨迹。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/langchain/test/integration-testing.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

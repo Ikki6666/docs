@@ -1,0 +1,134 @@
+---
+title: 故障排查 SmithDB
+sidebarTitle: 故障排查
+description: 诊断 SmithDB 故障、收集故障排查上下文，或在自托管 LangSmith 上禁用和重置 SmithDB deployment。
+---
+
+<Note>
+在本页的所有操作中，保持 ClickHouse 处于已配置且可用的状态。如果没有匹配的已记录问题，请通过 [Support Portal](https://support.langchain.com/) 联系 LangChain。
+</Note>
+
+使用本页诊断 SmithDB 安装和迁移故障、在升级之前收集上下文，或把 SmithDB 从 deployment 中撤出：把流量返回给 ClickHouse、禁用 SmithDB 服务，并可选地移除 SmithDB 数据。
+
+## 通用最佳实践
+
+- 在理解问题之前，停在当前安装或迁移阶段。
+- 记录 LangSmith 和 Helm chart 版本，以及最近一次配置变更。
+- 在删除或重建资源之前，保留失败的 Jobs、TaskDB 和相关日志。
+- 故障排查期间不要删除 SmithDB metastore 或 object-storage 数据。
+
+## 支撑基础设施
+
+大多数 SmithDB 安装失败可以追溯到以下之一。各项依赖的配置请参见[准备 SmithDB 支撑基础设施](/langsmith/self-host-smithdb-infrastructure)。
+
+**Pods 保持 `Pending`。** 在网络挂载缓存上，claim 无法绑定。检查 claim 和 pod events 中的 StorageClass、zone 或 quota 错误：
+
+```bash
+kubectl get pvc -n NAMESPACE
+kubectl describe pod -n NAMESPACE POD_NAME | grep -A5 Events
+```
+
+对于本地 SSD，比较 pod 的 `ephemeral-storage` 请求与节点可分配容量：
+
+```bash
+kubectl get node NODE_NAME -o jsonpath='{.status.allocatable.ephemeral-storage}{"\n"}'
+```
+
+要么预配更大的节点，要么选择更小的层级。节点还需要为镜像、logs 和 Kubernetes 预留超出 pod 请求的余量。如果你在 0.17 上迁移到了网络挂载缓存，而 pods 仍然请求节点存储，说明较旧 values 文件中的 `ephemeral-storage` 覆盖项仍然生效；把它移除。Migration Job 无论缓存类型如何都会请求节点存储。
+
+**Object store 访问被拒绝。** workload identity 绑定与 SmithDB 实际运行的 ServiceAccount 不匹配。信任策略必须指明 release namespace 和 ServiceAccount 名称，后者默认为 `HELM_RELEASE-smithdb`。确认 pod 正在使用的名称：
+
+```bash
+kubectl get pod -n NAMESPACE POD_NAME -o jsonpath='{.spec.serviceAccountName}{"\n"}'
+```
+
+使用 `create: false` 时，`name` 是必需的。否则 pods 会回退到 `default` ServiceAccount，绑定永远不会生效。
+
+**Metastore 拒绝连接。** 检查集群是否可以访问数据库、`useSsl` 是否与服务器要求一致，以及 `smithdb.config.metastore` 中指定的 Secret key 是否与 Secret 中实际存在的 key 匹配。
+
+**缓存 I/O 缓慢。** 在本地 SSD 上，`emptyDir` 由启动磁盘而不是 SSD 支撑。在网络挂载磁盘上，卷预配不足：确认 StorageClass 设置了至少 7000 IOPS 和 1000 MiB/s。检查运行中的 pod 内缓存文件系统由哪个设备支撑：
+
+```bash
+kubectl exec -n NAMESPACE POD_NAME -- df -h /data
+```
+
+对于本地 SSD，文件系统应该使用本地 NVMe 设备，例如 `/dev/md0` 或 `/dev/nvme1n1`。对于网络磁盘，确认 `/data` 挂载了预配的 claim。
+
+## Migration Job 失败
+
+migration Job 默认为 `backoffLimit: 3`，在 Kubernetes 把它标记为失败之前允许重试。
+
+如果 Job 因预配不足而失败，请同时调整 `smithdb.migration.job.parallelism` 和 `smithdb.migration.job.resources`（LangSmith 0.16 上为 `smithdb.migration.deployment.resources`）。保留 TaskDB，只删除 migration Job，然后运行正常的 Helm upgrade。删除一个活跃的 Job 可能会留下少量来自进行中写入的未跟踪 object-storage 数据。重建的 Job 会恢复 TaskDB 中跟踪的进度。
+
+<Warning>
+重置 SmithDB metastore 或 object store 时，也要重置 TaskDB。禁用 SmithDB 时，chart 管理的 TaskDB PVC 默认会被删除。手动清空外部或保留的 TaskDB，否则过期的迁移状态可能导致工作被跳过。
+</Warning>
+
+<Warning>
+对于验证失败、原因不明或预配不足之外的问题，请停止并升级处理。保持查询禁用、迁移启用。保留失败的 Job、TaskDB、SmithDB metastore 和 object storage。通过 [Support Portal](https://support.langchain.com/) 联系 LangChain。
+</Warning>
+
+## 禁用或重置 SmithDB
+
+使用本节把 LangSmith 流量返回给 ClickHouse 并禁用 SmithDB 服务。安装和切换顺序请参见[使用 SmithDB 安装 LangSmith](/langsmith/self-host-smithdb-install)。
+
+<Warning>
+如果历史迁移正在进行或其进度必须保留，请在禁用 SmithDB 之前停止。禁用迁移会移除 chart 管理的 TaskDB 资源，并默认移除其 PVC。如果需要保留迁移进度，请通过 [Support Portal](https://support.langchain.com/) 联系 LangChain。
+</Warning>
+
+如果你之后重新启用 SmithDB 摄取，需要运行另一次迁移来让它与 ClickHouse 重新同步。
+
+### Step 1. 把流量返回给 ClickHouse
+
+保持 SmithDB 服务启用，但禁用 query、ingestion 和 migration：
+
+```yaml
+smithdb:
+  enabled: true
+  langsmith:
+    ingestion:
+      enabled: false
+    migration:
+      enabled: false
+    query:
+      enabled: false
+```
+
+通过你的正常部署 workflow 应用 chart，并等待 rollout 完成。这会在任何 SmithDB workload 被移除之前，把所有查询和摄取流量返回给 ClickHouse。
+
+### Step 2. 禁用 SmithDB 服务
+
+第一次 Helm 更新完成后，在保持集成开关关闭的状态下禁用 SmithDB 服务：
+
+```yaml
+smithdb:
+  enabled: false
+  langsmith:
+    ingestion:
+      enabled: false
+    migration:
+      enabled: false
+    query:
+      enabled: false
+```
+
+再次应用 chart。把流量切换与 workload 移除分开，可以避免请求与 SmithDB 关闭过程竞态。
+
+### Step 3.（可选）移除 SmithDB 数据
+
+<Danger>
+这个清理是破坏性的。只有在 SmithDB 服务已禁用，并且你不再需要这些数据用于重新启用、诊断或恢复时，才继续。
+</Danger>
+
+可选地移除专用的 SmithDB object-storage 数据和 PostgreSQL metastore。这次清理之后重新启用 SmithDB，需要重建其支撑基础设施并从 ClickHouse 重新迁移数据。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/self-host-smithdb-troubleshooting.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

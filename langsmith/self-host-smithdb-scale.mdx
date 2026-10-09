@@ -1,0 +1,144 @@
+---
+title: 按规模配置 SmithDB
+sidebarTitle: 按规模配置
+description: 选择经过测试的 SmithDB 资源层级，并设定 Kubernetes workloads 和 PostgreSQL metastore 的规格。
+---
+
+<Note>
+关于非 SmithDB 的 LangSmith 服务，请参见[按规模配置 LangSmith](/langsmith/self-host-scale)。
+</Note>
+
+把这些经过测试的层级用作 SmithDB 的初始配置。在调优容量之前，先把 SmithDB 连接到你的监控栈，这样你可以观察每项变更的效果。请参见[配置 SmithDB observability](/langsmith/self-host-smithdb-observability)。
+
+## 选择并扩展层级
+
+这些层级不是吞吐量限制或规定配置。CPU、内存和缓存大小都是每 replica 的。缓存大小是每个 replica 得到的卷：网络挂载磁盘上的 claim 大小，或本地 SSD 上的 `emptyDir` limit。
+
+选择其经过测试的摄取和查询速率最接近或超过你预期稳态负载的层级。要估算你当前的 trace 量，请在 LangSmith 中打开 **Settings > Usage**。请参见[细粒度计费用量](/langsmith/granular-usage)。
+
+如果你无法测量负载，请从 `small` 开始并向上扩展。规格不足会表现为更慢的摄取和查询，而不是数据丢失。
+
+应用所选层级的每 replica 资源和初始 replica 数量。如果 workload 之后超出该起点，你可以水平扩展 SmithDB 计算。
+
+<Note>
+SmithDB query、ingestion 和 compaction-worker 的 HPA 默认启用。它们需要 Kubernetes Metrics Server 或其他 `metrics.k8s.io` provider。用 `kubectl get --raw /apis/metrics.k8s.io/v1beta1` 验证可用性。
+</Note>
+
+### 改用 KEDA 扩展
+
+<Note>
+SmithDB compaction workers 的 KEDA 扩缩容需要 Helm chart `0.17.0` 或更高。
+</Note>
+
+SmithDB compaction workers 可以通过 [KEDA](https://keda.sh/) 按队列深度扩展，而不是基于 CPU 的 HPA。这适合突发性的 compaction 积压，队列深度会先于 CPU 上升。LangSmith 对自己的队列使用相同的 KEDA 安装；安装和配置请参见 [KEDA autoscaling for LangSmith queues](/langsmith/self-host-scale#keda-autoscaling-for-langsmith-queues)。
+
+为 compaction workers 启用 KEDA scaler：
+
+```yaml
+smithdb:
+  compactionWorker:
+    autoscaling:
+      hpa:
+        enabled: false
+      keda:
+        enabled: true
+```
+
+对一个组件使用 HPA 或 KEDA 之一，不要同时使用。
+
+## 基线层级
+
+| 组件 | Small<br />10 ingest / 10 query QPS | Medium<br />100 ingest / 40 query QPS | Large<br />1000 ingest / 100 query QPS |
+| --- | --- | --- | --- |
+| Ingestion | 1 replica<br />4 CPU<br />8 Gi memory<br />100 Gi cache | 1 replica<br />16 CPU<br />32 Gi memory<br />100 Gi cache | 2 replicas<br />56 CPU<br />150 Gi memory<br />1000 Gi cache |
+| Query | 1 replica<br />4 CPU<br />8 Gi memory<br />200 Gi cache | 1 replica<br />28 CPU<br />48 Gi memory<br />200 Gi cache | 4 replicas<br />28 CPU<br />50 Gi memory<br />1000 Gi cache |
+| Compaction | 1 replica<br />2 CPU<br />4 Gi memory | 1 replica<br />4 CPU<br />8 Gi memory | 1 replica<br />8 CPU<br />16 Gi memory |
+| Compaction worker | 1 replica<br />8 CPU<br />16 Gi memory<br />100 Gi cache | 1 replica<br />16 CPU<br />32 Gi memory<br />100 Gi cache | 4 replicas<br />28 CPU<br />50 Gi memory<br />300 Gi cache |
+| Cluster manager | 1 replica<br />250m CPU<br />256 Mi memory | 1 replica<br />250m CPU<br />256 Mi memory | 1 replica<br />2 CPU<br />2 Gi memory |
+
+## 使用 Helm 配置资源
+
+chart 默认为 `small`。选择 `small`、`medium` 或 `large`：
+
+```yaml
+smithdb:
+  resourceTier: medium
+```
+
+在 LangSmith 0.17 上，层级的缓存大小会变成生成的 claim 的容量。在 0.16 上，它是 `ephemeral-storage` request 和 limit，同时也会设定生成的 `emptyDir` 的大小。Replica 数量和 autoscaling 单独配置。
+
+显式的组件 `resources` 块会替换层级的 CPU 和内存。在 0.17 上，它不会更改缓存大小；为此请选择不同的层级或覆盖 `deployment.volumes`。本地 SSD values 请参见[缓存存储](/langsmith/self-host-smithdb-infrastructure#cache-storage)。
+
+当前值和 chart 详情请参见 [SmithDB resource tiers](https://github.com/langchain-ai/helm/tree/main/charts/langsmith#smithdb-resource-tiers)。
+
+<Accordion title="Example explicit resource configuration">
+
+这个示例以 medium 层级规格覆盖 query 组件。
+
+<Tabs>
+<Tab title="LangSmith 0.17">
+
+缓存 claim 保持层级大小。这些 values 不请求节点存储。
+
+```yaml
+smithdb:
+  resourceTier: medium
+  query:
+    deployment:
+      resources:
+        requests:
+          cpu: "28"
+          memory: "48Gi"
+        limits:
+          cpu: "28"
+          memory: "48Gi"
+```
+
+</Tab>
+<Tab title="LangSmith 0.16">
+
+存储 limit 也会同时设定默认 `emptyDir` 的大小。
+
+```yaml
+smithdb:
+  resourceTier: medium
+  query:
+    deployment:
+      resources:
+        requests:
+          cpu: "28"
+          memory: "48Gi"
+          ephemeral-storage: "200Gi"
+        limits:
+          cpu: "28"
+          memory: "48Gi"
+          ephemeral-storage: "200Gi"
+```
+
+</Tab>
+</Tabs>
+
+</Accordion>
+
+## Metastore 容量
+
+基线层级只覆盖 SmithDB Kubernetes workloads。它们不包含 PostgreSQL metastore。对专用的 metastore 使用以下起点：
+
+| 层级 | vCPU | Memory |
+| --- | --- | --- |
+| Small | 2 | 16 GiB |
+| Medium | 4 | 32 GiB |
+| Large | 8 | 64 GiB |
+
+从你的 provider 中选择最接近的受支持 PostgreSQL 实例规格，并在 rollout 期间监控数据库资源使用和事务延迟。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/self-host-smithdb-scale.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

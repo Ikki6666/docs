@@ -1,0 +1,307 @@
+---
+title: 从 Deep Agents 迁移到 Managed Deep Agents
+sidebarTitle: Move from Deep Agents
+description: 将使用 create_deep_agent 构建的 agent 转换为 Managed Deep Agents 项目。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/javascript/langsmith/managed-deep-agents-public-beta-note.mdx';
+
+Managed Deep Agents 运行的正是你已经基于其构建的 [Deep Agents](/oss/javascript/deepagents/overview) harness，因此迁移现有 agent 是一次重新打包，而不是重写。你的 tools、middleware 和 subagents 原样保留。变化的是 agent 入口，而 system prompt、skills 和 memory 会移入项目文件。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+## 判断是否迁移
+
+Managed Deep Agents 运行的是同一个 harness，因此 agent 本身的行为不变。Tools、middleware 和 subagents 的工作方式与现在完全相同。迁移增加的是 agent 外围的那一层：Slack 和其他聊天界面、面向最终用户的 OAuth、调度 run、托管 sandbox 和 durable memory，都变成项目文件中的声明，而不是需要你自行搭建和运维的服务。
+
+当你想要这一层但不想自己运行它时，请迁移 agent。当你需要拥有它时，请留在 Deep Agents。
+
+| | Deep Agents | Managed Deep Agents |
+| --- | --- | --- |
+| **托管方式** | 你在自己的进程或容器中运行 agent，或者将其部署为 [LangSmith deployment](/langsmith/deployment)。 | LangSmith 将 agent 托管在 [Agent Server](/langsmith/agent-server-overview) 上。`mda deploy` 就是全部的部署步骤。 |
+| **文件系统和 shell** | 任意 [backend](/oss/javascript/deepagents/backends)：agent state、本地磁盘、store，或你通过某个 provider 预置的 [sandbox](/oss/javascript/deepagents/sandboxes)。 | 一个托管 [sandbox](/langsmith/javascript/managed-deep-agents-sandboxes)，在文件中声明。LangSmith 负责创建、快照，并在空闲时停止它。 |
+| **跨对话的 memory** | 你自己运行存储并完成接线。 | 一个共享的 [memory](/langsmith/javascript/managed-deep-agents-memory) 树，通过添加一个文件启用。 |
+| **最终用户的第三方访问** | 你为每个用户预置并存储凭据。 | [Connections](/langsmith/javascript/managed-deep-agents-connections) 保存 workspace secret 并运行 OAuth，最终用户自己授权服务。 |
+| **聊天界面** | 你自己编写集成。 | [Channels](/langsmith/javascript/managed-deep-agents-channels) 连接 Slack 和其他消息服务。 |
+| **调度 run** | 你自己运行调度器。 | [Schedules](/langsmith/javascript/managed-deep-agents-schedules) 运行托管的 cron 任务。 |
+| **agent 周围的代码** | 由你编写，包括自定义 route 和应用代码。 | 只有 agent 本身。自定义 route 或应用代码请使用 [LangSmith deployment](/langsmith/deployment)。 |
+
+无论哪种方式 harness 都是相同的，因此先基于 Deep Agents 构建、在 agent 准备好进入生产时再迁移是一条正常路径。请参阅 [Going to production](/oss/javascript/deepagents/going-to-production)。
+
+## 理解哪些内容会变化
+
+
+
+[createDeepAgent](https://reference.langchain.com/javascript/deepagents/agent/createDeepAgent) 在你的进程中编译 agent，因此它把 backend、store 和 checkpointer 作为选项。`defineDeepAgent` 改为返回一个定义，由托管运行时负责编译。该定义是配置，而不是可运行的 agent：`mda` CLI 在 `mda dev` 和 `mda deploy` 时消费它，运行时在那时提供托管的部分。完整说明请参见 [Relationship to Deep Agents](/langsmith/javascript/managed-deep-agents-overview#relationship-to-deep-agents)。
+
+
+## 检查哪些内容无法直接迁移
+
+大多数 agent 除了入口文件之外无需任何改动即可迁移。有四种情况需要先做决定：
+
+- **自定义 backends**：手写的 `BackendProtocol` 实现没有对应物。运行时拥有 backend，而[托管 sandbox](/langsmith/javascript/managed-deep-agents-sandboxes) 是为 agent 提供文件系统和 shell 的唯一选择。
+- **你自己的 store 或 checkpointer**：Threads、runs 和持久化来自 [Agent Server](/langsmith/agent-server-overview)。依赖特定 store 实现的 agent，需要把那部分逻辑移入 tool 或 middleware。
+- **自定义应用代码和 route**：Managed Deep Agents 托管的是 agent，而不是任意 web 应用。对于自定义 route、高级身份验证或 agent 周围的应用代码，请改用 [LangSmith deployment](/langsmith/deployment)。
+- **Python 中的自定义 state schema**：`define_deep_agent` 不接受 `state_schema`，因此扩展了 `DeepAgentState` 的 agent 无法原样迁移。TypeScript 的 `defineDeepAgent` 接受 `stateSchema`。
+
+如果以上都不适用，agent 逻辑按原样迁移。
+
+<Prompt
+    description="将 Deep Agents 项目转换为 Managed Deep Agents 项目。"
+    icon="arrow-right"
+    actions={["copy"]}
+>
+将这个代码库从自托管的 Deep Agents agent 转换为 Managed Deep Agents (MDA) 项目。
+
+## 第 1 步：阅读指南
+
+
+
+获取并遵循 https://docs.langchain.com/langsmith/javascript/managed-deep-agents-migrate.md，将其作为参数映射和项目布局的唯一依据。
+
+
+## 第 2 步：添加 SDK
+
+在原有项目中原地转换；不要运行 `mda init`，它只会创建一个新目录。将 `managed-deepagents` 添加到现有项目清单中，固定为 `mda --version` 报告的版本，并且不要动任何现有依赖。
+
+在 Python 中，如果清单设置了 `build-backend = "hatchling.build"`，还要添加 `[tool.hatch.metadata] allow-direct-references = true`。`mda build` 会把该 requirement 重写为 path reference，否则 Hatchling 在安装时会拒绝它。
+
+## 第 3 步：迁移配置
+
+找到 `create_deep_agent`（或 `createDeepAgent`）的调用点，然后：
+
+- 在项目根目录的 `agent.py`（或 `agent.ts`）中将其替换为 `define_deep_agent`（或 `defineDeepAgent`），导出一个名为 `agent` 的变量。定义调用必须位于该文件中，不能从其他文件 re-export 进来。
+- 添加一个静态 `name`，这是必填的。使用匹配 `[a-zA-Z][a-zA-Z0-9_-]*` 的字符串。
+- 将 `system_prompt` 文本移到 agent 入口旁边的 `instructions.md`，并移除该参数。
+- 将 `skills` 引用的文件移到 `skills/<name>/SKILL.md`，并移除该参数。
+- 将 `memory` 替换为根目录的 `memory.py`（或 `memory.ts`），导出一个名为 `memory` 的变量，值为 `define_memory(scope="agent")`，并移除该参数。如果 agent 不需要 durable memory，则不创建该文件。提醒用户：这会挂载一棵空树，任何已有的 memory 内容必须移入 `instructions.md` 或某个 skill。
+- 删除 `backend`、`store` 和 `checkpointer`。三者都由运行时拥有。如果 agent 使用了 sandbox backend，改为添加一个导出 `define_sandbox(...)` 的 `sandbox/` 声明。托管 sandbox 是 Managed Deep Agents 提供的唯一 backend。
+- 保持 `model`、`tools`、`middleware`、`subagents`、`permissions`、`cache` 和 `debug` 原样，interrupt、response-format 和 context-schema 参数也保持现有名称。提醒用户：声明了 `sandbox/` 的项目会以清空的 `permissions` 运行，因为文件系统权限规则会禁用 sandbox 的 `execute` tool。
+- Tool 和 middleware 模块留在原处，继续从 agent 入口导入它们。不要重构项目结构。
+
+## 第 4 步：显式处理缺口
+
+如果代码库在 Python 中传入 `state_schema`、构建了自定义 `BackendProtocol`，或将 agent 包装在自己的 server route 或应用代码中，请停止并询问用户如何继续。Managed Deep Agents 不接受这些做法。不要自行发明替代方案。
+
+## 第 5 步：验证
+
+运行 `mda build`，再运行 `mda dev`，确认 agent 能够启动并回答一条测试消息。`mda build` 不会校验定义调用，因此遗留的托管参数只会在 graph 加载时出现。报告任何无法迁移的内容。
+</Prompt>
+
+## 映射参数
+
+
+
+大部分选项会以相同的名称原样迁移到 `defineDeepAgent`：`model`、`tools`、`middleware`、`subagents`、`interruptOn`、`responseFormat`、`contextSchema`、`stateSchema`、`cache` 和 `debug`。Tool 和 middleware 模块留在原处，继续从 agent 入口导入它们。
+
+`defineDeepAgent` 增加一个必填选项。为 `name` 传入一个静态字符串，以字母开头，只包含字母、数字、下划线或连字符。Managed Deep Agents 将它用作 agent 的 graph ID 和默认 deployment 名称。
+
+其余选项移入项目文件或成为运行时的职责：
+
+| `createDeepAgent` | 去向 | 说明 |
+| --- | --- | --- |
+| `systemPrompt` | `instructions.md` | 将文本移入该文件，然后移除该选项。参见 [Instructions](/langsmith/javascript/managed-deep-agents-instructions)。 |
+| `skills` | `skills/` | 每个 skill 一个目录，各含一个 `SKILL.md`。参见 [Skills](/langsmith/javascript/managed-deep-agents-skills)。 |
+| `memory` | `memory.ts` | 导出 `defineMemory({ scope: "agent" })`。不需要 durable memory 则省略该文件。参见 [Memory](/langsmith/javascript/managed-deep-agents-memory)。 |
+| `backend` | `sandbox/` | 声明一个托管 sandbox，而不是构造 backend。参见 [Sandboxes](/langsmith/javascript/managed-deep-agents-sandboxes)。 |
+| `permissions` | 仍是选项 | 接受，但当项目声明了 sandbox 时会被清空。参见 [Permissions](/oss/javascript/deepagents/permissions)。 |
+| `store`、`checkpointer` | 托管运行时 | 两者都移除。 |
+
+
+Deep Agents 的 backend 是可插拔的，而托管运行时会提供自己的。声明了 `sandbox/` 的项目会获得一个托管 sandbox，用于 agent 的文件系统和 shell。没有声明的项目则获得 thread 范围的 agent state，以及用于 instructions、skills 和 memory 的只读 [Context Hub](/langsmith/javascript/managed-deep-agents-context-hub) 挂载。没有其他 backend 可选，因此依赖特定 backend 的 agent 应留在 Deep Agents。
+
+## 迁移 agent
+
+在原有项目中原地转换。现有的布局、模块结构和依赖保持原样：`mda build` 会把它需要的依赖合并到项目清单中，而不是替换清单。
+
+如果需要先安装 `mda` CLI，请参阅 [quickstart](/langsmith/javascript/managed-deep-agents-quickstart)。
+
+<Steps>
+<Step title="将 SDK 添加到项目">
+
+
+```bash
+npm install managed-deepagents
+```
+
+将版本固定为与 CLI 一致，即 `mda --version` 报告的版本。
+
+
+项目已声明的所有依赖都保持原位。Tools 和 middleware 继续导入它们一直使用的内容。
+</Step>
+
+<Step title="重写 agent 入口">
+
+
+按照上表转换调用点，写入项目根目录下名为 `agent.ts` 的文件：
+
+
+
+
+```ts agent.ts (before)
+import { createDeepAgent } from "deepagents";
+
+import { internetSearch } from "./tools/search.js";
+
+export const agent = createDeepAgent({
+  model: "openai:gpt-5.5",
+  tools: [internetSearch],
+  systemPrompt: SYSTEM_PROMPT,
+  skills: ["/skills/research/"],
+  checkpointer,  // yours to construct and wire
+});
+```
+
+```ts agent.ts (after)
+import { defineDeepAgent } from "managed-deepagents";
+
+import { internetSearch } from "./tools/search.js";
+
+export const agent = defineDeepAgent({
+  name: "research-assistant",
+  model: "openai:gpt-5.5",
+  tools: [internetSearch],
+});
+```
+
+
+入口必须导出一个名为 `agent` 的变量，并且定义调用本身必须位于该文件中。从其他模块 re-export 该定义的根入口会失败，而且错误提示的是 `name`，而不是真正的问题。
+
+除此之外，`src/` 布局没有问题。保持 package 原位，并从根入口导入它们。
+</Step>
+
+<Step title="将 prompt、skills 和 memory 移入文件">
+将 system prompt 放到项目根目录的 `instructions.md` 中。为每个 skill 在 `skills/` 下提供独立目录，其中包含一个 `SKILL.md`。
+
+如果 agent 需要跨 threads 保留的 memory，请在根文件中声明，导出一个名为 `memory` 的变量：
+
+
+
+```ts memory.ts
+import { defineMemory } from "managed-deepagents";
+
+export const memory = defineMemory({ scope: "agent" });
+```
+
+
+Durable memory 是可选的，没有该文件的项目不会挂载任何内容。scope 是唯一的开关：`"agent"` 挂载一棵由该 deployment 所有调用者共享的树。要控制 agent 在其中保留什么，请在 `instructions.md` 中写入 memory 策略。参见 [Guide what to remember](/langsmith/javascript/managed-deep-agents-memory#guide-what-to-remember)。
+
+<Warning>
+    `define_memory` 会挂载一棵空的 memory 树。旧 `memory` 参数指向的文件内容不会迁移，因此在删除那些文件之前，请把 agent 仍然需要的内容移入 `instructions.md` 或某个 skill。
+</Warning>
+</Step>
+
+<Step title="声明 sandbox">
+之前传入了 sandbox `backend` 的 agent 需要一个托管 sandbox 声明。创建目录并声明它：
+
+
+
+```ts sandbox/index.ts
+import { defineSandbox } from "managed-deepagents";
+
+export const sandbox = defineSandbox({
+  idleTtlSeconds: 600,
+  defaultTimeout: 600,
+});
+```
+
+
+<Warning>
+    声明 sandbox 会清空 `permissions`。文件系统权限规则会禁用 sandbox 的 `execute` tool，因此运行时会丢弃这些规则而不是丢弃 shell。请改为通过你提供的 tools 来约束 sandboxed agent。
+</Warning>
+
+要预置 snapshot，请添加 `sandbox/setup.sh`。如果 agent 之前没有 sandbox backend，请跳过此步骤。参见 [Sandboxes](/langsmith/javascript/managed-deep-agents-sandboxes)。
+</Step>
+
+<Step title="声明 identity">
+（可选）要让每个调用者拥有私有的 threads 和下游凭据，请添加一个根 identity 声明：
+
+
+
+```ts identity.ts
+import { auth, defineIdentity } from "managed-deepagents";
+
+export const identity = defineIdentity({
+  auth: auth.langsmithApiKey(),
+});
+```
+
+
+没有该文件时，deployment 会以无托管 auth 的方式运行，`mda dev` 会报告 `Identity none`。参见 [Identity](/langsmith/javascript/managed-deep-agents-identity)。
+</Step>
+
+<Step title="设置凭据并忽略构建输出">
+将模型和 tool 的 API key 放到项目根目录的 `.env` 文件中。在你的 shell 中 export 的值不会被读取。对于共享的 workspace secret 和 OAuth，请改用 [connections](/langsmith/javascript/managed-deep-agents-connections)。
+
+将构建目录添加到 `.gitignore`：
+
+```text .gitignore
+.env
+.env.*
+.mda/
+```
+
+`mda build` 会把整个项目根目录复制到 `.mda/build`，`mda deploy` 会上传它。任何位于 agent 入口旁边的内容都会随 agent 一起发布，因此请把 deployment 不需要的内容移出项目根目录。
+</Step>
+
+<Step title="编译，然后运行">
+只编译、不部署：
+
+```bash
+mda build
+```
+
+然后在本地启动：
+
+```bash
+mda dev
+```
+
+<Note>
+    `mda build` 不会检查定义调用，因此即使仍有托管参数遗留，它也会以 0 退出。遗留的参数会在 `mda dev` 下 graph 加载时显现。
+</Note>
+
+参见 [Local development](/langsmith/javascript/managed-deep-agents-local-development)。
+</Step>
+
+<Step title="部署">
+上传项目并让 LangSmith 构建和托管它：
+
+```bash
+mda deploy
+```
+
+参见 [Deploy](/langsmith/javascript/managed-deep-agents-deploy)。
+</Step>
+</Steps>
+
+<Tip>
+    想启动一个新 agent 而不是迁移现有的？用脚手架生成整个项目，包括上面的 identity、sandbox、`.env` 和 `.gitignore` 文件：
+
+
+
+    ```bash
+    npx managed-deepagents init research-assistant
+    ```
+
+
+    安装渠道决定编写语言：npm package 生成 TypeScript，PyPI package 生成 Python。该命令会创建一个新目录且不能原地运行，因此适合全新项目而不是迁移。请参阅 [quickstart](/langsmith/javascript/managed-deep-agents-quickstart)。
+</Tip>
+
+## 另请参阅
+
+- [Relationship to Deep Agents](/langsmith/javascript/managed-deep-agents-overview#relationship-to-deep-agents)：两个入口点为何不同。
+- [Agent definition](/langsmith/javascript/managed-deep-agents-agent-definition)：完整的参数参考。
+- [Project structure](/langsmith/javascript/managed-deep-agents-project-structure)：每个文件放在哪里。
+- [Going to production](/oss/javascript/deepagents/going-to-production)：Deep Agents 的部署选项。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/managed-deep-agents-migrate.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>
