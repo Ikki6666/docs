@@ -1,0 +1,636 @@
+---
+title: 在自托管 LangSmith 上启用 Fleet
+sidebarTitle: 启用 Fleet
+description: 在自托管 LangSmith 上安装 Fleet，并可选地配置 tools 和 triggers。
+---
+
+[Fleet](/langsmith/fleet/index) 让你无需编写代码即可创建和管理 agents。当你的安装需要无代码 agents 时，请启用它。
+
+## 前提条件
+
+Fleet 需要 [Enterprise](https://langchain.com/pricing) plan 和 [LangSmith Self-Hosted v0.13](https://changelog.langchain.com/announcements/langsmith-self-hosted-v0-13) 或更高版本。此独立部署配置需要 v0.15 或更高版本。请先安装[基础 LangSmith 平台](/langsmith/kubernetes)。
+
+Fleet 会预置一个 API server、task queue、PostgreSQL、Redis、tool server 和 trigger server。它不需要 LangSmith Deployment。
+
+## 启用 Fleet
+
+为 Fleet 生成一个 Fernet 加密 key：
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+将该 key 作为 `agent_builder_encryption_key` 存入你[现有的 LangSmith app Secret](/langsmith/self-host-using-an-existing-secret#parameters)。在你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中添加以下内容：
+
+```yaml
+config:
+  existingSecretName: "<your-secret-name>"
+
+fleet:
+  enabled: true
+
+fleetToolServer:
+  enabled: true
+
+fleetTriggerServer:
+  enabled: true
+```
+
+或者，你也可以直接内联设置 `fleet.encryptionKey`。不要将加密 key 提交到版本控制。`fleetToolServer` 和 `fleetTriggerServer` 都是必需的。
+
+<Warning>
+如果你正在从旧版 `agentBootstrap` 部署模型迁移，请在升级前通过 [Support Portal](https://support.langchain.com) 联系技术支持。当前 chart 会拒绝 `backend.agentBootstrap`、`config.insights` 和 `config.polly`；请移除这些旧版设置，而不是将它们设为 `false`。禁用旧版 `config.agentBuilder.enabled` 标志。在删除旧版 deployment 之前，请保留现有的 Fleet 数据。
+</Warning>
+
+Fleet 默认使用专用的 PostgreSQL 和 Redis 实例。要使用外部数据库，请配置 `fleet.postgres.external` 和 `fleet.redis.external`：
+
+```yaml
+fleet:
+  enabled: true
+  postgres:
+    external:
+      enabled: true
+      connectionUrl: "<fleet-postgres-connection-url>"
+  redis:
+    external:
+      enabled: true
+      connectionUrl: "<fleet-redis-connection-url>"
+```
+
+应用更改并验证 pods：
+
+```bash
+helm upgrade -i langsmith langchain/langsmith --values langsmith_config.yaml --version <version> -n <namespace> --wait --debug
+kubectl get pods -n <namespace>
+```
+
+### （可选）为 Fleet 启用 OAuth tools 和 triggers
+
+要在 Fleet 中启用基于 OAuth 的 tools（例如 Gmail、Slack 或 Linear），请配置 `providerOrgId`，并为每个想使用的集成添加 provider ID。你可以启用任意 provider 组合。
+
+#### 可用的 providers
+
+| Provider | 启用的 tools | 启用的 triggers |
+|----------|---------------|-----------------|
+| `googleOAuthProvider`<br />[配置指南](#google-oauth-provider) | Gmail、Google Calendar、<br />Google Sheets、BigQuery | Gmail |
+| `linearOAuthProvider`<br />[配置指南](#linear-oauth-provider) | Linear | - |
+| `linkedinOAuthProvider`<br />[配置指南](#linkedin-oauth-provider) | LinkedIn | - |
+| `microsoftOAuthProvider`<br />[配置指南](#microsoft-oauth-provider) | Outlook、Calendar、Teams、SharePoint、<br />Word、Excel、PowerPoint | Outlook |
+| `salesforceOAuthProvider`<br />[配置指南](#salesforce-oauth-provider) | Salesforce | - |
+| `slackOAuthProvider`<br />[配置指南](#slack-oauth-provider) | Slack | Slack |
+
+#### 通用配置
+
+在你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中添加以下内容。只包含你需要的 providers。
+
+```yaml
+fleet:
+  oauth:
+    # Organization ID where OAuth providers are configured
+    providerOrgId: "<your-org-id>"
+    # Add provider IDs for integrations you want to enable.
+    slackOAuthProvider: "<provider-id>"
+    googleOAuthProvider: "<provider-id>"
+    linkedinOAuthProvider: "<provider-id>"
+    linearOAuthProvider: "<provider-id>"
+    microsoftOAuthProvider: "<provider-id>"
+    salesforceOAuthProvider: "<provider-id>"
+```
+
+<Warning>
+provider ID 必须唯一，且不能以 `-agent-builder` 或 `-oauth-provider` 结尾。
+</Warning>
+
+#### Provider 配置指南
+
+<AccordionGroup>
+<Accordion title="Google OAuth provider" id="google-oauth-provider">
+
+要为 Fleet 启用 Google OAuth，请在 GCP 中创建一个 OAuth client，并使用所需的 URL 和凭据对其进行配置。
+
+<Steps>
+  <Step title="在 GCP 中创建 OAuth client">
+    在 [Google Cloud Console](https://console.cloud.google.com/apis/credentials) 中创建一个新的 OAuth client 应用（Web application）。
+  </Step>
+
+  <Step title="将 URL 添加到 GCP">
+    将以下 URL 添加到你的 OAuth client，将 `<hostname>` 替换为你的 LangSmith 主机名，将 `<provider-id>` 替换为你要使用的 provider ID（例如 `google`）：
+
+    **Authorized JavaScript origins:**
+    - `https://<hostname>`
+
+    **Authorized redirect URIs:**
+    - `https://<hostname>/api-host/v2/auth/callback/<provider-id>`
+    - `https://<hostname>/host-oauth-callback/<provider-id>`
+  </Step>
+
+  <Step title="复制凭据">
+    从 GCP OAuth 应用中复制 **Client ID** 和 **Client Secret**。
+  </Step>
+
+  <Step title="在 LangSmith 中配置 OAuth provider">
+    在 LangSmith 中，前往 **Settings > OAuth Providers** 并添加一个新的 provider：
+    - **Client ID**：来自 GCP
+    - **Client Secret**：来自 GCP
+    - **Authorization URL**：`https://accounts.google.com/o/oauth2/auth`
+    - **Token URL**：`https://oauth2.googleapis.com/token`
+    - **Provider ID**：唯一字符串，例如 `google`
+  </Step>
+
+  <Step title="应用更改">
+    将 LangSmith OAuth provider ID 添加到你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 并部署：
+
+    ```yaml
+    fleet:
+      oauth:
+        providerOrgId: "<your-org-id>"
+        googleOAuthProvider: "<provider-id>"
+    ```
+
+    ```bash
+    helm upgrade -i langsmith langchain/langsmith --values langsmith_config.yaml --version <version> -n <namespace> --wait --debug
+    ```
+  </Step>
+</Steps>
+
+</Accordion>
+
+<Accordion title="Microsoft OAuth provider" id="microsoft-oauth-provider">
+
+要为 Fleet 启用 Microsoft OAuth，请创建一个 Azure 应用注册，添加所需的 Microsoft Graph 委派权限，然后在 LangSmith 中配置一个 Microsoft OAuth provider。
+
+<Steps>
+  <Step title="创建 Azure 应用注册">
+    在 [Microsoft Entra admin center](https://entra.microsoft.com/) 中，前往 **Applications > App registrations** 并创建一个新的注册。
+  </Step>
+
+  <Step title="选择受支持的账号类型">
+    选择与你的部署相匹配的账号类型。如果你需要来自多个 Microsoft Entra tenant 的用户进行认证，请选择多租户选项。如果你的部署仅限单个 tenant，则可以使用单租户应用注册。
+  </Step>
+
+  <Step title="添加 redirect URI">
+    添加以下 web redirect URI，将 `<hostname>` 替换为你的 LangSmith 主机名，将 `<provider-id>` 替换为你的 provider ID：
+
+    ```
+    https://<hostname>/host-oauth-callback/<provider-id>
+    ```
+  </Step>
+
+  <Step title="创建 client secret">
+    在 **Certificates & secrets** 中创建一个新的 client secret。复制 **Application (client) ID** 和生成的 client secret 值。
+  </Step>
+
+  <Step title="添加 Microsoft Graph 委派权限">
+    在 **API permissions** 中，添加以下 Microsoft Graph 委派权限：
+    - `Mail.ReadWrite`
+    - `Mail.Send`
+    - `Calendars.ReadWrite`
+    - `Team.ReadBasic.All`
+    - `Channel.ReadBasic.All`
+    - `Channel.Create`
+    - `ChannelMessage.Send`
+    - `ChannelMessage.Read.All`
+    - `Chat.Create`
+    - `Chat.ReadWrite`
+    - `User.ReadBasic.All`
+    - `Files.ReadWrite.All`
+    - `Sites.ReadWrite.All`
+
+    <Note>
+    LangSmith 会自动为 Microsoft providers 请求 `offline_access`，以便用户能够收到 refresh token。
+    </Note>
+  </Step>
+
+  <Step title="授予 tenant 同意">
+    如果你的 Microsoft 365 策略要求对这些委派权限进行管理员同意，请为该 tenant 授予 admin consent。
+  </Step>
+
+  <Step title="在 LangSmith 中配置 OAuth provider">
+    在 LangSmith 中，前往 **Settings > OAuth Providers** 并添加一个新的 provider：
+    - **Name**：例如 `Microsoft`
+    - **Provider ID**：唯一字符串，例如 `microsoft-oauth-provider`
+    - **Client ID**：来自 Azure 的 Application (client) ID
+    - **Client Secret**：来自 Azure 的 client secret 值
+    - **Authorization URL**：`https://login.microsoftonline.com/common/oauth2/v2.0/authorize`
+    - **Token URL**：`https://login.microsoftonline.com/common/oauth2/v2.0/token`
+    - **Provider Type**：`microsoft`
+    - **Token endpoint auth method**：`client_secret_post`
+
+    <Note>
+    如果你创建的是单租户应用注册，请将 authorization URL 和 token URL 中的 `common` 替换为你的 tenant ID。
+    </Note>
+  </Step>
+
+  <Step title="应用更改">
+    在你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中添加以下内容并部署：
+
+    ```yaml
+    fleet:
+      oauth:
+        providerOrgId: "<your-org-id>"
+        microsoftOAuthProvider: "<provider-id>"
+    ```
+
+    ```bash
+    helm upgrade -i langsmith langchain/langsmith --values langsmith_config.yaml --version <version> -n <namespace> --wait --debug
+    ```
+  </Step>
+</Steps>
+
+</Accordion>
+
+<Accordion title="Linear OAuth provider" id="linear-oauth-provider">
+
+要为 Fleet 启用 Linear OAuth，请创建一个 Linear OAuth 应用，并使用所需的凭据对其进行配置。
+
+<Steps>
+  <Step title="创建 Linear OAuth 应用">
+    前往 [Linear Settings > API > Applications](https://linear.app/settings/api/applications/new) 并创建一个新的 OAuth 应用。
+  </Step>
+
+  <Step title="添加 callback URL">
+    设置 callback URL，将 `<hostname>` 替换为你的 LangSmith 主机名，将 `<provider-id>` 替换为你的 provider ID：
+
+    ```
+    https://<hostname>/host-oauth-callback/<provider-id>
+    ```
+  </Step>
+
+  <Step title="复制凭据">
+    创建应用后，复制 **Client ID** 和 **Client Secret**。
+  </Step>
+
+  <Step title="在 LangSmith 中配置 OAuth provider">
+    在 LangSmith 中，前往 **Settings > OAuth Providers** 并添加一个新的 provider：
+    - **Client ID**：来自 Linear 应用
+    - **Client Secret**：来自 Linear 应用
+    - **Authorization URL**：`https://linear.app/oauth/authorize`
+    - **Token URL**：`https://api.linear.app/oauth/token`
+    - **Provider ID**：唯一字符串，例如 `linear`
+  </Step>
+
+  <Step title="应用更改">
+    在你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中添加以下内容并部署：
+
+    ```yaml
+    fleet:
+      oauth:
+        providerOrgId: "<your-org-id>"
+        linearOAuthProvider: "<provider-id>"
+    ```
+
+    ```bash
+    helm upgrade -i langsmith langchain/langsmith --values langsmith_config.yaml --version <version> -n <namespace> --wait --debug
+    ```
+  </Step>
+</Steps>
+
+</Accordion>
+
+<Accordion title="LinkedIn OAuth provider" id="linkedin-oauth-provider">
+
+要为 Fleet 启用 LinkedIn OAuth，请创建一个 LinkedIn OAuth 应用，并使用所需的凭据对其进行配置。
+
+<Steps>
+  <Step title="创建 LinkedIn OAuth 应用">
+    前往 [linkedin.com/developers/apps](https://www.linkedin.com/developers/apps/) 并创建一个新的应用。
+  </Step>
+
+  <Step title="添加 redirect URI">
+    在你的应用设置中，前往 **Auth** 标签页。添加以下 redirect URI，将 `<hostname>` 替换为你的 LangSmith 主机名，将 `<provider-id>` 替换为你的 provider ID：
+
+    ```
+    https://<hostname>/host-oauth-callback/<provider-id>
+    ```
+  </Step>
+
+  <Step title="复制凭据">
+    从 **Auth** 标签页复制 **Client ID** 和 **Client Secret**。
+  </Step>
+
+  <Step title="在 LangSmith 中配置 OAuth provider">
+    在 LangSmith 中，前往 **Settings > OAuth Providers** 并添加一个新的 provider：
+    - **Client ID**：来自 LinkedIn 应用
+    - **Client Secret**：来自 LinkedIn 应用
+    - **Authorization URL**：`https://www.linkedin.com/oauth/v2/authorization`
+    - **Token URL**：`https://www.linkedin.com/oauth/v2/accessToken`
+    - **Provider ID**：唯一字符串，例如 `linkedin`
+  </Step>
+
+  <Step title="应用更改">
+    在你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中添加以下内容并部署：
+
+    ```yaml
+    fleet:
+      oauth:
+        providerOrgId: "<your-org-id>"
+        linkedinOAuthProvider: "<provider-id>"
+    ```
+
+    ```bash
+    helm upgrade -i langsmith langchain/langsmith --values langsmith_config.yaml --version <version> -n <namespace> --wait --debug
+    ```
+  </Step>
+</Steps>
+
+</Accordion>
+
+<Accordion title="Salesforce OAuth provider" id="salesforce-oauth-provider">
+
+要为 Fleet 启用 Salesforce OAuth，请创建一个 Salesforce External Client App，配置其 OAuth 设置和策略，获取其凭据，然后在 LangSmith 中配置一个 Salesforce OAuth provider。
+
+<Steps>
+  <Step title="创建 External Client App">
+    在 Salesforce **Setup** 中，使用 **Quick Find** 打开 **External Client App Manager**，然后点击 **New External Client App**。
+
+    在 **Basic Information** 下，设置：
+    - **External Client App Name**：例如 `LangSmith Fleet`
+    - **Contact Email**：管理员邮箱地址
+    - **Distribution State**：**Local**
+
+    <Note>
+    External Client Apps 是 Salesforce 当前用于 OAuth 集成的框架。如果 **New External Client App** 不可用，请在 **Setup > External Client App Settings** 下确认你的 org 已启用应用创建。
+    </Note>
+  </Step>
+
+  <Step title="启用 OAuth 并配置 OAuth 设置">
+    展开 **API (Enable OAuth Settings)** 并勾选 **Enable OAuth**。然后配置：
+
+    - **Callback URL**，将 `<hostname>` 替换为你的 LangSmith 主机名，将 `<provider-id>` 替换为你的 provider ID：
+
+    ```
+    https://<hostname>/host-oauth-callback/<provider-id>
+    ```
+
+    - **Selected OAuth Scopes**：添加 **Manage user data via APIs (api)** 和 **Perform requests at any time (refresh_token, offline_access)**。
+    - 保持 **Require Secret for the Web Server Flow** 处于勾选状态。
+    - 保持 **Enable Authorization Code and Credentials Flow** 和 **Enable Client Credentials Flow** 不勾选。Fleet 使用标准的 web server（authorization code）流程。
+
+    点击 **Create**。
+  </Step>
+
+  <Step title="设置 OAuth 策略">
+    打开该应用，选择 **Policies** 标签页，然后点击 **Edit**：
+
+    - **Refresh Token Policy**：选择 **Refresh token is valid until revoked**。
+    - **Permitted Users**：保持 **All users may self-authorize**。如果你改为选择 **Admin approved users are pre-authorized**，则必须先将该应用分配给 permission set 或 profile，否则授权会失败。
+
+    点击 **Save**。
+
+    <Note>
+    External Client App 需要在两处进行配置：**Settings**（上一步中的 OAuth 定义）和 **Policies**（本步骤）。两处都必须保存。
+    </Note>
+  </Step>
+
+  <Step title="复制凭据">
+    在 **Settings** 标签页的 **OAuth Settings** 下，选择 **Consumer Key and Secret**。**Consumer Key** 就是你的 Client ID，**Consumer Secret** 就是你的 Client Secret。
+
+    <Note>
+    创建应用后，请预留最多 30 分钟的传播时间，再进行首次连接尝试。
+    </Note>
+  </Step>
+
+  <Step title="在 LangSmith 中配置 OAuth provider">
+    在 LangSmith 中，前往 **Settings > OAuth Providers**，点击 **OAuth Provider**，并填写：
+    - **Provider ID**：唯一字符串，例如 `salesforce-oauth-provider`。在下一步中为 `salesforceOAuthProvider` 使用同一个值。
+    - **Display Name**：例如 `Salesforce`
+    - **Client ID**：来自 Salesforce 的 Consumer Key
+    - **Client Secret**：来自 Salesforce 的 Consumer Secret
+    - **Authorization URL**：`https://<MyDomain>.my.salesforce.com/services/oauth2/authorize`
+    - **Token URL**：`https://<MyDomain>.my.salesforce.com/services/oauth2/token`
+
+    LangSmith 会根据 Token URL 自动识别 Salesforce，因此无需设置 provider 类型或 token 认证方式字段。保持 **Enable PKCE** 关闭，以匹配上面配置的 web server 流程。
+
+    <Note>
+    将 `<MyDomain>` 替换为你 org 的 My Domain，可在 **Setup > My Domain** 下找到。对于 sandbox，请使用 `https://<MyDomain>--<SandboxName>.sandbox.my.salesforce.com/services/oauth2/authorize` 以及对应的 token URL。
+    </Note>
+  </Step>
+
+  <Step title="应用更改">
+    在你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中添加以下内容并部署：
+
+    ```yaml
+    fleet:
+      oauth:
+        providerOrgId: "<your-langsmith-org-id>"
+        salesforceOAuthProvider: "<provider-id>"
+    ```
+
+    ```bash
+    helm upgrade -i langsmith langchain/langsmith --values langsmith_config.yaml --version <version> -n <namespace> --wait --debug
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+如果登录失败：请确认 Salesforce 中的 **Callback URL** 与 `https://<hostname>/host-oauth-callback/<provider-id>` 完全匹配（HTTPS，末尾没有斜杠）；如果你选择了 **Admin approved users are pre-authorized**，请通过 permission set 分配该应用；如果你的 org 强制执行登录 IP 范围，请在用户的 profile 上将 Fleet server 的 egress IP 加入白名单，或在应用的策略中将 **IP Relaxation** 设置为 **Relax IP restrictions**。
+</Warning>
+
+</Accordion>
+
+<Accordion title="Slack OAuth provider" id="slack-oauth-provider">
+
+一个 Slack OAuth provider 同时支撑 Slack tools 和你添加到各个 agent 的 Slack 应用，因此 Slack 的配置与其他 Slack 集成内容放在一起。
+
+完整流程请参阅[在 Self-hosted 上设置 Slack](/langsmith/fleet/slack-app#set-up-slack-on-self-hosted)。它涵盖创建 Slack 应用、添加 bot scopes、注册 provider、设置 redirect URI 以及配置 Helm values。
+
+</Accordion>
+</AccordionGroup>
+
+### （可选）为 Fleet 启用 GitHub App
+
+Fleet 通过一个专用的 **GitHub App**（而非 OAuth 应用）与 GitHub 集成。该 GitHub App 为 Fleet 的 GitHub tools 提供 repository 访问能力，并支持访问私有 repository 所需的用户授权流程。
+
+配置过程包括：创建一个 GitHub App、收集其凭据、将它们存储为 Kubernetes secret，然后在你的 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中引用它们。
+
+<Steps>
+  <Step title="创建 GitHub App">
+    前往 [GitHub Settings > Developer settings > GitHub Apps](https://github.com/settings/apps) 并点击 **New GitHub App**。
+
+    <Note>
+    你可以在个人账号或 organization 下创建该应用。如果会有多人共同管理该集成，建议使用 organization 所有的应用。
+    </Note>
+  </Step>
+
+  <Step title="填写基本信息">
+    - **GitHub App name**：任意唯一名称，例如 `acme-langsmith-fleet`。记下 GitHub 生成的 slug（名称的小写连字符形式），因为这就是你为 `FLEET_GITHUB_APP_SLUG` 使用的值。
+    - **Homepage URL**：你的 LangSmith 主机名，例如 `https://langsmith.acme.com`。
+    - 暂时取消勾选 **Webhook** 下的 **Active**。你会在生成 webhook secret 之后的步骤中启用它。
+  </Step>
+
+  <Step title="设置 callback URL">
+    在 **Identifying and authorizing users** 下，添加以下 **Callback URL**，将 `<hostname>` 替换为你的 LangSmith 主机名：
+
+    ```
+    https://<hostname>/api/v1/platform/fleet/providers/github-app/auth/callback
+    ```
+
+    勾选 **Redirect on update**。
+
+    在 **Post installation** 下，添加以下 **Setup URL**：
+
+    ```
+    https://<hostname>/api/v1/platform/fleet/providers/github-app/callback
+    ```
+
+    勾选 **Redirect on update**。
+  </Step>
+
+  <Step title="设置 webhook URL 并生成 webhook secret">
+    生成一个随机的 webhook secret：
+
+    ```bash
+    python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+    ```
+
+    在 **Webhook** 下：
+    - 勾选 **Active**。
+    - 将 **Webhook URL** 设置为：
+
+      ```
+      https://<hostname>/api/v1/platform/fleet/providers/github-app/webhooks
+      ```
+
+    - 将生成的值粘贴到 **Webhook secret** 中。保存该值，因为在后续步骤中创建 Kubernetes secret 时需要用到相同的值。
+  </Step>
+
+  <Step title="设置 repository 权限">
+    在 **Permissions > Repository permissions** 下，授予以下权限：
+
+    - **Contents**：Read and write
+    - **Issues**：Read and write
+    - **Pull requests**：Read and write
+    - **Metadata**：Read-only（自动勾选）
+
+    在 **Permissions > Account permissions** 下，授予 **Email addresses: Read-only**。
+
+    <Note>
+    这些是 Fleet 内置 GitHub tools（issue 管理、pull request 创建、repository 内容访问）所需的最低权限。如果你需要其他 tool 能力，可以进行调整。
+    </Note>
+  </Step>
+
+  <Step title="选择安装可见性">
+    在 **Where can this GitHub App be installed?** 下，选择符合你分发需求的选项。对于大多数自托管部署，**Only on this account** 是正确的选择。
+  </Step>
+
+  <Step title="创建应用">
+    点击 **Create GitHub App**。在应用设置页面上，记下以下值：
+
+    | 值 | 在哪里查找 | 环境变量 |
+    |-------|-----------------|----------------------|
+    | **App ID** | 数字，位于页面顶部 | `FLEET_GITHUB_APP_ID` |
+    | **Public link** | 例如 `https://github.com/apps/acme-langsmith-fleet` | `FLEET_GITHUB_APP_PUBLIC_LINK` |
+    | App slug | public link 的最后一段路径 | `FLEET_GITHUB_APP_SLUG` |
+    | **Client ID** | 在 **About** 下 | `FLEET_GITHUB_APP_CLIENT_ID` |
+  </Step>
+
+  <Step title="生成 client secret">
+    在 **Client secrets** 下，点击 **Generate a new client secret** 并复制该值。这就是 `FLEET_GITHUB_APP_CLIENT_SECRET`。GitHub 只会显示一次。
+  </Step>
+
+  <Step title="生成私钥">
+    滚动到 **Private keys** 并点击 **Generate a private key**。GitHub 会下载一个 `.pem` 文件。请妥善保管该文件，因为它拥有对 GitHub App 的完全访问权限。PEM 文件内容就是 `FLEET_GITHUB_APP_PRIVATE_KEY`。
+  </Step>
+
+  <Step title="生成 state JWT secret">
+    LangSmith 使用 HMAC key 对短期有效的 OAuth state token 进行签名。生成一个：
+
+    ```bash
+    python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+    ```
+
+    这就是 `FLEET_GITHUB_APP_STATE_JWT_SECRET`。
+  </Step>
+
+  <Step title="创建 Kubernetes secret">
+    将敏感值存储在一个 Kubernetes secret 中：
+
+    ```bash
+    kubectl create secret generic fleet-github-app \
+      --namespace <your-langsmith-namespace> \
+      --from-literal=client_secret="<client-secret>" \
+      --from-literal=webhook_secret="<webhook-secret>" \
+      --from-literal=state_jwt_secret="<state-jwt-secret>" \
+      --from-file=private_key=/path/to/fleet-app.private-key.pem
+    ```
+
+    对于生产部署，请通过你现有的 secrets 工作流管理该 secret（例如 [Sealed Secrets](https://github.com/bitnami-labs/sealed-secrets) 或 [External Secrets Operator](https://external-secrets.io/)）。更多信息请参阅[在安装中使用现有 secret](/langsmith/self-host-using-an-existing-secret)。
+  </Step>
+
+  <Step title="将配置添加到 langsmith_config.yaml">
+    添加以下内容，将占位值替换为上面收集到的非敏感值：
+
+    ```yaml
+    commonEnv:
+      - name: FLEET_GITHUB_APP_ID
+        value: "<app-id>"
+      - name: FLEET_GITHUB_APP_SLUG
+        value: "<app-slug>"
+      - name: FLEET_GITHUB_APP_PUBLIC_LINK
+        value: "https://github.com/apps/<app-slug>"
+      - name: FLEET_GITHUB_APP_CLIENT_ID
+        value: "<client-id>"
+      - name: FLEET_GITHUB_APP_CLIENT_SECRET
+        valueFrom:
+          secretKeyRef:
+            name: fleet-github-app
+            key: client_secret
+      - name: FLEET_GITHUB_APP_PRIVATE_KEY
+        valueFrom:
+          secretKeyRef:
+            name: fleet-github-app
+            key: private_key
+      - name: FLEET_GITHUB_APP_WEBHOOK_SECRET
+        valueFrom:
+          secretKeyRef:
+            name: fleet-github-app
+            key: webhook_secret
+      - name: FLEET_GITHUB_APP_STATE_JWT_SECRET
+        valueFrom:
+          secretKeyRef:
+            name: fleet-github-app
+            key: state_jwt_secret
+
+    fleetToolServer:
+      deployment:
+        extraEnv:
+          - name: FLEET_GITHUB_APP_ENABLED
+            value: "true"
+    ```
+
+    <Note>
+    `FLEET_GITHUB_APP_ENABLED` 必须设置在 tool server 上，这样 GitHub tools 才会被注册。其余的 `FLEET_GITHUB_APP_*` 变量由 platform backend 使用，放在 `commonEnv` 下。
+    </Note>
+  </Step>
+
+  <Step title="部署并在 repository 上安装该应用">
+    运行以下命令应用更改：
+
+    ```bash
+    helm upgrade -i langsmith langchain/langsmith --values langsmith_config.yaml --version <version> -n <namespace> --wait --debug
+    ```
+
+    待 pods 健康后：
+
+    1. 在 LangSmith 中，打开一个 Fleet agent，并在 agent 编辑器中前往 GitHub 集成。
+    2. 点击 **Connect GitHub**，将该应用安装到 Fleet 应访问的 repository 上。
+    3. 对于私有 repository，你必须在安装过程中显式选择每个 repository。
+
+    <Note>
+    每个用户还必须使用 LangSmith 中的重新认证流程，针对自己的 GitHub 账号授权该 GitHub App。这样 Fleet 就能为代表用户执行操作的 tools 解析每个用户的 token。
+    </Note>
+  </Step>
+</Steps>
+
+## 禁用 Fleet
+
+要禁用 Fleet，请设置这些值并应用 Helm upgrade：
+
+```yaml
+fleet:
+  enabled: false
+fleetToolServer:
+  enabled: false
+fleetTriggerServer:
+  enabled: false
+```

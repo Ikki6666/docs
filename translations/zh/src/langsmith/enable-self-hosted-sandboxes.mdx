@@ -1,0 +1,388 @@
+---
+title: 在自托管 LangSmith 上启用 Sandboxes
+sidebarTitle: 启用 Sandboxes
+description: 为自托管 LangSmith Sandboxes 配置 Kubernetes 节点、存储和 Helm values。
+---
+
+[Sandboxes](/langsmith/sandboxes) 提供用于运行代码和暴露服务的隔离环境。当你需要 sandbox workloads 或需要它们的功能（例如 [Engine](/langsmith/engine-self-hosted)）时，请安装它们。
+
+<Info>
+Sandboxes 需要 [Enterprise](https://langchain.com/pricing) plan。
+</Info>
+
+Sandboxes 默认处于禁用状态。安装完成后，请参阅 [LangSmith Sandboxes](/langsmith/sandboxes) 了解 LangSmith UI 和 API 中的用户工作流。
+
+关于基础设施模型和生产环境规划，请参阅 [Sandbox 架构](/langsmith/self-host-sandbox-architecture)、[扩缩容与容量](/langsmith/self-host-sandbox-scaling)以及[升级与运维](/langsmith/self-host-sandbox-operations)。
+
+## 支持的平台
+
+自托管 Sandboxes 支持以下平台：
+
+- Amazon Elastic Kubernetes Service (EKS)
+- Google Kubernetes Engine (GKE)
+- Azure Kubernetes Service (AKS)
+
+<Note>
+Azure 上的自托管 Sandboxes 需要 LangSmith Helm chart v17（`0.17.x`）。
+</Note>
+
+## 组件
+
+启用 Sandboxes 会预置以下资源：
+
+- 在支持 KVM 的节点上运行 sandbox workloads 的 Sandbox runtime pods。
+- 由 Redis 支撑的 JuiceFS metadata 存储，以及由 S3、GCS 或 Azure Blob Storage 支撑的 object storage。
+- 可选的 wildcard ingress，用于暴露从 Sandboxes 内部提供的服务。
+
+## 前提条件
+
+<Steps>
+  <Step title="安装基础 LangSmith 平台">
+    在启用 Sandboxes 之前，请先在 Kubernetes 上安装 LangSmith。请参阅[在 Kubernetes 上自托管 LangSmith](/langsmith/kubernetes)。
+
+    Sandboxes 运行在与 LangSmith release 相同的 Kubernetes cluster 和 namespace 中。
+
+    如果你的集群无法从公共 registry 拉取镜像，还需要同步 sandbox runtime 镜像。请参阅 [Sandboxes 的附加镜像](/langsmith/self-host-mirroring-images#additional-images-for-sandboxes)。
+  </Step>
+
+  <Step title="添加支持 KVM 的节点">
+    你的集群必须包含专用节点，这些节点能够运行嵌套工作负载，且 Linux KVM 在 `/dev/kvm` 处可用。
+
+    这些节点可以是裸金属机器，也可以是启用了嵌套虚拟化的受支持云实例。在 AWS 和 GCP 上，请使用向 sandbox runtime 暴露 `/dev/kvm` 的 x86_64 Linux 实例。
+
+    <Warning>
+    在 EKS 上，VPC CNI 插件必须是 **v1.21 或更高版本**。`v1.20.0` 在第 8 代
+    Intel 实例（例如 `m8i`）上会崩溃：`aws-node` 进入 `CrashLoopBackOff`，节点报告
+    `cni plugin not initialized`，受管节点组最终会失败并报
+    `NodeCreationFailure: Unhealthy nodes in the kubernetes cluster`。
+    </Warning>
+
+    默认的 Helm 调度值要求这些节点具有以下 label 和 taint：
+
+    ```yaml
+    label:
+      sandbox.langsmith.com/host: "true"
+    taint:
+      key: sandbox.langsmith.com/host
+      value: "true"
+      effect: NoSchedule
+    ```
+
+    如果你的节点使用不同的 label 或 taint，请覆盖 `sandboxes.sandboxHost.deployment.nodeSelector` 和 `sandboxes.sandboxHost.deployment.tolerations`。
+  </Step>
+
+  <Step title="配置 JuiceFS 存储">
+    Sandboxes 需要由 JuiceFS 支撑的共享存储。你必须提供：
+
+    - 一个与 Redis 兼容的 metadata 存储。
+    - 一个 object storage bucket 或 bucket 根目录。
+    - 一个 JuiceFS 配置 Secret，或者足以让 chart 创建一个的 Helm values。
+
+    为 `sandboxes.juicefs.storage` 和 `sandboxes.juicefs.bucket` 使用以下 object storage 后端：
+
+    | **平台** | **Storage 值** | **Bucket 格式** |
+    | --- | --- | --- |
+    | AWS | `s3` | 带区域信息的 HTTPS S3 endpoint，例如 `https://bucket-name.s3.us-west-2.amazonaws.com` |
+    | GCP | `gs` | GCS URL，例如 `gs://bucket-name` |
+    | Azure | `wasb` | Azure Blob Storage URL，例如 `https://container-name.core.windows.net` |
+
+    不要在 `sandboxes.juicefs.name` 中使用 object store 子路径。请使用扁平名称，例如 `sandbox-juicefs`。JuiceFS 会在配置的 bucket 内以该名称存储对象。
+
+    <Tip>
+    对于 Redis metadata 存储，我们建议将 `maxmemory-policy` 设置为 `noeviction`。这样可以避免在内存压力下驱逐 JuiceFS metadata。请监控 Redis 容量，并在达到内存上限之前进行扩容。
+
+    使用 `noeviction` 时，当实例达到最大内存后 Redis 写入可能失败，因此请为 sandbox metadata 的增长预留足够的内存余量。
+    </Tip>
+  </Step>
+
+  <Step title="配置 sandbox secrets">
+    Sandboxes 需要额外的 secret 材料，用于服务间认证和 callback 签名。
+
+    <Tabs>
+      <Tab title="使用 Kubernetes secrets（推荐）">
+        如果你使用 `config.existingSecretName`，请将 sandbox keys 添加到同一个 LangSmith app Secret 中。不要直接在 Helm 中设置 secret 值。
+
+        ```yaml
+        stringData:
+          sandbox_callback_signing_jwk: '<ed25519-private-jwk>'
+          # Optional, only during service-auth secret rotation:
+        ```
+      </Tab>
+      <Tab title="使用内联值">
+        如果 Helm chart 管理你的 LangSmith app Secret，请直接在配置文件中设置 sandbox secret 值。避免将该文件提交到版本控制。
+
+        ```yaml
+        sandboxes:
+          callbackSigningJwk: '<ed25519-private-jwk>'
+        ```
+      </Tab>
+    </Tabs>
+
+    callback 签名值必须是 Ed25519 私有 JWK。请在升级过程中保持其稳定。
+  </Step>
+
+  <Step title="选择 proxy CA 模式">
+    sandbox egress 认证代理使用此 CA 进行 TLS 拦截和凭据注入。
+
+    chart 支持两种 proxy CA 模式：
+
+    | 模式 | 适用场景 |
+    | --- | --- |
+    | `generatedSecret` | 你希望 Helm 创建一个自签名的 CA Secret。这是默认值。 |
+    | `existingSecret` | 你在 LangSmith chart 之外管理 CA Secret。该 Secret 可以手动创建、由 cert-manager 创建，或由其他外部流程创建。 |
+
+    在无需实时集群访问即可渲染 manifest 的 GitOps 工作流中，请优先使用 `existingSecret`。`generatedSecret` 模式依赖 Helm 的实时 `lookup` 行为，以便在升级时复用已生成的 Secret；纯渲染工作流无法读取实时 Secret，可能在每次渲染时生成新的证书材料。
+  </Step>
+</Steps>
+
+## 使用 Helm 启用
+
+如本节所示，通过直接设置 Helm values 来启用 Sandboxes。在 AWS 和 GCP 上，你也可以改为[使用 Terraform 启用 Sandboxes](#enable-with-terraform)，由它预置基础设施并生成 Helm values。
+
+将以下值添加到你的 `langsmith_config.yaml`，连同[前提条件](#prerequisites)中描述的 sandbox secret 值。请将占位符替换为你部署专属的值。
+
+<Tabs>
+  <Tab title="AWS">
+
+```yaml
+images:
+  sandboxHostImage:
+    tag: "<same-release-tag-as-your-langsmith-images>"
+
+sandboxes:
+  enabled: true
+  juicefs:
+    name: "sandbox-juicefs"
+    storage: "s3"
+    bucket: "https://bucket-name.s3.us-west-2.amazonaws.com"
+    redis:
+      metaURL: "redis://redis-host:6379/1"
+  sandboxHost:
+    deployment:
+      nodeSelector:
+        kubernetes.io/arch: "amd64"
+        sandbox.langsmith.com/host: "true"
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: "<role_arn>"
+```
+
+  </Tab>
+  <Tab title="GCP">
+
+```yaml
+images:
+  sandboxHostImage:
+    tag: "<same-release-tag-as-your-langsmith-images>"
+
+sandboxes:
+  enabled: true
+  juicefs:
+    name: "sandbox-juicefs"
+    storage: "gs"
+    bucket: "gs://bucket-name"
+    redis:
+      metaURL: "redis://redis-host:6379/1"
+  sandboxHost:
+    deployment:
+      nodeSelector:
+        kubernetes.io/arch: "amd64"
+        sandbox.langsmith.com/host: "true"
+    serviceAccount:
+      annotations:
+        iam.gke.io/gcp-service-account: "<gsa_name>@<project_id>.iam.gserviceaccount.com"
+```
+
+  </Tab>
+  <Tab title="Azure">
+
+```yaml
+images:
+  sandboxHostImage:
+    tag: "<same-release-tag-as-your-langsmith-images>"
+
+sandboxes:
+  enabled: true
+  juicefs:
+    name: "sandbox-juicefs"
+    storage: "wasb"
+    bucket: "https://container-name.core.windows.net"
+    storageAccountName: "<storage-account-name>"
+    redis:
+      metaURL: "redis://redis-host:6379/1"
+  juicefsFormatJob:
+    labels:
+      azure.workload.identity/use: "true"
+  sandboxHost:
+    deployment:
+      labels:
+        azure.workload.identity/use: "true"
+      nodeSelector:
+        kubernetes.io/arch: "amd64"
+        sandbox.langsmith.com/host: "true"
+    serviceAccount:
+      annotations:
+        azure.workload.identity/client-id: "<client_id>"
+```
+
+  </Tab>
+</Tabs>
+
+应用更新后的 chart：
+
+```bash
+helm upgrade -i langsmith langchain/langsmith \
+  --values langsmith_config.yaml \
+  --version <version> \
+  --namespace <namespace> \
+  --wait
+```
+
+## 使用 Terraform 启用
+
+<div className="my-6 rounded-xl border border-gray-200 bg-gray-50 p-6 dark:border-gray-700 dark:bg-gray-900/40">
+
+LangSmith Terraform modules 可以预置所需的 AWS 和 GCP 基础设施，并生成相应的 Helm values。
+
+<Tabs>
+  <Tab title="AWS">
+
+在 `modules/aws/infra/terraform.tfvars` 中，启用 Sandboxes 并配置 sandbox 节点容量：
+
+```hcl
+enable_sandboxes = true
+redis_source     = "external"
+
+sandbox_juicefs_redis_instance_type             = "cache.m6g.large"
+sandbox_juicefs_redis_snapshot_retention_limit  = 7
+
+sandbox_host_node_count               = 1
+sandbox_host_instance_types           = ["m5d.metal"]
+sandbox_host_configure_instance_store = true
+
+sandbox_host_image_tag = "<same-release-tag-as-your-langsmith-images>"
+```
+
+AWS Sandboxes 要求 `redis_source = "external"`。该 Terraform module：
+
+- 为 JuiceFS sandbox metadata 创建一个专用的 ElastiCache Redis 实例。
+- 使用推荐的 `noeviction` 策略配置该专用实例。
+- 复用 LangSmith S3 bucket 作为 sandbox object storage。
+- 创建 JuiceFS 配置 Secret。
+- 添加所需的节点 label 和 taint。
+
+AWS setup 脚本会通过常规的基于 SSM 的 setup 流程生成 sandbox service-auth secret、callback 签名 JWK 以及专用的 JuiceFS Redis auth token。如果这些值尚不存在，请在应用 Terraform 之前运行 infra setup 脚本。
+
+如果你使用 Terraform app module 部署 Helm release，还需要在 `modules/aws/app/terraform.tfvars` 中设置 sandbox app values：
+
+```hcl
+enable_sandboxes      = true
+chart_version          = "~0.17.0"
+sandbox_host_image_tag = "<same-release-tag-as-your-langsmith-images>"
+```
+
+当 `enable_sandboxes = true` 时，Terraform app module 要求显式指定 LangSmith Helm chart v17 release 以及 sandbox runtime 镜像 tag。
+
+运行常规的 AWS 流程：
+
+```bash
+make apply
+make init-values
+CHART_VERSION="~0.17.0" make deploy
+```
+
+  </Tab>
+  <Tab title="GCP">
+
+在 `modules/gcp/infra/terraform.tfvars` 中，启用 Sandboxes 并配置一个 Standard GKE node pool：
+
+```hcl
+enable_sandboxes = true
+redis_source     = "external"
+
+gke_use_autopilot     = false
+enable_gcp_iam_module = true
+
+sandbox_juicefs_redis_memory_size       = 5
+sandbox_juicefs_redis_high_availability = true
+
+sandbox_host_node_count     = 1
+sandbox_host_min_node_count = 1
+sandbox_host_max_node_count = 5
+sandbox_host_machine_type   = "n2-standard-8"
+
+sandbox_host_image_tag = "<same-release-tag-as-your-langsmith-images>"
+```
+
+GCP Sandboxes 要求 `redis_source = "external"`。该 Terraform module：
+
+- 为 JuiceFS sandbox metadata 创建一个专用的 Memorystore Redis 实例。
+- 使用推荐的 `noeviction` 策略配置该专用实例。
+- 复用 LangSmith GCS bucket 作为 sandbox object storage。
+- 创建 JuiceFS 配置 Secret。
+- 添加所需的节点 label 和 taint。
+
+GCP setup 脚本会通过常规的 Secret Manager setup 流程生成 sandbox service-auth secret 和 callback 签名 JWK。如果这些值尚不存在，请在应用 Terraform 之前运行 infra setup 脚本。
+
+如果你使用 Terraform app module 部署 Helm release，还需要在 `modules/gcp/app/terraform.tfvars` 中设置 sandbox app values：
+
+```hcl
+enable_sandboxes      = true
+chart_version          = "~0.17.0"
+sandbox_host_image_tag = "<same-release-tag-as-your-langsmith-images>"
+```
+
+当 `enable_sandboxes = true` 时，Terraform app module 要求显式指定 LangSmith Helm chart v17 release 以及 sandbox runtime 镜像 tag。
+
+运行常规的 GCP 流程：
+
+```bash
+make apply
+make init-values
+CHART_VERSION="~0.17.0" make deploy
+```
+
+  </Tab>
+</Tabs>
+
+</div>
+
+## 可选：启用 service URL
+
+当用户需要通过浏览器或编程方式访问 Sandboxes 内运行的 HTTP 服务时，请设置 `sandboxes.serviceUrlBaseUrl`。
+
+```yaml
+sandboxes:
+  serviceUrlBaseUrl: "https://sandbox-services.example.com"
+```
+
+这需要为 `*.sandbox-services.example.com` 配置 wildcard DNS 和 TLS。当 `ingress.enabled` 为 `true` 时，chart 还会添加一条 wildcard ingress 规则，将这些 service URL 路由到 LangSmith platform backend。
+
+Service URL 还需要一个 Ed25519 私有 JWKS，且其第一个 key 上的 `kid` 不能为空。请设置 `config.signingJwks`，或将 `langsmith_signing_jwks` 添加到你[现有的 LangSmith app Secret](/langsmith/self-host-using-an-existing-secret) 中。它与 `sandboxes.callbackSigningJwk` 相互独立。关于密钥生成说明，请参阅[配置签名 JWKS](/langsmith/langsmith-remote-mcp#enabling-remote-mcp)。
+
+[通过聊天构建和编辑 custom 应用](/langsmith/custom-apps#configure-self-hosted-chat)需要 service URL，尽管它们对于其他 sandbox 工作流是可选的。
+
+## 验证安装
+
+升级完成后，验证 sandbox runtime pods 和 JuiceFS 卷是否就绪：
+
+```bash
+kubectl rollout status deployment/sandbox-host -n <namespace>
+kubectl get pods,pvc -n <namespace>
+```
+
+然后运行一次 sandbox 冒烟测试：
+
+1. 从一个公共镜像创建 sandbox，例如 Python 镜像。
+2. 在 sandbox 内启动一个 Python HTTP server。
+3. 在启用内存的情况下为 sandbox 创建快照。
+4. 从该快照创建一个新的 sandbox。
+5. 验证 HTTP server 仍在恢复后的 sandbox 中运行。
+
+## 升级注意事项
+
+Sandbox runtime 镜像的变更通过 `sandbox-host` Kubernetes Deployment 滚动发布。chart 默认使用无 surge 的滚动更新策略，因此 host 一次只被替换一个。
+
+在正常的 Helm upgrade 期间，正在终止的 host 会停止接受新的 Sandboxes，尝试将每个运行中 Sandbox 的 VM 内存保存到 JuiceFS，然后在 pod 退出之前停止这些 VM。此次关机受 `sandbox-host` pod 终止宽限期的限制，默认为 300 秒。这不是实时迁移：该 host 上的 Sandboxes 会在重启期间被中断。
+
+Sandboxes 不会被主动重启。当用户或 API 操作启动 Sandbox，或某个请求路径唤醒它时，它们才会再次启动。随后 LangSmith 会将 Sandbox 放置到可用的 host 上，如果关机捕获已完成，则从已保存的内存镜像恢复。如果内存镜像缺失或不完整，Sandbox 会从已保存的根文件系统启动。
