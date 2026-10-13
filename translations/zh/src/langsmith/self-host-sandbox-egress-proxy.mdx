@@ -1,0 +1,120 @@
+---
+title: 通过 forward proxy 路由自托管 Sandbox egress
+sidebarTitle: 通过 forward proxy 转发 egress
+description: 将自托管 LangSmith Sandboxes 的出站连接通过企业的 HTTP 或 HTTPS forward proxy 发送，支持绕过列表和自定义 CA 信任。
+---
+
+自托管的 `sandbox-host` 可以将 Sandboxes 的每一条出站连接通过你的企业 forward proxy 发送，而不是直接拨号到目标地址。当你的网络只允许出站流量通过 proxy，或者你的安全团队需要所有 Sandbox 流量都经过某个 proxy 的访问策略和日志时，可以使用此功能。
+
+关于 Sandbox 流量如何离开 microVM，请参阅 [Sandbox 架构](/langsmith/self-host-sandbox-architecture)。关于安装，请参阅[启用 Sandboxes](/langsmith/enable-self-hosted-sandboxes)。
+
+## 了解代理 egress 的工作方式
+
+来自 Sandbox 的每一条出站 TCP 连接会先到达其 host 上的 [Sandbox auth proxy](/langsmith/sandbox-auth-proxy)。host 会应用该 Sandbox 的允许列表、拒绝列表以及 auth proxy 规则，然后按照配置了 `HTTP_PROXY` 和 `HTTPS_PROXY` 的客户端的方式，将流量发送到你的 forward proxy：
+
+- **明文 HTTP**：以标准 proxy 请求的形式发送，例如 `GET http://example.com/path`。发往已加入 allow-list 的 IP 地址的 HTTP 是例外：它会通过一条到 80 端口的 `CONNECT` 隧道发送，因此 host 检查的是 Sandbox 实际连接到的地址，而不是其 `Host` 请求头。
+- **HTTPS 和其他 TCP**：通过到目标主机和端口的 `CONNECT` 隧道发送，例如 `CONNECT example.com:443` 或 `CONNECT github.com:22`。
+
+host 还会应用以下规则：
+
+- **没有直接回退**：当 forward proxy 拒绝某个请求或无法建立隧道时，该请求或连接会失败。host 绝不会直接重试。
+- **绕过列表**：host 会直接拨号 `noProxy` 中的目标，并执行相同的 Sandbox 访问检查。
+- **LangSmith API**：host 会直接拨号来自 Sandbox 的、发往你 LangSmith 安装 API 的 HTTPS 请求，而不经过 forward proxy。
+
+代理发生在 Sandbox 之外的 host 上。Sandbox 内的代码看不到 forward proxy 地址，也不需要设置 `HTTP_PROXY` 或 `HTTPS_PROXY`。
+
+## 检查要求
+
+代理 egress 需要满足以下条件：
+
+- `sandbox-host` 镜像需要 0.17 release line 上的 LangSmith 0.17.32 或更高版本，或 0.18 line 上的 0.18.5rc1 或更高版本。
+- `sandboxes.authProxy.httpProxy` 需要 0.17 release line 上的 LangSmith Helm chart 0.17.7 或更高版本，或 0.18 line 上的 0.18.0-rc.19 或更高版本。
+- 一个接受标准 HTTP proxy 请求以及到 443 端口 `CONNECT` 的 forward proxy。要访问其他 TCP 服务，例如 22 端口上基于 SSH 的 Git，或发往已加入 allow-list 的 IP 地址的 HTTP，proxy 还必须接受到这些端口的 `CONNECT`。
+- 从 Sandbox node pool 到 proxy 的网络可达性。proxy 地址可以是私有 IP 地址；在 LangSmith 0.17.36 或更高版本上，也可以是集群内的 Kubernetes Service 名称，例如 `squid.proxy.svc.cluster.local`。
+
+forward proxy 不能要求身份验证：`sandbox-host` 不支持 URL 中的 proxy 凭证、Basic 或 NTLM 身份验证，也不支持客户端证书（mTLS）。当 host 只需要信任 proxy 的服务器证书时，HTTPS proxy 可以工作。
+
+## 配置 proxy
+
+要将 Sandbox egress 路由到 forward proxy：
+
+<Steps>
+  <Step title="将 proxy 设置添加到你的 values">
+    在你的 LangSmith Helm values 中设置 `sandboxes.authProxy.httpProxy`：
+
+    ```yaml
+    sandboxes:
+      authProxy:
+        httpProxy:
+          enabled: true
+          scheme: http
+          host: proxy.corp.internal
+          port: 3128
+          noProxy:
+            - .corp.internal
+    ```
+
+    - **`enabled`**：将 Sandbox egress 路由到该 proxy。默认为 `false`。
+    - **`scheme`**：`http`，或当到 proxy 本身的连接使用 TLS 时的 `https`。默认为 `http`。
+    - **`host`**：proxy 的主机名、IP 地址或集群内 Service 名称，不带 scheme、凭证或路径。当 `enabled` 为 `true` 时必填。
+    - **`port`**：proxy 端口。默认为 `3128`。
+    - **`noProxy`**：host 直接拨号而不经过 proxy 的目标，匹配规则与 `NO_PROXY` 环境变量相同。像 `corp.internal` 这样的条目匹配该主机及其子域，带前导点的条目（如 `.corp.internal`）只匹配子域，而 `*` 匹配所有主机。条目还可以是 IP 地址、CIDR 范围（如 `10.0.0.0/8`）或 `host:port` 对。
+
+    当 `host` 缺失、`host` 包含 scheme、凭证或路径，或 `scheme` 或 `port` 无效时，chart 的渲染会失败。在 LangSmith 0.17.36 或更高版本上，`sandbox-host` 还会在启动时检查 proxy 地址：回环或云元数据地址会让 pod 以 `sandbox host config invalid` 停止，而不是让每个 Sandbox 创建都失败。
+  </Step>
+  <Step title="（可选）为 HTTPS proxy 信任私有 CA">
+    当 `scheme` 为 `https` 且 proxy 的证书由私有 CA 签发时，请将该 CA 添加到 `config.customCa` 的 bundle 中。`sandbox-host` pod 除了系统根证书之外，还信任与其他 LangSmith 服务相同的 bundle。请参阅[为 TLS 挂载内部 CA](/langsmith/self-host-custom-tls-certificates#mount-internal-cas-for-tls)。
+  </Step>
+  <Step title="应用更改">
+    升级 Helm release。更改这些设置会滚动更新 `sandbox-host` Deployment，因此每个 host 在重启之前会 drain 其运行中的 Sandboxes。请参阅[了解滚动升级](/langsmith/self-host-sandbox-operations#understand-a-rolling-upgrade)。
+  </Step>
+  <Step title="验证 egress">
+    创建一个 Sandbox，并从其内部请求一个公共 URL：
+
+    ```bash
+    curl -sS -o /dev/null -w '%{http_code}\n' https://www.langchain.com/
+    ```
+
+    该命令会输出 `200`，并且你的 forward proxy 会记录一条来自 Sandbox 节点的 `CONNECT www.langchain.com:443` 请求。发往 `http://` URL 的请求在 proxy 日志中则会显示为 `GET http://...` 请求。
+  </Step>
+</Steps>
+
+## 直接访问私有服务
+
+默认情况下，`sandbox-host` 拒绝连接到私有地址，因此即使 `noProxy` 将连接改为直连，Sandbox 也无法访问内部服务。在自托管安装上，当 Sandbox 的 `allow_list` 放行某个目标时，它就可以访问私有地址：主机名、`*.corp.internal` 这样的 glob，或正则表达式。字面 IP 地址需要 IP 或 CIDR 条目。带有 `deny_list` 或没有 `access_control` 的 Sandboxes 永远无法访问私有地址。请参阅[允许列表与拒绝列表](/langsmith/sandbox-auth-proxy#allow-and-deny-lists)。
+
+例如，一个需要内部网络中的 Git 和数据库、同时通过 forward proxy 访问公共 HTTP 和 HTTPS 的 Sandbox，会使用以下 `proxy_config`：
+
+```json
+{
+  "access_control": {
+    "allow_list": ["*:80", "*:443", "git.corp.internal", "db.corp.internal:5432"]
+  }
+}
+```
+
+host 会在解析主机名之后检查它实际连接到的地址。即使被列出，回环和云元数据地址也保持阻止状态。这不需要任何 Helm 设置。
+
+当 Sandbox 的 `allow_list` 中列出了某个 Service 的 Kubernetes 名称时，它也可以通过该名称访问集群中的 Service，例如 `api.team.svc.cluster.local`。你的 forward proxy 无法解析集群内的名称，因此在使用 forward proxy 时，请将 `.svc.cluster.local` 添加到 `noProxy`。
+
+<Warning>
+每个匹配的条目都会生效，包括 `*` 和 `*:443`。在自托管安装上，`["*:80", "*:443"]` 这样的 `allow_list` 也会开放这些端口上的私有目标。任何能够创建或更新 Sandbox 的人都可以将私有地址加入 allow-list，包括你的集群内部的地址，因此请相应地限制可以创建 Sandboxes 的人员。
+</Warning>
+
+## 保护 proxy 安全
+
+解析目标主机名的是 forward proxy，而不是 host。host 会根据 Sandbox 访问列表检查主机名，并且默认阻止字面的私有、回环和云元数据 IP 地址，但它看不到 proxy 将主机名解析到的地址。如果 Sandbox 请求的主机名解析到内部地址，且 proxy 允许，它就能访问该地址。
+
+请配置 proxy 的访问策略，以阻止 Sandboxes 不应访问的目标，例如内部网络和云元数据 endpoint。
+
+## 了解限制
+
+- **私有服务需要网络连通性**：forward proxy 只能到达 proxy 自身可到达的目标。它不为私有服务提供 VPN 或网络 peering。
+- **TLS 检查型 proxy**：当 proxy 在隧道内解密并重新加密 HTTPS 时，客户端会看到来自你的检查 CA 的证书。对于 auth proxy 规则匹配到的 host，`sandbox-host` 就是该客户端，因此请将该 CA 添加到 `config.customCa`。对于其他 host，Sandbox 中的程序就是客户端，因此请将该 CA 添加到 Sandbox 镜像的信任存储中。或者，也可以将 Sandbox 流量排除在检查之外。
+
+## 另请参阅
+
+- [Sandbox auth proxy](/langsmith/sandbox-auth-proxy)
+- [Sandbox 架构](/langsmith/self-host-sandbox-architecture)
+- [升级与运维](/langsmith/self-host-sandbox-operations)
+- [配置自定义 TLS 证书](/langsmith/self-host-custom-tls-certificates)

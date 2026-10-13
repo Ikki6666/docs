@@ -21,6 +21,8 @@ Sandboxes 默认处于禁用状态。安装完成后，请参阅 [LangSmith Sand
 - Amazon Elastic Kubernetes Service (EKS)
 - Google Kubernetes Engine (GKE)
 - Azure Kubernetes Service (AKS)
+- Red Hat OpenShift，需要[配置 OpenShift](#configure-openshift) 中的额外步骤
+- 满足[裸金属和本地部署集群的节点要求](#node-requirements-for-bare-metal-and-on-premises-clusters)的裸金属和本地部署 Kubernetes 集群
 
 <Note>
 Azure 上的自托管 Sandboxes 需要 LangSmith Helm chart v17（`0.17.x`）。
@@ -85,6 +87,7 @@ Azure 上的自托管 Sandboxes 需要 LangSmith Helm chart v17（`0.17.x`）。
     | AWS | `s3` | 带区域信息的 HTTPS S3 endpoint，例如 `https://bucket-name.s3.us-west-2.amazonaws.com` |
     | GCP | `gs` | GCS URL，例如 `gs://bucket-name` |
     | Azure | `wasb` | Azure Blob Storage URL，例如 `https://container-name.core.windows.net` |
+    | S3 兼容（例如 MinIO） | `s3` | 以 bucket 作为路径的 endpoint URL，例如 `http://minio.example.com:9000/bucket-name`。需要静态 keys；请参阅[使用 S3 兼容对象存储](#use-s3-compatible-object-storage)。 |
 
     不要在 `sandboxes.juicefs.name` 中使用 object store 子路径。请使用扁平名称，例如 `sandbox-juicefs`。JuiceFS 会在配置的 bucket 内以该名称存储对象。
 
@@ -134,6 +137,92 @@ Azure 上的自托管 Sandboxes 需要 LangSmith Helm chart v17（`0.17.x`）。
     在无需实时集群访问即可渲染 manifest 的 GitOps 工作流中，请优先使用 `existingSecret`。`generatedSecret` 模式依赖 Helm 的实时 `lookup` 行为，以便在升级时复用已生成的 Secret；纯渲染工作流无法读取实时 Secret，可能在每次渲染时生成新的证书材料。
   </Step>
 </Steps>
+
+## 配置 OpenShift
+
+在 Red Hat OpenShift 上，sandbox runtime 需要一个允许特权容器的安全上下文约束（SCC）。sandbox runtime pods 以特权模式运行并使用 host networking，因为它们要管理其节点上的 microVM、network namespace 和挂载。其他 LangSmith 组件（包括内置的 PostgreSQL、Redis 和 ClickHouse）则在默认的 `restricted-v2` SCC 下运行。
+
+要准备 OpenShift 集群，请在[使用 Helm 启用 Sandboxes](#enable-with-helm) 之前完成以下步骤：
+
+<Steps>
+  <Step title="添加支持 KVM 的 worker 节点">
+    使用裸金属 worker 节点，或启用了嵌套虚拟化的虚拟机 worker 节点。要确认某个节点暴露了 KVM，请运行：
+
+    ```bash
+    oc debug node/<node-name> -- chroot /host ls -l /dev/kvm
+    ```
+
+    应用 chart 所期望的 label 和 taint：
+
+    ```bash
+    oc label node <node-name> sandbox.langsmith.com/host=true
+    oc adm taint node <node-name> sandbox.langsmith.com/host=true:NoSchedule
+    ```
+
+    应用到节点上的 label 和 taint 不会延续到替换的机器上。要保留它们，请在创建 sandbox 节点的 MachineSet 中、`spec.template.spec.metadata.labels` 和 `spec.template.spec.taints` 下进行设置。
+  </Step>
+
+  <Step title="向 sandbox runtime 授予 privileged SCC">
+    仅向 sandbox runtime 的 service account 授予内置的 `privileged` SCC。chart 将该 service account 命名为 `<release-fullname>-sandbox-host`，对于名为 `langsmith` 的 release，即为 `langsmith-sandbox-host`：
+
+    ```bash
+    oc adm policy add-scc-to-user privileged -z langsmith-sandbox-host -n <namespace>
+    ```
+
+    JuiceFS formatter Job 以同一个 service account 运行，因此它不需要单独的授权。如果你设置了 `sandboxes.sandboxHost.serviceAccount.name`，请改为向该名称授予 SCC。
+  </Step>
+</Steps>
+
+## 裸金属和本地部署集群的节点要求
+
+在托管云集群上，支持 KVM 的节点池已满足这些要求。在裸金属和本地部署的 Kubernetes 集群上，请在[使用 Helm 启用 Sandboxes](#enable-with-helm) 之前，确认每个 sandbox 节点和集群都满足这些要求。
+
+每个 sandbox 节点需要：
+
+- **CPU 架构**：x86-64（`amd64`）。sandbox runtime 不能在 Arm 节点上运行。
+- **硬件虚拟化**：固件中启用了虚拟化扩展、KVM 内核模块已加载，且 `/dev/kvm` 存在。
+- **cgroup v2**：具有可用 `cpu` 控制器的统一 cgroup 层级结构。sandbox runtime 用它来强制执行每个 sandbox 的 CPU 限制。
+- **TUN/TAP 和 FUSE**：`/dev/net/tun` 用于 sandbox 网络接口，`/dev/fuse` 用于 JuiceFS 挂载。
+- **nftables**：内核支持带 nftables 后端的 `iptables`。sandbox runtime 在每个 sandbox 的 network namespace 内应用其 egress 规则。
+- **JuiceFS 缓存的本地磁盘**：`sandboxes.juicefs.hostMount.cacheDirs` 的节点本地路径，默认为 `/var/cache/juicefs`，缓存大小为 50 GiB。
+
+集群需要：
+
+- **特权 pods**：sandbox runtime pods 以特权模式运行，使用 host networking 和 `hostPath` 卷。如果你的集群强制执行 Pod Security Admission，请为 LangSmith namespace 添加 label 以允许特权 pods，例如 `pod-security.kubernetes.io/enforce=privileged`。
+- **节点端口可达性**：LangSmith platform backend 通过 TCP 端口 `19190` 连接到每个 sandbox 节点。请允许从 LangSmith pods 到 sandbox 节点的此流量，并将该端口保持在私有网络中。
+- **出站访问**：sandbox 节点需要能够通过网络访问 JuiceFS Redis metadata 存储、object storage 后端，以及 sandbox 调用的目标。要通过企业 HTTP 代理发送 sandbox egress，请设置 `sandboxes.authProxy.httpProxy`。
+
+如果你的集群无法从公共 registry 拉取镜像，请同步 sandbox runtime 镜像。更多信息请参阅 [Sandboxes 的附加镜像](/langsmith/self-host-mirroring-images#additional-images-for-sandboxes)。
+
+### 使用 S3 兼容对象存储
+
+在没有 cloud workload identity 的集群上，JuiceFS 可以使用静态 access keys 将 sandbox 数据存储在与 S3 兼容的对象存储（例如 MinIO）中。
+
+<Note>
+使用静态 keys 的 S3 兼容对象存储要求 LangSmith 应用版本为 0.17.35 或更高版本。
+</Note>
+
+创建一个包含 access keys 的 JuiceFS 配置 Secret，并将 `sandboxes.juicefs.existingSecretName` 设置为它的名称：
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: langsmith-sandbox-juicefs
+  namespace: <namespace>
+type: Opaque
+stringData:
+  name: sandbox-juicefs
+  metaurl: redis://<redis-host>:6379/1
+  storage: s3
+  bucket: http://<s3-endpoint>:9000/<bucket-name>
+  access-key: <access-key>
+  secret-key: <secret-key>
+```
+
+只有当 Secret 同时包含 `access-key` 和 `secret-key` 时，JuiceFS formatter 才会使用这些 keys。JuiceFS 会将这些 keys 存储在其 Redis metadata 存储中，因此请限制对该 Redis 实例的访问。
+
+对象存储必须能承受 sandbox runtime 的写入吞吐量。当对象存储写入停滞时，JuiceFS 挂载健康检查会失败，sandbox runtime pod 会重启，从而中断该节点上的 Sandboxes。
 
 ## 使用 Helm 启用
 
@@ -361,6 +450,21 @@ sandboxes:
 Service URL 还需要一个 Ed25519 私有 JWKS，且其第一个 key 上的 `kid` 不能为空。请设置 `config.signingJwks`，或将 `langsmith_signing_jwks` 添加到你[现有的 LangSmith app Secret](/langsmith/self-host-using-an-existing-secret) 中。它与 `sandboxes.callbackSigningJwk` 相互独立。关于密钥生成说明，请参阅[配置签名 JWKS](/langsmith/langsmith-remote-mcp#enabling-remote-mcp)。
 
 [通过聊天构建和编辑 custom 应用](/langsmith/custom-apps#configure-self-hosted-chat)需要 service URL，尽管它们对于其他 sandbox 工作流是可选的。
+
+## 可选：通过正向代理路由 egress
+
+当 Sandboxes 必须通过企业 HTTP 或 HTTPS 正向代理访问互联网时，请设置 `sandboxes.authProxy.httpProxy`。
+
+```yaml
+sandboxes:
+  authProxy:
+    httpProxy:
+      enabled: true
+      host: proxy.corp.internal
+      port: 3128
+```
+
+关于要求、bypass 列表、HTTPS 代理的 CA 信任以及安全注意事项，请参阅[通过正向代理路由 Sandbox egress](/langsmith/self-host-sandbox-egress-proxy)。
 
 ## 验证安装
 
