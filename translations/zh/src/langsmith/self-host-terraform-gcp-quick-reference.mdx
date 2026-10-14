@@ -4,7 +4,7 @@ sidebarTitle: 速查表
 description: LangSmith self-hosted 在 GKE 上的 make targets、Terraform、kubectl、gcloud 和 Helm 命令。
 ---
 
-针对使用 [GCP Terraform modules](https://github.com/langchain-ai/terraform/tree/main/modules/gcp) 预配的 GCP LangSmith 部署进行日常运维的命令速查表。所有 `make` targets 都在 `modules/gcp/` 中运行。运行 `make help` 查看内联摘要。
+针对使用 [GCP Terraform modules](https://github.com/langchain-ai/terraform/tree/main/modules/gcp) 预配的 GCP LangSmith 部署进行日常运维的命令速查表。所有 `make` targets 都在 `modules/gcp/` 中运行。运行 `make help` 查看内联摘要。命令反映 `main` 分支和 `v0.17.x` tag，它们部署 Helm chart 0.17。`v0.16.x` tag 上不存在 `smithdb-*` targets。
 
 ## 部署概览
 
@@ -14,9 +14,11 @@ description: LangSmith self-hosted 在 GKE 上的 make targets、Terraform、kub
 | Cluster credentials | 关联到新 GKE 集群的 kubeconfig | `make kubeconfig` |
 | LangSmith base | Frontend、backend、ingest、queue、ClickHouse | `make init-values && make deploy` |
 | Fleet add-on（standalone） | standalone-fleet-* API server、tool server、trigger server、queue | `make apply && make init-values && make deploy` |
-| LangSmith Deployment add-on | host-backend、listener、operator | `make apply && make init-values && make deploy` |
-| Agent Builder add-on（已弃用） | tool-server、trigger-server + agent-builder LGP | `make init-values && make deploy` |
-| Insights + Polly add-on | Clio analytics、Polly eval agent | `make init-values && make deploy` |
+| LangSmith Deployment add-on | host-backend、listener、operator | `make init-values && make deploy` |
+| Agent Builder add-on（已弃用） | tool-server、trigger-server | `make init-values && make deploy` |
+| Insights + Polly add-on | Insights analytics、Polly eval agent | `make init-values && make deploy` |
+| SmithDB add-on | Metastore、object-store bucket、node pools、SmithDB services | `make apply && make init-values && make deploy` |
+| Sandboxes add-on | sandbox-host node pool、JuiceFS metadata Redis | `make apply && make init-values && make deploy` |
 
 每个阶段都建立在前一阶段之上。启用下一阶段之前，先确认 pods 处于健康状态。
 
@@ -25,15 +27,16 @@ description: LangSmith self-hosted 在 GKE 上的 make targets、Terraform、kub
 ```bash
 cd terraform/modules/gcp
 
-# Interactive wizard — generates terraform.tfvars
+# Interactive wizard: generates terraform.tfvars
 make quickstart
 
-# Set up secrets in Secret Manager (auto-generates passwords + Fernet keys)
+# Set up secrets in Secret Manager (auto-generates salts + Fernet keys)
 # Must be sourced so it can export TF_VAR_* into your shell
 source infra/scripts/setup-env.sh
+export LANGSMITH_ADMIN_EMAIL="<your-admin-email>"
 
-# Verify secrets are stored correctly
-make secrets
+# Validate credentials, APIs, permissions, and quotas
+make preflight
 
 # Deploy infrastructure
 make init
@@ -47,17 +50,7 @@ make init-values
 make deploy
 ```
 
-`make deploy-all` 将 `apply`、`init-values` 和 `deploy` 串联在一条命令中。
-
-要将 Helm release 交给 Terraform 管理而不是部署脚本，使用 `app` 层：
-
-```bash
-make init-values  # generate the layered values files
-make init-app     # pull infra outputs into app/infra.auto.tfvars.json
-make apply-app    # terraform apply the Helm release (make destroy-app to remove)
-```
-
-`app` 层使用自己的变量名：`sizing`（不是 `sizing_profile`）和 `enable_agent_deploys`（不是 `enable_deployments`）。
+`make deploy-all` 将 `apply`、`init-values` 和 `deploy` 串联在一条命令中。请在 source `setup-env.sh` 的 shell 中运行 `make init-values` 和 `make deploy`；部署脚本会从该 shell 读取 `TF_VAR_*` secrets 和 `LANGSMITH_ADMIN_EMAIL`。
 
 ## Day-2 运维
 
@@ -77,7 +70,19 @@ make secrets
 
 # Update kubeconfig for the GKE cluster
 make kubeconfig
+
+# SmithDB: run only the commands you need, with your own values
+make smithdb-status                                  # read-only: gates, sizing, pods, backfill progress
+make smithdb-configure SIZING=<size> CACHE=<cache>  # minimal | small | medium | large; local-ssd | network-disk
+make smithdb-phase PHASE=<phase>                     # off | dual-write | backfill | cutover
+make deploy-all                                      # apply the change: apply, init-values, deploy
 ```
+
+`make kubeconfig` 包装了 `helm/scripts/get-kubeconfig.sh`。要直接调用该脚本，请将 cluster 名称、region 和 project 作为参数传入，或省略它们以读取 Terraform 输出。
+
+`make smithdb-configure` 和 `make smithdb-phase` 只编辑 `terraform.tfvars`，由 `make deploy-all` 应用变更。更改规格可能替换 SmithDB node pool。离开 `backfill` 阶段会移除回填 Job 及其任务数据库；在每一行回填数据被提升（promote）之前，`make smithdb-phase PHASE=cutover` 会拒绝执行，但更早的阶段没有此类检查。
+
+SmithDB rollout 阶段参见部署指南中的 [SmithDB](/langsmith/self-host-terraform-gcp-deploy#smithdb)。
 
 ## Add-on
 
@@ -86,7 +91,7 @@ make kubeconfig
 ```hcl
 # terraform.tfvars
 enable_deployments   = true
-enable_fleet         = true   # Fleet (formerly Agent Builder), standalone (chart v0.15+); no enable_deployments required
+enable_fleet         = true   # Fleet (formerly Agent Builder), standalone; no enable_deployments required
 enable_agent_builder = false  # deprecated, superseded by enable_fleet; mutually exclusive with it
 enable_insights      = true
 enable_polly         = true   # requires enable_deployments = true + Polly license
@@ -134,7 +139,7 @@ kubectl logs <pod-name> -n langsmith --previous --tail=50
 kubectl logs -n langsmith deploy/langsmith-backend --tail=100 -f
 
 # Gateway and HTTPRoute
-kubectl get gateway -n langsmith
+kubectl get gateway -n envoy-gateway-system
 kubectl get httproute -n langsmith
 kubectl get svc -n envoy-gateway-system
 
@@ -205,11 +210,11 @@ gcloud secrets versions access latest --secret=<secret-id> --project <project-id
 cd modules/gcp/infra
 
 terraform init
-terraform plan -var-file=terraform.tfvars
-terraform apply -var-file=terraform.tfvars
+terraform plan
+terraform apply
 
 # Target a specific module
-terraform apply -var-file=terraform.tfvars -target=module.networking
+terraform apply -target=module.networking
 
 # Outputs
 terraform output
@@ -219,7 +224,7 @@ terraform output -raw storage_bucket_name
 # State
 terraform state list
 terraform state show module.gke_cluster
-terraform refresh -var-file=terraform.tfvars
+terraform refresh
 ```
 
 ## 关键约束
@@ -227,12 +232,30 @@ terraform refresh -var-file=terraform.tfvars
 - 在 `terraform destroy` 之前先卸载 Helm。Envoy Gateway load balancer 引用了 VPC；不卸载会阻塞网络删除。务必先运行 `make uninstall`。
 - `config.deployment.url` 必须包含 `https://`。缺少协议时，operator 拉起的 agent 会一直卡在 `DEPLOYING` 状态。
 - LangSmith Deployment add-on 需要 `config.deployment.enabled: true`。只设置 URL 而不设置 `enabled: true`，会静默跳过 `listener` 和 `operator`。
-- 加密 key 在首次启用后绝不能更改。轮换 `insights_encryption_key` 或 `polly_encryption_key` 会永久破坏现有加密数据。
-- 首次启用 Polly 后要重启 frontend。`agentBootstrap` 在注册之后才创建 `langsmith-polly-config` ConfigMap；更早启动的 frontend pods 不会加载它。
+- 加密 key 在首次启用后绝不能更改。轮换 `langsmith_insights_encryption_key` 或 `langsmith_polly_encryption_key` 会永久破坏现有加密数据。
 - Envoy Gateway IP 在拆除时会变化。删除 Gateway 后 GCP 会释放 external IP。`terraform destroy` 并重新 apply 之后，需要更新你的 DNS A record。
-- `langsmith-ksa` annotation 不是永久的。operator 在运行时创建该 ServiceAccount，namespace 删除后它不会保留。`deploy.sh` 会以幂等方式重新添加 annotation。
+- 从 chart 0.16 升级有门槛。当 `values-overrides.yaml` 仍包含 `sandboxes.juicefs.csi` 块、JuiceFS CSI 卷或挂载 pods 仍存在，或 `helm/values/` 仍有 chart 0.16 SmithDB overlay 时，`deploy.sh` 会拒绝升级。每次拒绝都会打印清除它的命令。完整步骤参见[从 chart 0.16 升级](/langsmith/self-host-terraform-gcp-deploy#upgrade-from-chart-0-16)。
+- `langsmith-ksa` annotation 不是永久的。Terraform 在 `k8s-bootstrap` module 中创建该 ServiceAccount，位于 Helm release 之外，因此 namespace 删除后它不会保留。`deploy.sh` 会以幂等方式重新创建并添加 annotation。
 
 ## 拆除
+
+<Warning>
+拆除会永久删除 Cloud SQL 实例。Cloud SQL 在删除时不会做最终快照：其自动备份、按需备份和 point-in-time recovery 日志都会随实例一起删除。要保留数据，请在第 1 步之前将其导出到本部署之外的 bucket。一次性测试栈可以跳过导出。
+</Warning>
+
+```bash
+# Export the LangSmith database. Repeat for the SmithDB metastore with
+# smithdb_metastore_instance_name and --database=smithdb.
+PROJECT_ID=<project-id>
+BACKUP_BUCKET=gs://<export-bucket>
+PG=$(terraform -chdir=infra output -raw postgres_instance_name)
+SA=$(gcloud sql instances describe "$PG" --project "$PROJECT_ID" \
+  --format="value(serviceAccountEmailAddress)")
+gcloud storage buckets add-iam-policy-binding "$BACKUP_BUCKET" \
+  --member="serviceAccount:$SA" --role=roles/storage.objectAdmin
+gcloud sql export sql "$PG" "$BACKUP_BUCKET/${PG}-final.sql.gz" \
+  --database=langsmith --project "$PROJECT_ID"
+```
 
 ```bash
 # 1. Remove LangSmith Deployment resources (if the add-on was enabled)
@@ -241,7 +264,15 @@ kubectl delete lgp --all -n langsmith 2>/dev/null || true
 # 2. Uninstall LangSmith
 make uninstall
 
-# 3. Set deletion protection = false in terraform.tfvars, then:
+# 3. Load the TF_VAR_* secrets
+source infra/scripts/setup-env.sh
+
+# 4. Set the teardown flags below in terraform.tfvars, then apply them
+terraform -chdir=infra apply \
+  -target=module.gke_cluster -target=module.cloudsql \
+  -target=module.smithdb -target=module.networking
+
+# 5. Destroy
 make destroy
 ```
 
@@ -249,4 +280,14 @@ make destroy
 # terraform.tfvars
 gke_deletion_protection      = false
 postgres_deletion_protection = false
+
+# Only when enable_smithdb = true and smithdb_metastore_source = "create"
+smithdb_metastore_deletion_protection = false
+
+# Optional, any SmithDB install: lets make destroy delete the SmithDB bucket and
+# its trace segments. With the default (false), make destroy stops at a
+# non-empty SmithDB bucket.
+smithdb_bucket_force_destroy = true
 ```
+
+删除保护同样作用于 Cloud SQL API 层面，因此第 4 步的定向 apply 必须在 `make destroy` 之前运行，即使保护已经关闭。如果你从未启用 SmithDB，去掉 `module.smithdb` target。要同时删除集群内数据库的持久化磁盘，在第 2 步运行 `DELETE_DATA_PVCS=true make uninstall`。

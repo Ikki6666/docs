@@ -1,7 +1,7 @@
 ---
 title: 通过 forward proxy 路由自托管 Sandbox egress
 sidebarTitle: 通过 forward proxy 转发 egress
-description: 将自托管 LangSmith Sandboxes 的出站连接通过企业的 HTTP 或 HTTPS forward proxy 发送，支持绕过列表和自定义 CA 信任。
+description: 将自托管 LangSmith Sandboxes 的出站连接通过企业的 HTTP 或 HTTPS forward proxy 发送，支持绕过列表、Basic proxy 身份验证和自定义 CA 信任。
 ---
 
 自托管的 `sandbox-host` 可以将 Sandboxes 的每一条出站连接通过你的企业 forward proxy 发送，而不是直接拨号到目标地址。当你的网络只允许出站流量通过 proxy，或者你的安全团队需要所有 Sandbox 流量都经过某个 proxy 的访问策略和日志时，可以使用此功能。
@@ -28,11 +28,11 @@ host 还会应用以下规则：
 代理 egress 需要满足以下条件：
 
 - `sandbox-host` 镜像需要 0.17 release line 上的 LangSmith 0.17.32 或更高版本，或 0.18 line 上的 0.18.5rc1 或更高版本。
-- `sandboxes.authProxy.httpProxy` 需要 0.17 release line 上的 LangSmith Helm chart 0.17.7 或更高版本，或 0.18 line 上的 0.18.0-rc.19 或更高版本。
+- `sandboxes.authProxy.httpProxy.url` 需要 0.17 release line 上的 LangSmith Helm chart 0.17.10 或更高版本，或 0.18 line 上的 0.18.0-rc.21 或更高版本。更早的 chart 使用 `enabled`、`scheme`、`host` 和 `port` 来配置 proxy，无法传递凭证。
 - 一个接受标准 HTTP proxy 请求以及到 443 端口 `CONNECT` 的 forward proxy。要访问其他 TCP 服务，例如 22 端口上基于 SSH 的 Git，或发往已加入 allow-list 的 IP 地址的 HTTP，proxy 还必须接受到这些端口的 `CONNECT`。
 - 从 Sandbox node pool 到 proxy 的网络可达性。proxy 地址可以是私有 IP 地址；在 LangSmith 0.17.36 或更高版本上，也可以是集群内的 Kubernetes Service 名称，例如 `squid.proxy.svc.cluster.local`。
 
-forward proxy 不能要求身份验证：`sandbox-host` 不支持 URL 中的 proxy 凭证、Basic 或 NTLM 身份验证，也不支持客户端证书（mTLS）。当 host 只需要信任 proxy 的服务器证书时，HTTPS proxy 可以工作。
+forward proxy 可以要求 Basic 身份验证，这需要 0.17 release line 上的 LangSmith 0.17.37 或更高版本，或 0.18 line 上的 0.18.11rc1 或更高版本。`sandbox-host` 不支持 NTLM、Negotiate (Kerberos) 或 Digest proxy 身份验证，也不支持客户端证书（mTLS）。当 host 只需要信任 proxy 的服务器证书时，HTTPS proxy 可以工作。
 
 ## 配置 proxy
 
@@ -46,24 +46,31 @@ forward proxy 不能要求身份验证：`sandbox-host` 不支持 URL 中的 pro
     sandboxes:
       authProxy:
         httpProxy:
-          enabled: true
-          scheme: http
-          host: proxy.corp.internal
-          port: 3128
+          url: http://proxy.corp.internal:3128
           noProxy:
             - .corp.internal
     ```
 
-    - **`enabled`**：将 Sandbox egress 路由到该 proxy。默认为 `false`。
-    - **`scheme`**：`http`，或当到 proxy 本身的连接使用 TLS 时的 `https`。默认为 `http`。
-    - **`host`**：proxy 的主机名、IP 地址或集群内 Service 名称，不带 scheme、凭证或路径。当 `enabled` 为 `true` 时必填。
-    - **`port`**：proxy 端口。默认为 `3128`。
+    - **`url`**：proxy URL，`http://host:port`，或当到 proxy 本身的连接使用 TLS 时的 `https://host:port`。主机可以是主机名、IP 地址或集群内 Service 名称。将其留空则直接发送 egress。chart 会将该 URL 存储在 LangSmith 应用 Secret 中，因为它可以携带凭证（见下一步）。设置 `config.existingSecretName` 时，请将 `url` 留空，改为将该 URL 添加到该 Secret 中键为 `sandbox_egress_proxy_url` 的条目。
     - **`noProxy`**：host 直接拨号而不经过 proxy 的目标，匹配规则与 `NO_PROXY` 环境变量相同。像 `corp.internal` 这样的条目匹配该主机及其子域，带前导点的条目（如 `.corp.internal`）只匹配子域，而 `*` 匹配所有主机。条目还可以是 IP 地址、CIDR 范围（如 `10.0.0.0/8`）或 `host:port` 对。
 
-    当 `host` 缺失、`host` 包含 scheme、凭证或路径，或 `scheme` 或 `port` 无效时，chart 的渲染会失败。在 LangSmith 0.17.36 或更高版本上，`sandbox-host` 还会在启动时检查 proxy 地址：回环或云元数据地址会让 pod 以 `sandbox host config invalid` 停止，而不是让每个 Sandbox 创建都失败。
+    当 `url` 不是不带路径的 `http://` 或 `https://` URL，或者同时设置了 `url` 与 `config.existingSecretName` 或 `config.disableSecretCreation` 时，chart 的渲染会失败。在 LangSmith 0.17.36 或更高版本上，`sandbox-host` 还会在启动时检查 proxy 地址：回环或云元数据地址会让 pod 以 `sandbox host config invalid` 停止，而不是让每个 Sandbox 创建都失败。
+  </Step>
+  <Step title="（可选）向 proxy 进行身份验证">
+    当 proxy 需要用户名和密码时，将它们添加到 URL 中：
+
+    ```text
+    http://svc-sandboxes:p%40ssw0rd@proxy.corp.internal:3128
+    ```
+
+    请对用户名和密码中的保留字符进行百分号编码，例如 `@` 编码为 `%40`，`:` 编码为 `%3A`，`/` 编码为 `%2F`。将该 URL 设置为 values 中的 `url`，或设置为 `config.existingSecretName` 中的 `sandbox_egress_proxy_url` 键。
+
+    `sandbox-host` 会在每一条 `CONNECT` 和明文 HTTP proxy 请求上，以 Basic `Proxy-Authorization` 请求头的形式将凭证发送给 proxy。Sandboxes 永远不会看到它们：隧道由 host 建立，并且它会丢弃 Sandbox 内代码发送的任何 `Proxy-Authorization` 请求头。Basic 凭证不会加密，因此当 Sandbox 节点与 proxy 之间的网络不受信任时，请使用 `https` proxy URL。
+
+    当 proxy 拒绝这些凭证时，来自 Sandboxes 的连接会失败，并且 `sandbox-host` 日志会显示 `upstream proxy CONNECT rejected: 407`。轮换密码后，请更新 Secret 并重启 `sandbox-host` Deployment；它只在启动时读取该 URL。
   </Step>
   <Step title="（可选）为 HTTPS proxy 信任私有 CA">
-    当 `scheme` 为 `https` 且 proxy 的证书由私有 CA 签发时，请将该 CA 添加到 `config.customCa` 的 bundle 中。`sandbox-host` pod 除了系统根证书之外，还信任与其他 LangSmith 服务相同的 bundle。请参阅[为 TLS 挂载内部 CA](/langsmith/self-host-custom-tls-certificates#mount-internal-cas-for-tls)。
+    当 proxy URL 使用 `https` 且 proxy 的证书由私有 CA 签发时，请将该 CA 添加到 `config.customCa` 的 bundle 中。`sandbox-host` pod 除了系统根证书之外，还信任与其他 LangSmith 服务相同的 bundle。请参阅[为 TLS 挂载内部 CA](/langsmith/self-host-custom-tls-certificates#mount-internal-cas-for-tls)。
   </Step>
   <Step title="应用更改">
     升级 Helm release。更改这些设置会滚动更新 `sandbox-host` Deployment，因此每个 host 在重启之前会 drain 其运行中的 Sandboxes。请参阅[了解滚动升级](/langsmith/self-host-sandbox-operations#understand-a-rolling-upgrade)。

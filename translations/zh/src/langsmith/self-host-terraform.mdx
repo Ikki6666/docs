@@ -5,12 +5,14 @@ description: 使用 LangChain 生产可用的 Terraform modules，在 AWS、Azur
 ---
 
 <Info>
-Self-hosted LangSmith 是 Enterprise plan 的附加组件，面向 LangChain 规模最大、对安全要求最高的客户。详情请参见 [pricing](https://www.langchain.com/pricing)，或[联系销售团队](https://www.langchain.com/contact-sales)申请试用 license key。
+Self-hosted LangSmith 是 Enterprise plan 的附加组件，面向 LangChain 规模最大、对安全要求最高的客户。详情请参见 [pricing](https://www.langchain.com/pricing)，或[联系 LangChain 销售团队](https://www.langchain.com/contact-sales)申请试用 license key。
 </Info>
 
 LangChain 在 [github.com/langchain-ai/terraform](https://github.com/langchain-ai/terraform) 上发布了面向 [LangSmith self-hosted](/langsmith/self-hosted) 的生产可用 Terraform modules。这些 module 会预配云基础设施（网络、集群、数据库、缓存、对象存储、机密、DNS），并按照合理的默认值安装 LangSmith Helm chart。
 
 如果你希望从第一天起就采用基础设施即代码，请使用这条路径。如果你已经用自己的工具管理云基础设施，只需要安装应用本身，请改为遵循 [Helm installation guide](/langsmith/kubernetes)。
+
+每个 module release tag 部署一条 Helm chart 版本线：`v0.17.*` tag 部署 chart 0.17，`v0.16.*` tag 部署 chart 0.16。在配置 module 之前，请先检出你想要的 chart 版本线对应的 tag。
 
 <Tip>
 **更偏好 Helm？** [Kubernetes setup guide](/langsmith/kubernetes) 介绍了如何在任何符合规范的集群上使用 Helm 安装，无需 Terraform。Terraform 路径则把集群预配、机密接线和 Helm release 打包成同一个工作流。
@@ -36,26 +38,28 @@ LangChain 在 [github.com/langchain-ai/terraform](https://github.com/langchain-a
 
 | 工具 | 版本 | 用途 |
 |---|---|---|
-| `terraform` | 1.5 | 运行这些 module |
-| `kubectl` | 1.33 | 预配完成后检查集群 |
-| `helm` | 3.12 | 管理 LangSmith chart release |
+| `terraform` | 1.11 或更高版本 | 运行这些 module |
+| `kubectl` | 1.34 或更高版本 | 预配完成后检查集群 |
+| `helm` | 3.12 或更高版本 | 管理 LangSmith chart release |
 | Cloud CLI | latest | 目标 provider 对应的 `aws`、`az` 或 `gcloud` |
 
 你还需要：
 
-- 一个 LangSmith license key。可[联系销售团队](https://www.langchain.com/contact-sales)申请。
+- 一个 LangSmith license key。可[联系 LangChain 销售团队](https://www.langchain.com/contact-sales)申请。
 - 目标云账号中的权限，能够创建 VPC 或 VNet 网络、托管 Kubernetes 集群、托管数据库、对象存储、机密和 IAM 角色。
-- 一个已注册的域名（或子域名），用于 LangSmith UI endpoint。
+- 一个已注册的域名（或子域名），用于 LangSmith UI endpoint。GCP 需要一个，通过 `langsmith_domain` 设置。AWS 上可选，可以直接用负载均衡器主机名提供 LangSmith 服务；Azure 上也可选，除 `none` 之外的任何 ingress controller 都可以通过 `dns_label` 主机名提供服务。使用 AGIC 时，`dns_label` 主机名仅支持 HTTP。
 
 ## 部署层级
 
-只需设置一个 Terraform 变量即可选择层级。各 module 会据此调整所有依赖资源的大小。
+每个层级都是 `terraform.tfvars` 中一组设置的组合：`postgres_source`、`redis_source` 和 `clickhouse_source` 决定各个数据存储放在集群内还是托管服务中，`sizing_profile` 决定工作负载的规格。
 
 | 层级 | PostgreSQL | Redis | ClickHouse | 使用场景 |
 |---|---|---|---|---|
 | `dev` | In-cluster | In-cluster | In-cluster | 演示、evaluations、短期 POC |
-| `production` | Cloud-managed（RDS、Cloud SQL、Azure Database） | Cloud-managed（ElastiCache、Memorystore、Azure Cache） | [LangChain Managed ClickHouse](/langsmith/langsmith-managed-clickhouse) | 持久化、可扩展的生产环境 |
+| `production` | Cloud-managed（RDS、Cloud SQL、Azure Database for PostgreSQL） | Cloud-managed（ElastiCache、Memorystore、Azure Managed Redis） | [LangChain Managed ClickHouse](/langsmith/langsmith-managed-clickhouse) | 持久化、可扩展的生产环境 |
 | `production-large` | Cloud-managed，更大的实例规格 | Cloud-managed，更大的实例规格 | LangChain Managed ClickHouse | 高吞吐量生产环境 |
+
+在 AWS 和 Azure 上，从 `terraform.tfvars.example`、`terraform.tfvars.minimum`、`terraform.tfvars.dev` 或 `terraform.tfvars.production` 模板入手。在 GCP 上，从 `terraform.tfvars.example` 或 `terraform.tfvars.minimum` 入手。这些模板与上述层级并非一一对应：所有模板都把 ClickHouse 保留在集群内，而 dev 模板使用托管 PostgreSQL 和 Redis。复制其中一个之后，设置三个 `*_source` 值和 `sizing_profile`，使其匹配你想要的层级。
 
 <Warning>
 In-cluster ClickHouse 仅用于开发和 POC，不要用于生产环境。生产部署必须使用 [LangChain Managed ClickHouse](/langsmith/langsmith-managed-clickhouse) 或自行管理的外部 ClickHouse 集群。无论哪种层级，blob storage 都是必需的，因为 trace payload 不能存放在 ClickHouse 中。
@@ -65,19 +69,27 @@ In-cluster ClickHouse 仅用于开发和 POC，不要用于生产环境。生产
 
 - **网络：** 包含公网和私网子网、NAT 和安全组的 VPC 或 VNet。
 - **计算：** 托管 Kubernetes（EKS、AKS 或 GKE），节点池支持自动扩缩容，并按层级调整规格。
-- **Data plane：** 托管 PostgreSQL、托管 Redis 或缓存，以及用于存放 trace payload 的 blob storage bucket。
-- **机密：** 云原生 secret store（AWS SSM Parameter Store、Azure Key Vault、GCP Secret Manager），由 [External Secrets Operator](https://external-secrets.io/) 同步到 Kubernetes。
-- **Ingress：** 默认使用云原生负载均衡器。Envoy Gateway（Gateway API）适用于多 namespace 的 dataplane 部署。
-- **可选加固（目前仅 AWS）：** 带 FQDN 出站 allowlist 的 AWS Network Firewall、WAFv2、CloudTrail，以及支持 SSM bastion 访问的私有 EKS API endpoint。
+- **Data plane：** 托管或集群内的 PostgreSQL 和 Redis，以及用于存放 trace payload 的 blob storage bucket。
+- **机密：** 每个 module 把应用机密保存在云端的 secret store 中，再按各自的方式写入 Kubernetes。在 AWS 上，[External Secrets Operator](https://external-secrets.io/) 从 SSM Parameter Store 同步它们。在 GCP 上，`setup-env.sh` 把机密存入 Secret Manager，Terraform 写入 Kubernetes Secrets，`make deploy` 构建 `langsmith-config` Secret。在 Azure 上，`secrets.auto.tfvars` 保存 Terraform 输入，Key Vault 保存应用机密，`make k8s-secrets` 把它们复制到 `langsmith-config-secret` Kubernetes Secret 中。
+- **Ingress：** 每个 provider 上都以 Envoy Gateway（Gateway API）为默认。在 AWS 上，由 ALB 转发到它，也可以选择 NGINX、Istio 或仅用 ALB Ingress。在 Azure 上，可选择 NGINX、自行管理的 Istio、AKS Istio add-on，以及 Application Gateway Ingress Controller（AGIC）。在 GCP 上，Envoy Gateway 是唯一已实现的选项。
+- **可选加固：** 在 AWS 上，包括带 FQDN 出站 allowlist 的 AWS Network Firewall、WAFv2、CloudTrail，以及支持 SSM bastion 访问的私有 EKS API endpoint。在 Azure 上，包括 WAF 策略（OWASP 3.2 加 bot 防护，通过 AGIC 挂接到 Application Gateway）、Azure Monitor 诊断设置、跳板 VM、仅允许 Entra 访问的私有 AKS API server，以及 Blob Storage 和 Key Vault 的私有 endpoint。在 GCP 上，`gke_master_authorized_cidrs` 限制哪些 CIDR 可以访问 GKE control plane。
 
 ## Enterprise 功能开关
 
-每个 module 都为可选的 LangSmith add-on 提供了开关。在运行 `make apply` 之前，先在 `tfvars` 文件中逐项设置。
+每个 module 都为可选的 LangSmith add-on 提供了开关。在 `terraform.tfvars` 中逐项设置。各 module 的部署脚本会读取这些开关，并生成对应的 Helm values。
 
 - **[LangSmith Deployment](/langsmith/deploy-self-hosted-full-platform)**（`enable_deployments`）：Agent Server，以及运行和管理已部署 agent 的 host-backend、listener 和 operator。
-- **[Fleet](/langsmith/fleet)**（`enable_fleet`）：agent 构建产品，原名 Agent Builder，以独立服务形式部署（chart v0.15+）。
+- **[Fleet](/langsmith/fleet)**（`enable_fleet`）：agent 构建产品，原名 Agent Builder，以独立服务形式部署。
 - **Insights**（`enable_insights`）：基于 ClickHouse 的分析功能。
 - **Polly**（`enable_polly`）：AI 评估与监控。
+- **[LLM Gateway](/langsmith/llm-gateway)**（`enable_llm_gateway`）：一个 LangSmith API key 即可访问组织配置的各家 provider 的模型，处于 beta 阶段。`enable_gateway_pii_redaction` 增加 PII 脱敏功能。
+- **[SSO with OIDC](/langsmith/self-host-sso)**（`enable_sso_oidc`）：通过标准 OIDC provider 登录，取代 basic auth。只有在已用 basic auth 以 org admin 身份登录之后才能启用，因为该开关会禁用 basic auth。
+
+<Note>
+运行 `make init-values && make deploy` 来应用开关变更。`enable_fleet` 还会创建 Terraform 资源，所以要先运行 `make apply`。Fleet 取代了旧版 `enable_agent_builder` 开关，其前置条件因 provider 而异。参见 [AWS](/langsmith/self-host-terraform-aws-deploy#fleet)、[GCP](/langsmith/self-host-terraform-gcp-deploy#fleet) 或 [Azure](/langsmith/self-host-terraform-azure-deploy#fleet) 部署指南中的 Fleet 部分。
+
+`enable_sso_oidc` 在三个 module 的 `v0.17.*` tag 上都可用，AWS module 从 v0.16.83 开始也可用。LLM Gateway 开关仅在 Azure module 的 `v0.17.*` tag 上可用。
+</Note>
 
 ## 后续步骤
 

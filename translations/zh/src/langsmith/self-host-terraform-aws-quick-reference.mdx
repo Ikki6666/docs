@@ -17,27 +17,27 @@ cd terraform/modules/aws
 make quickstart
 
 # 2. Load secrets into SSM Parameter Store and export TF_VAR_* into your shell.
-#    Must use `source` — Make runs each target in a subshell.
+#    Use `source`: Make runs each target in a subshell.
 source infra/scripts/setup-env.sh
 
 # 2a. Confirm secrets and TF_VAR_* are set (optional but recommended)
 make secrets
 
-# 3. Provision infrastructure (~20–25 min)
+# 3. Provision infrastructure
 make init
-make plan       # review — confirm no unexpected destroy/replace actions
+make plan       # review: confirm no unexpected destroy or replace actions
 make apply
 
-# 3a. Verify post-infra state (optional)
-make preflight-post
-
-# 4. Update kubeconfig for the EKS cluster
-make kubeconfig
+# 4. Point kubectl at the EKS cluster
+source infra/scripts/set-kubeconfig.sh
 
 # 5. Generate Helm values from Terraform outputs
 make init-values
 
-# 6. Deploy LangSmith (~10 min)
+# 5a. Verify post-infra state (optional)
+make preflight-post
+
+# 6. Deploy LangSmith
 make deploy
 ```
 
@@ -57,6 +57,12 @@ make status
 # Re-deploy after editing Helm values or upgrading
 make deploy
 
+# Pin a chart version for one deploy (or set langsmith_helm_chart_version in tfvars)
+CHART_VERSION=<version> make deploy
+
+# Raise the Helm timeout (default 30m)
+HELM_TIMEOUT=45m make deploy
+
 # Re-generate Helm values after Terraform changes
 make init-values
 
@@ -69,11 +75,11 @@ make secrets
 # List all SSM parameters with last-modified timestamps
 make secrets-list
 
-# Manage SSM secrets interactively (view, set, rotate, diff vs cluster)
+# Manage SSM secrets interactively (view, set, diff vs cluster)
 make ssm
 
-# Update kubeconfig for the EKS cluster
-make kubeconfig
+# Point kubectl at the EKS cluster
+source infra/scripts/set-kubeconfig.sh
 ```
 
 ## Preflight 检查
@@ -82,31 +88,33 @@ make kubeconfig
 # Pre-Terraform: AWS credentials + IAM permissions
 make preflight
 
-# Post-apply: kubectl, SSM params, Helm values, TLS config
+# Post-infra (after make init-values): kubectl, SSM params, Helm values, TLS config
 make preflight-post
 
-# SSM only — confirm all parameters are populated (after make setup-env)
+# SSM only: confirm all parameters are populated (after sourcing setup-env.sh)
 make preflight-ssm
 ```
 
 ## add-on
 
-Add-on 由 `infra/terraform.tfvars` 中的 `enable_*` 开关控制。设置开关后，重新运行 `init-values` 以复制对应的 values 文件，然后重新部署。
+Add-on 由 `infra/terraform.tfvars` 中的 `enable_*` 开关控制。设置开关后，运行 `make apply`，重新运行 `make init-values` 以复制对应的 values 文件，然后运行 `make deploy`。使用外部存储的 Fleet、Insights 和 LangSmith Chat，以及 sandboxes 和 SmithDB，都会创建 Terraform 资源。
 
 ```hcl
 # infra/terraform.tfvars
-enable_deployments     = true   # LangGraph Platform (required for Fleet, Agent Builder, and Polly)
-enable_fleet           = true   # Fleet (formerly Agent Builder), standalone (chart v0.15+); requires external Postgres + Redis
-enable_agent_builder   = false  # Older agent-builder path; mutually exclusive with enable_fleet
-enable_insights        = true   # ClickHouse-backed analytics
-enable_polly           = true   # Polly AI eval/monitoring
+enable_deployments     = true   # LangSmith Deployment (listener, operator, host-backend)
+enable_fleet           = true   # Fleet (formerly Agent Builder); needs external Postgres and Redis when fleet_storage = "external" (default)
+enable_insights        = true   # AI-powered trace analysis
+enable_polly           = true   # LangSmith Chat (formerly Polly)
 enable_usage_telemetry = false  # Extended usage telemetry
 ```
 
 ```bash
+make apply
 make init-values
 make deploy
 ```
+
+`enable_agent_builder` 在 chart v16 中已被移除。将其设置为 `true` 会在 `terraform plan` 时验证失败，请改用 `enable_fleet`。
 
 ## Sizing profile
 
@@ -130,61 +138,56 @@ sizing_profile = "default"           # chart defaults (no sizing file)
 | `make setup-env` | 打印将机密加载到 shell 的确切 `source` 命令。无法直接导出变量。 |
 | `make secrets` | 显示每个参数的 SSM 机密状态（`✓ SET` / `✗ MISSING`），检查 `TF_VAR_*` 导出情况，给出后续步骤。 |
 | `make secrets-list` | 列出本次部署的所有 SSM 参数及最后修改时间。 |
-| `make ssm` | 交互式 SSM 参数管理器。查看、设置、轮换、校验、与集群 Secret 对比。 |
+| `make ssm` | 交互式 SSM 参数管理器。查看、设置、校验、与集群 Secret 对比。要轮换某个值，请设置一个新值。 |
 
 ### Preflight
 
 | 命令 | 描述 |
 |---|---|
 | `make preflight` | 在 Terraform 运行之前验证 AWS 凭证、IAM 权限和必需的 CLI 工具。 |
-| `make preflight-post` | 在 `make apply` 之后运行。检查 kubectl context、集群可达性、SSM 参数是否已填充、Helm values 是否存在、TLS 配置。 |
+| `make preflight-post` | 在 `make init-values` 之后、`make deploy` 之前运行。检查 kubectl context、集群可达性、SSM 参数是否已填充、Helm values 是否存在、TLS 配置。 |
 | `make preflight-ssm` | 仅检查 SSM 参数。范围比 `preflight-post` 更窄。 |
 
 ### 基础设施
+
+`make init`、`make plan`、`make apply` 和 `make destroy` 会将 `ARGS` 透传给 Terraform。例如：`make plan ARGS="-target=module.eks"`、先 `make plan ARGS="-out=tfplan"` 再 `make apply ARGS="tfplan"`、`make apply ARGS="-auto-approve"`，或 `make init ARGS="-upgrade"`。
 
 | 命令 | 描述 |
 |---|---|
 | `make init` | `terraform init`。下载 providers 和 modules。可安全重复运行。 |
 | `make plan` | `terraform plan`。预览变更。每次 apply 前都应审查。 |
-| `make apply` | `terraform apply`。预配 VPC、EKS、RDS、ElastiCache、S3、ALB、IRSA。需要 20 到 25 分钟。 |
-| `make destroy` | `terraform destroy`。拆除全部基础设施。先运行 `make uninstall`。 |
+| `make apply` | `terraform apply`。预配 VPC、EKS、RDS、ElastiCache、S3、ALB、IRSA。 |
+| `make destroy` | `terraform destroy`。拆除全部基础设施。先运行 `make uninstall` 并关闭删除保护。会将 `make purge-secrets` 打印为下一步。 |
+| `make tf ARGS="<subcommand>"` | 在 `infra/` 中运行任意 Terraform 子命令，例如 `make tf ARGS="output -raw cluster_name"` 或 `make tf ARGS="state list"`。 |
+| `make purge-secrets` | 在 `make destroy` 之后删除本次部署的 SSM 参数。当 Terraform state 中仍有资源时会拒绝执行，并要求你输入前缀进行确认。 |
+| `make teardown-byo-sg BYO_SECURITY_GROUP_IDS="sg-..."` | 从 module 创建的 VPC 中删除在 Terraform 之外创建的安全组，以便 `make destroy` 能删除该 VPC。 |
 
 ### Helm 部署
 
 | 命令 | 描述 |
 |---|---|
 | `make init-values` | 根据 Terraform outputs 生成 `helm/values/langsmith-values-overrides.yaml`。根据 `enable_*` 开关复制 add-on values 文件。 |
-| `make deploy` | 通过 Helm 部署或升级 LangSmith。运行 preflight、ESO 同步、分层 values 构建和核心就绪检查。 |
+| `make deploy` | 通过 Helm 部署或升级 LangSmith。更新 kubeconfig，运行 preflight、ESO 同步、分层 values 构建和核心就绪检查。会清理卡住的 `pending-upgrade` 或 `pending-install` release，并刷新过期的 ALB hostname。 |
 | `make apply-eso` | 仅重新应用 ESO `ClusterSecretStore` 和 `ExternalSecret`。在轮换机密但不想完整重新执行 Helm 部署时使用。 |
-| `make uninstall` | 卸载 LangSmith Helm release。Terraform 基础设施保持不变。 |
-
-### Terraform 托管的 Helm
-
-| 命令 | 描述 |
-|---|---|
-| `make init-app` | 将实时的基础设施 Terraform outputs 拉取到 `app/infra.auto.tfvars.json`。 |
-| `make plan-app` | 针对 `app/` module 的 `terraform plan`。会自动先运行 `init-app`。 |
-| `make apply-app` | 通过 Terraform（`app/` module）部署 LangSmith Helm release。 |
-| `make destroy-app` | 通过 Terraform 销毁 Helm release。基础设施保持不变。 |
+| `make uninstall` | 卸载 LangSmith Helm release。Terraform 基础设施保持不变。`DELETE_DATA_PVCS=true` 还会删除 ClickHouse PVC。 |
 
 ### 快速路径
 
 | 命令 | 描述 |
 |---|---|
-| `make quickdeploy` | 一条命令完成完整部署。串联 `terraform apply` → `kubeconfig` → `init-values` → `helm deploy`，带检查门。 |
+| `make quickdeploy` | 一条命令完成完整部署。串联 `terraform apply`、kubeconfig、`init-values` 和 Helm 部署，带检查门。要求已运行 `make quickstart` 并 source 过 `setup-env.sh`。 |
 | `make quickdeploy-auto` | 与 `quickdeploy` 相同，但非交互。向 terraform 传入 `-auto-approve`。 |
-| `make deploy-all` | 依次执行 `make apply` → `make kubeconfig` → `make init-values` → `make deploy`。 |
-| `make deploy-all-tf` | 依次执行 `make apply` → `make init-values` → Terraform `app/` 的 plan 和 apply。 |
+| `make deploy-all` | 依次运行 `make apply`、`make kubeconfig`、`make init-values` 和 `make deploy`。`make deploy` 会在安装前刷新 kubeconfig。 |
 
 ### 实用工具
 
 | 命令 | 描述 |
 |---|---|
-| `make status` | 检查各层的部署状态，并打印接下来应运行的命令。 |
-| `make status-quick` | 与 `status` 相同，但跳过 SSM 和 Kubernetes 查询（更快）。 |
+| `make status` | 检查各层的部署状态，并打印接下来应运行的命令。启用 SmithDB 时会报告 SmithDB 的 ingestion 和 query 开关状态。 |
+| `make status-quick` | 与 `status` 相同，但跳过 SSM、kubeconfig、Helm release 和 Kubernetes 查询（更快）。 |
 | `make kubeconfig` | 打印一条待运行的 `source infra/scripts/set-kubeconfig.sh` 命令。source 该命令会把 `KUBECONFIG` 导出到专用的 `~/.kube/langsmith-<cluster>` 文件，而不是修改 `~/.kube/config`。 |
 | `make tls` | 自带 ACM 证书 + Route 53 A alias。当设置了 `langsmith_domain` 且需要 DNS 接线时使用。 |
-| `make clean` | 删除所有本地生成的文件和敏感文件。在 `make destroy` 之后运行。 |
+| `make clean` | 删除本地 Terraform state、备份、日志、生成的 Helm values 和 `terraform.tfvars`。在 `make destroy` 和 `make purge-secrets` 之后运行。当 Terraform state 仍跟踪资源或仍有 SSM 参数时会拒绝执行。如果 state 已删除但本地 state 备份仍在，会要求你输入 `DELETE BACKUPS` 后再删除。 |
 
 ### 测试
 
@@ -193,6 +196,7 @@ sizing_profile = "default"           # chart defaults (no sizing file)
 | `make test-e2e` | 针对当前集群运行端到端 gateway 测试（ALB 或 Envoy Gateway）。 |
 | `make test-permutations` | 在当前集群上顺序运行组合（permutation）测试。使用 `ARGS="1 2 5"` 可只测子集。 |
 | `make test-parallel` | 在多个隔离集群上并行运行组合测试。不会影响你的集群。 |
+| `make test-quickstart` | 测试 `make quickstart` 的 Route 53 选择和更新模式默认值。不发起任何 AWS 调用。 |
 
 ## kubectl
 
@@ -204,7 +208,10 @@ kubectl describe pod <pod-name> -n langsmith
 kubectl logs <pod-name> -n langsmith --tail=100 -f
 kubectl logs <pod-name> -n langsmith --previous --tail=50
 
-# ALB and ingress
+# Gateway routes (default Envoy Gateway mode)
+kubectl get gateway,httproute -n langsmith
+
+# Ingress (classic ALB Ingress mode only)
 kubectl get ingress -n langsmith
 kubectl describe ingress -n langsmith
 
@@ -221,7 +228,7 @@ helm status langsmith -n langsmith
 helm history langsmith -n langsmith
 helm get values langsmith -n langsmith
 
-# IRSA — check per-component service account annotations
+# IRSA: check per-component service account annotations
 kubectl get sa -n langsmith -o yaml | grep eks.amazonaws.com
 
 # LangSmith Deployment (LangGraph Platform)
@@ -240,11 +247,11 @@ aws eks update-kubeconfig --region <region> --name <cluster-name>
 
 # RDS
 aws rds describe-db-instances \
-  --query "DBInstances[?contains(DBInstanceIdentifier,'langsmith')]"
+  --query "DBInstances[?contains(DBInstanceIdentifier,'<name_prefix>-<environment>')]"
 
 # ElastiCache
 aws elasticache describe-cache-clusters \
-  --query "CacheClusters[?contains(CacheClusterId,'langsmith')]"
+  --query "CacheClusters[?contains(CacheClusterId,'<name_prefix>-<environment>')]"
 
 # S3
 aws s3 ls s3://<bucket-name>
@@ -252,15 +259,16 @@ aws s3api get-bucket-location --bucket <bucket-name>
 
 # ALB
 aws elbv2 describe-load-balancers \
-  --query "LoadBalancers[?contains(LoadBalancerName,'langsmith')]"
+  --query "LoadBalancers[?contains(LoadBalancerName,'<name_prefix>-<environment>')]"
 
 # VPC endpoint
 aws ec2 describe-vpc-endpoints \
   --filters "Name=service-name,Values=com.amazonaws.<region>.s3" \
   --query "VpcEndpoints[].State"
 
-# SSM secrets
-aws ssm get-parameters-by-path --path "/langsmith/<base-name>/" --with-decryption
+# SSM secrets (names only, so no secret value is printed)
+aws ssm get-parameters-by-path --path "/langsmith/<name_prefix>-<environment>/" \
+  --query "Parameters[].Name"
 
 # IAM role
 aws iam get-role --role-name <irsa-role-name>
@@ -268,36 +276,56 @@ aws iam get-role --role-name <irsa-role-name>
 
 ## Terraform
 
-```bash
-cd modules/aws/infra
+在 `modules/aws/` 中运行以下命令：
 
-terraform init
-terraform plan
-terraform apply
-terraform apply -target=module.eks
-terraform output
-terraform output -raw cluster_name
-terraform output -raw alb_dns_name
-terraform output -raw langsmith_irsa_role_arn
-terraform output -raw bucket_name
-terraform state list
+```bash
+make plan ARGS="-target=module.eks"
+make apply ARGS="-target=module.eks"
+make tf ARGS="output"
+make tf ARGS="output -raw cluster_name"
+# Entry point in Envoy (default), Istio, and NGINX modes; unused in classic ALB Ingress mode
+make tf ARGS="output -raw alb_dns_name"
+make tf ARGS="output -raw langsmith_irsa_role_arn"
+make tf ARGS="output -raw bucket_name"
+make tf ARGS="state list"
 ```
 
 ## 拆除
 
+<Warning>
+拆除会永久删除 LangSmith 数据。步骤 1 会删除 ClickHouse 卷，步骤 4 会删除 S3 中的每个 trace 对象，步骤 6 会删除 SSM 参数。这些参数包括绝不能更改的 API key salt、JWT secret 和加密 key。从 `-final` RDS 快照恢复的数据库需要它们：没有原始的 salt 和 key，现有 API key 会停止工作，加密数据也无法读取。如果你要保留快照，请在 `make purge-secrets` 之前将 SSM 参数导出到安全位置。
+</Warning>
+
 ```bash
 cd terraform/modules/aws
 
-# Option A: script-driven deploy
-make uninstall
+# 1. Uninstall LangSmith. DELETE_DATA_PVCS=true also deletes the ClickHouse PVC,
+#    whose EBS volume is otherwise left behind after destroy.
+DELETE_DATA_PVCS=true make uninstall
 
-# Option B: Terraform-managed deploy
-make destroy-app
+# 2. Load the database and Redis credentials that apply and destroy require
+source infra/scripts/setup-env.sh
 
-# Then destroy infrastructure:
-# 1. Set postgres_deletion_protection = false in infra/terraform.tfvars
-# 2. Apply the change, then destroy
-cd infra
-terraform apply
-terraform destroy
+# 3. Turn off deletion protection in infra/terraform.tfvars, then apply:
+#      postgres_deletion_protection          = false
+#      smithdb_metastore_deletion_protection = false   # only if SmithDB is enabled
+make apply
+
+# 4. Empty the trace bucket, which Terraform cannot delete while it holds objects
+aws s3 rm s3://<bucket-name> --recursive
+
+# 5. Destroy infrastructure
+make destroy
+
+# 6. Delete this deployment's SSM parameters
+make purge-secrets
+
+# 7. Remove local state, generated values, logs, and terraform.tfvars
+make clean
 ```
+
+启用 SmithDB 时，还需在 `make destroy` 之前清空 SmithDB bucket，或在步骤 3 中设置 `smithdb_s3_force_destroy = true`。启用 bucket versioning 时，`aws s3 rm` 会留下旧的对象版本；请在 S3 控制台中或使用 `aws s3api delete-objects` 删除它们。
+
+如果 `make destroy` 因为在 Terraform 之外创建的安全组仍位于 module 创建的 VPC 中而无法删除该 VPC，请运行 `make teardown-byo-sg BYO_SECURITY_GROUP_IDS="sg-..."`，然后重新运行 `make destroy`。当 `create_vpc = false` 时该脚本会拒绝运行。
+
+除非设置了 `postgres_skip_final_snapshot = true`，否则 RDS 会拍摄一个名为 `<identifier>-final` 的最终快照。启用 SmithDB 时，除非设置 `smithdb_metastore_skip_final_snapshot = true`，否则 metastore RDS 也会拍摄一个 `-final` 快照。如果该快照仍存在，重复 destroy 会以 `DBSnapshotAlreadyExists` 失败。

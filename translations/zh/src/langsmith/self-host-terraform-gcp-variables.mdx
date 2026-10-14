@@ -11,6 +11,8 @@ description: LangSmith self-hosted 在 GCP GKE 上的 Terraform 变量完整参�
 - **非敏感**（region、规格、feature 开关）：在 `infra/terraform.tfvars` 中设置。
 - **敏感**（license key、密码、加密 key）：通过 `infra/scripts/setup-env.sh` 载入，该脚本将它们写入 Google Secret Manager，并导出供 Terraform 和 Helm 步骤使用。
 
+默认值反映 `main` 分支和 `v0.17.x` tag，它们部署 Helm chart 0.17。在 `v0.16.x` tag（部署 chart 0.16）上不同的行会注明。
+
 端到端安装请参阅[部署指南](/langsmith/self-host-terraform-gcp-deploy)。module 之间如何协同，请参阅[架构参考](/langsmith/self-host-terraform-gcp-architecture)。
 
 ## Core
@@ -20,11 +22,11 @@ description: LangSmith self-hosted 在 GCP GKE 上的 Terraform 变量完整参�
 | `project_id` | — | 是 | 创建资源所在的 GCP project ID。 |
 | `region` | `us-west2` | 否 | regional 资源使用的 GCP region。 |
 | `zone` | `us-west2-a` | 否 | zonal 资源使用的 GCP zone。 |
-| `environment` | `prod` | 否 | 应用到 label 的环境名称：`dev`、`staging` 或 `prod`。 |
+| `environment` | `prod` | 否 | 应用到 label 和资源名称的环境名称：`dev`、`staging`、`prod`、`test` 或 `uat`。`setup-env.sh` 从 `terraform.tfvars` 导出该值，缺失时回退到 `dev`。请显式设置：缺失时，`setup-env.sh` 仍会用空值命名 secrets（`langsmith-<name_prefix>--<key>`）。 |
 | `name_prefix` | `ls` | 否 | 所有资源名称的前缀。1 到 11 个字符，以小写字母开头；只能包含小写字母、数字和连字符。 |
 | `unique_suffix` | `true` | 否 | 在资源名称后追加随机后缀。多租户项目推荐使用。 |
-| `owner` | `platform-team` | 否 | 应用到所有资源的 owner label。 |
-| `cost_center` | `""` | 否 | 用于计费归因的 cost center label。 |
+| `owner` | `platform-team` | 否 | 应用到所有资源的 owner label。source `setup-env.sh` 会用 `LANGSMITH_OWNER` 环境变量覆盖它，该变量未设置时为空。 |
+| `cost_center` | `""` | 否 | 用于计费归因的 cost center label。source `setup-env.sh` 会用 `LANGSMITH_COST_CENTER` 覆盖它。 |
 | `labels` | `{}` | 否 | 应用到所有资源的额外 label。 |
 
 ## 网络
@@ -48,6 +50,7 @@ description: LangSmith self-hosted 在 GCP GKE 上的 Terraform 变量完整参�
 | `gke_disk_size` | `100` | 否 | 节点磁盘大小（GB）。 |
 | `gke_release_channel` | `REGULAR` | 否 | GKE release channel：`RAPID`、`REGULAR` 或 `STABLE`。 |
 | `gke_deletion_protection` | `true` | 否 | 为 GKE 集群启用删除保护。 |
+| `gke_node_service_account_email` | `null` | 否 | Standard 模式 GKE 节点使用的 service account。`null` 保留 GKE 默认值；生产部署应传入最小权限的节点 service account。Pods 单独通过 Workload Identity 使用身份。 |
 | `gke_network_policy_provider` | `DATA_PLANE_V2` | 否 | 网络策略提供方：`CALICO`（旧版）或 `DATA_PLANE_V2`（基于 Cilium，推荐）。 |
 
 ## PostgreSQL（Cloud SQL）
@@ -59,7 +62,7 @@ description: LangSmith self-hosted 在 GCP GKE 上的 Terraform 变量完整参�
 | `postgres_tier` | `db-custom-2-8192` | 否 | Cloud SQL 机器层级（例如 `db-f1-micro`、`db-custom-2-8192`）。 |
 | `postgres_disk_size` | `50` | 否 | Cloud SQL 磁盘大小（GB）。 |
 | `postgres_high_availability` | `true` | 否 | 启用 Cloud SQL HA（regional 备用实例）。 |
-| `postgres_deletion_protection` | `true` | 否 | 为 Cloud SQL 启用删除保护。 |
+| `postgres_deletion_protection` | `true` | 否 | 防止通过 Terraform 和 Cloud SQL API 删除 Cloud SQL 实例。运行 destroy 之前，先设置 `false` 并应用该变更。 |
 | `postgres_database_flags` | 见描述 | 否 | 在 Cloud SQL 实例上设置的 database flags。默认为 `max_connections = 500`，外加 checkpoint 和连接日志 flags。 |
 | `postgres_ssl_mode` | `ENCRYPTED_ONLY` | 否 | Cloud SQL SSL 强制策略。`ENCRYPTED_ONLY` 要求每个连接都使用 TLS。`ALLOW_UNENCRYPTED_AND_ENCRYPTED` 接受明文。`TRUSTED_CLIENT_CERTIFICATE_REQUIRED` 还要求客户端证书。 |
 | `postgres_password` | `""` | external 时 | Cloud SQL 密码。通过 `TF_VAR_postgres_password` 设置，或由 `setup-env.sh` 存入 Secret Manager。 |
@@ -103,16 +106,17 @@ description: LangSmith self-hosted 在 GCP GKE 上的 Terraform 变量完整参�
 | `langsmith_namespace` | `langsmith` | 否 | LangSmith 使用的 Kubernetes namespace。 |
 | `langsmith_domain` | `langsmith.example.com` | 否 | LangSmith 的完全限定域名。 |
 | `langsmith_license_key` | `""` | 否 | License key。使用 `TF_VAR_langsmith_license_key`。 |
-| `langsmith_helm_chart_version` | `""` | 否 | 建议的 chart 版本，作为 Terraform 输出公开。部署脚本通过 `CHART_VERSION` 环境变量固定 chart 线（默认 `~0.15.1`，即最新的 `0.15.x` 补丁版本）。导出 `CHART_VERSION` 可覆盖。 |
+| `langsmith_helm_chart_version` | `""` | 否 | 部署脚本使用的 Helm chart 版本。为空时安装最新的 `0.17.x` 补丁版本（`~0.17.0`）。导出的 `CHART_VERSION` 优先。部署脚本会拒绝 0.17 版本线之外的版本。在 chart 0.16 上，默认值为 `~0.16.0`，版本线为 0.16。 |
+| `langsmith_release_name` | `langsmith` | 否 | Helm release 名称。必须与部署步骤安装的 release 一致，因为 chart 创建的 service account 名称由它派生。 |
 
 ## Ingress 与 TLS
 
 | 变量 | 默认值 | 必填 | 描述 |
 |---|---|---|---|
-| `install_ingress` | `true` | 否 | 通过 Terraform 安装 ingress controller。Gateway 仅支持 HTTPS，因此 `tls_certificate_source` 必须是 `letsencrypt` 或 `existing`。 |
+| `install_ingress` | `true` | 否 | 通过 Terraform 安装 Envoy Gateway。Gateway listener 跟随 `tls_certificate_source`：`none` 创建 HTTP listener，`letsencrypt` 创建 HTTP 和 HTTPS listener，`existing` 仅创建 HTTPS listener。 |
 | `ingress_type` | `envoy` | 否 | Ingress 类型：`envoy`（已实现），或 `istio` / `other`（预留）。 |
 | `tls_certificate_source` | `none` | 否 | `none`、`letsencrypt`（通过 cert-manager 自动签发）或 `existing`（提供自己的证书）。 |
-| `install_cert_manager` | `false` | 否 | 安装 cert-manager 以使用 Let's Encrypt 证书。 |
+| `install_cert_manager` | `false` | 否 | 安装 cert-manager。当 `tls_certificate_source = "letsencrypt"` 时，Terraform 也会安装它。 |
 | `letsencrypt_email` | `""` | 使用 `letsencrypt` 时 | 接收 Let's Encrypt 通知的 email。 |
 | `tls_certificate_crt` | `""` | 使用 `existing` 时 | TLS 证书（PEM）。使用 `file()` 加载。 |
 | `tls_certificate_key` | `""` | 使用 `existing` 时 | TLS 私钥（PEM）。使用 `file()` 加载。 |
@@ -130,6 +134,7 @@ description: LangSmith self-hosted 在 GCP GKE 上的 Terraform 变量完整参�
 |---|---|---|---|
 | `enable_gcp_iam_module` | `true` | 否 | 关联 `modules/iam`，用于 Workload Identity 和 bucket IAM 绑定。 |
 | `enable_secret_manager_module` | `false` | 否 | 关联 `modules/secrets`，将生成的 bootstrap 凭证存入 Secret Manager。 |
+| `grant_project_secret_accessor` | `false` | 否 | 向 LangSmith service account 授予整个项目上的 `roles/secretmanager.secretAccessor`。没有任何 module 组件需要它；只有当你添加的某个工作负载需要以该 service account 身份读取 Secret Manager 时才设置为 `true`。在 chart 0.16 上，该授权始终开启，此变量不存在。 |
 | `enable_dns_module` | `false` | 否 | 关联 `modules/dns`，用于 Cloud DNS 和托管证书。 |
 | `dns_create_zone` | `true` | 否 | 启用 DNS module 时创建新的 Cloud DNS managed zone。 |
 | `dns_existing_zone_name` | `""` | `!dns_create_zone` 时 | 要使用的现有 Cloud DNS zone。 |
@@ -137,31 +142,105 @@ description: LangSmith self-hosted 在 GCP GKE 上的 Terraform 变量完整参�
 
 ## 规格与 feature 开关
 
-Terraform `app` 层和 Helm 部署脚本会读取这些开关，以启用对应的 chart 组件并预配各功能专属的数据库。部署脚本读取 `sizing_profile` 来选择 Helm 规格 overlay。
+Helm 部署脚本会从 `terraform.tfvars` 读取这些开关，以启用对应的 chart 组件；当 Postgres 和 Redis 为外部时，Terraform 读取 `enable_fleet`、`enable_standalone_polly` 和 `enable_standalone_insights` 来预配各功能专属的数据库。部署脚本读取 `sizing_profile` 来选择 Helm 规格 overlay。
 
 | 变量 | 默认值 | 必填 | 描述 |
 |---|---|---|---|
-| `sizing_profile` | `default` | 否 | Helm 规格：`production`（约 20 用户、约 100 traces/秒）、`production-large`（约 50 用户、约 1000 traces/秒）、`dev`（单副本）、`minimum`（成本占位下限，不适用于生产）或 `default`（chart 默认值）。 |
+| `sizing_profile` | `default` | 否 | Helm 规格：`production`（约 20 用户、约 100 traces/秒）、`production-large`（约 50 用户、约 1000 traces/秒）、`dev`（单副本）、`minimum`（成本占位下限，不适用于生产）或 `default`（chart 默认值）。当 `enable_smithdb = true` 时，还决定 `smithdb_sizing` 的默认值，并决定 `sandbox_host_machine_type` 的默认值。 |
 | `enable_deployments` | `false` | 否 | 启用 LangSmith Deployment（listener、operator、host-backend）。需要 license 中的 Deployments entitlement。 |
 | `enable_agent_builder` | `false` | 否 | 启用 Agent Builder。需要 `enable_deployments = true` 和 Agent Builder entitlement。 |
 | `enable_insights` | `false` | 否 | 启用 Insights（基于 ClickHouse 的分析）。需要 Insights entitlement。 |
 | `enable_polly` | `false` | 否 | 启用 Polly（AI 评估与监控）。需要 `enable_deployments = true` 和 Polly entitlement。 |
-| `enable_fleet` | `false` | 否 | 启用 Fleet 独立部署（chart v0.15+）。不要求 `enable_deployments`。从 `enable_agent_builder` 迁移时复用 `langsmith_agent_builder_encryption_key`。 |
-| `enable_standalone_polly` | `false` | 否 | 启用 Polly 独立部署（chart v0.15+）。不要求 `enable_deployments`。复用 `langsmith_polly_encryption_key`。 |
-| `enable_standalone_insights` | `false` | 否 | 启用 Insights 独立部署（chart v0.15+）。不要求 `enable_deployments`。复用 `langsmith_insights_encryption_key`。 |
+| `enable_fleet` | `false` | 否 | 启用 Fleet 独立部署。不要求 `enable_deployments`。与 `enable_agent_builder` 互斥。从 `enable_agent_builder` 迁移时复用 `langsmith_agent_builder_encryption_key`。 |
+| `enable_standalone_polly` | `false` | 否 | 启用 Polly 独立部署。不要求 `enable_deployments`。复用 `langsmith_polly_encryption_key`。 |
+| `enable_standalone_insights` | `false` | 否 | 启用 Insights 独立部署。不要求 `enable_deployments`。复用 `langsmith_insights_encryption_key`。 |
+| `enable_sso_oidc` | `false` | 否 | 启用通过标准 OIDC provider 的 SSO 登录，并关闭 basic auth。`init-values.sh` 从 `TF_VAR_langsmith_oauth_client_id`、`TF_VAR_langsmith_oauth_client_secret` 和 `TF_VAR_langsmith_oauth_issuer_url` 变量读取 client ID、client secret 和 issuer URL，这些变量由 `setup-env.sh` 从 Secret Manager 加载。只有在完成 basic auth 的初始安装并确认组织 admin 访问权限之后才启用，否则你会被锁在 UI 之外。在 chart 0.16 上不可用。 |
 | `enable_usage_telemetry` | `false` | 否 | 启用扩展使用量 telemetry 上报（`PHONE_HOME_USAGE_REPORTING_ENABLED`）。 |
+
+## SmithDB
+
+SmithDB 要求 GKE Standard。Terraform 会拒绝在 Autopilot 上设置 `enable_smithdb`，并且在 `smithdb_ingestion_enabled = true` 之前拒绝 migration 和 query 开关。
+
+| 变量 | 默认值 | 必填 | 描述 |
+|---|---|---|---|
+| `enable_smithdb` | `false` | 否 | 预配 SmithDB 的依赖：Cloud SQL metastore、GCS object store、Workload Identity service account，以及缓存和计算 node pool。 |
+| `smithdb_sizing` | `null` | 否 | `minimal`、`small`、`medium` 或 `large`。`null` 跟随 `sizing_profile`：`minimum` 对应 `minimal`，`dev` 和 `default` 对应 `small`，`production` 对应 `medium`，`production-large` 对应 `large`。`minimal` 不创建 SmithDB node pool，运行在通用 node pool 上。在 chart 0.16 上不可用。 |
+| `smithdb_cache_storage` | `null` | 否 | `local-ssd`（Local SSD 缓存节点）或 `network-disk`（C3 或 C3D 缓存池上每个 pod 一个 Hyperdisk Balanced 卷；`minimal` 使用 `standard-rwo`）。`null` 在 `minimal` 时取 `network-disk`，其他情况取 `local-ssd`。变更会替换缓存 node pool。在 chart 0.16 上不可用。 |
+| `smithdb_ingestion_enabled` | `false` | 否 | 把新写入同时路由到 SmithDB 和 ClickHouse。只有在 SmithDB 服务通过就绪检查之后再启用。 |
+| `smithdb_migration_enabled` | `false` | 否 | 从 ClickHouse 回填历史数据。需要 `smithdb_ingestion_enabled`。还会在 chart 内运行一个 Postgres，用于 migration 任务状态。在 chart 0.16 上，要求 Helm chart 0.16.6 或更高版本。 |
+| `smithdb_migration_start_time` | `""` | 否 | RFC 3339 格式的回填起始时间，例如 `2026-01-01T00:00:00Z`。留空保留 chart 默认窗口。在 chart 0.16 上不可用。 |
+| `smithdb_query_enabled` | `false` | 否 | 让 UI 和 API 读取来自 SmithDB。需要 `smithdb_ingestion_enabled`。 |
+| `smithdb_metastore_source` | `create` | 否 | `create`（专用 Cloud SQL 实例）或 `external`（自带，例如 Auth Proxy 后面的 AlloyDB）。必须是专用的空数据库，绝不能是 LangSmith 运营 Postgres。 |
+| `smithdb_metastore_database_version` | `POSTGRES_18` | 否 | metastore 使用的 Cloud SQL 版本。SmithDB 要求 PostgreSQL 18 或更高版本。 |
+| `smithdb_metastore_tier` | `null` | 否 | 创建的 metastore 使用的 Cloud SQL 机器层级。`null` 跟随 `smithdb_sizing`：`minimal` 对应 `db-custom-2-8192`，`small` 对应 `db-custom-4-16384`，`medium` 对应 `db-custom-6-32768`，`large` 对应 `db-custom-10-65536`。在 chart 0.16 上，默认值为 `db-custom-2-8192`。 |
+| `smithdb_metastore_disk_size` | `50` | 否 | Metastore 磁盘大小（GB）。Autoresize 已开启，因此这是一个下限。 |
+| `smithdb_metastore_high_availability` | `false` | 否 | 将 metastore 作为 regional（HA）Cloud SQL 实例运行。 |
+| `smithdb_metastore_deletion_protection` | `true` | 否 | 防止通过 Terraform 和 Cloud SQL API 删除 metastore。运行 destroy 之前，先设置 `false` 并应用该变更。 |
+| `smithdb_metastore_ssl_mode` | `ENCRYPTED_ONLY` | 否 | metastore 的 Cloud SQL SSL 强制策略。 |
+| `smithdb_metastore_use_ssl` | `null` | 否 | 直接通过 TLS 连接 metastore。`null` 解析为与 `smithdb_metastore_use_auth_proxy` 相反的值。使用 Auth Proxy 时必须为 `false`。在 chart 0.16 上，默认值为 `true`。 |
+| `smithdb_metastore_use_auth_proxy` | `null` | 否 | 在每个 SmithDB Pod 中运行 Cloud SQL Auth Proxy sidecar。`null` 在 `smithdb_metastore_source = "create"` 时解析为 `true`，`external` 时解析为 `false`。需要 `smithdb_metastore_source = "create"` 和 `smithdb_metastore_use_ssl = false`。在 chart 0.16 上，默认值为 `false`。 |
+| `smithdb_auth_proxy_image` | `gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.25.0` | 否 | sidecar 使用的 Cloud SQL Auth Proxy 镜像。请固定确切的 tag。 |
+| `smithdb_metastore_master_username` | `smithdb` | 否 | metastore 的 master 用户名。 |
+| `smithdb_metastore_master_password` | `null` | 否 | metastore 的 master 密码。`null` 会自动生成一个。通过 `TF_VAR_smithdb_metastore_master_password` 设置。 |
+| `smithdb_external_metastore_host` | `null` | external 时 | metastore 使用的现有 Postgres 实例的 host。用 Auth Proxy sidecar 前置 AlloyDB 时使用 `127.0.0.1`。 |
+| `smithdb_external_metastore_port` | `5432` | 否 | 现有 metastore 的端口。 |
+| `smithdb_external_metastore_database` | `smithdb` | 否 | 现有 metastore 上的数据库名。 |
+| `smithdb_external_metastore_username` | `null` | external 时 | 现有 metastore 的用户名。 |
+| `smithdb_external_metastore_password` | `null` | 否 | 现有 metastore 的密码。使用 AlloyDB IAM 数据库认证时为空。通过 `TF_VAR_smithdb_external_metastore_password` 设置。 |
+| `smithdb_bucket_name` | `""` | 否 | Object-store bucket 名称。留空自动生成。使用单 region 的 bucket。 |
+| `smithdb_bucket_kms_key` | `""` | 否 | bucket 上用于 CMEK 的 Cloud KMS key。留空使用 Google 托管的加密。 |
+| `smithdb_bucket_versioning_enabled` | `false` | 否 | 在 bucket 上启用对象版本控制。 |
+| `smithdb_bucket_force_destroy` | `false` | 否 | 允许 Terraform 在 destroy 时删除非空 bucket。仅为测试环境设置 `true`。 |
+| `smithdb_service_account_email` | `null` | 否 | SmithDB pods 使用的现有 service account。`null` 会创建一个专用的最小权限 service account。 |
+| `smithdb_node_locations` | `[]` | 否 | SmithDB node pool 使用的 zone。留空使用该 region 中的每个 zone；在确认机型和 Local SSD 可用性之后再固定此值。 |
+| `smithdb_instance_store_machine_type` | `null` | 否 | 缓存池的机型。`null` 跟随规格和缓存模式：`local-ssd` 对应 `n2-standard-16`、`n2-standard-32` 或 `n2-standard-64`，`network-disk` 对应 `c3-standard-22`、`c3-standard-44` 或 `c3-standard-88`，分别用于 `small`、`medium` 和 `large`。`network-disk` 要求 C3 或 C3D 类型。在 chart 0.16 上，默认值为 `n2-standard-16`。 |
+| `smithdb_instance_store_local_ssd_count` | `null` | 否 | 每个缓存节点的 Local SSD 数量。每块盘 375 GB。`null` 在使用 `local-ssd` 时为 `small`、`medium` 和 `large` 分别取 `2`、`4` 或 `8`，`network-disk` 时取 `0`。Compute Engine 对每种机型只接受特定的数量。对自带磁盘的 `-lssd` 机型设置 `0`。在 chart 0.16 上，默认值为 `2`。 |
+| `smithdb_instance_store_disk_size` | `null` | 否 | 缓存池节点的启动磁盘大小（GB）。`null` 在 `local-ssd` 时取 `100`，`network-disk` 时取 `300`。启用回填的 `network-disk` 至少需要 `300`。在 chart 0.16 上，默认值为 `100`。 |
+| `smithdb_instance_store_min_nodes` | `0` | 否 | 每个 zone 的最小缓存池节点数。`0` 允许池缩容到零。 |
+| `smithdb_instance_store_max_nodes` | `3` | 否 | 每个 zone 的最大缓存池节点数。 |
+| `smithdb_compute_machine_type` | `null` | 否 | 计算池的机型（compaction、cluster manager、回填任务数据库）。`null` 在 `small` 和 `medium` 时取 `n2-standard-8`，`large` 时取 `n2-standard-16`。在 chart 0.16 上，默认值为 `n2-standard-8`。 |
+| `smithdb_compute_disk_size` | `100` | 否 | 计算池节点的启动磁盘大小（GB）。 |
+| `smithdb_compute_min_nodes` | `0` | 否 | 每个 zone 的最小计算池节点数。 |
+| `smithdb_compute_max_nodes` | `3` | 否 | 每个 zone 的最大计算池节点数。 |
+
+## Sandboxes
+
+Sandboxes 要求 GKE Standard 和 `enable_gcp_iam_module = true`。
+
+| 变量 | 默认值 | 必填 | 描述 |
+|---|---|---|---|
+| `enable_sandboxes` | `false` | 否 | 为 LangSmith Sandboxes 预配基础设施。要求 Standard GKE、外部 Redis、Workload Identity，以及带有可用 Linux KVM（`/dev/kvm`）的 sandbox-host 节点。 |
+| `sandbox_host_image_tag` | `""` | 否 | 已弃用且被忽略；请从 `terraform.tfvars` 中移除。部署脚本会根据 chart 的 app version 设置 sandbox-host 镜像 tag。在 chart 0.16 上，启用 sandboxes 时必填，缺失时 `init-values.sh` 会退出。 |
+| `sandbox_service_url_base_url` | `""` | 否 | sandbox 内运行的 HTTP service 的 service URL 的 base URL。设置时要求该 host 具备通配符 DNS 和 TLS。 |
+| `platform_backend_component_label` | `langsmith-platform-backend` | 否 | platform-backend pods 的组件 label，被排除在默认拒绝（default-deny）网络策略之外，以便 sandbox host 可以访问它们。如果你的 Helm release 不叫 `langsmith`，设置为 `<release-name>-platform-backend`。 |
+| `sandbox_host_machine_type` | `null` | 否 | sandbox-host 节点的机型。必须支持嵌套虚拟化。`null` 跟随 `sizing_profile`：`production` 和 `production-large` 对应 `n2-standard-32`，其他情况对应 `n2-standard-8`。不支持 C4 机型，因为该池使用 pd-ssd 启动磁盘。在 chart 0.16 上，默认值为 `n2-standard-8`。 |
+| `sandbox_host_node_count` | `1` | 否 | 每个 zone 的初始 sandbox-host 节点数。 |
+| `sandbox_host_min_node_count` | `0` | 否 | 每个 zone 的最小 sandbox-host 节点数。`0` 让自动扩缩容只保留 sandbox-host 需要的节点。在 chart 0.16 上，默认值为 `1`。 |
+| `sandbox_host_max_node_count` | `5` | 否 | 每个 zone 的最大 sandbox-host 节点数。 |
+| `sandbox_host_disk_size_gb` | `200` | 否 | sandbox-host 节点的启动磁盘大小（GB）。 |
+| `sandbox_host_ephemeral_local_ssd_count` | `0` | 否 | 为 sandbox-host 节点上的 kubelet 和容器运行时临时存储提供支持的 Local SSD。JuiceFS 缓存保留在启动磁盘上，因此这些盘不会加快 sandbox 文件 I/O。接受 `0`、`1`、`2`、`4`、`8`、`16` 或 `24`，受机型限制。在 chart 0.16 上，接受任何非负整数。 |
+| `sandbox_default_container_requests` | `{ cpu = "100m", memory = "128Mi" }` | 否 | 注入到未指定 requests 的 sandbox 容器中的默认 requests。 |
+| `sandbox_juicefs_name` | `sandbox-juicefs` | 否 | 用于 sandbox 快照和文件系统状态的 JuiceFS 卷名称。 |
+| `sandbox_juicefs_redis_memory_size` | `5` | 否 | 专用 JuiceFS metadata Memorystore 实例的内存大小（GB）。 |
+| `sandbox_juicefs_redis_high_availability` | `true` | 否 | 为 JuiceFS metadata Redis 使用 Standard HA 层级。 |
+| `sandbox_juicefs_redis_prevent_destroy` | `false` | 否 | 防止 Terraform 销毁 JuiceFS metadata Redis。 |
+| `sandbox_juicefs_redis_rdb_snapshot_period` | `null` | 否 | JuiceFS metadata Redis 的 RDB 快照周期，例如 `ONE_HOUR`。`null` 禁用 RDB 持久化。 |
+| `sandbox_juicefs_csi_config_secret_name` | `juicefs-csi-config` | 否 | 保存 sandbox JuiceFS 配置的 Kubernetes Secret，以 `sandboxes.juicefs.existingSecretName` 传给 chart。在 chart 0.16 上，以 `sandboxes.juicefs.csi.existingSecretName` 传入。 |
+| `sandbox_juicefs_csi_config_secret_revision` | `1` | 否 | 递增以重写 JuiceFS 配置 Secret。chart 在重写后不会重启 sandbox-host，因此 apply 之后请手动重启。 |
 
 ## 敏感值（使用 `setup-env.sh` 设置）
 
-运行 source 载入 `infra/scripts/setup-env.sh` 会将这些值写入 Google Secret Manager，并导出到当前 shell 供 Terraform 和 Helm 步骤使用。绝不要在 `terraform.tfvars` 中内联设置这些值。
+运行 source 载入 `infra/scripts/setup-env.sh` 会将这些值以 `langsmith-<name_prefix>-<environment>-<key>` 的形式写入 Google Secret Manager，并作为 `TF_VAR_*` 变量导出到当前 shell。绝不要在 `terraform.tfvars` 中内联设置这些值。`make deploy` 还会从 `LANGSMITH_ADMIN_EMAIL` 环境变量读取初始 admin email，该变量不由 `setup-env.sh` 设置。
 
 | 变量 | 描述 |
 |---|---|
-| `langsmith_license_key` | LangSmith 企业版 license key。 |
-| `langsmith_admin_password` | 初始组织 admin 密码。 |
+| `postgres_password` | Cloud SQL 密码。会提示输入。 |
+| `langsmith_license_key` | LangSmith 企业版 license key。会提示输入。 |
+| `langsmith_admin_password` | 初始组织 admin 密码。会提示输入。至少 12 个字符，包含小写字母、大写字母和一个符号。 |
 | `langsmith_api_key_salt` | 用于哈希 API key 的 salt。首次部署后必须保持稳定。 |
 | `langsmith_jwt_secret` | 用于 Basic Auth 会话的 JWT secret。必须保持稳定。 |
 | `langsmith_deployments_encryption_key` | LangSmith Deployment 的 Fernet key。绝不能更改。 |
 | `langsmith_agent_builder_encryption_key` | Agent Builder 的 Fernet key。绝不能更改。 |
 | `langsmith_insights_encryption_key` | Insights 的 Fernet key。绝不能更改。 |
 | `langsmith_polly_encryption_key` | Polly 的 Fernet key。绝不能更改。 |
+| `sandbox_callback_signing_jwk` | Sandbox 回调签名 key。仅在 `enable_sandboxes = true` 时生成。保持稳定。 |
