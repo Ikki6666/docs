@@ -68,7 +68,7 @@ Error: creating temporary Agent Pool ... "code": "ErrCode_InsufficientVCPUQuota"
 
 **原因：** 每个 VM 系列按 region 的 vCPU 配额。`eastus` 中 `standardDSv5Family` 的默认值通常是 10 核。一个 `Standard_D8s_v5` 节点（module 默认规格）占用 8 核，只剩 2 核。
 
-**为什么 `max_pods = 30` 会触发它：** AKS 默认每个节点 30 个 pods。基础安装会在节点上运行约 37 个 pods：约 17 个 LangSmith pods 加约 20 个系统 pods。autoscaler 尝试添加第二个节点时撞上配额，进入退避。module 默认设置 `default_node_pool_max_pods = 60`，让所有 pods 放进单个节点。检查 `terraform.tfvars` 没有把它调低。
+**为什么 `max_pods = 30` 会触发它：** 基础安装会运行约 37 个 pods（约 17 个 LangSmith pods 加约 20 个系统 pods），超过 AKS 默认的每节点 30 个，因此 autoscaler 会添加第二个节点，撞上配额并进入退避。module 默认值 `default_node_pool_max_pods = 60` 可以让所有 pods 放进单个节点。检查 `terraform.tfvars` 没有把它调低。
 
 **多 dataplane（3 个 dataplane）的推荐配额：** 32 核。
 
@@ -88,7 +88,7 @@ az quota update \
 az vm list-usage --location eastus --query "[?contains(name.value,'DSv5')]" -o table
 ```
 
-**替代方案，DSv5 配额耗尽时更换 VM 系列：** 设置 `default_node_pool_vm_size = "Standard_D8s_v3"`，并在 `additional_node_pools` 中为 `large` 节点池使用 `Standard_D16s_v3`。vCPU 和内存相同，只是配额池不同。module 迁移到 v5 之前默认使用 DSv3 规格。配额到位后再迁回 v5。不要回退到 DSv2（`Standard_DS4_v2`、`Standard_DS5_v2`），Azure 已将其退役。
+**替代方案，DSv5 配额耗尽时更换 VM 系列：** 设置 `default_node_pool_vm_size = "Standard_D8s_v3"`，并在 `additional_node_pools` 中为 `large` 节点池使用 `Standard_D16s_v3`。vCPU 和内存相同，只是配额池不同。配额到位后再迁回 v5。不要回退到 DSv2（`Standard_DS4_v2`、`Standard_DS5_v2`），Azure 已将其退役。
 
 <Note>
 `max_pods` 在已有节点池上不可修改。请在首次 `terraform apply` 之前设置。
@@ -261,7 +261,7 @@ az keyvault secret list --vault-name <vault> --query "length(@)"
 
 **症状：** `nslookup langsmith-demo.eastus.cloudapp.azure.com` 返回 NXDOMAIN。cert-manager ACME challenge 无法完成；TLS 证书停留在 `READY: False`。
 
-**原因：** 必须在 ingress controller 的 LoadBalancer service 上设置 `service.beta.kubernetes.io/azure-dns-label-name` 标注，Azure 才能把 DNS label 分配给公网 IP。`make deploy` 会通过 `deploy.sh` 自动设置。如果你直接运行了 `helm upgrade`，该标注从未被设置。
+**原因：** 只有当 ingress controller 的 LoadBalancer service 带有 `service.beta.kubernetes.io/azure-dns-label-name` 标注时，Azure 才会把 DNS label 分配给公网 IP。`make deploy` 会设置它；直接运行 `helm upgrade` 则不会。
 
 **`ingress_controller = "envoy-gateway"`（默认值）的修复：** EnvoyProxy `langsmith-proxy` 携带该标注，Envoy Gateway 会把它复制到 proxy service 上。检查两者：
 
@@ -472,7 +472,7 @@ config:
 
 **症状：** Pod 无限重启。没有 traceback。日志反复显示 "Child process died"。
 
-**原因：** `lc_config.settings.SharedSettings` 在 uvicorn worker 内部的模块导入时被实例化。此时抛出的 pydantic `ValidationError` 会让 worker 以退出码 0 退出；uvicorn 父进程打印 "Child process died" 但吞掉了 traceback。常见触发条件：`BASIC_AUTH_ENABLED = true` 但 `BASIC_AUTH_JWT_SECRET` 为空，或 `langsmith-config` 中缺少必需的功能开关 key。
+**原因：** 导入时的 settings 校验错误会让 uvicorn worker 以退出码 0 退出，父进程则吞掉了 traceback。常见触发条件：`BASIC_AUTH_ENABLED = true` 但 `BASIC_AUTH_JWT_SECRET` 为空，或 `langsmith-config` 中缺少必需的功能开关 key。
 
 **诊断**方式是在调试 pod 中运行该 server，`envFrom` 指向 `langsmith-config`，并设置 `PYTHONUNBUFFERED=1`。**修复：** 把缺失的 key 加入 Key Vault，重新运行 `make k8s-secrets`，重启 deployment。
 
@@ -601,7 +601,7 @@ make deploy
 
 **症状：** `ingress-appgw-deployment` 处于 CrashLoopBackOff。日志：`ErrorApplicationGatewayForbidden: does not have authorization to perform action Microsoft.Network/applicationGateways/read`。
 
-**原因：** AKS 会为 AGIC add-on 创建 managed identity（`MC_` 资源组中的 `ingressapplicationgateway-<cluster>`）。该身份在集群预配期间创建，但需要约 5 分钟才能在 Microsoft Entra ID 中完成注册，角色分配才会生效。
+**原因：** AGIC add-on 的 managed identity（`MC_` 资源组中的 `ingressapplicationgateway-<cluster>`）需要约 5 分钟才能在 Microsoft Entra ID 中完成注册，其角色分配才会生效。
 
 **修复：** `k8s-cluster` module 会在集群创建后等待 300 秒（`time_sleep.agic_identity_propagation`），并自动创建三个必需的角色分配。如果 `make apply` 之后 AGIC 仍然 403：
 

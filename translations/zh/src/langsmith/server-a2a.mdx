@@ -32,7 +32,7 @@ Agent Server 使用 A2A **v1.0** JSON-RPC 绑定，同时也接受 v0.3 的方�
 
 | v1.0 名称 | v0.3 名称 | 是否支持 |
 |---|---|---|
-| `SendMessage` | `message/send` | 支持 |
+| `SendMessage` | `message/send` | 支持，默认为阻塞。请参见[在运行结束前返回](#return-before-the-run-finishes) |
 | `SendStreamingMessage` | `message/stream` | 支持——Server-Sent Events |
 | `GetTask` | `tasks/get` | 支持 |
 | `CancelTask` | `tasks/cancel` | 支持 |
@@ -44,6 +44,33 @@ Agent Server 使用 A2A **v1.0** JSON-RPC 绑定，同时也接受 v0.3 的方�
 只接受这四个 v0.3 方法名：`message/send`、`message/stream`、`tasks/get` 和 `tasks/cancel`。其他任何方法名——包括 `agent/getAuthenticatedExtendedCard` 和 `tasks/resubscribe`——都会返回 `-32601 Method not found`。
 
 只有 JSON-RPC 绑定可用。gRPC 和 HTTP+JSON 均未实现。
+
+### 在运行结束前返回
+
+默认情况下，`SendMessage` 会保持请求打开，直到运行结束。若想在 run 创建后尽快拿回 task，请在 `configuration` 中把 `returnImmediately` 设为 `true`：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "role": "ROLE_USER",
+      "parts": [{"text": "hello"}],
+      "messageId": "message-1"
+    },
+    "configuration": {"returnImmediately": true}
+  }
+}
+```
+
+响应是一个处于 `TASK_STATE_SUBMITTED` 或 `TASK_STATE_WORKING` 状态的 task，没有 artifacts。使用返回的 `id` 轮询 `GetTask`，直到状态变为终止状态或 `TASK_STATE_INPUT_REQUIRED`。已完成的 task 会在 `artifacts` 中携带 agent 的回复，与阻塞式 `SendMessage` 返回的 parts 相同。
+
+- **`returnImmediately`**：v1.0 标志。同时发送两个标志时，它优先生效。
+- **`blocking`**：v0.3 标志。`"blocking": false` 的行为等同于 `"returnImmediately": true`。
+
+每个标志都必须是布尔值或 `null`，`null` 视为未设置。其他任何值都会在 run 创建之前返回 `-32602`。
 
 ### 响应中的任务历史
 
@@ -111,6 +138,33 @@ agent card 会在 `capabilities.extensions` 中声明这一能力，因此你可
 不要重发来自已完成 task 的 `taskId`。每一轮新对话都会在同一个 context 中开启一个新的 task，只需发送 `contextId`。指向已终止 task 的消息会被 `-32004` 拒绝，由其他 agent 生成的 `taskId` 会被 `-32001` 拒绝。
 </Warning>
 
+### 中断
+
+当 graph 调用 `interrupt()` 时，task 会转为 `TASK_STATE_INPUT_REQUIRED` 状态，并携带一个名为 `Interrupt` 的 artifact。该 artifact 为每个待处理的中断保留一个 `DataPart`：
+
+```json
+{
+  "name": "Interrupt",
+  "description": "Agent requires input to continue",
+  "parts": [
+    {
+      "kind": "data",
+      "data": {
+        "id": "<interruptId>",
+        "value": "<value passed to interrupt()>",
+        "response_schema": "<JSON Schema for the resume value>"
+      }
+    }
+  ]
+}
+```
+
+只有当 graph 向 `interrupt()` 传入 `response_schema` 时，它才会出现。
+
+要恢复执行，请发送一条消息，带上被中断 task 的 `taskId` 和 `contextId`。把恢复值放在一个 `resume` 键下的 `DataPart` 中，例如 `{"data": {"resume": true}}`，或者发送一个 text part，它会被原样用作恢复值。最多发送一个 `resume` `DataPart`。超过一个会返回 `-32602`。
+
+如果 task 并未在等待输入，`resume` `DataPart` 会返回 `-32602`，但 text part 会被视为普通消息，而不是恢复值。
+
 ## Agent card 发现
 
 每个 assistant 都会自动暴露一个 A2A Agent Card，用于描述其能力，并提供其他 agents 连接所需的信息。你可以使用以下方式获取任意 assistant 的 agent card：
@@ -146,13 +200,21 @@ agent card 中包含 assistant 的名称、描述、可用技能、支持的输�
 
 ### A2UI v0.9
 
-按 assistant 开启：
+A2UI 默认关闭。可以通过环境变量为 deployment 中的每个 assistant 开启它：
+
+```bash
+A2A_A2UI_ENABLED=true
+```
+
+也可以按 assistant 开启：
 
 ```json
 { "metadata": { "a2a": { "a2ui": true } } }
 ```
 
-之后 card 会声明该扩展，并将规范的 MIME 类型追加到两个模式列表中：
+按 assistant 设置的 `a2ui` 值优先于 `A2A_A2UI_ENABLED`，因此在已启用 A2UI 的 deployment 中，你也可以为单个 assistant 关闭 A2UI。每次 run 都会记录它启动时的设置，因此更改设置后，`GetTask` 和 `ListTasks` 仍会以相同的方式渲染已有的 task。
+
+当 A2UI 启用时，card 会声明该扩展，并将规范的 MIME 类型追加到两个模式列表中：
 
 ```json
 "capabilities": {
@@ -172,7 +234,32 @@ agent card 中包含 assistant 的名称、描述、可用技能、支持的输�
 }
 ```
 
-客户端通过在 `message.extensions` 中列出该 URI 来激活它。payload 会在两个方向上依据 v0.9 schema 校验，A2UI parts 会保留在 `message/send`、`tasks/get` 以及最终的 `message/stream` artifact 中。响应带有 `metadata.mimeType: "application/a2ui+json"`。输入时也接受 `application/json+a2ui` 作为别名。
+客户端通过在 `A2A-Extensions` 请求头中发送该 URI，按请求激活该扩展。旧版 `X-A2A-Extensions` 请求头同样可用：
+
+```txt
+A2A-Extensions: https://a2ui.org/a2a-extension/a2ui/v0.9
+```
+
+服务器从 `params.message.metadata`（`a2uiClientCapabilities` 和 `a2uiClientDataModel`）读取 A2UI 客户端能力和客户端数据模型，这也是 A2UI v0.9 schema 定义的位置。能力使用带标签的形状，例如 `{"v0.9": {"supportedCatalogIds": [...]}}`。扁平的能力对象会被拒绝。
+
+A2UI `DataPart` 可以包含一个 A2UI message 对象，也可以包含一个 message 数组，并把 `metadata.mimeType` 设置为 A2UI MIME 类型：
+
+- **`application/json+a2ui`**：规范类型。card 会声明它，响应默认使用它。
+- **`application/a2ui+json`**：输入时接受。当请求使用它时，该 task 的响应会原样回显它，包括后续的 `GetTask` 读取。
+
+payload 会在两个方向上依据 v0.9 schema 校验。客户端发来的无效 payload 会返回 `-32602`。agent 回复中的无效 payload 会让请求以 `-32603` 失败。A2UI parts 会保留在 `SendMessage`、`GetTask` 以及最终 `SendStreamingMessage` 的 artifact 中。
+
+只有当 assistant 启用了 A2UI 且客户端发送了扩展请求头时，服务器才会发布 A2UI 输出。否则，它会从 agent 的输出中丢弃 A2UI blocks，并返回回复的其余部分，而不是让请求失败。
+
+客户端输入的要求更严格。向未启用 A2UI 的 assistant 发送 A2UI `DataPart`，或者在没有扩展请求头的情况下发送，都会返回 `-32602`。
+
+要把某个工具的结果作为 A2UI 发布，请在 deployment 上列出工具名。该工具的结果必须是 A2UI JSON：
+
+```bash
+A2A_A2UI_TOOL_CALL_RESULTS=generative_ui_tool,another_tool
+```
+
+只有当 A2UI 对该请求处于活动状态时，列出的工具结果才会作为 A2UI `DataPart` 发送。错误结果和未通过校验的结果会被丢弃。
 
 ### 过滤工具结果
 
@@ -193,14 +280,14 @@ A2A_ALLOWED_TOOL_CALL_RESULTS=generative_ui_tool,another_tool
 | 工具结果 `DataPart` | `0.12.2` |
 | `A2A_ALLOWED_TOOL_CALL_RESULTS` | `0.12.4` |
 | 出站 `FilePart`、可配置的 card 模式 | `0.13.0` |
-| A2UI v0.9 | `0.15.0` |
+| A2UI v0.9、`A2A_A2UI_ENABLED`、`A2A_A2UI_TOOL_CALL_RESULTS` | `0.15.0` |
 | `historyScope` | `0.15.0` |
+| 中断 artifact 中的 `response_schema` | `0.16.0` |
+| `SendMessage` 上的 `returnImmediately` 和 `blocking` | `0.18.0` |
 
 ```bash
-pip install "langgraph-api>=0.13.0"
+pip install "langgraph-api>=0.16.0"
 ```
-
-A2UI v0.9 和 `historyScope` 是在 `0.14.0` release candidates 冻结之后才合入的，因此它们会随 `0.15.0` 到来。该版本尚未作为稳定版本发布——在依赖 `historyScope` 之前，请先检查 agent card 上的 `capabilities.extensions`。
 
 你的 graph 的 state 必须包含 `messages` 键，才能接受 A2A 的 text 和 file parts。输入 schema 中没有 `messages` 字段的 assistant 会被拒绝，并返回说明性错误。
 

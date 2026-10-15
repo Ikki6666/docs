@@ -244,7 +244,7 @@ Schedules 在 `mda dev` 下永远不会触发。本地服务器不会报告任�
 运行时 schedules 需要 `managed-deepagents` 0.9.0 或更高版本。
 </Note>
 
-`schedules/` 中的声明在部署时就固定了。`schedules` API 会在 agent 运行时创建 schedules，因此 agent 可以在对话中设置定期或一次性工作。可以从 tool 或 [middleware](/langsmith/managed-deep-agents-middleware) 中调用它。每个 schedule 属于当前用户或 agent。
+`schedules/` 中的声明在部署时就固定了。`runtime.schedules` 会在 agent 运行时创建 schedules，因此 agent 可以在对话中设置定期或一次性工作。tools 和 [middleware](/langsmith/managed-deep-agents-middleware) 收到的 runtime 上都有这个 API，它以当前 run 的调用者身份执行操作。每个 schedule 属于当前用户或 agent。
 
 agent 只能通过你编写的 tools 访问这个 API。只暴露 agent 需要的调用，把它不应该访问的留在外面。
 
@@ -256,6 +256,8 @@ agent 只能通过你编写的 tools 访问这个 API。只暴露 agent 需要�
 
 :::js
 `newThread` 决定 schedule 使用这两者中的哪一个。
+
+Managed Deep Agents 会在每个 tool 和 middleware runtime 上设置 `runtime.schedules`。它的 TypeScript 类型之所以是可选的，只是因为带注解的 tools 必须仍然匹配 LangChain 原生的 runtime 类型，因此示例中使用 `runtime.schedules!`。
 :::
 
 ### 创建定期 schedule
@@ -265,13 +267,15 @@ agent 只能通过你编写的 tools 访问这个 API。只暴露 agent 需要�
 :::python
 ```python tools/schedules.py
 from langchain.tools import tool
-from managed_deepagents import schedules
+from managed_deepagents import ManagedDeepAgentRuntime
 
 
 @tool
-async def remind_me(prompt: str, cron: str, timezone: str = "UTC") -> str:
+async def remind_me(
+    prompt: str, cron: str, runtime: ManagedDeepAgentRuntime, timezone: str = "UTC"
+) -> str:
     """Run a prompt for the current user on a cron schedule."""
-    item = await schedules.create(
+    item = await runtime.schedules.create(
         owner={"type": "user"},
         cron=cron,
         timezone=timezone,
@@ -285,11 +289,11 @@ async def remind_me(prompt: str, cron: str, timezone: str = "UTC") -> str:
 ```ts tools/schedules.ts
 import { tool } from "langchain";
 import { z } from "zod";
-import { schedules } from "managed-deepagents";
+import type { ManagedDeepAgentRuntime } from "managed-deepagents";
 
 export const remindMe = tool(
-  async ({ prompt, cron, timezone }) => {
-    const item = await schedules.create({
+  async ({ prompt, cron, timezone }, runtime: ManagedDeepAgentRuntime) => {
+    const item = await runtime.schedules!.create({
       owner: { type: "user" },
       cron,
       timezone,
@@ -321,13 +325,13 @@ export const remindMe = tool(
 from datetime import datetime, timedelta, timezone
 
 from langchain.tools import tool
-from managed_deepagents import schedules
+from managed_deepagents import ManagedDeepAgentRuntime
 
 
 @tool
-async def follow_up_later(prompt: str, hours: int) -> str:
+async def follow_up_later(prompt: str, hours: int, runtime: ManagedDeepAgentRuntime) -> str:
     """Run a prompt once, a number of hours from now."""
-    item = await schedules.create(
+    item = await runtime.schedules.create(
         owner={"type": "user"},
         at=datetime.now(timezone.utc) + timedelta(hours=hours),
         prompt=prompt,
@@ -340,11 +344,11 @@ async def follow_up_later(prompt: str, hours: int) -> str:
 ```ts tools/follow-up.ts
 import { tool } from "langchain";
 import { z } from "zod";
-import { schedules } from "managed-deepagents";
+import type { ManagedDeepAgentRuntime } from "managed-deepagents";
 
 export const followUpLater = tool(
-  async ({ prompt, hours }) => {
-    const item = await schedules.create({
+  async ({ prompt, hours }, runtime: ManagedDeepAgentRuntime) => {
+    const item = await runtime.schedules!.create({
       owner: { type: "user" },
       at: new Date(Date.now() + hours * 60 * 60_000),
       prompt,
@@ -421,16 +425,16 @@ export const followUpLater = tool(
 
 ### 管理 schedules
 
-`list`、`get`、`update` 和 `delete` 覆盖 schedule 生命周期的其余部分。当 agent 应该管理它创建的 schedules 时，把它们暴露为 tools。拥有 `list` 和 `delete` 的 agent 可以回答"我有哪些提醒？"并按请求取消一个。当对方以后还想要某个提醒时，用 `update` 暂停 schedule 而不是删除它。
+`runtime.schedules` 上的 `list`、`get`、`update` 和 `delete` 覆盖 schedule 生命周期的其余部分。当 agent 应该管理它创建的 schedules 时，把它们暴露为 tools。拥有 `list` 和 `delete` 的 agent 可以回答"我有哪些提醒？"并按请求取消一个。当对方以后还想要某个提醒时，用 `update` 暂停 schedule 而不是删除它。
 
 :::python
 ```python
 owner = {"type": "user"}
 
-page = await schedules.list(owner=owner, limit=20)
-item = await schedules.get(page["items"][0]["id"], owner=owner)
-await schedules.update(item["id"], {"paused": True}, owner=owner)
-await schedules.delete(item["id"], owner=owner)
+page = await runtime.schedules.list(owner=owner, limit=20)
+item = await runtime.schedules.get(page["items"][0]["id"], owner=owner)
+await runtime.schedules.update(item["id"], {"paused": True}, owner=owner)
+await runtime.schedules.delete(item["id"], owner=owner)
 ```
 :::
 
@@ -438,10 +442,10 @@ await schedules.delete(item["id"], owner=owner)
 ```ts
 const owner = { type: "user" } as const;
 
-const page = await schedules.list({ owner, limit: 20 });
-const item = await schedules.get(page.items[0].id, { owner });
-await schedules.update(item.id, { paused: true }, { owner });
-await schedules.delete(item.id, { owner });
+const page = await runtime.schedules!.list({ owner, limit: 20 });
+const item = await runtime.schedules!.get(page.items[0].id, { owner });
+await runtime.schedules!.update(item.id, { paused: true }, { owner });
+await runtime.schedules!.delete(item.id, { owner });
 ```
 :::
 

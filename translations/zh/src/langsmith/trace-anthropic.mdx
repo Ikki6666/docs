@@ -1,8 +1,112 @@
 ---
 title: 为 Anthropic 应用启用追踪
 sidebarTitle: Anthropic
+description: 通过 Claude Platform、基于 OpenTelemetry 的 Claude SDK，或 LangSmith SDK 包装器，在 LangSmith 中追踪 Anthropic 应用。
 ---
 
 import TraceAnthropic from '/snippets/trace-with-anthropic.mdx';
+
+你可以从 Anthropic 的服务器，或从你自己的应用程序，把 Anthropic traces 发送到 LangSmith：
+
+- **[从 Claude Platform 追踪](#trace-from-the-claude-platform)**：Claude Platform 直接从 Anthropic 的服务器发送 traces。你在 Claude Console 中配置它，无需更改应用程序代码。
+- **[从你的应用程序追踪](#trace-from-your-application)**：由你的应用程序发送 traces，有两种方式：
+  - **[Claude SDK](#use-the-claude-sdks)**：Claude SDK 会发出 OpenTelemetry（OTel）span，由 OTel exporter 库把它们发送到 LangSmith。
+  - **[LangSmith SDK 包装器](#use-the-langsmith-sdk-wrapper)**：用 LangSmith SDK（Python 或 TypeScript）包装 Anthropic 客户端。你可以把这些 traces 与代码其余部分的 `@traceable` span 合并到同一个 trace 中。
+
+<Note>
+从 Claude Platform 和 Claude SDK 进行的追踪处于公开 beta 阶段。
+</Note>
+
+## 从 Claude Platform 追踪
+
+Claude Platform 会导出你的 [Claude Managed Agents](https://platform.claude.com/docs/en/managed-agents/overview) 会话和 [Messages API](https://platform.claude.com/docs/en/api/messages) 请求的 OTel traces，并把它们发送到一个 _destination_，即你在 Claude Console 中注册的 OTel 端点。你可以把 LangSmith 添加为 destination，并在不更改应用程序代码的情况下查看这些 traces。关于 destination 和投递的详细信息，请参见 Anthropic 文档中的 [Use OpenTelemetry with the Claude API](https://platform.claude.com/docs/en/manage-claude/opentelemetry/api)。
+
+开始之前，你需要：
+
+- Claude Console 组织中的 admin 角色，或同等权限。没有它，你无法查看或管理 destination。
+- 一个 LangSmith API key。你可以使用 [personal access token](/langsmith/administration-overview#personal-access-tokens-pats)；如果你希望追踪独立于你的用户账号，可以使用 [service key](/langsmith/administration-overview#service-keys)。创建 key 请参见 [Create an account and API key](/langsmith/create-account-api-key)。
+- 对于 self-hosted LangSmith，一个 Claude Platform 可以访问的端点：端口 443 上的 HTTPS，主机名解析到公网 IP 地址。
+
+### 步骤 1. 将 LangSmith 添加为 destination
+
+添加 destination 的步骤：
+
+1. 在 Claude Console 中，打开你组织的 [OpenTelemetry 设置页面](https://platform.claude.com/settings/telemetry-destinations)，点击 **Add destination**。
+2. 在 **Provider** 下拉菜单中，选择 **LangSmith**。表单会切换为显示 LangSmith 字段。
+3. 填写各字段：
+   - **Name**：（可选）destination 的标签，例如 `LangSmith`。
+   - **Region**：你的 LangSmith 部署所在的区域：**US**、**EU**、**APAC** 或 **US on AWS**。对于 self-hosted LangSmith，选择 **Self-hosted**，并在 **LangSmith URL** 字段中输入你实例的 OTel 端点 URL，例如 `https://<your-langsmith-host>/api/v1/otel`。
+   - **API key**：你的 LangSmith API key。
+   - **Project**：（可选）接收 traces 的 [tracing project](/langsmith/log-traces-to-project) 的名称。留空时，traces 会进入 `default` project。
+   - **LangSmith workspace ID**：（可选）接收 traces 的 LangSmith workspace 的 ID。留空时，traces 会进入 API key 所属的 workspace。组织范围的 service key 需要它。查找 ID 请参见 [Create an account and API key](/langsmith/create-account-api-key)。
+   - **Content mode**：选择 **Full content** 以在 span 中包含 prompts 和 responses。选择 **Metadata only** 时，span 会省略输入和输出内容。
+   - **Workspaces**：向此 destination 发送 traces 的 Claude workspaces：**All**、**Selected** 或 **All except**。每个选项的详细信息，请参见 Anthropic 文档中的 [Choose workspaces for a destination](https://platform.claude.com/docs/en/manage-claude/opentelemetry/api#choose-workspaces-for-a-destination)。
+4. 点击 **Add destination**。
+
+之后编辑该 destination 时，表单会显示通用的 **OTLP endpoint URL** 和 **Request headers** 字段，而不是 LangSmith 字段。**OTLP endpoint URL** 保存你所在区域的 URL，LangSmith 字段则变为以下请求头：
+
+- `x-api-key`：**API key**。
+- `Langsmith-Project`：**Project**（如果你设置了）。
+- `X-Tenant-Id`：**LangSmith workspace ID**（如果你设置了）。
+
+如果你更改了 **OTLP endpoint URL** 的主机，请重新输入这些请求头的值。
+
+### 步骤 2. 检查 traces 是否到达
+
+检查设置的步骤：
+
+1. 在使用该 destination 的 Claude workspace 中，发送一个 Messages API 请求或运行一个 Claude Managed Agents 会话。
+2. 在 Claude Console 的 OpenTelemetry 设置页面上，检查该 destination 的 **Delivery** 列是否显示 **Healthy**。这可能需要大约一分钟。
+3. 在 LangSmith 中，打开你在 **Project** 字段中命名的 project，或 `default` project。
+
+### 排查投递问题
+
+如果 Claude Console [OpenTelemetry 设置页面](https://platform.claude.com/settings/telemetry-destinations)上的 **Delivery** 列显示 **Failing**，把指针悬停在上面查看最近的错误：
+
+- **HTTP 401**：destination 没有发送 API key。
+- **HTTP 403**：API key 错误，或已过期或已被删除。对于没有 workspace ID 的组织范围 service key，LangSmith 也会返回 403。
+- **HTTP 404**：端点 URL 错误。编辑该 destination，检查 **OTLP endpoint URL** 是否以 `/otel` 结尾（self-hosted LangSmith 为 `/api/v1/otel`），且不包含 `/v1/traces`。
+
+其他错误请参见 Anthropic 文档中的 [Delivery errors](https://platform.claude.com/docs/en/manage-claude/opentelemetry/api#delivery-errors)。
+
+如果 **Delivery** 列显示 **Disabled**，把指针悬停在上面查看原因。例如，当 destination 的主机名解析到非公网 IP 地址时，Claude Platform 会禁用它。请参见 Anthropic 文档中的 [Delivery and health](https://platform.claude.com/docs/en/manage-claude/opentelemetry/api#delivery-and-health)。
+
+## 从你的应用程序追踪
+
+当你的应用程序应当发送 traces 时，请使用以下方法之一。要把你的 Anthropic 调用与代码其余部分合并到同一个 trace 中，请使用 LangSmith SDK 包装器。
+
+### 使用 Claude SDK
+
+Claude SDK 会在你的应用程序中，为它们发送的每个请求以及 tool runner 运行的每个工具调用发出 OTel span。OTel exporter 库把这些 span 发送到 LangSmith。关于 SDK 选项和 SDK 发出的 span 的详细信息，请参见 Anthropic 文档中的 [Set up SDK tracing](https://platform.claude.com/docs/en/manage-claude/opentelemetry/sdk)。
+
+要把 Claude SDK span 发送到 LangSmith：
+
+1. [安装或升级 Claude SDK](https://platform.claude.com/docs/en/manage-claude/opentelemetry/sdk#install-the-sdk)，并[注册 tracer provider](https://platform.claude.com/docs/en/manage-claude/opentelemetry/sdk#register-a-tracer-provider)。
+2. 使用你的 LangSmith 部署的 OTel 端点 URL 配置 OTel exporter：
+
+   | LangSmith 部署 | OTel 端点 URL |
+   |----------------------|-------------------|
+   | GCP US | `https://api.smith.langchain.com/otel` |
+   | GCP EU | `https://eu.api.smith.langchain.com/otel` |
+   | GCP APAC | `https://apac.api.smith.langchain.com/otel` |
+   | AWS US | `https://aws.api.smith.langchain.com/otel` |
+   | Self-hosted | `https://<your-langsmith-host>/api/v1/otel` |
+
+   设置以下请求头：
+   - `x-api-key`：你的 LangSmith API key。
+   - `Langsmith-Project`：（可选）接收 traces 的 tracing project 的名称。没有此请求头时，traces 会进入 `default` project。
+   - `X-Tenant-Id`：（可选）接收 traces 的 LangSmith workspace 的 ID。没有此请求头时，traces 会进入 API key 所属的 workspace。组织范围的 service key 需要它。
+
+   例如，使用标准 OTel 环境变量：
+
+   ```bash
+   export OTEL_EXPORTER_OTLP_ENDPOINT=https://api.smith.langchain.com/otel
+   export OTEL_EXPORTER_OTLP_HEADERS="x-api-key=<your-langsmith-api-key>,Langsmith-Project=<your-project-name>"
+   ```
+
+   exporter 设置的更多信息，请参见 [Trace a non-LangChain application](/langsmith/trace-with-opentelemetry#trace-a-non-langchain-application)。
+3. （可选）默认情况下，Claude SDK 只记录 metadata。要在 span 中包含 prompts 和 responses，请设置 content mode。请参见 Anthropic 文档中的 [Configure the SDK](https://platform.claude.com/docs/en/manage-claude/opentelemetry/sdk#configure-the-sdk)。
+
+### 使用 LangSmith SDK 包装器
 
 <TraceAnthropic/>

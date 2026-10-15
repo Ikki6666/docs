@@ -3,6 +3,11 @@ title: 人类在回路中
 ---
 
 import HitlDecisionTypesTable from '/snippets/oss/hitl-decision-types-table.mdx';
+import HitlPerCallAgentPy from '/snippets/code-samples/hitl-per-call-agent-py.mdx';
+import HitlPerCallInvokePy from '/snippets/code-samples/hitl-per-call-invoke-py.mdx';
+import HitlPerCallResumePy from '/snippets/code-samples/hitl-per-call-resume-py.mdx';
+import HitlPerCallInvalidPy from '/snippets/code-samples/hitl-per-call-invalid-py.mdx';
+import HitlPerCallStreamPy from '/snippets/code-samples/hitl-per-call-stream-py.mdx';
 
 人类在回路中（HITL）[中间件](/oss/langchain/middleware/built-in#human-in-the-loop) 让你可以为智能体工具调用加入人工审核。
 当模型提出一个可能需要复核的动作时，例如写文件或执行 SQL，中间件可以暂停执行并等待决策。
@@ -31,7 +36,14 @@ import HitlDecisionTypesTable from '/snippets/oss/hitl-decision-types-table.mdx'
 
 每个工具可用的决策类型取决于你在 `interrupt_on` 中配置的策略。
 当多个工具调用同时暂停时，每个动作都需要单独决策。
-决策的顺序必须和中断请求里动作出现的顺序一致。
+
+:::python
+在默认的批量模式下，请按照动作在中断请求中出现的顺序提供决策。在[逐调用模式](#pause-once-per-tool-call)下，每个工具调用都有自己的中断，只需要一个决策。
+:::
+
+:::js
+决策的顺序必须和动作在中断请求中出现的顺序一致。
+:::
 
 :::python
 当人类是在拒绝请求的动作时，请使用 `reject`。只有在人工是在充当工具本身时才使用 `respond`，例如回答一个 `ask_user` 提示。不要用 `respond` 去拒绝会产生副作用的工具，因为它的消息会被当作成功的工具结果。
@@ -50,6 +62,10 @@ import HitlDecisionTypesTable from '/snippets/oss/hitl-decision-types-table.mdx'
 要使用 HITL，请在创建智能体时，把 [中间件](/oss/langchain/middleware/built-in#human-in-the-loop) 添加到智能体的 `middleware` 列表中。
 
 你需要用一个工具动作到决策类型的映射来配置它。只要某个工具调用匹配到映射中的动作，中间件就会中断执行。
+
+:::python
+这个示例使用默认的批量模式。若要每个工具调用暂停一次，请参见[设置中断模式](#set-the-interrupt-mode)。
+:::
 
 :::python
 ```python
@@ -137,6 +153,14 @@ const agent = createAgent({
 
 <ParamField body="description_prefix" type="string" default="Tool execution requires approval">
     动作请求描述的前缀
+</ParamField>
+
+<ParamField body="interrupt_mode" type="string" default="batched">
+    智能体暂停等待审查的方式。`"batched"` 在每个模型轮次发出一个中断，用一个有序列表应答。`"per_call"` 为每个受拦截的调用发出一个中断，以中断 ID 应答。`"per_call"` 需要 `langchain>=1.4.6`。请参见[设置中断模式](#set-the-interrupt-mode)。
+</ParamField>
+
+<ParamField body="edit_notice" type="string | None">
+    添加在审查者用 `edit` 决策替换的调用的结果之前的文本，让模型知道该调用已发生更改。默认为一条说明，指出人工审查者替换了该调用。传入 `None` 则不添加任何内容。
 </ParamField>
 
 **`InterruptOnConfig` 选项：**
@@ -228,7 +252,9 @@ agent = create_agent(
 )
 ```
 
-当 `when` 谓词返回 `False` 时，调用会直接运行而不中断。当它返回 `True`，或者你省略 `when` 时，调用就会像平常一样暂停。评估为 `False` 的调用不会被加入中断批次，因此审查者只会看到需要决策的动作。
+当 `when` 谓词返回 `False` 时，调用会直接运行而不中断。当它返回 `True`，或者你省略 `when` 时，调用就会像平常一样暂停。评估为 `False` 的调用永远不会暂停，因此审查者只会看到需要决策的动作。
+
+智能体恢复时，谓词会再次运行，因此它必须对同一个调用返回相同的结果。如果它在恢复时返回 `False`，工具会直接运行，审查者的答案会被忽略，即使是 `reject` 也是如此。在批量模式下，如果结果只对部分调用发生了变化，中间件会抛出 `ValueError`。
 :::
 
 :::js
@@ -276,9 +302,177 @@ const agent = createAgent({
 当 `when` 谓词返回 `false` 时，调用会直接运行而不中断。当它返回 `true`，或者你省略 `when` 时，调用就会像平常一样暂停。评估为 `false` 的调用不会被加入中断批次，因此审查者只会看到需要决策的动作。
 :::
 
+:::python
+
+## 设置中断模式
+
+中间件以两种模式之一暂停，由 `interrupt_mode` 设置：
+
+- **`"per_call"`**：每个需要审查的工具调用在开始时都会发出自己的中断。每个中断携带一个 [`response_schema`](/oss/langgraph/interrupts#define-an-interrupt-response-schema)，描述它接受的答案。你用一个决策来应答，并以中断 ID 作为键。
+- **`"batched"`**（默认）：每个模型轮次发出一个中断，列出所有需要审查的调用。你按相同的顺序用一个决策列表来应答。
+
+新智能体请使用逐调用模式。LangChain 计划在下一个主要版本中将其设为默认值。有关两种模式的并排对比以及逐调用模式解决的问题，请参见[人类在回路中概述](/oss/concepts/human-in-the-loop)。
+
+## 每个工具调用暂停一次
+
+<Note>
+逐调用中断需要 `langchain>=1.4.6`。
+</Note>
+
+设置 `interrupt_mode="per_call"` 可以单独审查每个工具调用。这个智能体会拦截 `write_file` 和 `execute_sql`，并让 `read_data` 直接运行而无需审查：
+
+<HitlPerCallAgentPy />
+
+### 读取中断
+
+当模型在一个轮次中调用全部三个工具时，`read_data` 会立即运行。两个受拦截的调用各自发出一个中断：
+
+<HitlPerCallInvokePy />
+
+每个中断值都有 `type: "tool_approval"`，因此客户端可以把它和其他中断区分开。`tool_call_id`、`name` 和 `args` 字段标识受审查的调用。
+
+### 读取响应模式
+
+每个中断还携带一个 `response_schema`：一个 JSON Schema，按决策的 `type` 匹配，工具允许的每种决策各对应一个分支。`execute_sql` 的模式有 `approve` 和 `reject` 分支。`write_file` 的模式包含全部四种。对于只允许一种决策的工具，`response_schema` 就是该决策自身的模式，没有 `oneOf`。
+
+每个标签页展示一个 `write_file` 分支、一个匹配它的答案，以及模型收到的 @[ToolMessage]。为了便于阅读，下面的分支就地展开了 `$ref` 定义，并省略了 `title` 和 `description` 字段。
+
+<Tabs>
+<Tab title="approve">
+按提议原样运行调用。
+
+```json Schema branch
+{"properties": {"type": {"const": "approve", "type": "string"}}, "required": ["type"], "type": "object"}
+```
+
+```python Answer
+{"type": "approve"}
+```
+
+```text Model receives
+Wrote 14 characters to orders_archive.csv
+```
+
+</Tab>
+<Tab title="edit">
+用新参数运行调用。`edited_action.name` 必须保持为 `write_file`，`edited_action.args` 必须匹配 `write_file` 的参数模式。工具未声明的参数会被忽略，与模型发送这些参数时的处理方式相同。
+
+```json Schema branch
+{
+  "properties": {
+    "type": {"const": "edit", "type": "string"},
+    "edited_action": {
+      "properties": {
+        "name": {"const": "write_file", "type": "string"},
+        "args": {
+          "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"}
+          },
+          "required": ["path", "content"],
+          "type": "object"
+        }
+      },
+      "required": ["name", "args"],
+      "type": "object"
+    }
+  },
+  "required": ["type", "edited_action"],
+  "type": "object"
+}
+```
+
+```python Answer
+{
+    "type": "edit",
+    "edited_action": {
+        "name": "write_file",
+        "args": {"path": "archive/orders_2024.csv", "content": "id,total\n1,20\n"},
+    },
+}
+```
+
+模型会先收到一条说明，指出审查者在调用运行前替换了它，然后才收到工具的结果。在中间件上设置 `edit_notice` 可以更改这条说明，传入 `None` 则移除它。
+
+```text Model receives
+Note: a human reviewer replaced this tool call before it ran. The call recorded in your message is the one you produced, not the one that executed. This was intentional and authorized. Do not re-issue your original call. Executed instead: write_file with arguments {"path": "archive/orders_2024.csv", "content": "id,total\n1,20\n"}.
+
+Tool response:
+Wrote 14 characters to archive/orders_2024.csv
+```
+
+</Tab>
+<Tab title="reject">
+跳过该调用。`message` 是可选的，用于告诉模型原因。
+
+```json Schema branch
+{"properties": {"type": {"const": "reject", "type": "string"}, "message": {"type": "string"}}, "required": ["type"], "type": "object"}
+```
+
+```python Answer
+{"type": "reject", "message": "Write to the archive/ folder instead."}
+```
+
+```text Model receives (error status)
+User rejected the tool call for `write_file` with reason: Write to the archive/ folder instead.
+```
+
+</Tab>
+<Tab title="respond">
+跳过该调用，并代替工具作答。`message` 是必需的。模型会把它当作成功的工具结果，因此要拒绝调用请使用 `reject`。
+
+```json Schema branch
+{"properties": {"type": {"const": "respond", "type": "string"}, "message": {"type": "string"}}, "required": ["type", "message"], "type": "object"}
+```
+
+```python Answer
+{"type": "respond", "message": "Saved orders_archive.csv to the shared drive myself."}
+```
+
+```text Model receives
+Saved orders_archive.csv to the shared drive myself.
+```
+
+</Tab>
+</Tabs>
+
+### 按 ID 恢复每个调用
+
+用一条决策应答每个中断，以中断 ID 作为键：
+
+<HitlPerCallResumePy />
+
+你也可以逐个应答中断。未应答的中断会保持待处理状态，一旦收到答案，其对应的工具就会运行。
+
+<Warning>
+如果一起发送的多个答案中有一个无效，其他答案对应的工具可能已经运行，而它们的中断仍显示为待处理。再次应答它们会让这些工具运行两次。一起发送前请先对照 `response_schema` 检查答案，或者逐个发送。
+</Warning>
+
+### 纠正无效答案
+
+LangGraph 在保存答案前会对照中断的 `response_schema` 检查每个答案。无效答案会抛出 `ValidationError`，并且不会保存任何内容，因此你可以向同一个中断 ID 发送纠正后的答案。这里，编辑操作遗漏了 `content`：
+
+<HitlPerCallInvalidPy />
+
+每个错误都会指出未通过检查的字段，因此你可以把它展示给审查者。对于参数是原始 JSON Schema 而非 Pydantic 模型的工具，`response_schema` 会展示这些参数，但 LangGraph 不会对照它们检查编辑操作。
+
+### 为逐调用审查排列中间件顺序
+
+在逐调用模式下，审查发生在工具调用开始时，位于工具调用中间件链内：
+
+- 把 `HumanInTheLoopMiddleware` 列在工具重试或错误处理中间件之前，例如 @[ToolRetryMiddleware] 和 @[ToolErrorMiddleware]，以便它包裹它们。否则，重试的调用会再次询问审查者，无效答案会被重试，或者作为工具错误返回给模型。
+- 当智能体恢复时，列在 `HumanInTheLoopMiddleware` 之前的中间件会重新运行到暂停点为止，因此它在调用自己的处理器之前不能有副作用。工具只会在收到答案后才运行。
+- [`when` 谓词](#conditional-interrupts)在每次调用开始时运行，因此它收到的 @[ToolCallRequest] 包含该工具。
+
+:::
+
 ## 响应中断
 
 当你调用智能体时，它会一直运行到完成或者触发一个中断。只要某个工具调用匹配到你在 `interrupt_on` 中配置的策略，就会触发中断。使用 `version="v2"` 时，返回结果是一个带有 `interrupts` 属性的 `GraphOutput`，其中包含需要审查的动作。然后你可以把这些动作展示给审查者，并在获得决策后恢复执行。
+
+:::python
+本节中的示例以及下面的决策类型都使用默认的批量模式。有关逐调用模式，请参见[每个工具调用暂停一次](#pause-once-per-tool-call)。
+:::
 
 
 :::python
@@ -311,7 +505,7 @@ print(result.interrupts)  # [!code highlight]
 # >          'action_requests': [
 # >             {
 # >                'name': 'execute_sql',
-# >                'arguments': {'query': 'DELETE FROM records WHERE created_at < NOW() - INTERVAL \'30 days\';'},
+# >                'args': {'query': 'DELETE FROM records WHERE created_at < NOW() - INTERVAL \'30 days\';'},
 # >                'description': 'Tool execution pending approval\n\nTool: execute_sql\nArgs: {...}'
 # >             }
 # >          ],
@@ -389,7 +583,7 @@ await agent.invoke(
 ### 决策类型
 
 <Tabs>
-<Tab title="✅ approve">
+<Tab title="approve">
 使用 `approve` 可原样批准工具调用，并在不做修改的情况下执行。
 
 :::python
@@ -431,7 +625,7 @@ await agent.invoke(
 ```
 :::
 </Tab>
-<Tab title="✏️ edit">
+<Tab title="edit">
     使用 `edit` 可以在执行前修改工具调用。
     需要提供编辑后的动作，包括新的工具名和参数。
 
@@ -496,7 +690,7 @@ await agent.invoke(
 
 </Tab>
 
-<Tab title="❌ reject">
+<Tab title="reject">
     使用 `reject` 可以拒绝工具调用，并提供反馈，而不是执行它。工具不会被运行。
 
     :::python
@@ -549,7 +743,7 @@ await agent.invoke(
 </Tab>
 
 :::python
-<Tab title="💬 respond">
+<Tab title="respond">
     当工具本质上是“ask user”这类场景时，请使用 `respond`，此时工具的真实实现就是人类的回复。`message` 内容会直接作为工具结果返回；工具本身不会执行。
 
     ```python
@@ -661,6 +855,10 @@ for message in stream.messages:  # [!code highlight]
     for token in message.text:
         print(token, end="", flush=True)
 ```
+
+在[逐调用模式](#pause-once-per-tool-call)下，`stream.interrupts` 会为每个受拦截的工具调用保存一个中断。恢复时使用以中断 ID 为键的字典：
+
+<HitlPerCallStreamPy />
 :::
 
 :::js
@@ -714,6 +912,10 @@ for await (const message of resumeStream.messages) {  // [!code highlight]
 
 :::js
 5. 根据 `HITLResponse` 中的决策，中间件会执行已批准或已编辑的调用，为被拒绝的调用合成 @[ToolMessage]，然后继续执行。
+:::
+
+:::python
+在[逐调用模式](#pause-once-per-tool-call)下，`after_model` 钩子不做任何事情。中间件改为在每个受拦截的调用运行时暂停它，每个调用对应一个 @[interrupt]，并在该调用的决策到达后运行工具。
 :::
 
 ## 自定义 HITL 逻辑
