@@ -2,7 +2,7 @@
 title: LangSmith CLI
 sidebarTitle: CLI
 icon: terminal-2
-description: 在终端中查询和管理 LangSmith 项目、traces、runs、datasets、evaluators、experiments 和 threads
+description: 在终端中查询和管理 LangSmith 项目、traces、runs、datasets、evaluators、experiments、insights 和 threads
 ---
 
 LangSmith CLI 是一个用于查询和管理 LangSmith 数据的命令行工具。它既适用于开发者，也适用于 AI 编码代理。默认输出为适合人类阅读的表格；如果需要用于脚本处理，可以使用 `--format json`。当你需要以可脚本化的方式访问 LangSmith 数据时，例如批量导出、自动化处理，或者给编码代理直接访问你的 [traces、runs 和 datasets](/langsmith/observability-concepts)，就可以使用它。
@@ -122,7 +122,7 @@ langsmith --api-key lsv2_... trace list --project my-app
 
 <Tabs>
 <Tab title="OAuth">
-需要 LangSmith CLI `v0.2.46` 或更高版本，并且部署在 LangSmith `0.16` 或更高版本上，同时启用了 OAuth 授权服务器。chart 会把 OAuth 授权服务器暴露在 `/api` 下，但在你配置签名 JWKS 之前，这些 endpoint 保持未激活状态。配置步骤请参见[启用 Remote MCP](/langsmith/langsmith-remote-mcp#enabling-remote-mcp)。
+需要 LangSmith CLI `v0.2.46` 或更高版本，并且部署在 LangSmith `0.16` 或更高版本上，同时启用了 OAuth 授权服务器。chart 会把 OAuth 授权服务器暴露在 `/api` 下，但在你[配置签名 JWKS](/langsmith/kubernetes#configure-a-signing-jwks) 之前，这些 endpoint 保持未激活状态。
 
 当 Helm chart 中设置了 `config.hostname` **并且**配置了签名 JWKS（通过 `config.signingJwks`，或 `config.existingSecretName` 中的 `langsmith_signing_jwks` key）时，OAuth 授权服务器会自动启用。如果没有签名 JWKS，OAuth endpoint 处于非激活状态，CLI 会收到 `404`，此时请改用 API key 标签页。
 
@@ -318,6 +318,63 @@ langsmith evaluator delete accuracy --yes
 langsmith experiment list
 langsmith experiment list --dataset my-eval-set
 langsmith experiment get my-experiment-2024-01-15
+```
+
+### 管理 insights
+
+`insights` 命令用于创建、运行和读取 [Insights](/langsmith/insights) 报告。这些报告把 project 的 traces 分组为类别，以呈现使用模式和失败模式。每个 `insights` 命令都需要 `--project`、`--project-id` 或 `LANGSMITH_PROJECT` 环境变量。
+
+<Note>
+`insights create`、`insights run` 和 `insights config` 需要 LangSmith CLI v0.2.60 或更高版本。
+</Note>
+
+要创建报告，请先在 JSON 文件中定义它：
+
+```json
+{
+  "name": "Weekly reliability review",
+  "summary_prompt": "Identify the request and outcome: {{run.inputs}} {{run.outputs}}",
+  "last_n_hours": 168,
+  "filter": "eq(is_root, true)",
+  "model": "openai",
+  "schedule_cron": "0 9 * * 1"
+}
+```
+
+- **`name`** 和 **`summary_prompt`**：必填。[summary prompt](/langsmith/insights#summary-prompt) 是一个 Mustache 模板，必须至少引用 `{{run.inputs}}`、`{{run.outputs}}`、`{{run.error}}`、`{{run.feedback}}` 或 `{{all_thread_messages}}` 之一。CLI 不支持 auto 模式，因此请在这个 prompt 中说明报告要查找什么。
+- **`last_n_hours`**，或 **`start_time`** 和 **`end_time`**：用于采样 traces 的时间范围。两种形式只用其一。
+- **`model`**：`openai`（默认）或 `anthropic`。要选择具体模型，请同时设置 **`cluster_model`** 和 **`summary_model`**，各自取值为 `openai`、`anthropic` 或一个[模型配置](/langsmith/model-configurations) UUID。不接受显示名称。
+- **`schedule_cron`**：用于周期性报告的 cron 表达式。第一个任务会立即启动，后续任务按计划运行。一次性报告可省略它。
+
+该文件还接受 `filter`、`sample`、`hierarchy`、`partitions`、`attribute_schemas` 和 `description`。未知字段会导致错误。
+
+`insights create` 会把文件保存为任务配置并启动第一份报告。报告异步运行并产生模型成本。workspace 需要所选模型的 secrets。传入 `--wait` 可轮询直到报告成功或失败，最长 30 分钟。传入 `--config -` 可从 stdin 读取文件。
+
+```bash
+langsmith insights create --project my-app --config insights.json
+langsmith insights create --project my-app --config insights.json --wait
+```
+
+`insights run` 会基于已保存的配置启动一份新报告，不会更改配置或其计划：
+
+```bash
+langsmith insights config list --project my-app
+langsmith insights config list --project my-app --include-prebuilt
+langsmith insights run <config-id> --project my-app --wait
+```
+
+`insights list` 返回报告及其状态和类别计数。`insights get` 额外提供执行摘要、重点 traces 和每个类别的统计信息：
+
+```bash
+langsmith insights list --project my-app --limit 5
+langsmith insights get <insight-id> --project my-app
+```
+
+`insights config update` 会用相同格式的 JSON 文件替换配置的名称和分析设置，但不会启动报告。省略 `description` 或 `schedule_cron` 可保留当前值，或将 `schedule_cron` 设为 `null` 以停止计划。`insights config delete` 会移除该配置及其产生的所有报告。
+
+```bash
+langsmith insights config update <config-id> --project my-app --config insights.json
+langsmith insights config delete <config-id> --project my-app --yes
 ```
 
 ### 管理 sandboxes

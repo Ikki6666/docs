@@ -21,6 +21,8 @@ description: "使用 LangChain Python 与 CockroachDB 集成。"
 pip install langchain-cockroachdb
 ```
 
+需要 CockroachDB v25.4 或更高版本。
+
 ### 获取 CockroachDB 连接字符串
 
 你需要一个 CockroachDB 集群。可以选择以下方式之一：
@@ -124,12 +126,14 @@ results = await vectorstore.asimilarity_search("distributed database performance
 **快速示例：**
 
 ```python
-from langchain_cockroachdb import CockroachDBChatMessageHistory
+from langchain_cockroachdb import CockroachDBChatMessageHistory, CockroachDBEngine
 import uuid
+
+engine = CockroachDBEngine.from_connection_string(CONNECTION_STRING)
 
 chat_history = CockroachDBChatMessageHistory(
     session_id=str(uuid.uuid4()),
-    connection_string=CONNECTION_STRING,
+    engine=engine,
     table_name="chat_history",
 )
 
@@ -140,6 +144,8 @@ await chat_history.aadd_message(AIMessage(content="Hi there!"))
 
 messages = await chat_history.aget_messages()
 ```
+
+共享 engine 会复用其连接池和重试策略。
 
 ### LangGraph Checkpointer
 
@@ -278,7 +284,9 @@ TTL 删除是 **eventual** 的，也就是说，即使行已过期，在 Cockroa
 
 - **Batch fetching**：`list()` 会用 2 次批量查询一次性获取所有 blobs 和 writes，而不是每个 checkpoint 执行 2 次查询
 - **Raw BYTEA**：使用 psycopg3 二进制协议，而不是在 SQL 中对 blobs 做十六进制编码
-- **Prepared statements**：`from_conn_string()` 会启用服务端查询计划缓存，即 `prepare_threshold=5`
+- **Prepared statements**：`prepare_threshold` 默认为 5，可以在 `from_conn_string` 中修改
+- **Concurrent setup**：`setup()` 可以安全地由多个进程同时运行
+- **Connection resilience**：对于长期运行的服务，请传入 `psycopg_pool` 连接池，而不是单个连接。单个连接一旦断开便无法恢复，`from_conn_string(..., pipeline=True)` 也是如此
 
 ### Multi-tenancy
 
@@ -311,6 +319,28 @@ vectorstore = AsyncCockroachDBVectorStore(
 ids = await vectorstore.aadd_texts(["Tenant A document"])
 results = await vectorstore.asimilarity_search("query", k=5)
 ```
+
+Document id 必须跨 namespace 唯一。库生成的 id 始终是唯一的；如果添加的文档 id 已属于另一个 namespace，则会引发 `ValueError`，且不会写入任何内容。
+
+### 重试与弹性（v0.4.0+）
+
+每个操作都会重试暂时性的 CockroachDB 错误：序列化失败（`40001`）、结果不明确（`40003`）、连接错误（`08xxx`）、节点下线（`57P01`），以及 CockroachDB 的 range 和节点故障 `58C00` 和 `58C01`。所有写入都是幂等的，因此在结果不明确后重试不会重复数据。在 engine 上配置一次即可：
+
+```python
+from langchain_cockroachdb import RETRYABLE_SQLSTATES, CockroachDBEngine, RetryPolicy
+
+engine = CockroachDBEngine.from_connection_string(
+    CONNECTION_STRING,
+    retry_policy=RetryPolicy(
+        max_attempts=8,
+        # 可选，适用于设置了 statement_timeout 的多区域应用：
+        retryable_sqlstates=RETRYABLE_SQLSTATES | {"57014"},
+        attempt_timeout=10,
+    ),
+)
+```
+
+vector store 和 chat history 会继承 engine 的策略。checkpointer 也接受 `retry_policy`；请为它们提供 `psycopg_pool` 连接池，以便在连接断开时进行替换。
 
 ## 为什么在 AI 应用中使用 CockroachDB？
 

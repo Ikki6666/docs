@@ -158,6 +158,67 @@ LangSmith 使用 PostgreSQL 数据库、Redis 缓存，以及 ClickHouse 数据�
 
 3. 如果你使用外部数据存储，请添加它们的连接信息。
 
+### 配置签名 JWKS
+
+自托管 LangSmith 使用 Ed25519 JSON Web Key Set (JWKS) 为其 OAuth Authorization Server 和 LLM auth proxy 签发 token。配置该 key 可以启用自托管 OAuth 登录，包括 `langsmith auth login` 和 Remote MCP 认证，并允许 LangSmith 为通过 LLM auth proxy 发送的请求签名。
+
+JWKS 包含一个私钥。请将它存储在 Kubernetes Secret 中，并在升级之间保持稳定。LangSmith 会派生公钥并从 `/.well-known/jwks.json` 提供它，因此 LLM auth proxy 等客户端无需接收私钥即可验证 token。
+
+<Note>
+本节中的 Helm 配置需要 LangSmith chart `0.16.0` 或更高版本。
+</Note>
+
+请使用 [step CLI](https://smallstep.com/docs/step-cli/installation/) 或你的内部密钥管理流程生成 Ed25519 key。RSA key 会被拒绝。
+
+```shell
+TMPDIR_KEYS="$(mktemp -d)"
+step crypto jwk create "$TMPDIR_KEYS/pub.json" "$TMPDIR_KEYS/priv.json" \
+  --kty OKP --crv Ed25519 --no-password --insecure
+SIGNING_JWKS=$(jq -c '{keys: [.]}' "$TMPDIR_KEYS/priv.json")
+```
+
+`step crypto jwk create` 会把 `use` 设为 `sig`，把 `alg` 设为 `EdDSA`，并把 `kid` 设为该 key 的指纹。如果你用其他方式生成 key，请给第一个 key 一个非空的 `kid`。[Sandbox service URLs](/langsmith/enable-self-hosted-sandboxes#optional-enable-service-urls) 需要它。
+
+从以下存储选项中选择一个：
+
+- **由 chart 管理的 Secret**：在你的 LangSmith `langsmith_config.yaml` 中设置 `config.signingJwks`。chart 会把该值存储在其托管的 Kubernetes Secret 中。
+
+  ```yaml
+  config:
+    signingJwks: |
+      {"keys":[...]}
+  ```
+
+- **已有 Secret**：如果你的安装已经使用 `config.existingSecretName`，请把生成的 JWKS 以准确的 key `langsmith_signing_jwks` 添加到该 Secret 中：
+
+  ```yaml
+  # Add this key to the existing chart-wide Kubernetes Secret.
+  stringData:
+    langsmith_signing_jwks: |
+      {"keys":[...]}
+  ```
+
+  ```yaml
+  config:
+    existingSecretName: "langsmith-secrets"
+  ```
+
+  `config.existingSecretName` 会替换整个 LangSmith 安装由 chart 管理的 Secret。不要把它指向只包含 JWKS 的 Secret。保留所有已有的 key，包括 `langsmith_license_key` 和 `api_key_salt`。完整的 Secret 结构请参阅[为你的安装使用已有 Secret](/langsmith/self-host-using-an-existing-secret)。
+
+<Warning>
+从 chart `0.16.0` 开始，chart 接管 `LANGSMITH_SIGNING_JWKS`。从更早的 chart 版本升级时，请从 `commonEnv` 和 `platformBackend.deployment.extraEnv` 中移除该环境变量。在那里设置它会导致重复的环境变量错误。如果你之前从单独的 Secret（例如 `langsmith-signing-jwks`）加载它，请把该值移入 chart 配置并移除那个引用。改为通过 `config.signingJwks` 或 `config.existingSecretName` 中的 `langsmith_signing_jwks` key 进行配置。
+</Warning>
+
+配置好 JWKS 后，请应用 Helm release。如果你在不更改 Helm values 的情况下更新了外部管理的 Secret，请重启 platform-backend pods，让它们加载新的环境变量。
+
+从你的 LangSmith 安装请求公钥 JWKS 以验证配置：
+
+```bash
+curl https://<your-langsmith-host>/.well-known/jwks.json
+```
+
+响应包含用于验证的公钥，不包含私有的 `d` 字段。
+
 ## 部署到 Kubernetes
 
 1. 确认你可以连接到 Kubernetes 集群。请安装到一个空的 namespace 中。

@@ -58,40 +58,16 @@ Playground 和 Evals 需要 v0.13.33 及以上。Chat 和 Insights 需要 v0.13.
 
 如果你使用的是 LangSmith SaaS，可以跳过这一步，因为 JWT 签名已经配置好了。
 
-**使用 [step CLI](https://smallstep.com/docs/step-cli/installation/) 生成一对 Ed25519 密钥**，如果你有自己的内部流程也可以。Ed25519 是 LangSmith 用来签发 JWT 的签名算法。私钥用于为每个请求签名，auth proxy 则只使用公钥来校验签名。
+按照[配置 signing JWKS](/langsmith/kubernetes#configure-a-signing-jwks) 中的步骤生成共享的 Ed25519 key，并将它提供给 LangSmith Helm chart。私钥用于为每个请求签名，而 auth proxy 只从 LangSmith 获取公钥。
 
-```shell
-TMPDIR_KEYS="$(mktemp -d)"
-step crypto keypair "$TMPDIR_KEYS/pub.pem" "$TMPDIR_KEYS/priv.pem" \
-  --kty OKP --crv Ed25519 --no-password --insecure
-PRIV_JWK=$(step crypto key format --jwk --no-password --insecure < "$TMPDIR_KEYS/priv.pem")
-SIGNING_JWKS=$(echo "$PRIV_JWK" | jq -c '{keys: [. + {use: "sig", alg: "EdDSA"}]}')
-echo "$SIGNING_JWKS"
-```
-
-**把 JWKS 保存到 Kubernetes secret 中：**
-
-```shell
-kubectl create secret generic langsmith-signing-jwks \
-  --namespace <namespace> \
-  --from-literal=LANGSMITH_SIGNING_JWKS="$SIGNING_JWKS"
-```
-
-JWKS，也就是 JSON Web Key Set，是一种用于发布密码学密钥的标准 JSON 格式。`LANGSMITH_SIGNING_JWKS` 包含 Ed25519 私钥，并作为 Kubernetes secret 保存。它不会被暴露。LangSmith 会自动提取对应的公钥，并通过 `/.well-known/jwks.json` 对外提供。auth proxy 会抓取这个公开端点，用它来校验 JWT 签名，而无需接触私钥。
-
-**在你的 [LangSmith `values.yaml`](https://github.com/langchain-ai/helm/blob/main/charts/langsmith/values.yaml) 中引用这个 secret：**
+在你的 LangSmith `values.yaml` 中设置 LLM auth proxy token 的 issuer：
 
 ```yaml
-platformBackend:
-  deployment:
-    extraEnv:
-      - name: LLM_AUTH_PROXY_ISSUER
-        value: "langsmith"        # must match jwtIssuer in the auth proxy chart
-      - secretRef:
-          name: langsmith-signing-jwks
+config:
+  llmAuthProxyIssuer: "langsmith"
 ```
 
-`LLM_AUTH_PROXY_ISSUER` 用来设置已签名 JWT 中的 `iss` claim。你可以使用 `langsmith`，这与 SaaS 默认值一致；也可以使用自定义标识，例如 `langsmith:self-hosted:<short_identifier>`，以区分你的安装实例。这个值必须与 auth proxy chart 中的 `jwtIssuer` 一致，见[步骤 4](#4-install-the-auth-proxy-helm-chart)。
+`config.llmAuthProxyIssuer` 用来设置已签名 JWT 中的 `iss` claim。你可以使用 `langsmith`，这与 SaaS 默认值一致；也可以使用自定义标识，例如 `langsmith:self-hosted:<short_identifier>`，以区分你的安装实例。这个值必须与 auth proxy chart 中的 `jwtIssuer` 一致，见[步骤 4](#4-install-the-auth-proxy-helm-chart)。
 
 ## 2. 为你的组织启用 LLM Auth Proxy
 
@@ -173,7 +149,7 @@ helm repo update
 ```yaml
 authProxy:
   upstream: "https://gateway.example.com"
-  jwtIssuer: "langsmith" # must match LLM_AUTH_PROXY_ISSUER in LangSmith values.yaml
+  jwtIssuer: "langsmith" # must match config.llmAuthProxyIssuer in LangSmith values.yaml
   jwtAudiences:
     - "example-audience" # must match the org setting in LangSmith
 
@@ -723,7 +699,7 @@ playground:
 ```yaml
 authProxy:
   upstream: "https://gateway.example.com"   # your LLM gateway or provider
-  jwtIssuer: "langsmith"                    # must match LLM_AUTH_PROXY_ISSUER on LangSmith
+  jwtIssuer: "langsmith"                    # must match config.llmAuthProxyIssuer on LangSmith
   jwtAudiences:
     - "example-audience"                    # must match org setting in LangSmith
 
@@ -770,7 +746,7 @@ LangSmith 使用 **Ed25519，也就是 EdDSA** 来签发 JWT。公钥会通过 `
 | Claim | Description |
 |-------|-------------|
 | `iat`, `exp`, `jti`, `nbf` | 标准 JWT claims，分别表示签发时间、过期时间、JWT ID 和 not-before |
-| `iss` | Issuer。SaaS 中为 `langsmith`；self-hosted 中通过 `LLM_AUTH_PROXY_ISSUER` 设置 |
+| `iss` | Issuer。SaaS 中为 `langsmith`；self-hosted 中通过 `config.llmAuthProxyIssuer` 设置 |
 | `aud` | Audience。与 LangSmith 组织设置中的 JWT audience 一致 |
 | `sub` | Actor 标识符，例如 user ID、evaluator ID、assistant ID 或 API key ID |
 | `actor_type` | 取值之一：`user`、`evaluator`、`agent-builder`、`insights`、`polly`、`api_key:pat`（personal access token），或 `api_key:service`（service account key） |
