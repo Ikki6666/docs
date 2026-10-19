@@ -165,11 +165,41 @@ LangSmith 会为启用了此选项的 evaluator 额外拉取数据。仅当你�
 
 [Code evaluators](/langsmith/online-evaluations-code) 会在 `run` 对象中接收到这些字段，包括 `feedback_stats`、`total_tokens` 和 `total_cost`。无论是否启用扩展统计信息，它们都会在 `run["feedback"]` 中收到[单条 feedback 记录](/langsmith/feedback-data-format)。对于 [LLM-as-a-judge evaluator](/langsmith/online-evaluations-llm-as-judge)，请将对应的 `run.*` 字段映射到某个 prompt 变量。例如，把 `{{correctness_average}}` 映射到 `run.feedback_stats.correctness.avg`，即可在 prompt 中纳入 `correctness` feedback 的平均值。可用的 `run.*` 字段还包括 prompt 和 completion 的 token、成本以及 detail 字段。完整的 run 数据 schema 请参阅 [Run data format](/langsmith/run-data-format)。
 
-### 链式 evaluator
+## 链式 evaluator
 
-扩展统计信息可用于链式 evaluator：一个 code evaluator 读取另一个 evaluator 已经产生的分数。将第二个 evaluator 按第一个 evaluator 的 feedback key 进行过滤（例如 `has(feedback_key, "answer_usefulness")`），然后启用扩展统计信息。该过滤器使 code evaluator 仅在该分数存在之后才运行，而扩展统计信息让该分数可以通过 `run["feedback_stats"]["answer_usefulness"]["avg"]` 读取。
+链式 evaluator 是一种在线 evaluator，只会在已被其他 evaluator 打过分的 run 上触发。通过链式，你可以使用更有针对性的 evaluator，或者把更昂贵的 evaluator 留给真正需要它的 run。例如，你可以让某个 [LLM-as-a-judge evaluator](/langsmith/online-evaluations-llm-as-judge) 只在先前的 `correctness` 分数低于某个阈值时才运行。
 
-过滤器匹配的是 feedback key，而非产生它的 evaluator，因此任何来源只要使用了该 key，其 feedback 都会触发该 code evaluator。要配置过滤器，请参阅[为触发 evaluator 的 run 应用过滤器](/langsmith/online-evaluations-code#configure-online-evaluators)。
+第二个 evaluator 必须是 run-level evaluator，因为 [multi-turn（thread-level）evaluator](/langsmith/online-evaluations-multi-turn) 无法按 feedback 过滤。第一个 evaluator 可以是任意一种类型。multi-turn evaluator 会把它的 feedback 附加到线程中的最后一个 run 上，因此链在其后的第二个 evaluator 评估的是该 run，而不是整个线程。
+
+要将第二个 evaluator 链式接到第一个 evaluator 之后：
+
+1. 创建或打开第二个 evaluator，并展开它的过滤器。更多信息请参阅 LLM-as-a-judge evaluator 的[为触发 evaluator 的 run 应用过滤器](/langsmith/online-evaluations-llm-as-judge#apply-a-filter-to-runs-that-trigger-the-evaluator)，或 code evaluator 的[创建过滤器](/langsmith/online-evaluations-code#3-create-a-filter)。
+1. 按第一个 evaluator 的 feedback key 进行过滤。过滤器匹配的是 key，而非产生它的 evaluator，因此任何来源只要使用了该 key，其 feedback 都会触发第二个 evaluator，[用户 feedback](/langsmith/attach-user-feedback) 也不例外。请使用只有第一个 evaluator 会产生的 key。
+   - 要在第一个 evaluator 打过分的每个 run 上都触发，只按 key 过滤即可：
+
+     ```text
+     eq(feedback_key, "correctness")
+     ```
+
+   - 要只在分数满足某个条件时触发，请将 key 与 `feedback_score` 的比较组合使用。例如，要只在 `correctness` 低于 `0.5` 时触发：
+
+     ```text
+     and(eq(feedback_key, "correctness"), lt(feedback_score, 0.5))
+     ```
+
+1. 如果第二个 evaluator 会读取第一个分数，请[纳入扩展统计信息](#include-extended-stats)。LLM-as-a-judge evaluator 必须启用它，code evaluator 则可借助它可靠地读取分数。更多信息请参阅[读取第一个分数](#read-the-first-score)。
+1. 保存该 evaluator。
+
+只有当第一个 evaluator 的分数已附加到某个 run 之后，第二个 evaluator 才会处理该 run，因此两个 evaluator 的运行先后顺序无关紧要。完整的过滤器语法请参阅 [Trace query syntax](/langsmith/trace-query-syntax)。
+
+### 读取第一个分数
+
+第二个 evaluator 如何读取第一个 evaluator 的分数，取决于它的类型：
+
+- **LLM-as-a-judge evaluator**：[纳入扩展统计信息](#include-extended-stats)，然后将某个 prompt 变量映射到 `run.feedback_stats.<feedback_key>.avg`。例如，把 `{{correctness_average}}` 映射到 `run.feedback_stats.correctness.avg`。
+- **Code evaluator**：在 `run["feedback"]` 中读取 `key` 为第一个 evaluator 的 feedback key 的那条 [feedback 记录](/langsmith/feedback-data-format)，并使用它的 `score`。`run["feedback"]` 在该 evaluator 处理的每批 run 中最多保留 100 条 feedback 记录，最早的记录会最先被丢弃，因此当一批 run 携带大量 feedback 记录时，该分数可能缺失。要可靠地读取分数，请纳入扩展统计信息，并从 `run["feedback_stats"]["<feedback_key>"]["avg"]` 读取平均值。
+
+`avg` 字段对该 run 上使用该 key 的所有 feedback 记录取平均，因此只有当 run 上只有一条使用该 key 的记录时，它才等于第一个 evaluator 的分数。另一条使用相同 key 的记录（例如用户 feedback）会改变平均值。
 
 ## 删除 evaluator
 

@@ -80,7 +80,7 @@ LangSmith Deployment 需要 [Enterprise](https://langchain.com/pricing) 方案�
 
   </Step>
 
-  <Step title="（可选）配置镜像镜像同步">
+  <Step title="（可选）配置镜像同步">
     如果你需要把镜像同步到私有镜像仓库，请在 [`langsmith_config.yaml`](/langsmith/kubernetes#configure-your-helm-charts) 中配置 `hostBackendImage` 和 `operatorImage`。请使用 [最新 LangSmith Helm chart release](https://github.com/langchain-ai/helm/releases) 中指定的镜像标签。
 
     ```yaml
@@ -134,6 +134,7 @@ LangSmith Deployment 需要 [Enterprise](https://langchain.com/pricing) 方案�
   <Step title="验证 hybrid 前置条件">
     对新集群，验证 [hybrid 部分](/langsmith/hybrid-legacy#prerequisites)中的前置条件。在[前置条件](/langsmith/hybrid-legacy#prerequisites)的第 5 步中，请将 egress 配置为访问你的[自托管 LangSmith 实例](/langsmith/self-host-usage#configuring-the-application-you-want-to-use-with-langsmith)，而不是 `https://api.host.langchain.com` 和 `https://api.smith.langchain.com`。
   </Step>
+
   <Step title="在 Postgres 中启用功能">
     对你的 LangSmith Postgres 实例运行以下语句以启用该功能。请记下 workspace ID，后续步骤会用到。
 
@@ -175,3 +176,155 @@ LangSmith Deployment 需要 [Enterprise](https://langchain.com/pricing) 方案�
     为控制平面配置权限，以便读取新 namespace 中 Agent Server 部署的日志。参见[从其他 namespace 读取 Agent Server 日志](#read-agent-server-logs-from-other-namespaces)。
   </Step>
 </Steps>
+
+### 为私有仓库配置认证
+
+如果你的 [Agent Server deployments](/langsmith/agent-server) 会使用来自私有容器仓库（例如 AWS ECR、Azure ACR 或 GCP Artifact Registry）的镜像，请配置 image pull secrets。该配置会自动应用到所有部署，使它们能够通过你的私有仓库认证。
+
+<Steps>
+  <Step title="创建 Kubernetes image pull secret">
+    ```bash
+    kubectl create secret docker-registry langsmith-registry-secret \
+        --docker-server=myregistry.com \
+        --docker-username=your-username \
+        --docker-password=your-password \
+        --docker-email=your-email@example.com \
+        -n langsmith
+    ```
+
+    请把以下值替换为你的仓库凭据：
+    - `myregistry.com`：你的仓库 URL
+    - `your-username`：你的仓库用户名
+    - `your-password`：你的仓库密码或 access token
+    - `langsmith`：LangSmith 安装所在的 Kubernetes namespace
+  </Step>
+  <Step title="在 langsmith_config.yaml 中配置 deployment 模板">
+    要让 agent server 部署使用这个私有仓库 secret，请在 operator 的 deployment 模板中添加 `imagePullSecrets`：
+
+    ```yaml {21-22}
+    operator:
+      templates:
+        deployment: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${name}
+            namespace: ${namespace}
+          spec:
+            replicas: ${replicas}
+            revisionHistoryLimit: 10
+            selector:
+              matchLabels:
+                app: ${name}
+            template:
+              metadata:
+                labels:
+                  app: ${name}
+              spec:
+                enableServiceLinks: false
+                imagePullSecrets:
+                - name: langsmith-registry-secret
+                containers:
+                - name: api-server
+                  image: ${image}
+                  ports:
+                  - name: api-server
+                    containerPort: 8000
+                    protocol: TCP
+                  livenessProbe:
+                    httpGet:
+                      path: /ok
+                      port: 8000
+                    periodSeconds: 15
+                    timeoutSeconds: 5
+                    failureThreshold: 6
+                  readinessProbe:
+                    httpGet:
+                      path: /ok
+                      port: 8000
+                    periodSeconds: 15
+                    timeoutSeconds: 5
+                    failureThreshold: 6
+    ```
+  </Step>
+  <Step title="应用变更">
+    ```bash
+    helm upgrade -i langsmith langchain/langsmith --values langsmith_config.yaml --version <version> -n <namespace> --wait --debug
+    ```
+
+    所有通过 LangSmith UI 创建的用户部署都会继承这些仓库凭据。
+  </Step>
+</Steps>
+
+关于各仓库特有的认证方式，请参阅 [Kubernetes 关于从私有仓库拉取镜像的文档](https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/)。
+
+### 从其他 namespace 读取 Agent Server 日志
+
+<Warning>
+对于控制平面（`host-backend`）和数据平面（`listener`）部署在不同 Kubernetes 集群中的自托管部署，不支持获取服务器日志。
+</Warning>
+
+对于控制平面和数据平面位于同一集群的部署，请确保控制平面的 Kubernetes deployment（`host-backend`）拥有对 Agent Server 部署所在 namespace 中的 Kubernetes `deployments`、`pods`、`replicasets` 和 `logs` 执行 `get`、`list` 和 `watch` 的权限。实现方式不止一种。下面的示例使用 Kubernetes RBAC，你可以选择最符合自己场景的方式：
+
+<Steps>
+  <Step title="创建具有所需权限的 Role">
+    在 Agent Server 的 namespace 中创建一个 `Role`。请把 `<data_plane_namespace>` 替换为实际值：
+
+    ```bash
+    kubectl apply -n <data_plane_namespace> -f - <<EOF
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: read-agent-server-logs-role
+    rules:
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["get","list","watch"]
+    - apiGroups: [""]
+      resources: ["pods/log"]
+      verbs: ["get","watch"]
+    - apiGroups: ["apps"]
+      resources: ["deployments"]
+      verbs: ["get","list","watch"]
+    - apiGroups: ["apps"]
+      resources: ["replicasets"]
+      verbs: ["get","list","watch"]
+    EOF
+    ```
+  </Step>
+  <Step title="获取控制平面的 ServiceAccount">
+    请把 `<control_plane_namespace>` 替换为实际值：
+
+    ```bash
+    kubectl get serviceaccounts -n <control_plane_namespace> | grep host-backend
+    ```
+  </Step>
+  <Step title="将 Role 绑定到控制平面的 ServiceAccount">
+    请把 `<data_plane_namespace>`、`<control_plane_namespace>` 和 `<control_plane_service_account>` 替换为实际值：
+
+    ```bash
+    kubectl apply -n <data_plane_namespace> -f - <<EOF
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: read-agent-server-logs-role-binding
+    subjects:
+    - kind: ServiceAccount
+      name: <control_plane_service_account>
+      namespace: <control_plane_namespace>
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: read-agent-server-logs-role
+    EOF
+    ```
+  </Step>
+</Steps>
+
+<Note>
+在本示例中，Role 和 RoleBinding 定义在 Agent Server 部署所在的同一个 Kubernetes namespace 中。你可以为 Role 和 RoleBinding 指定任意名称，并按需自定义。
+</Note>
+
+## 后续步骤
+
+启用 LangSmith Deployment 之后，请参见 [Deploy with control plane](/langsmith/deploy-with-control-plane)，了解如何通过 LangSmith UI 构建和部署你的应用。
