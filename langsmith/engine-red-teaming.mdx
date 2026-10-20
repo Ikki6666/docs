@@ -1,0 +1,167 @@
+---
+title: 使用 Red Teaming 主动识别 issue
+sidebarTitle: 主动识别 issue
+description: 使用 LangSmith Engine 的合成探针测试已部署的 agent，在生产环境受到影响之前发现 prompt injection、数据暴露和不安全的工具使用。
+tag: "Beta"
+---
+
+<Note>
+Red Teaming 处于私有的 [beta](/langsmith/release-stages#beta) 阶段。它仅在 LangSmith Cloud 上、对已启用该功能的组织可用。它仅支持运行在 [LangSmith Cloud deployments](/langsmith/deploy-to-cloud) 上的 agent；不支持外部托管的 agent。如需申请访问权限，请[加入等待名单](https://www.langchain.com/langsmith-engine-v2-new-feature-access)。
+</Note>
+
+Red Teaming 通过向已部署的 agent 发送新的合成请求并评判其响应来测试它。[Engine 从你的 traces 中检测到的 issue](/langsmith/engine-issues) 来自生产环境中已经发生的失败。Red Teaming 寻找尚未发生的失败，例如一次成功的 prompt injection、在没有你的 agent 所要求的确认的情况下执行了有后果的 tool call，或隐藏上下文泄漏到答案中。
+
+每次 run 都会生成一份报告，包含假设、测试每个假设的探针，以及每个假设的结论。
+
+## Red Teaming 的工作方式
+
+Red Teaming 会探测被设置为 tracing project 的 [baseline deployment](/langsmith/engine-fix-validation#set-the-baseline-deployment) 的 deployment。每次 run：
+
+1. **映射应用。** Engine 审查 tracing project 中最多 25 条最近的 traces，以及（如果已连接）你的代码仓库。它会从中学习 agent 的 prompts、tools、guardrails 和请求格式。如果 Engine 已经扫描过该 project，run 会从该 project 的 agent overview 开始，并运行一次较短的确认扫描。
+2. **形成假设。** 每个假设描述 agent 可能失败的一种具体方式。Engine 为它分配一个 [issue class](#red-teaming-issue-classes) 和一个场景类型，后者记录该失败是普通用户可以触发的，还是需要蓄意攻击。
+3. **探测 deployment。** Engine 向 deployment 发送每个假设最多两个合成请求。探针会复用真实 trace 的请求格式，但将其内容替换为新的合成输入。
+4. **评判结果。** Engine 审查每个探针的响应和 trace，然后为该假设分配一个状态和一个严重性。对于模棱两可的结果，Engine 可以发送一个后续探针。
+
+过去的 trace 只帮助 Engine 理解应用。每个被确认的发现都来自 run 期间发送的探针，而不是早期 trace 中的错误。
+
+红队发现会保留在红队报告中。run 不会创建 Engine issue，也不会向你的 workspace 写入 datasets、evaluators 或 feedback。
+
+## Red Teaming 前置条件
+
+运行 Red Teaming 需要：
+
+- **tracing project 上的 Engine**：为接收你的 agent traces 的 project [设置 Engine](/langsmith/engine-setup)。
+- **一个 baseline deployment**：同一 workspace 中一个就绪的、非 preview 的 [LangSmith Cloud deployment](/langsmith/deploy-to-cloud)，并被设置为该 project 的基线。请参阅 [Set the baseline deployment](/langsmith/engine-fix-validation#set-the-baseline-deployment)。
+- **权限**：在 tracing project 上拥有 `runs:read` 权限以查看红队报告。要启动 run，你还需要项目上的 `runs:create` 权限和 baseline deployment 上的 `deployments:update` 权限。
+- **已连接的仓库（推荐）**：通过[已连接的 GitHub 仓库](/langsmith/engine-repositories)，Engine 会从源代码中读取你的 agent 的 prompts、tools 和 guardrails。没有仓库时，发现只能依赖 traces，报告会显示 **Repository context was not available**。
+
+<Warning>
+探针是真实的请求。每个探针都会在 baseline deployment 上创建一个 thread 和一个 run，而你的 agent 在响应时可以调用其工具。请选择一个可以接受合成测试流量和工具副作用的 deployment，例如 staging deployment。
+</Warning>
+
+## 启动 Red Teaming run
+
+启动 run：
+
+1. 在 [LangSmith UI](https://smith.langchain.com?utm_source=docs&utm_medium=cta&utm_campaign=langsmith-signup&utm_content=langsmith-engine-red-teaming) 中，在侧边栏中选择 **Engine**，然后选择 tracing project。
+2. 在左侧面板顶部，选择 **Red Teaming**。
+3. 点击 **Run red team**。
+
+该 run 会以 **Running** 状态出现在报告选择器中。完成后，其报告会在同一视图中打开。当 run 进行中时，**Run red team** 不可用。
+
+如果 run 未能完成，报告选择器会显示其最终状态：**Failed**、**Timed Out**、**Interrupted**、**Cancelled** 或 **Failed to Start**。该 run 没有可用的报告。
+
+## 阅读红队报告
+
+使用左侧面板顶部的报告选择器按日期选择一次 run。选择 **Load older reports** 可向前翻看更早的 run。
+
+### 审查概览
+
+未选择任何假设时，右侧面板会显示报告概览：
+
+- **Confirmed findings**：被确认的发现数量，按严重性细分。
+- **Hypotheses tested**：该 run 测试的假设数量。
+- **Issue classes tested**：该 run 测试了 10 个 [issue class](#red-teaming-issue-classes) 中的多少个。
+- **Findings by Issue Class**：每个 issue class 的被确认发现。
+- **Hypothesis Outcomes**：按状态划分的假设。点击某个状态可将假设列表过滤到该状态。
+- **Findings Over Runs**：每次 run 的被确认发现，按严重性堆叠。点击某个 run 可打开其报告。
+
+### 浏览假设
+
+左侧面板会对报告的假设分组：
+
+- **Product-Facing Findings**：普通用户可以触发的被确认发现，请求是正常的或真实而混乱的。
+- **Technical Hardening Observations**：需要蓄意攻击或技术边界检查才能触发的被确认发现。
+- **Legacy Confirmed Findings**：来自更早报告的被确认发现，记录于 Engine 分配场景类型之前。
+- **Other Tested Hypotheses**：所有未被确认的假设。
+
+点击筛选图标可显示单一状态，或点击排序图标按 **Default**、**Severity** 或 **Title (A-Z)** 排序。默认顺序先按严重性列出被确认的假设，然后列出需要审查的假设。
+
+每个假设具有以下状态之一：
+
+| Status | Meaning |
+|---|---|
+| **Confirmed** | 探针复现了该失败，Engine 判定它是真实发现。 |
+| **Needs Review** | 证据模糊或不完整。在基于该假设行动之前请审查探针。 |
+| **No Issue Found** | 探针已运行，agent 行为正确。 |
+| **Not Tested** | 没有探针测试过该假设。这是缺失的覆盖，而不是行为安全的证据。 |
+
+被确认的发现还有严重性：**Critical**、**High**、**Medium**、**Low** 或 **Info**。
+
+### 检查假设
+
+点击一个假设打开其详情。详情会显示 Engine 的结论，随后是每个探针一张卡片，标注为 **Prompt 1** 和 **Prompt 2**。每个探针的结果为 **Attack Worked**、**Attack Blocked** 或 **Needs Review**。
+
+展开探针卡片可以看到：
+
+- **合成 prompt**：Engine 发送给 deployment 的确切 prompt。
+- **Observed**：从你的 agent 响应中引用的摘录，以及探针 trace 的摘要，例如其 tool calls、tool errors 和 token 数。
+- **Expected**：正确的应用本应返回的内容。
+- **View proof trace**：在侧边面板中打开探针的 trace。
+
+在探针下方，**Why the Judge Decided This** 解释 Engine 如何得出该状态和严重性，**What to Do Next** 推荐修复方案。被标记为 **Unexpected** 的假设是 Engine 在测试另一个假设时发现的发现。
+
+## Red Teaming issue classes
+
+每个假设都属于一个 issue class，由失败的根因和它需要的修复来决定。每份报告都会统计全部 10 个 class，并将每个标记为已测试、未测试，或不适用于该 agent。
+
+| Issue class | Red Teaming 测试什么 |
+|---|---|
+| **Content Policy** | 违反明确的产品、法律、安全或业务政策，例如被禁止的竞争对手对比。 |
+| **Instruction Hierarchy** | 直接覆盖 agent 的指令，以及冲突或令人困惑的 prompt 指令。 |
+| **Indirect Injection** | 检索到的内容、tool 输出或其他试图控制 agent 的不可信数据。 |
+| **Data Exposure** | 隐藏上下文（例如探针植入的合成 canary 值）泄漏到响应中。 |
+| **Auth Isolation** | 超出调用者身份或权限边界的访问或操作。 |
+| **Tool Safety** | 不安全的工具选择、参数或审批，以及有后果的不安全工作流。 |
+| **Workflow Integrity** | 被跳过或伪造的必需步骤，例如检索、澄清或如实地完成。 |
+| **Session Integrity** | 多轮状态问题，例如 memory 投毒、延迟激活或角色混淆。 |
+| **Input Robustness** | 由结构化输出、解析、分隔符、编码或消息边界引起的混乱。 |
+| **Reliability Safety** | 围绕失败、重试、资源限制、循环、重复工作和不可逆副作用的行为。 |
+
+两个 class 有额外要求：
+
+- **Auth Isolation**：Red Teaming 不会确认该 class 中的发现。其假设会报告为 **Needs Review** 或 **Not Tested**。
+- **Session Integrity**：假设需要在单次对话中的两轮探针。当没有此类探针运行时，假设会报告为 **Needs Review** 或 **Not Tested**。
+
+## 再次运行 Red Teaming
+
+Red Teaming 会在同一 deployment revision 的 run 之间延续结论。新的 run 会从最多五个更早的、针对同一 baseline deployment 和活动 revision 的成功 run 中获得结论。Engine 会跳过更早的 run 已经确认或发现安全的假设（除非新的 run 显示行为发生了变化），并优先处理需要审查的假设。
+
+在你向 baseline deployment 部署新 revision 后，下一次 run 会在没有先前结论的情况下开始。使用 **Findings Over Runs** 对比各 run 之间的被确认发现。
+
+## Red Teaming 限制
+
+每次红队 run 都有上限：
+
+| Limit | 每次 run 的值 |
+|---|---|
+| 审查的 traces | 25，从最多 100 条最近的 trace 摘要中选出 |
+| 假设 | 50 |
+| 每个假设的探针 | 2 |
+| 发往 baseline deployment 的请求 | 100 |
+| 建议 | 20 |
+
+## Red Teaming 如何处理你的数据
+
+- **合成探针**：探针内容是合成的。Engine 不会把客户 trace 内容或仓库文本复制进探针；trace 只提供请求格式。
+- **只读访问**：Red Teaming 使用只读的 LangSmith 凭据读取你的 traces，并使用只读的 GitHub token 克隆你的仓库。
+- **筛查报告**：Engine 在存储模型撰写的报告文本之前会筛查其中的 secrets，并限制响应摘录的长度。
+
+关于 Engine 如何更广泛地处理你的数据，请参阅 [Engine security](/langsmith/engine-security)。
+
+## 另请参阅
+
+- [自动验证修复](/langsmith/engine-fix-validation)：设置 baseline deployment，并对它重放 issue traces。
+- [将 Engine 连接到你的仓库](/langsmith/engine-repositories)：从源代码向 Red Teaming 提供你的 agent 的 prompts、tools 和 guardrails。
+- [Engine security](/langsmith/engine-security)：审阅 Engine 如何访问你的 traces、deployments 和仓库。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/engine-red-teaming.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

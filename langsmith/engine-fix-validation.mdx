@@ -1,0 +1,323 @@
+---
+title: 自动验证修复
+sidebarTitle: 自动验证修复
+description: 通过重放 issue 的 traces，确认 LangSmith Engine 的 issue 会在你的 deployment 上复现，且 Engine 的修复方案能解决它。
+tag: "Beta"
+---
+
+<Note>
+修复验证处于私有的 [beta](/langsmith/release-stages#beta) 阶段。它仅在 LangSmith Cloud 上、对已启用该功能的组织可用。它仅支持运行在 [LangSmith Cloud deployments](/langsmith/deploy-to-cloud) 上的 agent；不支持外部托管的 agent。如需申请访问权限，请[加入等待名单](https://www.langchain.com/langsmith-engine-v2-new-feature-access)。
+</Note>
+
+Engine 通过运行你的 agent 来验证 issue 和修复方案：
+
+- 为了验证 issue，Engine 会将其关联的 traces 重放到一个已配置的 baseline deployment 上，以确认该 issue 会复现。
+- 为了验证修复方案，Engine 会将同样的 traces 重放到根据 Engine 提议的修复方案构建的 preview deployment 上。
+
+Engine 会将每次验证记录为基于该 issue 的 traces 构建的 dataset 上的一个 [experiment](/langsmith/evaluation-concepts#experiment)，因此你可以逐条对比基线和修复方案。
+
+## 设置 baseline deployment
+
+Baseline deployment 是 Engine 重放 issue traces 时对照的 deployment。[Red Teaming](/langsmith/engine-red-teaming) 会将其探针发送到同一个 deployment。它必须是你 agent 在同一 workspace 中的一个就绪的、非 preview 的 [LangSmith Cloud deployment](/langsmith/deploy-to-cloud)，并且选择它需要对该 deployment 拥有 `deployments:update` 权限。
+
+设置 baseline deployment：
+
+1. 在 **Engine** 页面上，选择 tracing project，然后点击 **Configure Engine**。
+2. 在 **Deployment** 部分，找到 **Baseline deployment** 字段。
+3. 搜索一个 deployment，或粘贴其 LangSmith URL 或 deployment ID。preview deployments 和尚未就绪的 deployments 无法从列表中选择。基线可以是生产或 staging deployment，但请尽可能使用 staging，这样验证就不会动用生产凭据和服务。
+4. 点击 **Save**。
+
+### 向你的 deployment 进行认证
+
+默认情况下，Engine 使用 LangSmith 凭据调用你的 deployment，该 deployment 会把调用者视为 Studio 用户。接受 LangSmith 平台认证的 deployment 无需进一步设置。
+
+如果你的 deployment 自行认证调用者，请把 Engine 需要的 headers 提供给它：
+
+1. 在 **Deployment** 部分，在 **Deployment authentication** 下点击 **Add custom headers**。
+2. 输入你的 deployment 要求的每个 header，然后点击 **Save**。
+3. 在你的 deployment 的认证处理器中，把这些 headers 映射到权限最小、仅满足验证所需访问级别的身份。
+
+Header 值经过加密且只写：LangSmith 只显示其名称，因此替换它们意味着要重新输入每个值。LangSmith 自身管理的 headers 不能被覆盖。要恢复默认，请点击 **Use platform authentication**。
+
+<Note>
+自定义 headers 只决定你的 deployment 是否接受该请求。它们不会告诉你的 agent 某个 run 是验证重放，那是另一个信号，请参阅[让重放的 runs 不产生副作用](#make-replayed-runs-side-effect-free)。
+</Note>
+
+## 设置修复验证
+
+要让 Engine 对照 preview deployment 验证它自己的修复方案：
+
+1. [设置 baseline deployment](#set-the-baseline-deployment)。
+2. [连接](/langsmith/engine-repositories) Engine 应修改的 GitHub 仓库。Engine 会在那里以 pull request 形式提交其修复方案。在仓库设置中，选择 Engine 修复方案的基础分支，或留空以使用仓库的默认分支。
+3. 在 baseline deployment 上[启用 preview builds](/langsmith/preview-builds#enable-preview-builds)，由 label 触发。使用以下起始配置：
+   - 将 **Preview base branch** 设置为与 Engine 配置的分支相同的分支。
+   - 选择 **Label only**，并将 **Trigger label** 设为 `preview`。Engine 会将此 label 应用于其修复 pull request。
+   - 将 **Idle TTL** 设置为 6 小时。
+   - 将 **Max concurrent previews** 设置为 20。
+4. 在 **Configure Engine** 的 **Deployment** 部分，选择 **Verify fixes with preview deployments**。
+5. 点击 **Save**。
+
+完成此设置后，Engine 会应用 preview label，等待 LangSmith 从提议的修复方案构建一个临时 deployment，对它重放验证，并在 issue 上显示结论和重放 traces。
+
+<Warning>
+验证会将来自 issue traces 的输入发送到 baseline deployment，并在验证修复时发送到 preview deployment。每次重放都会在该 deployment 上创建一个 thread 和一个 run，而你的 agent 在响应时可以调用其工具。
+
+当 LangSmith 创建 preview deployments 时，它们会[继承 baseline deployment 的 secrets](/langsmith/preview-builds#manage-secrets)。在启用修复验证之前，请确认每个继承的 secret 都适合临时 deployment 使用。对基线 secrets 的更改不会传播到已经存在的 previews。
+</Warning>
+
+## 准备用于测试的 deployment
+
+Engine 通过运行你的 agent 来确认 issue，因此你选择的 deployment 必须是你可以反复运行而不会产生后果的。
+
+### 使用可以安全运行的 deployment
+
+选择一个配置与你要测试的 agent 一致、但不服务于你的用户的 deployment。对于你的 agent 会写入的任何服务，让它指向测试凭据、测试账户和非生产数据存储。
+
+### 让重放的 runs 不产生副作用
+
+Engine 在每次重放时都会设置 `config.configurable.__engine_validation_replay__ = true`，这样你的 agent 可以识别出验证重放并更保守地响应。在 HTTP 边界，验证请求还会包含 `X-LangSmith-Source: engine`。在图代码中使用该 configurable 标记，在请求中间件中使用该 header。
+
+使用该标记来跳过或阻止那些影响会离开你的 agent 的工具，例如发送电子邮件或消息、向客户收费、提交工单、写入生产数据存储、调度任务，以及调用合作伙伴 API。
+
+<Accordion title="可直接复制的 allowlist 中间件">
+将以下中间件添加到你的 agent 项目中：
+
+```python
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable, Collection, Mapping
+from typing import Any, cast
+
+from langchain.agents.middleware import AgentMiddleware
+from langchain.messages import ToolMessage
+from langchain.tools.tool_node import ToolCallRequest
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import Command
+
+ENGINE_VALIDATION_CONFIG_KEY = "__engine_validation_replay__"
+LANGGRAPH_AUTH_USER_ID_CONFIG_KEY = "langgraph_auth_user_id"
+
+
+def _configurable(config: RunnableConfig | None) -> Mapping[str, object]:
+    configurable = (config or {}).get("configurable")
+    return configurable if isinstance(configurable, Mapping) else {}
+
+
+def is_engine_validation(config: RunnableConfig | None) -> bool:
+    """Return whether the caller requested reduced-privilege validation mode."""
+    return _configurable(config).get(ENGINE_VALIDATION_CONFIG_KEY) is True
+
+
+def is_trusted_engine_validation(
+    config: RunnableConfig | None,
+    *,
+    expected_user_id: str,
+) -> bool:
+    """Verify the validation marker and authenticated Engine identity."""
+    configurable = _configurable(config)
+    return (
+        bool(expected_user_id)
+        and configurable.get(ENGINE_VALIDATION_CONFIG_KEY) is True
+        and configurable.get(LANGGRAPH_AUTH_USER_ID_CONFIG_KEY) == expected_user_id
+    )
+
+
+def _request_config(request: ToolCallRequest) -> RunnableConfig | None:
+    runtime = getattr(request, "runtime", None)
+    config = getattr(runtime, "config", None)
+    return cast(RunnableConfig, config) if isinstance(config, dict) else None
+
+
+class EngineValidationSafetyMiddleware(AgentMiddleware):
+    """Allow only explicitly safe tools during Engine validation."""
+
+    def __init__(self, *, safe_tools: Collection[str]) -> None:
+        self._safe_tools = frozenset(safe_tools)
+
+    def _rejection(self, request: ToolCallRequest) -> ToolMessage | None:
+        if not is_engine_validation(_request_config(request)):
+            return None
+        call = request.tool_call
+        name = call.get("name") or "tool"
+        if name in self._safe_tools:
+            return None
+        return ToolMessage(
+            content=f"{name} is blocked during Engine validation.",
+            tool_call_id=call["id"],
+            name=name,
+            status="error",
+        )
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        rejection = self._rejection(request)
+        return rejection if rejection is not None else handler(request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[
+            [ToolCallRequest],
+            Awaitable[ToolMessage | Command[Any]],
+        ],
+    ) -> ToolMessage | Command[Any]:
+        rejection = self._rejection(request)
+        return rejection if rejection is not None else await handler(request)
+```
+
+在每次运行时注册它，并只允许只读且隔离的工具：
+
+```python
+from langchain.agents import create_agent
+
+from engine_validation import EngineValidationSafetyMiddleware
+
+agent = create_agent(
+    model=model,
+    tools=[search_catalog, lookup_order, send_message],
+    middleware=[
+        EngineValidationSafetyMiddleware(
+            safe_tools={"search_catalog", "lookup_order"},
+        )
+    ],
+)
+```
+
+在没有重放标记时，中间件会原样传递 tool calls。在验证期间，它只调用 `safe_tools` 中的工具，并为其他所有工具返回一个错误 `ToolMessage`。空的允许列表会阻止所有工具。
+</Accordion>
+
+只允许只读且隔离的工具。不要允许发送消息、投递通知、调度或排队任务、持久化数据或写入外部系统的工具。
+
+<Warning>
+将标记和 source header 视为不可信的提示，它们只能缩小 run 的操作范围。任何能访问你 deployment 的东西都可以设置它们，因此绝不要用它们来授予访问权限、跳过认证或扩大权限。
+</Warning>
+
+#### 验证可信的 Engine 上下文
+
+重放标记不能证明身份，因为任何调用者都可以设置 configurable 值。如果你的 deployment 在验证期间重建用户上下文或访问受保护的数据，请先验证经过认证的 Engine 身份：
+
+```python
+if is_trusted_engine_validation(
+    config,
+    expected_user_id=settings.engine_user_id,
+):
+    context = load_context_from_checkpoint()
+```
+
+从经过认证的运行时配置和复制的 checkpoint 中读取身份和应用上下文。不要从重放的输入或 metadata 中读取它们。
+
+对于使用[自定义认证](/langsmith/custom-auth)的 deployment，在应用相同检查之前，先在你的认证处理器中将经过认证的 Engine service principal 映射到 `langgraph_auth_user_id`。认证 headers 确立调用者身份，而重放标记激活低权限工具策略。
+
+### 预期突发流量
+
+Engine 会同时重放一个 issue 的 traces，因此一次验证最多可以同时启动五个 run，且每个 run 都会运行到完成。修复验证会对 preview deployment 重复同一组重放。请确认该 deployment 的速率限制、配额以及它调用的任何下游服务都能容忍这种突发流量。
+
+### 保持 deployment 可用
+
+Engine 只能对就绪的、非 preview 的 deployment 进行重放，并且它会记录产生每个结果的 deployment 和 revision。在验证进行期间保持该 deployment 运行，并预期结果会描述 Engine 测试它时处于活动状态的 revision。
+
+## 测试 issue
+
+设置了 baseline deployment 后，Engine 会在创建每个新 issue 的时候自动验证它。要再次验证某个 issue，请打开它并点击 **Test issue**。
+
+当没有设置 baseline deployment、该 issue 没有关联的 traces，或达到月度 LSU 支出上限时，**Test issue** 不可用。
+
+对于每次验证，Engine 会：
+
+1. 按关联顺序选择最多五条与该 issue 关联的不同 traces。
+2. 将每条 trace 的输入重放到 baseline deployment。对于来自多轮 thread 的 trace，Engine 会包含对话中较早的回合，因此后续失败会在相同的上下文中评判。
+3. 判断每次重放是否再次显示该 issue 所报告的行为。每条 trace 的结果是 **Reproduced**、**Not reproduced** 或 **Inconclusive**。
+
+当至少一条 trace 复现时，整个 issue 即视为复现。只有当每次重放都没有出现所报告的行为时，才视为未复现。否则结果为无法判定。当验证未能复现一个打开的 issue 时，Engine 会关闭该 issue。
+
+## 验证修复
+
+选择 **Verify fixes with preview deployments** 后，Engine 会验证它生成的每个修复方案：
+
+1. 当修复 run 完成时，如果尚未打开，Engine 会为该修复方案打开一个 pull request，然后为其添加 preview build label。
+2. LangSmith 从该 pull request 构建一个 preview deployment。
+3. 当 preview revision 上线后，Engine 将来自该 issue 验证的 traces 重放到 preview deployment 上。
+4. 如果 issue 仍然出现在 preview 上，Engine 会在同一个 pull request 上修改修复方案并再次验证，总共最多尝试三次。
+
+## 读取验证结果
+
+每个 issue 都会报告一个基线结果，以及（一旦存在修复方案）一个验证结果。
+
+基线结果回答该 issue 是否仍然发生在你的 deployment 上：
+
+| Status | Meaning |
+| --- | --- |
+| **Awaiting test** | Engine 尚未记录基线结果。 |
+| **Reproduced** | 至少一次重放再次显示了所报告的行为。 |
+| **Not reproduced** | 每次重放都没有出现所报告的行为，因此 Engine 会关闭打开的 issue。 |
+| **Inconclusive** | Engine 无法自信地评判重放结果。 |
+| **Error** | 验证未能完成。 |
+
+验证结果回答 Engine 的修复方案是否解决了它：
+
+| Status | Meaning |
+| --- | --- |
+| **Not run** | 该 issue 未复现，因此没有需要验证的内容。 |
+| **Generating fix** 或 **Awaiting fix** | Engine 仍在生成要验证的修复方案。 |
+| **Awaiting preview** 或 **Running** | preview deployment 正在构建，或重放正在进行。 |
+| **Verified** | 该 issue 不再出现在修复方案的 preview deployment 上。 |
+| **Not fixed** | 该 issue 仍然出现，因此 Engine 会修改修复方案并再次尝试。 |
+| **Inconclusive**、**Timed out** 或 **Error** | Engine 无法为该次尝试建立结论。 |
+
+<Warning>
+**Inconclusive** 意味着 Engine 无法收集到可信的证据，而不是该 issue 不存在或已修复。请将其视为重新测试的信号，而不是通过的结果。
+</Warning>
+
+## 审查验证 experiments
+
+Engine 会在你的 workspace 中存储每个 issue 的验证 evidence：
+
+- **Dataset**：每个 issue 一个，描述为 `Engine validation evidence`，每条重放的 trace 对应一个 example。
+- **Baseline experiment**：对 baseline deployment 的重放。
+- **Fix experiment**：对修复方案的 preview deployment 的重放，每次验证尝试对应一个 experiment。
+
+Engine 会以 key 为 `engine_issue_validation` 的 feedback 形式，在每个可判定的重放中记录其结论。其值为 `reproduced` 或 `not_reproduced`，feedback comment 会解释该结论。
+
+当 Engine 对照 preview deployment 验证修复方案时，该 issue 的 **Evidence** 部分会显示总体结论，以及每条 trace 一行：
+
+- **Flagged traces**：Engine 在原始 trace 中看到的内容。点击 **Original trace** 打开它。
+- **Reproduced on prod**：基线结果，为 **Reproduced**、**Not reproduced** 或 **Inconclusive**。点击 **Repro trace** 打开重放。
+- **After PR #\<number\>**：修复方案 preview 上的结果，为 **Fix verified**、**Recurred** 或 **Inconclusive**。点击 trace 链接打开重放。
+
+每个列标题都会统计有多少条 trace 在基线上复现，或由修复方案解决。点击 **View Experiment** 可在 dataset 的 comparison 视图中并排打开基线和修复 experiments。更多信息请参阅[比较实验结果](/langsmith/compare-experiment-results)。
+
+在修复验证运行之前，该 issue 会显示一个验证摘要：基线结果、修复方案的验证状态，以及每个重放 example 的链接。
+
+## 排查验证问题
+
+如果某个 issue 一直停留在 **Awaiting test**，或返回的结果无法判定，请在再次测试之前检查以下内容：
+
+- **Baseline deployment**：确认它仍然就绪、不是 preview，并且与 tracing project 在同一个 workspace 中。
+- **认证**：如果你的 deployment 自行认证调用者，请确认保存的 headers 是最新的。替换凭据需要重新输入每个 header 值。
+- **重放本身**：从该 issue 的 **Evidence** 部分或验证摘要中打开重放的 runs，阅读你的 agent 返回了什么。
+- **Deployment 限制**：查找速率限制、配额耗尽，或由并发重放导致的超时，以及非常大的响应，Engine 可能无法评判它们。
+- **受限工具**：如果你的 agent 在重放期间阻止工具，请确认被 stub 的工具仍返回可用的结果，而不是让 run 结束的错误。
+
+在修正 deployment 或其设置后，打开该 issue 并点击 **Test issue** 再次运行验证。
+
+## 另请参阅
+
+- [查找并修复 issue](/langsmith/engine-issues)：审查 Engine 验证的 issue。
+- [Red Teaming](/langsmith/engine-red-teaming)：用合成请求探测同一个 baseline deployment。
+- [Preview builds](/langsmith/preview-builds)：创建 Engine 用于验证修复方案的 preview deployments。
+- [比较实验结果](/langsmith/compare-experiment-results)：并排比较基线和修复 experiments。
+- [Engine security](/langsmith/engine-security)：审阅 Engine 如何访问你的 traces、deployments 和仓库。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/engine-fix-validation.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

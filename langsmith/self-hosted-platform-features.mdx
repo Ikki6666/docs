@@ -19,15 +19,43 @@ description: LangSmith Deployment 的自托管专属平台特性，包括自定�
 
 多个 deployments 也可以共享同一个 Redis 实例。例如，对于 `Deployment A`，`REDIS_URI_CUSTOM` 可以设置为 `redis://<hostname_1>:<port>/1`；对于 `Deployment B`，`REDIS_URI_CUSTOM` 可以设置为 `redis://<hostname_1>:<port>/2`。其中 `1` 和 `2` 是同一实例中的不同数据库编号，而 `<hostname_1>` 相同。**不同 deployment 不能共用相同的数据库编号**。
 
+Redis Cluster 仅支持数据库 `0`，因此 deployments 无法按数据库编号共享一个 Redis Cluster。要在多个 deployments 之间共享同一个 Redis 服务器，请使用独立的 Redis 实例，并为每个 deployment 分配一个单独的数据库编号。
+
 ## Listeners
 
 listener 是 [listener application](/langsmith/data-plane#listener-application) 的一个实例。listener 中包含关于应用本身的元数据（例如版本），以及关于可供其部署的计算基础设施的元数据（例如 Kubernetes namespaces）。
 
 listener 数据模型仅适用于 self-hosted 部署。control plane 与 listener 会共同协作，在你的基础设施上完成 deployment 的创建与状态协调。
 
+### Listener 版本要求
+
+在更改 deployment 的 `resource_spec` 之前，请先保持 listener 为最新版本。control plane 会按其自身版本的规则校验 `PATCH`。listener 在应用 revision 时，会再按其自身版本的规则校验已存储的 `resource_spec`。如果 listener 比 control plane 旧，`PATCH` 可能返回 `200`，而 revision 随后以 `DEPLOY_FAILED` 失败。
+
+被拒绝的值会留在已存储的 `resource_spec` 中，因此该 deployment 之后的每个 revision 都会失败，包括仅更新 image 的部署，直到你用 listener 接受的值 `PATCH` 该 deployment 为止。
+
+以下 `resource_spec` 字段依赖 listener 版本：
+
+| 字段 | listener 最低版本 |
+| :--- | :--- |
+| 小数形式的 `cpu` 和 `queue_cpu` 值（例如 `0.5`） | 高于 0.12.x。listener 0.12.x 会拒绝小数值。 |
+| `redis_cpu` 和 `redis_cpu_limit` | 0.13.22 或更高。更早的 listener 会忽略这些字段。 |
+| 低于 `2048` 的 `redis_memory_mb` | 0.13.27 或更高。更早的 listener 要求至少为 `2048`。 |
+
+升级 listener 不会重启已有的 deployments。升级后，请用完整的 `resource_spec` `PATCH` 每个 deployment，以应用新值。关于接受的取值范围和 `PATCH` 行为，请参阅 [Resource spec](/langsmith/api-ref-control-plane#resource-spec)。
+
 ## Resource customization
 
-self-hosted deployments 的资源可以完全自定义。不同于 Cloud 只暴露固定的 Serverless 和 Dedicated [deployment types](/langsmith/cloud-platform-features#deployment-types)，self-hosted deployments 会依据你的基础设施配置来设定 CPU、内存、副本数和存储。关于调优建议，请参阅 [Configure Agent Server for scale](/langsmith/agent-server-scale)。
+你通过 deployment 的 `resource_spec` 为每个 self-hosted deployment 设置资源，包括它的 Redis 和 PostgreSQL 实例。不同于 Cloud 只暴露固定的 Serverless 和 Dedicated [deployment types](/langsmith/cloud-platform-features#deployment-types)，self-hosted deployments 会依据你的基础设施配置来设定 CPU、内存、副本数和存储。某些字段（例如 Redis CPU）需要 listener 最低版本。请参阅 [Listener 版本要求](#listener-version-requirements)。
+
+`db_*` 字段设定 control plane 创建的 PostgreSQL 实例的规格，`redis_*` 字段设定 Redis 实例的规格。如果 deployment 使用[自定义 PostgreSQL](#custom-postgresql) 或[自定义 Redis](#custom-redis)，对应的字段不会生效。
+
+deployment 资源没有组织或 workspace 级别的默认值。未设置的字段会回退为该 deployment 类型的默认值，因此创建每个 deployment 时都要发送完整的 `resource_spec`。关于调优建议，请参阅 [Configure Agent Server for scale](/langsmith/agent-server-scale)。
+
+## PodDisruptionBudgets
+
+从 operator 0.1.60（`langgraph-dataplane` chart 0.2.24）开始，当 deployment 的 API server 和 queue worker Deployment 的最小副本数为 2 或更多时，operator 会为它们创建 `minAvailable: 1` 的 PodDisruptionBudget。这些 PodDisruptionBudget 无法关闭。
+
+升级到 operator 0.1.60 或更高版本之前，请移除你自己创建的、选择相同 pods 的 PodDisruptionBudget。当两个 PodDisruptionBudget 选择同一个 pod 时，Kubernetes 无法驱逐它，因此节点排空和其他驱逐操作会失败。
 
 ---
 

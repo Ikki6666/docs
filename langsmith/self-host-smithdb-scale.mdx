@@ -10,13 +10,46 @@ description: 选择经过测试的 SmithDB 资源层级，并设定 Kubernetes w
 
 把这些经过测试的层级用作 SmithDB 的初始配置。在调优容量之前，先把 SmithDB 连接到你的监控栈，这样你可以观察每项变更的效果。请参见[配置 SmithDB observability](/langsmith/self-host-smithdb-observability)。
 
+## 选择部署模式
+
+<Note>
+`smithdb.topology` 需要 Helm chart `0.18.0` 或更高。
+</Note>
+
+把 `smithdb.topology` 设置为 `single` 或 `cluster`，需要时可在 `cluster` 之上启用专用查询服务：
+
+| 模式 | 运行的内容 | 适用场景 |
+| --- | --- | --- |
+| `single` | 一个运行摄取、查询和 compaction 的 `smithdb all` pod | 测试环境和低流量安装 |
+| `cluster`（默认） | 由 cluster manager 协调的独立摄取、查询和 compaction workloads | 生产安装 |
+| `cluster` 加[专用查询服务](#dedicated-query-services) | cluster 模式加上用于 run 统计、run 规则或变更的独立服务 | 某类查询负载拖慢其他查询的生产安装 |
+
+```yaml
+smithdb:
+  topology: single
+```
+
+single 模式的 pod 运行一个 replica，按 [single 层级](#single-tiers)设定规格。当该 pod 重启或从节点故障中恢复时，查询会失败。LangSmith 会把传入的 traces 排入 Redis 队列，并在 pod 重新运行后写入，因此摄取只会延迟而不会丢失。PodDisruptionBudget 可防止节点排空时驱逐该 pod。
+
+### 专用查询服务
+
+在 cluster 模式下，query 服务承载所有 SmithDB 读取。要隔离某种 workload，可以启用一个专用服务：
+
+| 服务 | 承载的内容 | 启用方式 |
+| --- | --- | --- |
+| Stats query | run 统计，例如 run 数量、延迟和错误率 | `smithdb.statsQuery.enabled` |
+| Run rules | automation 规则和在线评估 | `smithdb.runRules.enabled` |
+| Mutations | feedback 更新和 run 删除 | `smithdb.mutations.enabled` |
+
+每个服务都有自己的 replicas 和 autoscaling，并使用 query 层级的资源。
+
 ## 选择并扩展层级
 
 这些层级不是吞吐量限制或规定配置。CPU、内存和缓存大小都是每 replica 的。缓存大小是每个 replica 得到的卷：网络挂载磁盘上的 claim 大小，或本地 SSD 上的 `emptyDir` limit。
 
 选择其经过测试的摄取和查询速率最接近或超过你预期稳态负载的层级。要估算你当前的 trace 量，请在 LangSmith 中打开 **Settings > Usage**。请参见[细粒度计费用量](/langsmith/granular-usage)。
 
-如果你无法测量负载，请从 `small` 开始并向上扩展。规格不足会表现为更慢的摄取和查询，而不是数据丢失。
+如果你无法测量负载，请从 `small` 开始并向上扩展。
 
 应用所选层级的每 replica 资源和初始 replica 数量。如果 workload 之后超出该起点，你可以水平扩展 SmithDB 计算。
 
@@ -48,6 +81,8 @@ smithdb:
 
 ## 基线层级
 
+在 cluster 模式下，每个层级为每个组件设定每 replica 资源：
+
 | 组件 | Small<br />10 ingest / 10 query QPS | Medium<br />100 ingest / 40 query QPS | Large<br />1000 ingest / 100 query QPS |
 | --- | --- | --- | --- |
 | Ingestion | 1 replica<br />4 CPU<br />8 Gi memory<br />100 Gi cache | 1 replica<br />16 CPU<br />32 Gi memory<br />100 Gi cache | 2 replicas<br />56 CPU<br />150 Gi memory<br />1000 Gi cache |
@@ -55,6 +90,16 @@ smithdb:
 | Compaction | 1 replica<br />2 CPU<br />4 Gi memory | 1 replica<br />4 CPU<br />8 Gi memory | 1 replica<br />8 CPU<br />16 Gi memory |
 | Compaction worker | 1 replica<br />8 CPU<br />16 Gi memory<br />100 Gi cache | 1 replica<br />16 CPU<br />32 Gi memory<br />100 Gi cache | 4 replicas<br />28 CPU<br />50 Gi memory<br />300 Gi cache |
 | Cluster manager | 1 replica<br />250m CPU<br />256 Mi memory | 1 replica<br />250m CPU<br />256 Mi memory | 1 replica<br />2 CPU<br />2 Gi memory |
+
+### Single 层级
+
+在 single 模式下，`smithdb.resourceTier` 为唯一的 SmithDB pod 设定规格：
+
+| 组件 | Small | Medium | Large |
+| --- | --- | --- | --- |
+| Single | 1 replica<br />4 CPU<br />16 Gi memory<br />100 Gi cache | 1 replica<br />16 CPU<br />64 Gi memory<br />300 Gi cache | 1 replica<br />32 CPU<br />128 Gi memory<br />1000 Gi cache |
+
+要覆盖层级的 CPU 和内存，请设置 `smithdb.single.deployment.resources`。当 workload 超出 large 层级时，请切换到 cluster 模式。
 
 ## 使用 Helm 配置资源
 

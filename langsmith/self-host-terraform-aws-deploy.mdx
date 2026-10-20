@@ -8,7 +8,7 @@ description: 使用 LangChain Terraform modules 在 AWS EKS 上预配 LangSmith 
 
 安装分为两个阶段：
 
-1. **Infrastructure**：Terraform 预配 VPC、EKS、RDS、ElastiCache、S3 和 IAM。
+1. **Infrastructure**：Terraform 预配 VPC、EKS、RDS、ElastiCache、S3、ALB 和 IAM，然后引导安装集群 add-on。
 2. **Application**：Helm 在集群上安装 LangSmith chart。
 
 完成基础安装后，通过设置开关并重新部署来启用可选 add-on。
@@ -18,34 +18,29 @@ description: 使用 LangChain Terraform modules 在 AWS EKS 上预配 LangSmith 
 graph TB
     subgraph stage1["Set up infrastructure"]
         direction LR
-        Start["setup-env.sh<br/>secrets to SSM"]
-        TF["terraform apply"]
+        Start["source setup-env.sh<br/>secrets to SSM"]
+        TF["make apply"]
         Infra["VPC · EKS · RDS<br/>ElastiCache · S3 · ALB<br/>IAM"]
-        Bootstrap["k8s-bootstrap<br/>ESO · KEDA<br/>cert-manager"]
+        Bootstrap["k8s-bootstrap<br/>ESO · KEDA<br/>Envoy Gateway"]
         Start --> TF --> Infra -->|EKS ready| Bootstrap
     end
     subgraph stage2["Deploy the application"]
         direction LR
-        Deploy["deploy.sh<br/>ARNs + hostname<br/>ESO syncs secrets"]
-        Helm["helm install<br/>langsmith chart"]
-        First{"First<br/>deploy?"}
+        Deploy["make init-values<br/>+ make deploy"]
+        Helm["helm upgrade --install<br/>ESO syncs secrets"]
         Running["LangSmith running<br/>all pods healthy"]
-        Deploy --> Helm --> First
-        First -->|no| Running
-        First -->|yes, re-run| Helm
+        Deploy --> Helm --> Running
     end
     stage1 --> stage2
 
     classDef trigger fill:#F6FFDB,stroke:#6E8900,stroke-width:2px,color:#2E3900
     classDef process fill:#E5F4FF,stroke:#006DDD,stroke-width:2px,color:#030710
     classDef neutral fill:#F2FAFF,stroke:#40668D,stroke-width:2px,color:#2F4B68
-    classDef decision fill:#FDF3FF,stroke:#7E65AE,stroke-width:2px,color:#504B5F
     classDef output fill:#EBD0F0,stroke:#885270,stroke-width:2px,color:#441E33
 
     class Start trigger
     class TF,Bootstrap,Deploy,Helm process
     class Infra neutral
-    class First decision
     class Running output
 
     style stage1 fill:none,stroke:#40668D,stroke-width:1px
@@ -59,9 +54,9 @@ graph TB
 | 工具 | 版本 | 用途 |
 |---|---|---|
 | AWS CLI | v2 | 认证、查询 AWS 资源、管理 EKS kubeconfig |
-| Terraform | 1.5 | 运行基础设施 module |
-| `kubectl` | 1.33 | 检查 EKS 集群 |
-| Helm | 3.12 | 安装和管理 LangSmith chart |
+| Terraform | 1.11 或更高版本 | 运行基础设施 module |
+| `kubectl` | 1.34 或更高版本 | 检查 EKS 集群 |
+| Helm | 3.12 或更高版本 | 安装和管理 LangSmith chart |
 | `eksctl` | latest | 可选，便于 kubeconfig 和调试 |
 
 在 macOS 上安装：
@@ -84,19 +79,10 @@ helm version
 
 ### 所需的 AWS IAM 权限
 
-运行 Terraform 的 IAM 用户或角色需要创建和管理云基础的权限。以下托管策略覆盖了全部权限面。可将它们作为起点，待部署稳定后再收窄为最小权限。
-
-| 策略 | 用途 |
-|---|---|
-| `AmazonEKSClusterPolicy` | 创建和管理 EKS 集群 |
-| `AmazonVPCFullAccess` | 创建 VPC、子网、路由表和 NAT |
-| `AmazonRDSFullAccess` | 创建和管理 RDS PostgreSQL 实例 |
-| `AmazonElastiCacheFullAccess` | 创建 ElastiCache Redis 集群 |
-| `AmazonS3FullAccess` | 创建 S3 bucket 和 VPC endpoint |
-| `IAMFullAccess` | 创建 IRSA 角色和策略 |
+运行 Terraform 的 IAM 用户或角色需要 `AdministratorAccess`，或 `PowerUserAccess` 加上 `IAMFullAccess`。module 会为 IRSA 创建 IAM 角色和策略，因此仅有 `PowerUserAccess` 不够。如需收窄权限的策略，请参见 module 中的 [`PERMISSIONS.md`](https://github.com/langchain-ai/terraform/blob/main/modules/aws/PERMISSIONS.md)。
 
 <Tip>
-认证后，在 `modules/aws/` 中运行 `make preflight`。preflight 脚本会确认当前凭证能否执行每个所需操作，并报告第一个缺失的权限，这比在 `terraform apply` 中途才发现缺口要快。
+完成认证并创建 `infra/terraform.tfvars`（参见[克隆并配置](#clone-and-configure)）后，在 `modules/aws/` 中运行 `make preflight`。这些只读检查会确认 CLI 工具、`tfvars` 文件、当前凭证和 region，然后探测对 module 使用的每个 AWS 服务的读取权限。若还要测试凭证能否创建资源，请运行 `make preflight ARGS="--create-test-resources"`。
 </Tip>
 
 ### 认证
@@ -124,16 +110,14 @@ aws ec2 describe-availability-zones --query 'AvailabilityZones[].ZoneName' --out
 
 ### License key 与域名
 
-在 `terraform apply` 之前，必须准备好两个非 AWS 项：
-
-- **LangSmith license key。** 可[联系销售团队](https://www.langchain.com/contact-sales)申请。该 key 由 setup 脚本存入 AWS SSM Parameter Store，而不是存放在 `tfvars` 中。
-- **域名或子域名**，需能解析到该 AWS 账号，并配有一张覆盖它的 ACM 证书（或为 `tls_certificate_source` 变量使用 `letsencrypt` / `none`）。
+- **LangSmith license key。** 可[联系 LangChain 销售团队](https://www.langchain.com/contact-sales)申请。setup 脚本会将该 key 存入 AWS SSM Parameter Store，而不是存放在 `tfvars` 中。
+- **域名（可选）。** 设置 `langsmith_domain` 即可通过自己的 hostname 访问 LangSmith。设置了域名且未设置 `acm_certificate_arn` 时，Terraform 会创建 Route 53 hosted zone、申请 ACM 证书并创建 ALB alias 记录。要改用已有的 hosted zone，请设置 `dns_create_zone = false` 和 `dns_existing_zone_id`。要自带证书，请设置 `acm_certificate_arn`。将 `langsmith_domain` 留空即可通过 ALB hostname 访问 LangSmith。没有域名时，请设置 `tls_certificate_source = "none"` 以提供纯 HTTP。`acm_certificate_arn` 也可以在没有域名的情况下使用，但 `make preflight-post` 的 TLS 检查会失败，因为 `acm` 要求 `langsmith_domain`。
 
 ### 集群容量参考
 
 容量由两个相互独立的设置控制：
 
-- **Infrastructure capacity** 通过基础设施变量 `eks_managed_node_groups`、`postgres_instance_type` 和 `redis_instance_type` 直接设置实例类型和节点数量。module 默认值为一个 `m5.4xlarge` 节点组（最少 3 个、最多 10 个节点）、RDS 使用 `db.t3.large`、ElastiCache 使用 `cache.m6g.xlarge`。
+- **Infrastructure capacity** 通过基础设施变量 `eks_managed_node_groups`、`postgres_instance_type` 和 `redis_instance_type` 直接设置实例类型和节点数量。module 默认值为一个 `m5.4xlarge` 节点组（最少 3 个、最多 10 个节点）、RDS 使用 `db.t3.large`、ElastiCache 使用 `cache.m6g.xlarge`。`infra/terraform.tfvars.dev`、`terraform.tfvars.minimum` 和 `terraform.tfvars.production` 模板会设置更小或更大的值。
 - **`sizing_profile`** 选择 Helm sizing overlay（pod 资源 requests 和 limits）。由 `init-values.sh` 和 `deploy.sh` 读取；Terraform 不读取它。
 
 部署之前，请按目标层级规划好基础设施容量。各层级建议请参见[扩缩容指引](/langsmith/self-host-scale)。
@@ -162,32 +146,34 @@ make quickstart
 #    Must be sourced, not executed
 source infra/scripts/setup-env.sh
 
-# 4. Provision infrastructure (~20 to 25 min)
+# 4. Provision infrastructure
 make init
 make plan
 make apply
 
 # 5. Configure kubectl
-make kubeconfig
+source infra/scripts/set-kubeconfig.sh
 kubectl get nodes
 
-# 6. Deploy LangSmith via Helm (~5 to 10 min)
+# 6. Deploy LangSmith with Helm
 make init-values
 make deploy
 
 # 7. Confirm
 kubectl get pods -n langsmith
-kubectl get ingress -n langsmith
+kubectl get httproute -n langsmith
 ```
 
-要在一条命令中串联基础设施和应用部署：
+`make deploy` 会在完成时打印 LangSmith URL。
+
+要在一条命令中串联基础设施和应用部署，请先在同一个 shell 中运行 `make quickstart` 和 `source infra/scripts/setup-env.sh`，然后：
 
 ```bash
 make quickdeploy          # interactive, prompts before terraform apply
 make quickdeploy-auto     # non-interactive, auto-approves terraform
 ```
 
-`make quickdeploy` 按 `terraform apply` → `kubeconfig` → `init-values` → `helm deploy` 的顺序执行。任何一步失败时，命令会退出并给出从该步骤继续的说明。
+`make quickdeploy` 会先检查 `setup-env.sh` 的导出是否已加载、`infra/terraform.tfvars` 是否存在，若任一缺失则停止并给出要运行的命令。如果 `infra/.terraform/` 不存在，它会先运行 `terraform init`，然后运行 `terraform apply`、source `set-kubeconfig.sh`，并运行 `init-values` 和 `deploy.sh`。如果 `terraform apply` 失败，请修复问题后重新运行 `make quickdeploy`。如果后续步骤失败，命令会打印要重试的 `make` 目标。
 
 以下各节详细介绍每个阶段。
 
@@ -202,10 +188,11 @@ Terraform 会预配以下 AWS 资源：
 | RDS PostgreSQL | LangSmith 运营数据 |
 | ElastiCache Redis | 队列与缓存 |
 | S3 bucket + VPC endpoint | Trace payload blob storage |
-| ALB + listeners | 带 TLS 的公共 ingress |
-| SSM Parameter Store entries | 应用机密，由 External Secrets Operator 同步到集群 |
+| ALB + listeners | 入口点；使用 `acm` 终止 TLS |
 | IRSA roles + IAM policies | 每个服务的 AWS 访问权限 |
-| KEDA, cert-manager, ESO | 随基础设施一同安装的引导工作负载 |
+| KEDA, External Secrets Operator, Envoy Gateway | 随基础设施一同安装的引导工作负载。Envoy Gateway 是默认 ingress。cert-manager 仅在 Let's Encrypt 时添加。 |
+
+应用机密存放在 SSM Parameter Store 中。由 `setup-env.sh` 写入（而非 Terraform），External Secrets Operator 会将其同步到集群。
 
 ### 克隆并配置
 
@@ -213,6 +200,12 @@ Terraform 会预配以下 AWS 资源：
 git clone https://github.com/langchain-ai/terraform.git
 cd terraform/modules/aws
 ```
+
+`main` 分支和 `v0.17.*` release tag 部署的是 LangSmith Helm chart v17，即本指南所描述的版本。
+
+<Note>
+要继续使用 chart v16，请运行 `git checkout release/0.16` 或检出某个 `v0.16.*` tag。本指南中的提示会标注 chart v16 的差异之处。
+</Note>
 
 后续所有命令都在 `modules/aws/` 中运行。完整目标列表请运行 `make help`。
 
@@ -222,7 +215,7 @@ cd terraform/modules/aws
 make quickstart
 ```
 
-向导会依次询问命名前缀、region、EKS 规格、TLS source、外部服务还是 in-cluster 服务，以及可选 add-on 开关，并写入 `infra/terraform.tfvars`。重新运行向导时会预选现有值；在每个提示处按 Enter 即可保留当前配置。
+向导会依次走过 13 个部分，包括命名、region、网络、EKS 规格、数据源、TLS 和 DNS、ingress，以及可选 add-on 开关，并写入 `infra/terraform.tfvars`。当文件已存在时，向导会提供三个选项：以预选现有值的方式更新、从头开始，或取消，并且会先备份原文件。有些设置（例如自带安全组变量 `*_existing_security_group_id`）不在向导中，需要手动写入 `terraform.tfvars`。向导更新已有文件时会丢弃这类手写设置，请从 `infra/terraform.tfvars.backup` 恢复它们。
 
 更喜欢手动编辑？复制示例文件并填写必需字段：
 
@@ -238,7 +231,7 @@ name_prefix = "acme"
 environment = "prod"
 region      = "us-west-2"
 
-eks_cluster_version = "1.33"
+eks_cluster_version = "1.34"
 eks_managed_node_groups = {
   default = {
     name           = "node-group-default"
@@ -252,14 +245,20 @@ postgres_source = "external"
 redis_source    = "external"
 
 tls_certificate_source = "acm"
-acm_certificate_arn    = "arn:aws:acm:us-west-2:<account-id>:certificate/<cert-id>"
 langsmith_domain       = "langsmith.example.com"
+# dns_create_zone      = false                    # write records into a zone that already resolves
+# dns_existing_zone_id = "<hosted-zone-id>"
+# acm_certificate_arn  = "arn:aws:acm:us-west-2:<account-id>:certificate/<cert-id>"  # optional with a domain
 ```
+
+<Note>
+设置了域名且未设置 `acm_certificate_arn` 时，Terraform 会申请 ACM 证书，`make apply` 会等待 DNS 验证成功。使用默认的 `dns_create_zone = true` 时，Terraform 会为 `langsmith_domain` 创建新的 hosted zone，只有在你从父域名委托该 zone 的 NS 记录之后验证才会成功。要在已解析的 zone 中验证，请设置 `dns_create_zone = false` 和 `dns_existing_zone_id`。要在委托完成之前部署，请遵循 [自动预配的 DNS](/langsmith/self-host-terraform-aws-architecture#auto-provisioned-dns) 中的分阶段部署模式。
+</Note>
 
 所有输入变量请参见 [AWS 变量参考](/langsmith/self-host-terraform-aws-variables)。
 
 <Tip>
-在 apply 之前配置远程 state 后端。编辑 `infra/backend.tf`，指向你自己的 S3 bucket 和 DynamoDB 锁表。Terraform 仓库默认提供本地 backend，便于首次评估。
+在 apply 之前配置远程 state 后端。将 `infra/backend.tf.example` 复制为 `infra/backend.tf`，并设置 S3 bucket、key、region 和 DynamoDB 锁表。没有它时，Terraform 会在本地保存 state。
 </Tip>
 
 ### 将机密写入 SSM Parameter Store
@@ -268,22 +267,27 @@ langsmith_domain       = "langsmith.example.com"
 source infra/scripts/setup-env.sh
 ```
 
-该脚本读取 `terraform.tfvars`，推导出 SSM 路径 `/langsmith/{name_prefix}-{environment}/`，然后对每个机密依次尝试：复用已导出的值、读取已有的 SSM 参数、自动生成（用于 salt 和 token），或提示你输入。license key 和管理员密码是两个需要交互输入的值。脚本必须以 `source` 方式加载（而非直接执行），因为 `make` 无法把环境变量导回父 shell。
+该脚本读取 `terraform.tfvars`，推导出 SSM 路径 `/langsmith/{name_prefix}-{environment}/`，然后对每个机密依次尝试：复用已导出的值、读取已有的 SSM 参数、自动生成，或提示你输入。你需要交互输入三个值：license key、管理员密码和管理员邮箱。脚本必须以 `source` 方式加载（而非直接执行），因为 `make` 无法把环境变量导回父 shell。
 
 该脚本管理以下 SSM 参数：
 
 | SSM key | 设置方式 | 说明 |
 |---|---|---|
-| `postgres-password` | 提示输入 | RDS 使用该密码 |
-| `redis-auth-token` | 自动生成（`openssl rand -hex 32`） | ElastiCache 要求十六进制 |
+| `postgres-password` | 自动生成（`openssl rand -hex 32`） | RDS master password |
+| `redis-auth-token` | 自动生成（hex） | ElastiCache auth token |
+| `sandbox-juicefs-redis-auth-token` | 自动生成（hex） | 仅在 `enable_sandboxes = true` 时 |
 | `langsmith-api-key-salt` | 自动生成（`openssl rand -base64 32`） | 切勿轮换，否则所有 API key 失效 |
 | `langsmith-jwt-secret` | 自动生成（`openssl rand -base64 32`） | 切勿轮换，否则所有会话失效 |
-| `langsmith-license-key` | 提示输入 | 来自[销售团队](https://www.langchain.com/contact-sales) |
-| `langsmith-admin-password` | 提示输入 | 必须包含一个符号 |
+| `sandbox-callback-signing-jwk` | 自动生成 Ed25519 key | 仅在 `enable_sandboxes = true` 时 |
+| `langsmith-license-key` | 提示输入 | 来自 [LangChain 销售团队](https://www.langchain.com/contact-sales) |
+| `langsmith-admin-password` | 提示输入 | 至少 12 个字符，包含小写字母、大写字母和一个符号 |
+| `langsmith-admin-email` | 提示输入 | 初始组织 admin |
 | `deployments-encryption-key` | 自动生成 Fernet key | LangSmith Deployment add-on |
-| `agent-builder-encryption-key` | 自动生成 Fernet key | Agent Builder add-on（由 Fleet 复用） |
+| `agent-builder-encryption-key` | 自动生成 Fernet key | 由 Fleet 使用；名称沿用改名前的叫法 |
 | `insights-encryption-key` | 自动生成 Fernet key | Insights add-on |
-| `polly-encryption-key` | 自动生成 Fernet key | Polly add-on |
+| `polly-encryption-key` | 自动生成 Fernet key | LangSmith Chat（原 Polly）add-on |
+
+如果之后才开启 `enable_sandboxes`，请在 `make apply` 之前重新 source `setup-env.sh`，以便它创建 sandbox 机密。
 
 确认机密已存在且 `TF_VAR_*` 环境变量已导出：
 
@@ -293,144 +297,167 @@ make secrets
 
 ### 执行 apply
 
-<Note>
-在干净的账号上预配 AWS 云基础需要 20 到 25 分钟。不要中断 apply。
-</Note>
-
 ```bash
 make init
 make plan
 make apply
 ```
 
-`make plan` 会显示拟议的变更。执行 apply 前请先审查输出。`make apply` 按依赖顺序预配：先 VPC 和安全组，然后 EKS（约 12 分钟）和 RDS（约 8 分钟，并行），再是节点组、ElastiCache、S3 和 ALB。
+`make plan` 会显示拟议的变更。执行 apply 前请先审查输出。`make apply` 会跨所有 module 运行单个 `terraform apply`；Terraform 按依赖顺序排列资源。传入 `ARGS="-auto-approve"` 可跳过确认提示。
 
 ### 配置 kubectl
 
 ```bash
-make kubeconfig
+source infra/scripts/set-kubeconfig.sh
 kubectl get nodes
-kubectl get pods -n kube-system
+kubectl get pods -A
 ```
 
-所有节点都应报告 `Ready`，核心 add-on（CoreDNS、kube-proxy、VPC CNI、KEDA、ESO）应处于 `Running` 状态。cert-manager 仅在 `tls_certificate_source = letsencrypt` 或 `create_cert_manager_irsa = true` 时运行。
+`set-kubeconfig.sh` 会写入专用的 `~/.kube/langsmith-<cluster>` 文件并导出 `KUBECONFIG`，因此不会改动 `~/.kube/config`。`make kubeconfig` 只会打印这条命令。
+
+所有节点都应报告 `Ready`。核心 add-on 应处于 `Running` 状态：`kube-system` 中的 CoreDNS、kube-proxy 和 VPC CNI，`keda` 中的 KEDA，`external-secrets` 中的 External Secrets Operator，以及 `envoy-gateway-system` 中的 Envoy Gateway。cert-manager 仅在 `tls_certificate_source = "letsencrypt"` 或 `create_cert_manager_irsa = true` 时运行。
 
 ## 部署 LangSmith
 
-支持两种部署路径，二选一即可。
-
-### 脚本驱动的 Helm 部署（推荐）
-
-适合大多数部署。交互式提示会引导你完成容量和产品选择。
-
 ```bash
-cd modules/aws
-
 make init-values
 make deploy
 ```
 
-`init-values.sh` 会提示输入管理员邮箱，然后从 `terraform.tfvars` 读取 `sizing_profile` 和 `enable_*` 开关，并把对应的 values 文件从 `helm/values/examples/` 复制到 `helm/values/`。重复运行时会保留你的选择并刷新 Terraform outputs。
+`make init-values` 从 `terraform.tfvars` 读取 `sizing_profile` 和 `enable_*` 开关，根据 Terraform outputs 写出 `helm/values/langsmith-values-overrides.yaml`，并把对应的 values 文件从 `helm/values/examples/` 复制到 `helm/values/`。管理员邮箱会复用已有 overrides 文件中的值，或取自 `LANGSMITH_ADMIN_EMAIL`（由 `setup-env.sh` 设置），否则提示输入。重复运行时会刷新 Terraform outputs，并且只在其缺失时才复制 add-on values 文件，因此你对已有文件的修改会保留下来。
 
 `make deploy` 会运行 `helm/scripts/deploy.sh`，它会：
 
-1. 刷新 kubeconfig。
-2. 运行 preflight 检查（AWS 凭证、集群可达性、`langchain` Helm 仓库）。
-3. 应用 External Secrets Operator 的 `ClusterSecretStore` 和 `ExternalSecret`，让集群直接从 SSM 读取机密。
-4. 使用分层 values 文件安装 LangSmith Helm chart。
+1. 解析 chart 版本，并确认其位于 v17 线上。
+2. 使用 `aws eks update-kubeconfig` 刷新 kubeconfig。
+3. 运行 preflight 检查（AWS 凭证、集群可达性、`langchain` Helm 仓库）。
+4. 应用 External Secrets Operator 的 `ClusterSecretStore` 和 `ExternalSecret`，让集群直接从 SSM 读取机密。
+5. 使用分层 values 文件运行 `helm upgrade --install`，并等待核心 pods 就绪。
+6. 在未设置 `langsmith_domain` 且负载均衡器 hostname 发生变化时再升级一次，然后打印 LangSmith URL。
 
-chart 安装和 pods 就绪预计需要 5 到 10 分钟。
+### 固定 chart 版本
 
-#### 验证
+`deploy.sh` 默认安装 LangSmith Helm chart v17 线（`~0.17.0`）上的最新补丁版本。要固定到某个确切的补丁版本，请在 `terraform.tfvars` 中设置 `langsmith_helm_chart_version = "0.17.x"`，或运行 `CHART_VERSION=0.17.x make deploy`。环境变量优先于 `tfvars` 设置。`deploy.sh` 会拒绝 v17 线之外的版本，Terraform 验证也会在 plan 阶段拒绝 v17 线之外的 `langsmith_helm_chart_version`。`deploy.sh` 还会拒绝仍在使用 chart v15 key（`config.insights`、`config.polly`、`backend.agentBootstrap`）的 values 文件。
+
+<Note>
+在 chart v16 上，请使用 `v0.16.*` module release 或 `release/0.16` 分支。这些 release 固定在 `~0.16.0`，且只接受 `0.16.x` 版本。要将现有的 chart v16 部署迁移到 v17，请遵循[从 chart v16 升级到 v17](#upgrade-from-chart-v16-to-v17)。
+</Note>
+
+### 验证
 
 ```bash
 kubectl get pods -n langsmith
-kubectl get ingress -n langsmith
+kubectl get httproute -n langsmith
 ```
 
-当所有 pods 处于 `Running` 且 ingress 显示 ALB DNS 名称时，部署即告就绪。使用你在 `langsmith_domain` 中配置的域名（或 ALB DNS 名称）访问 UI。
+当所有 pods 处于 `Running` 后，打开 `make deploy` 打印的 URL。设置了 `langsmith_domain` 时会使用该域名，否则使用 ALB hostname。随时可以运行 `make status`，查看每一层的摘要和下一步要运行的命令。
 
-如果你完成的是脚本驱动的部署，到这里就结束了。下一节是另一种部署路径，而不是一个额外步骤。
-
-### Terraform 托管的 Helm 部署
-
-适合希望把整个部署纳入 Terraform state 的团队，或自带基础设施的场景。`app/` module 直接管理 External Secrets Operator 的接线、`helm_release` 和功能开关。
-
-```bash
-cd modules/aws
-
-# Generate Helm values files from templates (required, the app module reads these)
-make init-values
-
-# Pull infra outputs into app/infra.auto.tfvars.json
-make init-app
-
-# Configure app-specific settings
-cp app/terraform.tfvars.example app/terraform.tfvars
-# Edit app/terraform.tfvars, set admin_email, sizing, and feature toggles
-
-# Deploy
-make plan-app
-make apply-app
-```
-
-`app/terraform.tfvars` 文件控制应用配置：
-
-```hcl
-admin_email          = "admin@example.com"
-sizing               = "production"   # production | production-large | dev | none
-enable_agent_deploys = true
-enable_agent_builder = true
-enable_insights      = true
-enable_polly         = true
-clickhouse_host      = "clickhouse.example.com"
-```
+### 从 chart v16 升级到 v17
 
 <Warning>
-`make plan-app` 之前必须先运行 `make init-values`。app module 会从 `helm/values/` 读取 values 文件，而 `init-values` 根据 `infra/terraform.tfvars` 中的容量和 add-on 选择，从 `helm/values/examples/` 填充这些文件。
+不支持从 chart v17 降级到 v16。升级前请备份数据库。
 </Warning>
 
-对于自带基础设施的场景，跳过 `make init-app`，在 `app/terraform.tfvars` 中手动设置所有变量。
+`enable_sandboxes = false` 且 `enable_smithdb = false` 的部署只需移动 chart 固定版本。Sandboxes 和 SmithDB 需要以下额外步骤。module 不会设置 Engine values，因此如果你在自己的 values overrides 中启用了 Engine，还请在[从 v16 升级到 v17](/langsmith/self-host-upgrades#upgrade-from-v16-to-v17) 中一并应用 Engine 的变更。
+
+1. 检出某个 `v0.17.*` tag，或拉取 `main`。
+1. 如果 `terraform.tfvars` 将 `langsmith_helm_chart_version` 固定在某个 `0.16.x` 补丁版本上，请清除它或设置为 `0.17.x` 补丁版本；如果你的 shell 设置了 `CHART_VERSION`，请运行 `unset CHART_VERSION`。Terraform 验证会在 plan 阶段拒绝 `0.16.x` 固定版本，`deploy.sh` 也会拒绝 `CHART_VERSION` 中的 `0.16.x` 值。
+1. 运行 `make apply`。从 module release `v0.16.83` 或更高版本开始，v17 module 不会更改任何 AWS 资源，因此 Terraform 不会报告基础设施变更。如果来自更早的 `v0.16.*` release，请在 apply 前先审查 `make plan` 的输出。
+1. 运行 `make init-values`。它会按 chart v17 的 sandbox schema 重写 `langsmith-values-overrides.yaml`。
+1. 如果 `enable_smithdb = true`，请更新 `make init-values` 不会覆盖的 values 文件中的 SmithDB key。Chart v17 无法渲染旧 key：
+   - 在 `helm/values/langsmith-values-smithdb.yaml` 中，将 `smithdb.migration.deployment` 重命名为 `smithdb.migration.job`。
+   - 在 `helm/values/langsmith-values-sizing-*.yaml` 中，将 `smithdb.query.autoscaling.*`、`smithdb.ingestion.autoscaling.*` 和 `smithdb.compactionWorker.autoscaling.*` 移到 `autoscaling.hpa.*` 下。在 `langsmith-values-sizing-production-large.yaml` 中，将 `local-ssd-storage` 卷重命名为 `cache`。
+
+   如果你没有自定义过这些文件，直接删除它们并重新运行 `make init-values`，以复制 v17 版本。这些 key 背后的 chart 变更请参见 [Cache storage](/langsmith/self-host-smithdb-infrastructure#cache-storage)。
+
+   只有 `production-large` sizing 文件定义了 `cache` 卷。使用 `dev`、`minimum` 或 `production` profile 时，chart v17 会根据 `smithdb.cache.storageClassName` 为每个 SmithDB cache 提供每 pod 的 PVC，未设置该值时则使用集群默认的 StorageClass。在 chart v16 上，每个 cache 是一个 `emptyDir`。要选择 cache 的存放位置，请设置 `smithdb.cache.storageClassName`，或为每个使用磁盘的 SmithDB 组件定义一个名为 `cache` 的卷。
+1. 运行 `make deploy`。当 chart v16 上有正在运行的 sandboxes 时，第一次运行会以 `namespace langsmith still mounts sandbox volumes through the chart 0.16 JuiceFS CSI driver` 停止，并打印排出（drain）旧卷的命令。运行这些命令，等到只剩下 `juicefs-csi-*` pods 后，再次运行 `make deploy`。正在运行的 sandboxes 会在 drain 期间停止。它们的数据保留在 S3 和 Redis 中，chart v17 会挂载同一个 JuiceFS 卷。
+1. 验证 sandbox 切换：
+
+   ```bash
+   kubectl get jobs -n langsmith -l app.kubernetes.io/component=juicefs-format
+   kubectl rollout status deployment -n langsmith -l app=sandbox-host --timeout=10m
+   kubectl get daemonset,statefulset -n langsmith | grep juicefs-csi   # expect no output
+   ```
+
+v17 中的所有 chart 变更请参见[从 v16 升级到 v17](/langsmith/self-host-upgrades#upgrade-from-v16-to-v17)，以及 Terraform 仓库中的 [`MIGRATION-0.16-to-0.17.md`](https://github.com/langchain-ai/terraform/blob/main/MIGRATION-0.16-to-0.17.md) 指南。
 
 ## 启用 add-on
 
-每个 add-on 都由 `infra/terraform.tfvars` 中的一个开关控制。设置开关后，重新运行 `make init-values` 以复制对应的 values 文件，然后重新运行 `make deploy`。
+每个 add-on 都由 `infra/terraform.tfvars` 中的一个开关控制。设置开关后，运行 `make apply`，重新运行 `make init-values` 以复制对应的 values 文件，然后重新运行 `make deploy`。对于由 Terraform 预配的 add-on，`make apply` 是必需的：使用外部存储的 Fleet（默认）、使用外部存储的 LangSmith Chat 或 Insights、sandboxes，以及 SmithDB。Sandboxes 和 SmithDB 会创建 AWS 资源。外部存储会在现有 RDS 实例上创建数据库，并创建对应的 Kubernetes 机密。其余 add-on 的 `make apply` 不会做任何更改。
 
 ```hcl
-enable_deployments     = true   # LangGraph Platform (required for Fleet, Agent Builder, and Polly)
-enable_fleet           = true   # Fleet (formerly Agent Builder), standalone service (chart v0.15+)
-enable_agent_builder   = false  # Older agent-builder path; mutually exclusive with enable_fleet
-enable_insights        = true   # ClickHouse-backed analytics
-enable_polly           = true   # Polly AI eval and monitoring
-enable_usage_telemetry = false  # Extended usage telemetry
+enable_deployments     = true            # LangSmith Deployment (listener, operator, host-backend)
+enable_fleet           = true            # Fleet (formerly Agent Builder)
+fleet_storage          = "external"      # default; "in-cluster" uses chart StatefulSets
+enable_polly           = true            # LangSmith Chat (formerly Polly)
+polly_storage          = "in-cluster"    # default; "external" uses RDS and ElastiCache
+enable_insights        = true            # AI-powered trace analysis
+insights_storage       = "in-cluster"    # default; "external" uses RDS and ElastiCache
+enable_sandboxes       = false           # LangSmith Sandboxes
+enable_smithdb         = false           # SmithDB
+enable_usage_telemetry = false           # Extended usage telemetry
 ```
 
 ```bash
+make apply
 make init-values
 make deploy
 ```
 
-各 add-on 的详细信息请参见 [LangSmith Deployment](/langsmith/deploy-self-hosted-full-platform)。
+`enable_agent_builder` 在 chart v16 中已被移除。将其设置为 `true` 会在 `terraform plan` 时验证失败，因此请从现有的 `tfvars` 文件中删除它，改用 `enable_fleet`。`enable_standalone_polly` 和 `enable_standalone_insights` 作为旧版简写保留，它们以外部存储启用对应 add-on（即 `enable_polly = true` 加 `polly_storage = "external"`，Insights 同理）。
+
+agent 部署的详细信息请参见 [LangSmith Deployment](/langsmith/enable-self-hosted-deployment)。
 
 ### Fleet
 
 <Note>
-Fleet 是原 Agent Builder 功能的现有形态，以独立服务形式部署（chart v0.15+）。
+Fleet 是原 Agent Builder 功能的现有形态。它要求 LangSmith Helm chart v15 或更高版本，且 license 中包含 Fleet entitlement。
 </Note>
 
-可以通过 `enable_fleet` 启用 Fleet。在 AWS 上，它要求 `enable_deployments = true`，因为 Fleet chat UI 需要通过 LangSmith Deployment 附带的 host-backend 解析 OAuth provider 和 token 连接。它还要求外部 Postgres 和 Redis（`postgres_source = "external"` 和 `redis_source = "external"`）。
+通过 `enable_fleet = true` 启用 Fleet。Fleet 会安装它所需的 host-backend，因此 `enable_deployments` 是可选的。
 
-Terraform 会在 RDS 上创建专用的 `langsmith_fleet` 数据库，并把 `langsmith-fleet-postgres` 和 `langsmith-fleet-redis` 机密接到现有的 RDS 和 ElastiCache 实例上。Fleet 复用 `langsmith_agent_builder_encryption_key`，因此从 `enable_agent_builder` 迁移会保留相同的 key 和数据。
+使用默认的 `fleet_storage = "external"` 时，Fleet 要求外部 Postgres 和 Redis（`postgres_source = "external"` 和 `redis_source = "external"`）。Terraform 会在 RDS 上创建专用的 `langsmith_fleet` 数据库，并把 `langsmith-fleet-postgres` 和 `langsmith-fleet-redis` 机密接到现有的 RDS 和 ElastiCache 实例上。设置 `fleet_storage = "in-cluster"` 可改用 chart 中的 PostgreSQL 和 Redis StatefulSets。
+
+Fleet 会复用 `agent-builder-encryption-key` SSM 参数，因此从 Agent Builder 迁移的部署会保留相同的 key 和数据。
+
+### LangSmith Chat 与 Insights
+
+`enable_polly` 开启 LangSmith Chat（原 Polly），`enable_insights` 开启 Insights。两者都不要求 `enable_deployments`，默认都使用 in-cluster 存储。设置 `polly_storage = "external"` 或 `insights_storage = "external"` 可使用共享 RDS 和 ElastiCache 实例上的专用数据库；这要求 `postgres_source = "external"` 和 `redis_source = "external"`。每个 add-on 都需要 license 中包含对应的 entitlement。
+
+### Sandboxes
+
+`enable_sandboxes = true` 会添加一个基于带 KVM 的裸金属 x86_64 实例的 sandbox-host 节点组（默认 `m5d.metal`），以及一个用于 JuiceFS metadata 的专用 ElastiCache 实例。Sandboxes 要求 LangSmith Helm chart v16 或更高版本。
+
+`sandbox-host` 自身挂载 JuiceFS，并由一个 `juicefs-format` Job 格式化卷。`make init-values` 会写入指向 `juicefs-csi-config` Secret 的 `sandboxes.juicefs.existingSecretName`，在 sandbox-host 节点有本地 NVMe 缓存路径时将 `sandboxes.juicefs.hostMount.cacheDirs` 设置为这些路径，并把 IRSA 角色标注放到 `sandboxes.sandboxHost.serviceAccount` 上。
 
 <Note>
-Fleet 要求 LangSmith Helm chart 0.15.0 或更高版本，且 license 中包含 Agent Builder 或 Fleet entitlement。
+在 chart v16 上，chart 改为捆绑 JuiceFS CSI driver。来自 `v0.16.*` module release 的 `make init-values` 会写入 `sandboxes.juicefs.csi.existingSecretName`，并把 IRSA 角色标注放到 `sandboxes.juicefs.csi.node.serviceAccount` 上。`juicefs-csi-config` Secret 在两条版本线上相同。
 </Note>
 
-Fleet 会安装 `standalone-fleet-api-server`、`standalone-fleet-tool-server`、`standalone-fleet-trigger-server` 和 `standalone-fleet-queue` 服务。
+在现有部署上启用 sandboxes：
 
-<Warning>
-不要同时启用 `enable_fleet` 和 `enable_agent_builder`。Fleet values 文件会设置 `config.agentBuilder.enabled: false`，因此这两个 add-on 互斥。
-</Warning>
+```bash
+# After setting enable_sandboxes = true in infra/terraform.tfvars
+source infra/scripts/setup-env.sh
+make apply
+make init-values
+make deploy
+```
+
+重新 source `setup-env.sh` 会创建 JuiceFS Redis auth token 和 sandbox 回调签名 key。`sandbox_*` 变量控制节点数量、实例类型和 JuiceFS 设置；参见[变量参考](/langsmith/self-host-terraform-aws-variables#sandboxes)。
+
+### SmithDB
+
+`enable_smithdb = true` 会预配 SmithDB 的依赖：一个 metastore PostgreSQL 实例、一个 S3 bucket、一个 IRSA role，以及基于本地 NVMe 实例的 Karpenter node pool。随后 `make init-values` 会写出 `langsmith-values-smithdb.yaml` 和 `langsmith-values-smithdb-overrides.yaml`，`make deploy` 在任一文件缺失时会停止。
+
+服务健康后，三个开关将流量迁移到 SmithDB：
+
+- `smithdb_ingestion_enabled` 将新的写入路由到 SmithDB。
+- `smithdb_migration_enabled` 迁移历史 ClickHouse 数据。它要求先开启 ingestion。
+- `smithdb_query_enabled` 由 SmithDB 提供查询服务。它要求先开启 ingestion。
+
+三者都要求 `enable_smithdb = true`。请按照 [Karpenter 兼容性矩阵](https://karpenter.sh/docs/upgrading/compatibility/)使 `smithdb_karpenter_chart_version`（默认 `1.6.3`）与 `eks_cluster_version` 保持兼容。完整列表参见[变量参考](/langsmith/self-host-terraform-aws-variables#smithdb)。
 
 ## 可选：带 bastion 的私有 EKS 集群
 
@@ -453,48 +480,63 @@ create_bastion            = true
 通过 SSM Session Manager 连接：
 
 ```bash
-terraform output bastion_ssm_command
+make tf ARGS="output bastion_ssm_command"
 aws ssm start-session --target <instance-id> --region us-west-2
 ```
 
 <Note>
-bastion 位于公共子网以保证 SSM agent 连通性，但如果你的 VPC 配有 SSM、SSMMessages 和 EC2Messages 的 VPC endpoint，则不需要公网 IP。bastion 预装了 `kubectl`、`helm`、`terraform`、`git` 和 `jq`，kubeconfig 已为 EKS 集群配置好。请在你的工作站上为 AWS CLI 安装 [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)。
+bastion 运行在没有公网 IP 的私网子网中，并通过 NAT gateway 访问 SSM。设置 `bastion_enable_ssh = true` 会将其移到带公网 IP 的公共子网。设置 `bastion_existing_security_group_id` 可挂载你自己的安全组。bastion 预装了 `kubectl`、`helm`、`terraform`、`git` 和 `jq`，kubeconfig 已为 EKS 集群配置好。请在你的工作站上为 AWS CLI 安装 [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)。
 </Note>
 
-## 可选：Envoy Gateway ingress
+## Ingress、DNS 与 TLS
 
-默认 ingress 是 AWS Load Balancer Controller（ALB）。在 `terraform.tfvars` 中设置 `enable_envoy_gateway = true` 可改为安装 [Envoy Gateway](https://gateway.envoyproxy.io/)。当 `langgraph-dataplane` chart 运行在独立 namespace 的多 namespace dataplane 部署中时，必须使用 Envoy Gateway。
+ALB 始终是入口点。使用 `acm` 时，由它终止 TLS。它后面的 [Envoy Gateway](https://gateway.envoyproxy.io/) 是默认 ingress：ALB 通过 TargetGroupBinding 将流量转发到 Envoy pods，LangSmith chart 会创建 `HTTPRoute` 资源而不是 `Ingress`。
 
-```hcl
-# infra/terraform.tfvars
-enable_envoy_gateway = true
-```
+| `terraform.tfvars` 中的设置 | Ingress |
+|---|---|
+| 未设置任何开关 | ALB 后面的 Envoy Gateway（默认） |
+| `enable_envoy_gateway = false` | 由 AWS Load Balancer Controller 创建的 ALB Ingress |
+| `enable_istio_gateway = true` | ALB 后面的 Istio gateway |
+| `enable_nginx_ingress = true` | ALB 后面的 NGINX ingress controller（旧版） |
 
-```bash
-source infra/scripts/setup-env.sh
-make apply
+Terraform 会拒绝同时开启其中多个的配置。
 
-make init-values
-cp helm/values/examples/langsmith-values-ingress-envoy-gateway.yaml helm/values/
-make deploy
-```
+在 ALB Ingress 模式下，AWS Load Balancer Controller 会创建自己的 ALB，Terraform ALB 则不会被使用。Terraform 为 `langsmith_domain` 创建的 Route 53 alias 记录仍指向 Terraform ALB，因此需要你自行将域名指向 Ingress hostname（`kubectl get ingress -n langsmith`）。
 
-当 `tls_certificate_source = "acm"` 时，部署脚本会自动为 Envoy Gateway NLB service 标注 ACM 证书 ARN。TLS 在 NLB 处终止；Envoy 内部看到的是明文 HTTP。
+<Warning>
+在 Envoy Gateway 成为默认值之前创建、且未设置任何 gateway 开关的部署，会在下一次 `make apply` 时切换到 Envoy Gateway。要保留 ALB Ingress，请在 apply 之前设置 `enable_envoy_gateway = false`。
+</Warning>
 
-当 dataplane chart 运行在独立 namespace 时，每个 dataplane namespace 需应用一次 RBAC manifest：
+`tls_certificate_source` 选择证书：
+
+- `acm`（默认）：ALB 上的 ACM 证书，由 Terraform 为 `langsmith_domain` 创建，或通过 `acm_certificate_arn` 提供。适用于所有 ingress 选项。
+- `letsencrypt`：使用 Let's Encrypt 的 cert-manager，通过 ALB Ingress class 解决 HTTP-01 challenge。仅在 ALB Ingress 模式（`enable_envoy_gateway = false`）下可用。要求设置 `letsencrypt_email`。
+- `none`：不带证书的纯 HTTP。
+
+对于 Istio 要求的经 Route 53 的 Let's Encrypt DNS-01，请设置 `create_cert_manager_irsa = true`、`cert_manager_hosted_zone_id` 和 `letsencrypt_email`。设置 `langsmith_domain` 时，Terraform 会创建 DNS-01 issuer。`create_cert_manager_irsa` 与 `tls_certificate_source = "letsencrypt"` 互斥。
+
+设置了 `langsmith_domain` 且 `acm_certificate_arn` 为空时，`make apply` 会创建 ACM 证书和 Route 53 alias 记录。`make tls` 可以在 Terraform 之外做同样的事：它申请并通过 DNS 验证一张证书、写入 alias 记录，并把证书 ARN 写入 `terraform.tfvars`。
+
+<Warning>
+在 `make apply` 已为 `langsmith_domain` 创建证书和 alias 之后，不要再运行 `make tls`。`make tls` 写入的 ARN 会关闭 Terraform DNS module，因此下一次 `make apply` 会销毁 Terraform 证书、alias 记录，以及 Terraform 创建的 hosted zone（`dns_create_zone = true` 时）。
+</Warning>
+
+### 分离式 dataplane namespace
+
+Envoy Gateway 支持路由到运行在独立 namespace 的 `langgraph-dataplane` chart。每个 dataplane namespace 需应用一次 RBAC manifest：
 
 ```bash
 kubectl apply -f helm/values/examples/dataplane-rbac.yaml
 ```
 
-这会授予 `langsmith-host-backend` ServiceAccount 对 dataplane namespace 中 pods、pod 日志、deployments 和 ReplicaSets 的读取权限。缺少它时，agent 运行日志不会在 LangSmith UI 中流式显示。
+该 manifest 面向 `langsmith-agents` namespace；如需其他 namespace，请自行编辑。它会授予 `langsmith-host-backend` ServiceAccount 对 dataplane namespace 中 pods、pod 日志、deployments 和 ReplicaSets 的读取权限。缺少它时，agent 运行日志不会在 LangSmith UI 中流式显示。
 
 ## 后续步骤
 
 - 查阅 [AWS 变量](/langsmith/self-host-terraform-aws-variables)和[速查参考](/langsmith/self-host-terraform-aws-quick-reference)。
 - 查看 [AWS 架构](/langsmith/self-host-terraform-aws-architecture)，了解平台分层、IRSA 和 module 依赖。
 - 出现问题时，请查阅 [AWS 故障排查指南](/langsmith/self-host-terraform-aws-troubleshooting)。
-- 使用 [LangSmith Deployment](/langsmith/deploy-self-hosted-full-platform) 在 UI 中启用 agent 部署。
+- 使用 [LangSmith Deployment](/langsmith/enable-self-hosted-deployment) 在 UI 中启用 agent 部署。
 
 ---
 

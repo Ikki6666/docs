@@ -13,6 +13,7 @@ OpenWiki 支持以下 provider：
 | `copilot` | GitHub CLI 会话或 `COPILOT_API_KEY` | 可选 `COPILOT_BASE_URL`。CI 需要 OAuth token，而不是经典 PAT |
 | `openrouter` | `OPENROUTER_API_KEY` | 可选 `OPENWIKI_OPENROUTER_PROVIDER_ONLY` allowlist |
 | `anthropic` | `ANTHROPIC_API_KEY` | 可选 `ANTHROPIC_BASE_URL` |
+| `bob` | `BOB_API_KEY` | 可选 `BOB_BASE_URL`。固定模型 ID `premium`；没有模型选择器 |
 | `gemini` | `GEMINI_API_KEY` | Google AI Studio |
 | `gemini-enterprise` | Google ADC + `GOOGLE_CLOUD_PROJECT` | 可选 `GOOGLE_CLOUD_LOCATION`（默认为 `global`） |
 | `bedrock` | AWS 凭据 + 区域 | 显式的 Bedrock key 或 AWS SDK 默认链 |
@@ -39,7 +40,7 @@ OPENWIKI_MODEL_ID=gpt-5.6-terra
 OPENWIKI_PROVIDER_RETRY_ATTEMPTS=3
 ```
 
-该值必须是正整数。未设置时，OpenWiki 默认为 3 次 retry。
+该值必须是正整数。未设置时，OpenWiki 默认为 3 次 retry；当 `OPENWIKI_PAGE_CONCURRENCY` 大于 `1` 时，默认为 5 次。
 
 ### 输出 token 限制
 
@@ -82,10 +83,33 @@ OPENWIKI_REASONING_EFFORT=high
 | `openai` | `gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.6-sol` | `none`、`low`、`medium`、`high`、`xhigh`、`max` | Responses API `reasoning.effort` |
 | `openai-chatgpt` | `gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.6-sol` | `none`、`low`、`medium`、`high`、`xhigh`、`max` | Responses API `reasoning.effort` |
 | `nvidia` | `nvidia/nemotron-3-super-120b-a12b` | `none`、`low`、`high` | Chat Completions `reasoning_effort` |
+| `gemini` | `gemini-3.6-flash` | `low`、`medium`、`high` | Gemini thinking level |
+| `openai-compatible` | 任意模型 ID（启用时） | `none`、`low`、`medium`、`high`、`xhigh`、`max` | Responses API `reasoning.effort` 或 Chat Completions `reasoning_effort` |
 
 所有其他 provider 和模型组合（包括 OpenRouter）不提供 reasoning effort 选择。
 
+对于 `openai-compatible`，reasoning effort 在你主动启用之前保持关闭：
+
+```bash
+OPENWIKI_OPENAI_COMPATIBLE_REASONING_EFFORT_SUPPORTED=true
+```
+
+设置该标志后，如果 `OPENWIKI_OPENAI_COMPATIBLE_USE_RESPONSES_API=true`，OpenWiki 会通过 Responses API 映射 `OPENWIKI_REASONING_EFFORT`，否则通过 Chat Completions `reasoning_effort` 映射。
+
 在交互式聊天中，使用 `/effort` 选择一个可用值，或使用 `/effort default` 恢复 provider 默认值。
+
+## IBM Bob
+
+IBM Bob 是一个使用 API key 的 provider，具有固定的模型 ID `premium`，因此 OpenWiki 会跳过模型选择器：
+
+```bash
+OPENWIKI_PROVIDER=bob
+BOB_API_KEY=your-bob-api-key
+```
+
+可选的 `BOB_BASE_URL` 会覆盖默认的推理端点（`https://api.us-east.bob.ibm.com/inference/v1`）。此 provider 始终启用流式传输。
+
+要在 IBM Bob / Bob Shell 内部运行 OpenWiki，而不是将 Bob 配置为独立的 provider，请参阅 [Coding-agent integrations](/oss/openwiki/integrations)。
 
 ## GitHub Copilot
 
@@ -100,6 +124,37 @@ OpenWiki 会把 GitHub CLI token 留在 GitHub CLI 凭据存储中。它不会�
 OPENWIKI_PROVIDER=copilot
 OPENWIKI_MODEL_ID=gpt-5.5
 ```
+
+## Microsoft Entra 认证
+
+OpenWiki 支持将 Microsoft Entra ID（原 Azure Active Directory）用作 token provider，用于需要 Entra bearer token 而不是静态 API key 的 OpenAI 兼容端点。
+
+<Note>
+Entra ID 认证需要 OpenWiki v0.7.0 或更高版本。
+</Note>
+
+要以交互方式配置 Entra 认证，请运行 `openwiki --init`，选择 **OpenAI-compatible**，然后选择 **Microsoft Entra ID**。输入 HTTPS API 根地址、你的 gateway 接受的 token scope，以及模型 ID。OpenWiki 会保存这些设置，供后续 `--update` 运行使用。它不会请求或存储 access token。
+
+对于非交互式运行，请将相同的值设置为环境变量：
+
+```bash
+OPENWIKI_PROVIDER=openai-compatible
+OPENAI_COMPATIBLE_AUTH=entra-id
+OPENAI_COMPATIBLE_BASE_URL=https://gateway.example.com/openai/v1
+OPENAI_COMPATIBLE_ENTRA_SCOPE=api://gateway-application-id/.default
+OPENWIKI_MODEL_ID=your-gateway-model
+```
+
+- **`OPENAI_COMPATIBLE_AUTH`**：设置为 `entra-id` 以启用 Entra 认证。默认值为 `api-key`。在 Entra 模式下，不需要 `OPENAI_COMPATIBLE_API_KEY`。
+- **`OPENAI_COMPATIBLE_BASE_URL`**：必须使用 HTTPS，并且不能包含内嵌的凭据。
+- **`OPENAI_COMPATIBLE_ENTRA_SCOPE`**：可选。默认为 `https://cognitiveservices.azure.com/.default`，即 Azure OpenAI 的 scope。自定义 gateway 可能需要不同的 scope。
+
+OpenWiki 通过 [Azure Identity](https://learn.microsoft.com/en-us/javascript/api/overview/azure/identity-readme) 获取 token，后者会缓存 token 并在过期前刷新。请在运行 OpenWiki 的每个环境中单独配置 Azure Identity 凭据：
+
+- **Workload identity federation**：设置 `AZURE_CLIENT_ID`、`AZURE_TENANT_ID` 和 `AZURE_FEDERATED_TOKEN_FILE`。当设置了 `AZURE_FEDERATED_TOKEN_FILE` 时，OpenWiki 会使用 `WorkloadIdentityCredential`。将该文件变量指向 runner 提供的 token 文件。不要提交该文件。
+- **其他环境**：OpenWiki 使用 `DefaultAzureCredential`，它接受诸如 `az login`、managed identity 或环境凭据之类的凭据。
+
+生成的 CI 工作流会保留认证模式和 scope，但你仍需要在 CI 中配置无人值守的 Azure Identity 凭据。
 
 ## OpenAI（ChatGPT 登录）
 

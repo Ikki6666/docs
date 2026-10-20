@@ -1,0 +1,303 @@
+---
+title: 为自托管和 BYOC 上的 Engine 配置 model providers
+sidebarTitle: Model providers
+description: 选择 LangSmith Engine 在自托管 LangSmith 实例上使用的 model providers，使用凭据或云身份进行认证，并让模型流量保持在私有网络上。
+---
+
+<Info>
+在你自己的 model providers 上运行 Engine 需要 LangSmith Helm chart `0.17.0` 或更高版本。更早的 chart 版本只能在 [LangSmith Intelligence](/langsmith/engine-self-hosted#langsmith-intelligence) 上运行 Engine。
+</Info>
+
+在自托管 LangSmith 上，由 Organization Admin 选择 [LangSmith Engine](/langsmith/engine) 在哪里运行其模型调用：在 LangSmith Intelligence (LSI) 上、在你自己的 model providers 上，或两者都选。在你自己的 providers 上运行 Engine 可以让 prompts 和响应处于你与这些 providers 签订的协议约束之下。本页介绍如何选择 providers、向它们认证，以及通过私有网络连接它们或 LSI。关于两个选项的对比，请参阅[选择 Engine 运行模型的方式](/langsmith/engine-self-hosted#choose-how-engine-runs-its-models)。请先完成[安装 Engine](/langsmith/engine-self-hosted#install-engine)。
+
+<Info>
+在 [BYOC](/langsmith/engine-self-hosted#engine-on-byoc) 上，LangSmith Intelligence 不可用，Engine 仅在你自己的 model providers 上运行。Amazon Bedrock 可以使用你的 data plane 的云身份，该身份由 LangChain 配置。[云身份](#use-cloud-identity-for-your-model-providers)和[私有连接](#connect-privately)部分仅适用于自托管 LangSmith。
+</Info>
+
+## 使用你自己的 model providers
+
+Engine 会直接从你的集群调用你的 providers。Prompts 和响应只会发送到你的 provider，受你与该 provider 之间的协议约束。LangChain 不会收到它们。
+
+Engine 的 sandbox 用量包含在 Engine 的 LSU 计费中。Engine 用于诊断 issue、生成修复方案和编写 evaluators 的 sandboxes 不会产生额外的 Sandboxes 产品费用。
+
+Engine 支持 Anthropic、OpenAI、Amazon Bedrock、Google Vertex AI 和 Azure AI Foundry。它会使用你选择的 providers 的模型组合，因此为了获得最佳结果，请为你有权限访问的每家 provider 添加凭据。
+
+在你的 provider 账户中，为你的 provider 提供的 Anthropic Claude 模型和 OpenAI GPT 模型启用访问。在 Azure 上，请使用 Azure AI Foundry 资源。要确认 Engine 可以访问它使用的模型，请运行 [**Test connection**](#test-a-provider)。
+
+## 选择 model providers
+
+在 **Settings > Engine > Model providers** 下，由 Organization Admin 选择 LangSmith Intelligence、你自己的 providers 中的一家或多家，或两者都选。凭据会保存为 organization secrets，并应用于该组织中的每个 workspace。
+
+只有当你的安装的 `engine.intelligenceBaseUrl` 服务 Engine 的模型时，LangSmith Intelligence 才会出现。
+
+当 LangSmith Intelligence 可用且被选中时，它优先于你选定的 providers。不选中它即可让推理保留在你自己的 providers 上。
+
+Engine 会从你启用的 providers 中选择模型。根据每家 provider 提供的模型，在你的 provider 账户中启用对 Claude 5.5 系列模型或 GPT 5.6 系列模型的访问。模型要求跟随 `images.engineInsightsAgentImage.tag` 中的 Engine 镜像标签，而不是 Helm chart 版本。运行 [**Test connection**](#test-a-provider) 可以识别所需的模型，并为已安装的 Engine 镜像确认访问权限。
+
+要使用你自己的 providers：
+
+<Steps>
+  <Step title="添加凭据">
+    点击 provider 旁边的 **Add credentials** 并输入：
+
+    <Tabs>
+      <Tab title="Anthropic">
+        一个 Anthropic API key。
+      </Tab>
+      <Tab title="Amazon Bedrock">
+        一个 AWS access key ID 和 secret access key（可选附带 session token），或一个 Bedrock API key（bearer token）。可选填写一个 AWS 区域。
+
+        Engine 使用 Bedrock Mantle API。请在所选 AWS 账户和区域中启用所需模型的访问。为调用身份授予 Mantle 推理和 model-subscription 权限；所需操作请参见 [AmazonBedrockMantleInferenceAccess](https://docs.aws.amazon.com/aws-managed-policy/latest/reference/AmazonBedrockMantleInferenceAccess.html)。
+
+        如果没有保存区域，Engine 会使用 `us-east-1`，包括在使用 workload identity 时。它不会继承 EKS 集群的区域。
+
+        若要改为使用 Engine pods 的云身份，请参见[为你的 model providers 使用云身份](#use-cloud-identity-for-your-model-providers)。
+      </Tab>
+      <Tab title="Google Vertex AI">
+        一个 JSON 格式的 service account key。Engine 使用该 JSON 的 `project_id` 作为推理项目，并调用 `global` 位置。
+
+        请在该项目中通过 [Model Garden](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/use-partner-models) 启用所需的模型。在同一项目中向该 service account 授予 `roles/aiplatform.user`。
+
+        若要改为使用 Engine pods 的云身份，请参见[为你的 model providers 使用云身份](#use-cloud-identity-for-your-model-providers)。
+      </Tab>
+      <Tab title="Azure AI Foundry">
+        确认你的资源区域对已安装 Engine 镜像所需的模型具有访问权限和配额。Azure 的配置步骤：
+
+        1. 在同一个 Azure AI Foundry 资源中创建所需的模型 deployments。Deployment 名称必须与模型名称（model ID）完全一致。Engine 使用 Claude 作为主模型，使用 GPT 作为备用。两个模型系列都不支持自定义 deployment 别名。
+
+           请按照 [Claude deployment instructions](https://platform.claude.com/docs/en/build-with-claude/claude-in-microsoft-foundry) 操作，并查看 [Azure OpenAI model availability](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/responses)。创建第一个 Claude deployment 时需要接受 Azure Marketplace 条款。
+        1. 输入一个 API key 和资源名称（而不是其完整 URL）。若要改为使用 Engine pods 的云身份而不是 API key，请参见[为你的 model providers 使用云身份](#use-cloud-identity-for-your-model-providers)。
+        1. 运行 [**Test connection**](#test-a-provider)，并确认 Claude 和 GPT 请求都成功，包括在选择其他 providers 时。保存之后，[启动一次 Engine 分析](/langsmith/engine-self-hosted#verify-the-installation)以验证完整设置。
+      </Tab>
+      <Tab title="OpenAI">
+        一个 OpenAI API key，可选填写你的 OpenAI organization ID。
+      </Tab>
+    </Tabs>
+
+    凭据完整的 provider 会显示为已配置。日后要更改它们，请点击 provider 旁边的钥匙图标。
+  </Step>
+  <Step title="测试 provider" id="test-a-provider">
+    点击 **Test connection**。Engine 会使用保存的凭据或配置的云身份，向该 provider 上它使用的每个模型发送一个小请求。它会显示每个请求是否成功，如果不成功，原因是什么。
+  </Step>
+  <Step title="选择 providers 并保存">
+    选择 Engine 可以使用的 providers，然后保存。
+  </Step>
+</Steps>
+
+如果保存之后 Engine 运行失败：
+
+- **未选择 provider：**在至少选择并保存一个 provider 之前，Engine 不会开始运行。
+- **凭据被拒绝：****Test connection** 会报告哪家 provider 拒绝了凭据。更新凭据并再次测试。
+- **模型不可用：**在你的 provider 账户中启用该模型，然后再次测试。
+
+## 为你的 model providers 使用云身份
+
+Amazon Bedrock、Google Vertex AI 和 Azure AI Foundry 可以使用 Engine pods 的云身份进行认证，而不是使用保存在 LangSmith 中的凭据。在 `engine.workloadIdentityProviders` 中列出这些 providers。为共享的 Engine 和 Insights deployment 的 API server 和 queue 都配置身份：
+
+<Tabs>
+  <Tab title="Amazon EKS">
+    配置 IAM roles for service accounts (IRSA)。信任两个 Engine 工作负载的 namespace 和 service account，并授予该角色访问 Engine 所用 Bedrock 模型的权限。
+
+    ```yaml
+    engine:
+      workloadIdentityProviders:
+        - bedrock
+
+    engineInsightsAgent:
+      apiServer:
+        serviceAccount:
+          annotations:
+            eks.amazonaws.com/role-arn: "arn:aws:iam::<account-id>:role/<engine-model-access-role>"
+      queue:
+        serviceAccount:
+          annotations:
+            eks.amazonaws.com/role-arn: "arn:aws:iam::<account-id>:role/<engine-model-access-role>"
+    ```
+  </Tab>
+  <Tab title="Google GKE">
+    在集群和运行 Engine 的 node pools 上启用 Workload Identity Federation for GKE。在每个 Engine Kubernetes service account 上，向该 Google service account 授予 `roles/iam.workloadIdentityUser`。将每个成员绑定为 `serviceAccount:<cluster-project-id>.svc.id.goog[<namespace>/<kubernetes-service-account>]`。
+
+    在托管模型的项目中，向该 Google service account 授予 Vertex AI 推理权限，例如 `roles/aiplatform.user`。在该项目中启用所需的模型。
+
+    ```yaml
+    engine:
+      workloadIdentityProviders:
+        - vertex
+
+    engineInsightsAgent:
+      apiServer:
+        serviceAccount:
+          annotations:
+            iam.gke.io/gcp-service-account: "<service-account>@<project-id>.iam.gserviceaccount.com"
+        deployment:
+          extraEnv:
+            - name: GOOGLE_CLOUD_PROJECT
+              value: "<vertex-project-id>"
+      queue:
+        serviceAccount:
+          annotations:
+            iam.gke.io/gcp-service-account: "<service-account>@<project-id>.iam.gserviceaccount.com"
+        deployment:
+          extraEnv:
+            - name: GOOGLE_CLOUD_PROJECT
+              value: "<vertex-project-id>"
+    ```
+
+    Engine 使用 Application Default Credentials (ADC) 来解析身份和项目。将两个工作负载上的 `GOOGLE_CLOUD_PROJECT` 都设置为目标 Vertex AI 项目。Engine 当前使用 `global` Vertex AI 位置，因此所需的模型必须在该位置可用。
+  </Tab>
+  <Tab title="Azure AKS">
+    启用 AKS OIDC issuer 和 Microsoft Entra Workload ID。在你的 managed identity 上为每个 Engine Kubernetes service account 创建一个联合身份凭据。每一项都使用集群的 OIDC issuer、audience `api://AzureADTokenExchange`，以及 subject `system:serviceaccount:<namespace>:<kubernetes-service-account>`。
+
+    向该 identity 授予 Cognitive Services User 角色，范围限定为托管 Engine 模型的 Azure AI Foundry 资源。仅凭 Azure OpenAI 角色无法建立对 Claude 模型的访问。
+
+    ```yaml
+    engine:
+      workloadIdentityProviders:
+        - azure
+
+    engineInsightsAgent:
+      apiServer:
+        serviceAccount:
+          annotations:
+            azure.workload.identity/client-id: "<managed-identity-client-id>"
+        deployment:
+          labels:
+            azure.workload.identity/use: "true"
+      queue:
+        serviceAccount:
+          annotations:
+            azure.workload.identity/client-id: "<managed-identity-client-id>"
+        deployment:
+          labels:
+            azure.workload.identity/use: "true"
+    ```
+
+    两个工作负载都需要 service account 注解和 pod label。在 **Settings > Engine > Model providers** 下保存 Foundry 资源名称。
+  </Tab>
+</Tabs>
+
+<Warning>
+`engine.workloadIdentityProviders` 中列出的 provider 在没有保存凭据的情况下也算作已配置，因此任何 Organization Admin 都可以选择它。请将身份范围限定为 Engine 使用的模型。
+</Warning>
+
+保存的凭据优先于云身份。在切换 provider 时，请先应用云身份配置，再移除其保存的凭据。然后只在 **Settings > Engine > Model providers** 下移除该 provider 保存的 API key 或 service account JSON。对于 Bedrock，还要移除所有保存的 access key、secret access key 和 session token。保留 Azure AI Foundry 资源名称和任何 Bedrock 区域设置，然后再次[测试该 provider](#test-a-provider)。
+
+## 私有连接
+
+Engine 可以通过公共 egress 工作。要让它的流量保持在私有网络上，请通过 AWS PrivateLink 连接到 LangSmith Intelligence，或通过你所在云的私有 endpoint 连接到你自己的 model providers。
+
+### 通过 AWS PrivateLink 连接
+
+LangSmith Intelligence gateway（`beacon.aws.langchain.com`）会将请求路由到 LangChain AWS 环境中的 Amazon Bedrock。
+
+在配置 PrivateLink 之前，请先完成[安装 Engine](/langsmith/engine-self-hosted#install-engine)，包括其 Helm 和 egress 配置。
+
+[AWS PrivateLink](https://docs.aws.amazon.com/vpc/latest/privatelink/) 会将 Engine 流量从你的 VPC 路由到 LSI，而不会将该流量暴露到公共互联网。LSI endpoint service 托管在 `us-east-2` 中，AWS 支持从其他区域的 VPC 访问。
+
+在开始之前，请收集你的 AWS 账户 ID、VPC ID、私有子网 ID，以及用于 interface endpoint 的安全组。将该 endpoint 安全组配置为仅允许来自运行 Engine 的节点或工作负载所关联安全组的入站 TCP 443 端口流量，或来自包含它们的最小私有 CIDR。不要允许 `0.0.0.0/0`。
+
+要将你的 VPC 连接到 LSI：
+
+<Steps>
+  <Step title="申请访问">
+    联系你的客户代表或 [sales@langchain.dev](mailto:sales@langchain.dev) 并提供你的 AWS 账户 ID。LangChain 会将你的账户添加到 endpoint service 的 allowed principals 列表中。
+  </Step>
+
+  <Step title="创建 interface VPC endpoint">
+    为包含你的 VPC 的区域配置 AWS provider。请将 `service_region` 保持为 `us-east-2`，即使你的 VPC 位于其他区域。每个可用区选择一个私有子网。
+
+    <Note>
+    `service_region` 参数需要 HashiCorp AWS provider `5.82.0` 或更高版本。
+    </Note>
+
+    ```hcl
+    resource "aws_vpc_endpoint" "langsmith_intelligence" {
+      vpc_id              = var.vpc_id
+      service_name        = "com.amazonaws.vpce.us-east-2.vpce-svc-054f37092752bff6b"
+      service_region      = "us-east-2"
+      vpc_endpoint_type   = "Interface"
+      subnet_ids          = var.private_subnet_ids
+      security_group_ids  = [var.security_group_id]
+      private_dns_enabled = false
+    }
+    ```
+  </Step>
+
+  <Step title="等待 LangChain 接受连接">
+    在 LangChain 接受连接之后，endpoint 状态会从 `pendingAcceptance` 变为 `available`。请等待几分钟让更改传播，然后再测试连通性。
+  </Step>
+
+  <Step title="将 LSI 主机名路由到该 endpoint">
+    为你的 VPC 启用 DNS resolution 和 DNS hostnames。然后创建一个 Route 53 私有托管区和别名记录，使 `beacon.aws.langchain.com` 在你的 VPC 内解析到该 VPC endpoint。保持此主机名不变，以便 TLS 证书校验成功。该私有托管区还可以防止在 endpoint 不可用时回退到公共 DNS。
+
+    ```hcl
+    resource "aws_route53_zone" "langsmith_intelligence" {
+      name = "beacon.aws.langchain.com"
+
+      vpc {
+        vpc_id = var.vpc_id
+      }
+    }
+
+    resource "aws_route53_record" "langsmith_intelligence" {
+      zone_id = aws_route53_zone.langsmith_intelligence.zone_id
+      name    = "beacon.aws.langchain.com"
+      type    = "A"
+
+      alias {
+        name                   = aws_vpc_endpoint.langsmith_intelligence.dns_entry[0].dns_name
+        zone_id                = aws_vpc_endpoint.langsmith_intelligence.dns_entry[0].hosted_zone_id
+        evaluate_target_health = true
+      }
+    }
+    ```
+
+    如果工作负载使用企业 DNS 解析器而不是 Amazon 提供的解析器，请配置到 Route 53 Resolver 的条件转发，或为 `beacon.aws.langchain.com` 创建等效的私有 DNS 覆盖，指向该 endpoint 的 DNS 名称。
+  </Step>
+
+  <Step title="验证私有连接">
+    从运行 Engine 的节点或容器中解析 gateway 主机名：
+
+    ```bash
+    getent ahostsv4 beacon.aws.langchain.com
+    ```
+
+    确认结果中包含分配给该 endpoint 网络接口的私有 IP 地址。然后启动一次分析，并确认它能成功完成。如果分析未能完成，请检查 Engine 安装和 egress 配置。
+  </Step>
+</Steps>
+
+### 私有连接到你的 providers
+
+Engine 会从 `standalone-insights` pods 调用每家 provider 的标准 API 主机名。要让该流量不经过公共互联网，请为你所在云设置到该 provider 的私有连接，使同一主机名在你的网络内部解析到私有地址：
+
+| **Provider** | **Engine 调用的主机名** | **私有连接** |
+| --- | --- | --- |
+| Amazon Bedrock | `bedrock-mantle.<region>.api.aws` | 针对 `com.amazonaws.<region>.bedrock-mantle` 的 interface VPC endpoint，启用 private DNS，或为该主机名创建 Route 53 私有托管区 |
+| Google Vertex AI | `<region>-aiplatform.googleapis.com`，对于 global 区域为 `aiplatform.googleapis.com` | 用于 Google API 的 Private Service Connect，并为 `googleapis.com` 配置私有 DNS |
+| Azure AI Foundry | `<resource>.openai.azure.com` 和 `<resource>.services.ai.azure.com` | 针对 Foundry 资源的私有 endpoint，及其私有 DNS 区域 |
+| Anthropic、OpenAI | `api.anthropic.com`、`api.openai.com` | 不可用。这些 provider 需要公共 egress。 |
+
+Engine 不接受自定义 endpoint URL，因此私有连接通过 DNS 实现：标准主机名必须能从 Engine pods 解析到你的私有 endpoint。
+
+如果 Engine 使用[云身份](#use-cloud-identity-for-your-model-providers)进行认证，pods 还需要访问你所在云的 token 服务，例如在 AWS 上为 AWS STS 的 interface VPC endpoint。
+
+使用保存的 Vertex AI service account JSON 时，除了用于推理的 `aiplatform.googleapis.com`，还要允许到 `oauth2.googleapis.com` 的 HTTPS 以进行 token 交换。
+
+向 LangSmith Intelligence 上报使用量是一条独立的连接。在 AWS 上，`https://beacon.aws.langchain.com/intelligence` 记录使用量并支持 [AWS PrivateLink](#connect-with-aws-privatelink)，因此安装可以在 Bedrock 上运行 Engine 并在没有公共 egress 的情况下上报使用量。默认的 `https://beacon.langchain.com/intelligence` 需要公共 egress。
+
+## 另请参阅
+
+- [自托管上的 Engine](/langsmith/engine-self-hosted)：安装 Engine 并选择它运行模型的方式。
+- [Engine security](/langsmith/engine-security#model-subprocessors)：模型子处理者控制。
+- [配置 egress](/langsmith/self-host-egress)：自托管 LangSmith 的其他出站流量。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/engine-self-hosted-model-providers.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

@@ -1,0 +1,184 @@
+---
+title: Tunnels
+sidebarTitle: Tunnels
+description: 通过仅出站的 connector，让 LangSmith 访问你私有网络上的服务，而无需将它们暴露在公共互联网上。
+---
+
+<Note>
+Tunnels 目前处于 [alpha](/langsmith/release-stages) 阶段。要为你的组织申请访问权限，请[联系销售团队](https://www.langchain.com/contact-sales)。
+</Note>
+
+Tunnel 让 LangSmith 能够访问运行在你私有网络中的服务，例如 model endpoint 或 MCP server，而无需将该服务开放到互联网。你在自己的网络内运行一个小型 connector。该 connector 会建立一条到 LangSmith 的出站连接，LangSmith 则通过这条连接发送对你的服务的请求。
+
+Tunnels 在每个区域的 [LangSmith Cloud](/langsmith/cloud) 上都可用。self-hosted 或 hybrid 部署不支持 Tunnels。
+
+## Tunnels 的工作原理
+
+1. 组织管理员在 LangSmith 中创建 tunnel。
+2. 你在自己的网络内运行 connector，并使用 tunnel ID、API key 以及一个或多个 **target** 对其进行配置。Target 是映射到私有地址的名称，例如 `litellm` 映射到 `http://litellm.internal:4000`。
+3. Connector 通过 HTTPS（端口 443）出站连接到 LangSmith。没有任何连接会接入你的网络，connector 也不暴露任何端口。
+4. 每个 HTTP target 都会获得一个 **tunnel URL**。在 LangSmith 中，凡是原本使用服务地址的地方，你都可以使用该 URL。
+5. 当 LangSmith 功能调用 tunnel URL 时，LangSmith 会检查调用方是否属于该 tunnel 的组织，然后将请求发送给 connector，由 connector 转发给 target。
+
+## 设置 tunnel
+
+要创建 tunnel，你需要 [Organization Admin 或 Organization Operator](/langsmith/rbac#organization-roles) 角色。你还需要在网络内有一个运行 connector 的位置：一个能够访问你的服务并发起出站 HTTPS 连接的 Kubernetes cluster 或 Docker host。
+
+<Steps>
+  <Step title="打开 Tunnels 设置" icon="settings">
+    在 LangSmith 中，进入 **Settings**，然后在 **Infrastructure** 下选择 **Tunnels**。
+
+    ![Tunnels settings page with no tunnels and a Create tunnel button](/langsmith/images/tunnels-empty.png)
+  </Step>
+  <Step title="创建 tunnel" icon="plus">
+    选择 **Create tunnel**。输入名称和可选的描述，然后选择 **Create tunnel**。
+
+    ![Create tunnel dialog with a name and a description filled in](/langsmith/images/tunnels-create-dialog.png)
+  </Step>
+  <Step title="复制 connector 配置" icon="copy">
+    新 tunnel 会显示 **Waiting for connector**。其 **Connector Configuration** 区域显示了 tunnel ID 以及 connector 所需的设置，以环境变量或 YAML 文件的形式提供。复制这些内容，并将示例 target 替换为你自己的（参见 [Targets](#targets)）。
+
+    ![Tunnel details showing Waiting for connector, the tunnel ID, and the connector configuration as environment variables](/langsmith/images/tunnels-connector-config.png)
+  </Step>
+  <Step title="为 connector 创建 API key" icon="key">
+    在 **Settings** > **API Keys** 中，[创建一个具有 Organization Admin 或 Organization Operator 角色的组织范围 service key](/langsmith/create-account-api-key)。Connector 使用此 key 连接到 LangSmith。将其存储在 connector 可以读取的位置，并且不要将其提交到版本控制。
+  </Step>
+  <Step title="运行 connector" icon="terminal">
+    在你的网络内运行 connector。如果你的组织不在 GCP US 区域，请将 endpoint 设置为所在区域的 API URL：
+
+    | 区域 | Endpoint |
+    | --- | --- |
+    | GCP US | `https://api.smith.langchain.com`（默认） |
+    | GCP EU | `https://eu.api.smith.langchain.com` |
+    | GCP APAC | `https://apac.smith.langchain.com` |
+    | AWS US | `https://aws.api.smith.langchain.com` |
+
+    <Tabs>
+      <Tab title="Kubernetes (Helm)">
+        将 API key 存储在 Secret 中，然后安装 [`langsmith-connector` chart](https://github.com/langchain-ai/helm/tree/main/charts/langsmith-connector)：
+
+        ```bash
+        kubectl create namespace langsmith-connector
+        kubectl -n langsmith-connector create secret generic langsmith-connector-key \
+          --from-literal=langsmith_api_key=<api key>
+
+        helm repo add langchain https://langchain-ai.github.io/helm/
+        helm repo update
+        helm install langsmith-connector langchain/langsmith-connector \
+          --namespace langsmith-connector \
+          --set config.connectionId=<tunnel id> \
+          --set config.existingSecretName=langsmith-connector-key \
+          --set config.targets.litellm=http://litellm.internal:4000
+        ```
+
+        对于 GCP US 以外的区域，请添加 `--set config.endpoint=<endpoint>`。该 chart 将 key 以文件形式挂载，connector 在每次重新连接时都会重新读取该文件，因此你可以在 Secret 中轮换 key，而无需重启 connector。
+
+        请运行单个 replica。一个 connector 本身就会保持两条到 LangSmith 的冗余连接。
+      </Tab>
+      <Tab title="Docker">
+        ```bash
+        docker run -d --name langsmith-connector --restart unless-stopped \
+          -e LANGSMITH_CONNECTION_ID=<tunnel id> \
+          -e LANGSMITH_API_KEY=<api key> \
+          -e LANGSMITH_CONNECTOR_TARGETS="litellm=http://litellm.internal:4000" \
+          langchain/langsmith-connector:0.2.0
+        ```
+
+        对于 GCP US 以外的区域，请添加 `-e LANGSMITH_ENDPOINT=<endpoint>`。如果改为从文件读取 key，请将 `LANGSMITH_API_KEY_FILE` 设置为该文件的路径。
+      </Tab>
+    </Tabs>
+
+    如果你的网络需要出站代理，connector 会遵循 `HTTPS_PROXY`。设置 `LOG_LEVEL=debug` 以记录其转发的每个请求。使用 Helm 时，通过 `connector.deployment.extraEnv` 进行设置。
+  </Step>
+  <Step title="检查 tunnel 是否已连接" icon="circle-check">
+    Connector 启动后的几秒内，tunnel 会显示 **Connected**，并列出 connector 所服务的每个 target 及其 tunnel URL。
+
+    ![Tunnel details showing Connected and two available HTTP targets, each with a tunnel URL and a copy button](/langsmith/images/tunnels-connected.png)
+
+    要从你自己的机器验证某个 target，请使用该组织的 API key 向其 tunnel URL 发送请求：
+
+    ```bash
+    curl -H "X-Api-Key: $LANGSMITH_API_KEY" https://<handle>.tunnels.smith.langchain.com/
+    ```
+
+    响应来自你的服务。没有有效 API key 的请求会返回 `403`，并带有 `connection access denied`。
+
+    如果 tunnel 一直停留在 **Waiting for connector** 状态，请检查 connector 的日志。Connector 每次连接失败时都会记录一条包含原因的 warning，并进行重试。常见原因包括：API key 不具备 Organization Admin 或 Organization Operator 角色、tunnel ID 不正确，或 tunnel 已被禁用。
+  </Step>
+</Steps>
+
+### Targets
+
+每个 target 由一个名称和一个地址组成：
+
+- **Name**：1 到 63 个字符。以小写字母开头，且仅包含小写字母、数字和下划线。
+- **Address**：`http://host:port` 或 `https://host:port`，不能包含路径。LangSmith 只能访问 HTTP 和 HTTPS target。
+
+一个 connector 最多可以服务 256 个 target。要添加或更改 target，请更新 connector 的配置并重启它，例如使用 `helm upgrade`。
+
+## 使用 tunnel URL
+
+选择 target 旁边的 **Copy tunnel URL** 即可复制其 URL。Tunnel URL 的格式为 `https://<handle>.tunnels.smith.langchain.com`，其他区域的域名中会包含区域信息（例如 `tunnels.eu.smith.langchain.com`）。你还可以使用 `GET /v1/connections/{tunnel_id}/targets` 列出 tunnel 的 target 和 URL。
+
+你可以在以下位置使用 tunnel URL 代替服务地址：
+
+- [Model configurations](/langsmith/model-configurations) 和 [custom model endpoints](/langsmith/custom-endpoint)，作为 base URL。这涵盖了使用该模型的 Playground、experiments 和 online evaluators。
+- [LangSmith Fleet](/langsmith/fleet)，作为 model 的 base URL 或 MCP server URL。
+- 使用 OAuth 的 MCP server，用于其 token endpoint。Authorization endpoint 必须保持可以从浏览器访问，因此它不能是 tunnel URL。
+
+请注意以下几点：
+
+- Tunnel URL 仅支持 HTTPS。
+- 通过 tunnel 发送的请求不会跟随 redirects。
+- 通过 tunnel 访问的 model 需要在其配置中提供自己的 API key。LLM auth proxy credentials 不会通过 tunnel 发送。
+- 你的 target 必须在 30 秒内开始响应。单个请求最多可以流式传输 1 小时，请求体最大为 32 MiB。
+
+## 安全性
+
+### 仅出站连接
+
+Connector 会通过 TLS 在端口 443 上向所在区域的 LangSmith API endpoint 发起出站 WebSocket 连接。你无需为 LangSmith 打开入站端口或更改防火墙规则，connector pod 也不暴露任何端口。
+
+### 认证与授权
+
+- **Connector**：Connector 使用具有连接 tunnel 权限的组织 API key 进行认证。仅当 tunnel 处于启用状态时，LangSmith 才会接受该 connector。
+- **每个请求**：LangSmith 会授权对 tunnel URL 的每个请求。调用方必须是代表 tunnel 组织中成员行事的 LangSmith 服务，或者必须出示该组织的 API key。Tunnel 必须处于启用状态。Tunnel URL 不是 secret，其本身不授予任何访问权限。
+
+### 你的网络暴露的内容
+
+- LangSmith 只向 connector 发送 target 名称。Connector 会在自己的配置中查找该名称，并拒绝其不拥有的名称，因此 LangSmith 只能访问你配置的 target。
+- Connector 不会连接到 cloud metadata 地址。
+- 对于 HTTP target，target 的 host 和 port 会与 LangSmith 共享，以便请求携带正确的 `Host` header。
+
+### Headers
+
+在请求到达你的服务之前，LangSmith 会移除自己的 credentials 和 identity header：`X-Service-Key`、`X-Api-Key`、`X-Tenant-Id`、`X-Organization-Id`、`X-User-Id`、`X-Data-Plane-Auth`、`Cookie`，以及任何以 `X-Langsmith-` 或 `X-Langchain-` 开头的 header。`Authorization` 会透传，因此使用 bearer token 进行认证的服务无需更改即可工作。
+
+如果你的服务使用自己的 `X-Api-Key` 或 `Cookie` header 进行认证，LangSmith 功能会将你配置的 header 传递给你的服务。与 LangSmith identity header 同名的 header（例如 `X-Tenant-Id`）永远不会到达你的服务。
+
+### 加密
+
+- LangSmith 与 connector 之间的流量在 TLS 加密的 WebSocket 连接内传输。
+- LangSmith 为 tunnel URL 终止 TLS，并在内存中处理每个请求，将其路由到你的 connector。
+- 在 connector 与你的服务之间，使用 `https://` target 来加密流量。Connector 会针对系统证书颁发机构验证服务的证书。要信任私有证书颁发机构，请在 connector 上设置 `SSL_CERT_FILE`。发往 `http://` target 的流量在你的网络内不会被加密。
+
+### 日志与数据存储
+
+LangSmith 不会记录通过 tunnel 发送的请求或响应体。对于失败的请求，LangSmith 会记录 tunnel、组织、target、状态和错误。LangSmith 只存储访问你的 connector 所需的路由信息。
+
+Connector 也不会记录请求或响应体。默认情况下，它只记录失败情况，例如无法访问的 target。在 debug 级别，它还会记录每个请求的 target、地址、持续时间和大小。
+
+### 撤销访问
+
+要阻止 LangSmith 访问你的服务，请在 **Settings** > **Tunnels** 中禁用或删除该 tunnel。此后，LangSmith 会拒绝对其 tunnel URL 的请求，并拒绝新的 connector 连接。你也可以停止 connector，或撤销其 API key。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/tunnels.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

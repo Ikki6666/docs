@@ -4,7 +4,7 @@ sidebarTitle: Code mode
 description: 使用 OpenWiki 为 coding agent 生成并维护仓库文档
 ---
 
-Code mode 会在 `openwiki/` 中构建一个仓库 wiki，包含架构、集成和工作流等持久细节。Coding agent 把该 wiki 用作上下文，因此可以更高效地在包中工作，减少重新探索和 token 消耗。人类可以阅读相同的 Markdown，但 agent 是主要受众。Agent 通过 OpenWiki 添加到 `AGENTS.md` 和 `CLAUDE.md` 中的指针发现该 wiki。
+Code mode 会在 `openwiki/` 中构建一个仓库 wiki，包含架构、集成和工作流等持久细节。Coding agent 把该 wiki 用作上下文，因此可以更高效地在包中工作，减少重新探索和 token 消耗。人类可以阅读相同的 Markdown，但 agent 是主要受众。Agent 通过 OpenWiki 在 `AGENTS.md` 中维护的指针发现该 wiki；当 `CLAUDE.md` 已存在时，还会通过该文件中的 `@AGENTS.md` import 发现。
 
 `openwiki`、`openwiki --init` 和 `openwiki --update` 以 code 模式运行。你也可以显式传入模式：
 
@@ -22,7 +22,21 @@ openwiki code --update --print
 openwiki --init --language ko
 ```
 
-你也可以在 Codex、Claude Code、OpenCode 或 Cursor 中运行 OpenWiki。请参见 [Coding-agent integrations](/oss/openwiki/integrations)。
+你也可以在 Codex、Claude Code、OpenCode、Cursor、IBM Bob、Kiro、Oh My Pi 或 Antigravity 中运行 OpenWiki。请参见 [Coding-agent integrations](/oss/openwiki/integrations)。
+
+## 并行页面 worker
+
+原生 CLI 的 init 和 update 运行可以并发编写多个页面。用以下方式设置并发数：
+
+```bash
+OPENWIKI_PAGE_CONCURRENCY=4 openwiki --update
+```
+
+并发数默认为 `1`，接受 `1` 到 `8` 的值。建议从 `2` 到 `4` 开始，并留意你的 provider 的速率限制。Coding-agent 集成保持宿主的顺序页面生命周期；该设置只控制原生 CLI worker。
+
+每个 worker 恰好负责一个页面，已完成的页面仍作为持久的恢复单元。quickstart 页面最后写入，因此它可以链接到它所路由的页面。当某个 worker 因 provider 速率限制失败时，本次运行的并发数会在其余运行中降低一；它正在编写的页面会被恢复，并在下一次 update 中被接手处理。
+
+Provider 重试次数默认为 `3`；当 `OPENWIKI_PAGE_CONCURRENCY` 大于 `1` 时为 `5`。可以通过 `OPENWIKI_PROVIDER_RETRY_ATTEMPTS`（正整数）覆盖。
 
 ## Code mode 会产出什么
 
@@ -33,7 +47,8 @@ openwiki --init --language ko
 - **`openwiki/.claims/`**：结构化的 Claim sidecar，让事实性页面与带版本的仓库证据保持一致
 - **`openwiki/.page-manifest.json`**：用于可恢复生成的每页进度和源 checkpoint
 - **`openwiki/.last-update.json`**：上次成功文档检查的元数据（包括 no-op 更新）
-- **`AGENTS.md` / `CLAUDE.md`**：OpenWiki 会插入或刷新一个 `<!-- OPENWIKI:START -->` … `<!-- OPENWIKI:END -->` block，告诉 coding agent 何时查阅 wiki。block 之外的现有内容不会被改动
+- **`AGENTS.md`**：缺失时创建，然后在 `<!-- OPENWIKI:START -->` … `<!-- OPENWIKI:END -->` block 内刷新，告诉 coding agent 何时查阅 wiki
+- **`CLAUDE.md`**：仅当该文件已存在时才刷新。托管的 block 会 import `@AGENTS.md`，因此 Claude Code 仍加载相同的指令。当 `CLAUDE.md` 不存在时，OpenWiki 不会创建它
 
 在活动运行期间，`openwiki/.run.json` 会 checkpoint 有序的页面队列。OpenWiki 会在成功完成后删除该文件。
 
@@ -42,6 +57,8 @@ openwiki --init --language ko
 OpenWiki 通过跟踪事实性页面背后的重要命题，而不仅仅是 Markdown 文件上次生成的时间，让 code wiki 具备自我纠正能力。Claims 涵盖未来 agent 依赖的事实：行为、职责、架构、数据流、不变量、失败语义、配置和安全边界。每个 Claim 都指向确切的仓库证据，例如 `repo://src/server.ts#L40-L82`，并带有 OpenWiki 建立 Claim 时观察到的证据版本。
 
 Markdown 保持整洁。结构化的 Claim state 位于 `openwiki/.claims/` 下。页面完成会持久化调和后的 Claims，将验证投影到 OKF front matter，并在将页面 job 标记为完成之前证明完整结果。Grounded Claims 适用于仓库 code wiki 和仓库证据。来自 connector 的事实（包括仅来自 LangSmith 的观察）不会作为 Claims 包含在内。
+
+Update 会以稀疏方式调和 Claims。页面 worker 只为需要处理的 Claims（确认、修订、新增或撤回）提交决策。未受影响的 Claims 保留其稳定标识符，不会让它们的陈述和证据在模型中往返一遍。由宿主驱动的运行会通过可选的 `openwiki_inspect_page_claims` MCP 工具公开当前页面的完整 Claims 集合。
 
 ## Markdown 输出
 
@@ -83,7 +100,7 @@ secrets/
 !logs/keep.log
 ```
 
-当 `.openwikiignore` 有生效的规则时，OpenWiki 会过滤文件系统发现并限制 shell 执行，让被忽略的路径远离本次运行。
+当 `.openwikiignore` 有生效的规则时，OpenWiki 会过滤文件系统发现并限制 shell 执行，让被忽略的路径远离本次运行。仓库 agent 使用受约束的文件系统工具，而不是任意的宿主 shell 命令或不受限制的仓库检查。
 
 <Note>
     这是一条读取边界：被忽略的路径永远不会被读取、扫描或在生成的文档中复现。它不保证某个主题永远不会被提及，因为 agent 仍可能从其他允许的证据（例如测试、README、commit message 或现有 wiki）推断出被忽略的区域。
@@ -114,6 +131,7 @@ openwiki "Update openwiki/INSTRUCTIONS.md to prioritize the public API and skip 
 ## See also
 
 - [Coding-agent integrations](/oss/openwiki/integrations)
+- [Search and link wikis](/oss/openwiki/search-and-link)
 - [Visualize your wiki](/oss/openwiki/visualize)
 - [Automate updates](/oss/openwiki/automate-updates)
 - [Customize OpenWiki](/oss/openwiki/customize)

@@ -20,8 +20,11 @@ description: 使用 LangChain Terraform modules 部署的 LangSmith self-hosted 
 # Full deployment health check + next-step guidance
 make status
 
-# Secret Manager validation
-make secrets    # → manage-secrets.sh validate
+# Check that all required secrets exist in Secret Manager
+./infra/scripts/manage-secrets.sh validate
+
+# Interactive Secret Manager tool (list, get, set, validate, delete)
+make secrets
 ```
 
 ## 已知问题
@@ -41,7 +44,7 @@ Error 403: ... has not been used in project <project-id> before or it is disable
 ```bash
 gcloud services enable cloudresourcemanager.googleapis.com --project <project-id>
 cd modules/gcp/infra
-terraform apply -var-file=terraform.tfvars
+terraform apply
 ```
 
 ### apply 后 GKE 集群 API server 不可访问
@@ -60,7 +63,7 @@ Error: Get "https://<cluster-endpoint>/api/v1/namespaces": dial tcp: connection 
 gcloud container clusters describe <cluster-name> \
   --region <region> --project <project-id> --format="value(status)"
 
-terraform apply -var-file=terraform.tfvars
+terraform apply
 ```
 
 ### GKE 节点未加入（NotReady）
@@ -97,11 +100,11 @@ gcloud sql instances describe <instance-name> --format="value(ipAddresses)"
 gcloud compute networks peerings list --network <vpc-name>
 ```
 
-如果缺少 peering，确认 `enable_private_service_connection = true` 并重新 apply：
+Terraform 在 `postgres_source = "external"`、`redis_source = "external"`、`enable_sandboxes = true`，或 SmithDB 创建自己的 metastore 时会创建私有服务连接。如果缺少 peering，确认 `terraform.tfvars` 中包含其中一项设置，然后重新 apply：
 
 ```bash
-terraform apply -var-file=terraform.tfvars -target=module.networking
-terraform apply -var-file=terraform.tfvars
+terraform apply -target=module.networking
+terraform apply
 ```
 
 ### Memorystore Redis 连接超时
@@ -130,9 +133,8 @@ kubectl run redis-test --rm -it --image=redis:7 -n langsmith -- \
 **修复**
 
 ```bash
-kubectl get svc -n envoy-gateway-system \
-  -l gateway.envoyproxy.io/owning-gateway-name=langsmith-gateway \
-  -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}'
+kubectl get gateway -n envoy-gateway-system \
+  -o jsonpath='{.items[0].status.addresses[0].value}'
 
 kubectl describe certificate <cert-name> -n langsmith
 kubectl get challenges -n langsmith
@@ -161,7 +163,7 @@ kubectl get serviceaccount langsmith-backend -n langsmith \
   -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}'
 ```
 
-GCP service account 必须拥有 bucket 上的 `roles/storage.objectAdmin`。如果 annotation 本身缺失，请采用下方 Workload Identity 一节的修复方法。对于 S3 兼容模式，在 Cloud Storage → Settings → Interoperability 下创建 HMAC key；其 service account 也需要 bucket 上的 `roles/storage.objectAdmin`。
+GCP service account 必须拥有 bucket 上的 `roles/storage.objectAdmin`。如果 annotation 本身缺失，请采用下方 Workload Identity 一节的修复方法。对于 S3 兼容模式，在 **Cloud Storage** > **Settings** > **Interoperability** 下创建 HMAC key；其 service account 也需要 bucket 上的 `roles/storage.objectAdmin`。
 
 ### Envoy Gateway webhook 阻塞 GKE 操作
 
@@ -197,7 +199,7 @@ kubectl rollout status deployment/envoy-gateway -n envoy-gateway-system
 **恢复：** 将你的 DNS A record 更新为新 IP：
 
 ```bash
-kubectl get gateway -n langsmith -o jsonpath='{.items[0].status.addresses[0].value}'
+kubectl get gateway -n envoy-gateway-system -o jsonpath='{.items[0].status.addresses[0].value}'
 
 gcloud dns record-sets update <your-domain>. \
   --type=A --ttl=300 \
@@ -214,7 +216,7 @@ gcloud dns record-sets update <your-domain>. \
 Error: googleapi: Error 409: The instance is protected from deletion.
 ```
 
-**原因：** `gke_deletion_protection = true`（默认）或 `postgres_deletion_protection = true` 阻止 Terraform 销毁资源。
+**原因：** `gke_deletion_protection`、`postgres_deletion_protection` 或 `smithdb_metastore_deletion_protection` 为 `true`。Cloud SQL 同时在 API 层面和 Terraform 中强制删除保护，因此修改 `terraform.tfvars` 在应用该变更之前不会生效。
 
 **修复**
 
@@ -222,12 +224,23 @@ Error: googleapi: Error 409: The instance is protected from deletion.
 # terraform.tfvars
 gke_deletion_protection      = false
 postgres_deletion_protection = false
+
+# Only when enable_smithdb = true and smithdb_metastore_source = "create"
+smithdb_metastore_deletion_protection = false
+smithdb_bucket_force_destroy          = true
 ```
 
 ```bash
-terraform apply -var-file=terraform.tfvars
-terraform destroy
+source infra/scripts/setup-env.sh
+
+terraform -chdir=infra apply \
+  -target=module.gke_cluster -target=module.cloudsql \
+  -target=module.smithdb -target=module.networking
+
+make destroy
 ```
+
+如果你从未启用 SmithDB，去掉 `module.smithdb` target。定向 apply 可以避免重新创建完整 `make apply` 会重建的集群内 add-on。
 
 ### Workload Identity 不生效（GCS 权限被拒绝）
 
@@ -264,9 +277,9 @@ make deploy
 
 ### `langsmith-ksa` 缺少 Workload Identity annotation
 
-**症状：** operator 拉起的 agent pods 无法启动或卡在 `Pending` 状态。日志显示权限错误，或 agent bootstrap job 挂起。
+**症状：** operator 拉起的 agent pods 无法启动或卡在 `Pending` 状态。日志显示权限错误。
 
-**原因：** `langsmith-ksa` 由 LangSmith operator（而非 Helm）创建，在 namespace 拆除或全新集群重建后不会保留。`deploy.sh` 会在部署后重新添加 annotation；如果上一次部署被中断，annotation 可能缺失。
+**原因：** Terraform 在 `k8s-bootstrap` module 中创建 `langsmith-ksa`，并且只在 `enable_gcp_iam_module = true` 时添加 annotation。`deploy.sh` 会在每次部署后重新应用该 annotation。如果 IAM module 关闭、namespace 被带外删除，或上一次部署被中断，annotation 就会缺失。
 
 **诊断**
 
@@ -276,6 +289,8 @@ kubectl get serviceaccount langsmith-ksa -n langsmith \
 ```
 
 **修复**
+
+如果 `enable_gcp_iam_module = false`，在 `terraform.tfvars` 中将其设置为 `true` 并运行 `make apply`。对于其他原因，重新运行部署或手动为 ServiceAccount 添加 annotation：
 
 ```bash
 # Re-run deploy; idempotently creates and annotates langsmith-ksa
@@ -288,6 +303,106 @@ kubectl create serviceaccount langsmith-ksa -n langsmith --dry-run=client -o yam
 kubectl annotate serviceaccount langsmith-ksa -n langsmith \
   iam.gke.io/gcp-service-account="$WI" --overwrite
 ```
+
+### Deploy 拒绝 chart 0.16 的 sandbox values
+
+**症状**
+
+```txt
+ERROR: values-overrides.yaml carries sandboxes.juicefs.csi, the chart 0.16 sandbox schema.
+```
+
+**原因：** `values-overrides.yaml` 是为 chart 0.16 生成的。Chart 0.17 没有 JuiceFS CSI driver，会忽略 `sandboxes.juicefs.csi` 块。
+
+**修复：** 运行 `make apply`，然后运行 `make init-values` 重新生成该文件，再运行 `make deploy`。
+
+### JuiceFS CSI 卷仍存在时 Deploy 拒绝执行
+
+**症状**
+
+```txt
+ERROR: namespace langsmith still mounts sandbox volumes through the chart 0.16 JuiceFS CSI driver.
+```
+
+**原因：** Chart 0.17 移除了 JuiceFS CSI driver。在 PersistentVolumeClaims 或挂载 pods 仍在使用它时升级，会让旧的 sandbox-host pods 卡在 `Terminating` 状态。
+
+**修复：** 在 driver 仍在运行时，运行错误信息打印的 `kubectl delete` 命令。等待 `kubectl get pods -n langsmith | grep juicefs` 只列出 `juicefs-csi-*` pods，然后再次运行 `make deploy`。运行中的 sandboxes 会停止。数据仍保留在对象存储和 Redis 中，chart 0.17 会挂载同一个 JuiceFS 卷。
+
+### Deploy 拒绝 chart 0.16 的 SmithDB overlay
+
+**症状**
+
+```txt
+ERROR: langsmith-values-smithdb.yaml has chart 0.16 SmithDB values that chart 0.17 rejects:
+```
+
+**原因：** `init-values.sh` 只复制一次 SmithDB overlay，因此 chart 0.16 的副本会留在 `helm/values/` 中。它设置了 `local-ssd-storage` 卷或 `smithdb.migration.deployment`，chart 0.17 已替换这些内容。
+
+**修复：** 保存你的副本，并从 0.17 示例重新开始：
+
+```bash
+cp helm/values/langsmith-values-smithdb.yaml helm/values/langsmith-values-smithdb-0.16.yaml
+cp helm/values/examples/langsmith-values-smithdb.yaml helm/values/langsmith-values-smithdb.yaml
+```
+
+只加回那些不设置 `nodeSelector`、`tolerations`、`volumes`、`volumeMounts` 或 `resources` 的修改。生成的 `langsmith-values-smithdb-sizing.yaml` 现在会设置这些内容。
+
+### `init-values.sh` 因缺少 SmithDB 输出而失败
+
+**症状**
+
+```txt
+ERROR: enable_smithdb = true but smithdb_helm_values or the resolved metastore TLS
+       outputs are missing. The state is older than this module. Run 'make apply'.
+```
+
+**原因：** Terraform state 早于添加了 SmithDB 规格和 metastore 输出的 chart 0.17 module。
+
+**修复：** 运行 `make apply`，然后运行 `make init-values`。
+
+### SmithDB 回填 Job 变更导致 Deploy 拒绝执行
+
+**症状**
+
+```txt
+ERROR: the existing <job-name> Job does not match what this deploy renders,
+       and a Job's pod template cannot be changed in place:
+```
+
+**原因：** chart 升级或规格变更会为回填 Job 渲染不同的 pod 模板，而 Kubernetes 不允许就地更改 Job 的 pod 模板。
+
+**修复：** 使用错误信息打印的命令删除该 Job，然后再次运行 `make deploy`。回填进度保存在任务数据库中，新 Job 会从上次进度继续，而不是重新开始。
+
+### JuiceFS format Job 失败
+
+**症状**
+
+```txt
+✗ The JuiceFS format Job for release langsmith failed (<reason>).
+```
+
+**原因：** `juicefs-format` Job 通过 `langsmith-sandbox-host` Workload Identity 绑定格式化 GCS bucket 中的 sandbox 卷。当原因为 `DeadlineExceeded` 时，Job 未能在 300 秒内完成，通常是因为 pod 无法调度或镜像拉取缓慢。对于其他原因，通常是绑定缺失或已过期。
+
+**修复：**
+
+1. 找出原因。对于 `DeadlineExceeded`，查找 `FailedScheduling` 事件或缓慢的镜像拉取：
+
+    ```bash
+    kubectl describe job -n langsmith -l app.kubernetes.io/component=juicefs-format
+    ```
+
+    对于其他原因，读取 Job 日志，然后运行 `make apply` 恢复 Workload Identity 绑定：
+
+    ```bash
+    kubectl logs -n langsmith -l app.kubernetes.io/component=juicefs-format
+    ```
+
+1. 删除失败的 Job 并重新部署。Helm 在清单未更改时不会重新运行失败的 Job，因此必须先删除 Job：
+
+    ```bash
+    kubectl delete job -n langsmith -l app.kubernetes.io/component=juicefs-format
+    make deploy
+    ```
 
 ### Helm release 卡在 `pending-upgrade`
 
@@ -327,11 +442,13 @@ gcloud projects add-iam-policy-binding <project-id> \
   --role="roles/secretmanager.admin"
 ```
 
+升级到 `main` 或 `v0.17.x` tag 之后，你添加的、以 LangSmith service account 身份读取 Secret Manager 的工作负载会失去访问权限，因为项目级 `roles/secretmanager.secretAccessor` 授权现在改为可选加入（opt-in）。请对具体的 secrets 授予访问权限，或设置 `grant_project_secret_accessor = true` 并运行 `make apply`。
+
 ### `langsmith-postgres-credentials` 或 `langsmith-redis-credentials` Secret 缺失
 
 **症状：** 部署后 pods 立即因数据库连接错误崩溃，或 `kubectl get secrets -n langsmith` 中未列出 `langsmith-postgres-credentials` / `langsmith-redis-credentials`。
 
-**原因：** 这些 Secrets 由 `k8s-bootstrap` module 创建。如果未运行 `terraform apply`、apply 中途失败，或 namespace 被带外删除，它们就会缺失。
+**原因：** 当 `postgres_source` 或 `redis_source` 为 `external` 时，这些 Secrets 由 `k8s-bootstrap` module 创建。如果未运行 `terraform apply`、apply 中途失败，或 namespace 被带外删除，它们就会缺失。
 
 **修复**
 
@@ -375,7 +492,7 @@ kubectl get clusterissuer
 ### Gateway 与 load balancer
 
 ```bash
-kubectl get gateway -n langsmith
+kubectl get gateway -n envoy-gateway-system
 kubectl get httproute -n langsmith
 kubectl get svc -n envoy-gateway-system -o wide
 kubectl get pods -n envoy-gateway-system
@@ -428,7 +545,7 @@ gcloud secrets versions access latest \
   --secret=langsmith-<prefix>-<env>-postgres-password \
   --project <project-id>
 
-make secrets
+./infra/scripts/manage-secrets.sh validate
 ```
 
 ### 快速健康检查
@@ -438,7 +555,7 @@ echo "=== Context ===" && kubectl config current-context
 echo "=== Nodes ===" && kubectl get nodes
 echo "=== Pods ===" && kubectl get pods -n langsmith
 echo "=== Certificate ===" && kubectl get certificate -n langsmith
-echo "=== Gateway ===" && kubectl get gateway -n langsmith
+echo "=== Gateway ===" && kubectl get gateway -n envoy-gateway-system
 echo "=== Secrets ===" && kubectl get secrets -n langsmith | grep -E "langsmith-postgres-credentials|langsmith-redis-credentials"
 echo "=== Helm ===" && helm status langsmith -n langsmith 2>/dev/null | grep -E "STATUS|LAST DEPLOYED"
 ```

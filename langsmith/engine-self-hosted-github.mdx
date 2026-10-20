@@ -1,0 +1,418 @@
+---
+title: 为自托管和 BYOC 上的 Engine 配置 GitHub
+sidebarTitle: GitHub 配置
+description: 注册 GitHub App 并配置自托管 LangSmith 或 BYOC 数据平面，使 LangSmith Engine 能够在 GitHub.com、支持数据驻留的 Enterprise Cloud 或 Enterprise Server 上读取仓库并打开 pull request。
+---
+
+[LangSmith Engine](/langsmith/engine) 通过你注册的 GitHub App 读取仓库并打开 pull request。每个 LangSmith 安装或 BYOC 数据平面完成一次此设置。之后，workspace 用户使用该 App [连接仓库](/langsmith/engine-repositories#connect-repositories)。
+
+- **BYOC**：由组织管理员在 LangSmith UI 中保存该 App 的凭据。请参阅[在 BYOC 上配置该 App](#configure-the-app-on-byoc)。
+- **自托管**：由运维人员在 Helm values 中配置该 App 的凭据。请参阅[在自托管上配置该 App](#configure-the-app-on-self-hosted)。
+
+此配置与 LangSmith Deployments 构建和 preview 的 GitHub 设置相互独立。
+
+<a id="byoc"></a>
+
+## 在 BYOC 上配置该 App
+
+在 [BYOC](/langsmith/byoc) 数据平面上，你注册自己的 GitHub App，并在 LangSmith UI 中从 Engine 项目保存其凭据。你无需设置环境变量或 Helm values。每个数据平面完成一次此设置：该数据平面上的所有 workspace 共享此 App。
+
+配置该 App 需要拥有该数据平面的组织中的 `organization:manage` 权限。其他用户会看到 **An installation administrator must configure the GitHub App.**
+
+要配置该 App：
+
+<Steps>
+  <Step title="打开 GitHub App 设置">
+    打开一个 tracing 项目或 agent environment。在其 **Engine** 标签页中选择 **Configure Engine**。在 **Code repository** 下会出现 **GitHub is not configured** 提示。点击 **Configure GitHub App**。
+
+    你也可以在首次为项目设置 Engine 时配置该 App。
+  </Step>
+  <Step title="在 GitHub 上注册该 App">
+    在 **Set up Engine GitHub App** 对话框中，点击 **Create App on GitHub**。该对话框列出了你的数据平面的 **Homepage URL**、**Redirect URI** 和 **Webhook URL**。将这些值复制到 GitHub 注册表单中。
+
+    按照[完成注册表单](#complete-the-registration-form)中的说明配置其余设置、权限和事件订阅。使用对话框中的 URL，而不是自托管示例。要选择 App 的所有者和可见性，请参阅[选择 App 的所有者](#choose-who-owns-the-app)。
+  </Step>
+  <Step title="生成 App 凭据">
+    在 GitHub 上该 App 的设置中，生成 client secret 和 private key。使用你在注册时输入的 webhook secret。详细信息请参阅[保存 App 的值](#save-the-app-values)。在 BYOC 上不需要 OAuth state secret。
+  </Step>
+  <Step title="在 LangSmith 中保存凭据">
+    在对话框中输入：
+
+    - **App ID**：数字形式的 App ID，而不是 Client ID 或安装 ID。
+    - **GitHub App Name**：App 公开 URL 中的名称，例如 `my-engine-app`。
+    - **Client ID**：该 App 的 Client ID。
+    - **Client secret**：你生成的 client secret。
+    - **Private key (PEM)**：下载的 PEM 文件的完整内容，包括换行符。
+    - **Webhook secret**：与你在 GitHub 中输入的相同的 webhook secret。
+
+    点击 **Save configuration**。LangSmith 会加密存储这些 secret，并且不会再次显示它们。
+  </Step>
+  <Step title="连接仓库">
+    [连接仓库](/langsmith/engine-repositories#connect-repositories)并[验证连接](/langsmith/engine-repositories#verify-the-connection)。测试期间，请确认 GitHub 可以投递 webhook，如[验证 webhook 投递](#verify-webhook-delivery)中所述。
+  </Step>
+</Steps>
+
+GitHub 会将 pull request webhook 发送到你数据平面上的 **Webhook URL**。如果 GitHub 无法访问该 URL，Engine 仍然可以读取代码、生成修复方案并打开 pull request。PR 关联和合并后自动完成 issue 将无法工作。
+
+稍后要更改该 App，请点击 **Manage GitHub App**，然后点击 **Edit or replace App**。要移除它，请点击 **Delete configuration**。更换该 App 需要重新连接仓库。关于轮换指南，请参阅[更改或轮换配置](#change-or-rotate-configuration)。
+
+{/* TODO: confirm how BYOC customers use GitHub Enterprise Server or ghe.com. The UI has no GitHub URL field; the instance URL comes from ENGINE_GITHUB_WEB_BASE_URL, which LangChain sets on the data plane. */}
+
+<a id="self-hosted"></a>
+
+## 在自托管上配置该 App
+
+在自托管 LangSmith 上，由运维人员注册该 App、配置 LangSmith 并验证连接。
+
+<Note>
+为自托管上的 Engine 配置 GitHub 需要 LangSmith Helm chart `0.17.2` 或更高版本。更早的 chart 仅在启用 LangSmith Deployment（`config.deployment.enabled`）时才暴露 GitHub 授权和 webhook 使用的 `/api-host` 路由。
+</Note>
+
+使用你的 Helm chart release 随附的 LangSmith 应用镜像。
+
+### 开始之前
+
+你需要：
+
+- **Engine 和 Sandboxes**：一个可正常工作的[自托管 Engine 部署](/langsmith/engine-self-hosted)，以及更新其 Helm values、secrets 和工作负载的权限。
+- **GitHub 管理权限**：在目标仓库上注册和安装 App 的权限。企业或组织政策可能要求审批。
+- **网络访问**：浏览器、服务和 sandbox 连通性，以及一条可从 GitHub 访问的 webhook 路由。请参阅[允许网络访问](#allow-network-access)。
+
+### 选择你的 GitHub 环境
+
+每个 LangSmith 安装配置一个 GitHub 实例和一个 App。
+
+将 `ENGINE_GITHUB_WEB_BASE_URL` 设置为你的 GitHub 实例的 Web 地址：
+
+| GitHub 环境 | Web 地址示例 |
+| --- | --- |
+| GitHub.com，包括 Enterprise Cloud | `https://github.com` |
+| 支持数据驻留的 Enterprise Cloud | `https://example.ghe.com` |
+| GitHub Enterprise Server (GHES) | `https://<ghes-hostname>` |
+
+将示例企业地址或 GHES 主机名占位符替换为你自己的。GHES 在云基础设施和本地部署上使用相同的配置。
+
+使用端口 443 上的 HTTPS 和完全限定主机名，不要包含 `/api/v3` 之类的路径或组织名称。LangSmith 会自动确定 API endpoint。不支持 SSH Git URL 和自定义 GitHub 端口。
+
+#### 允许网络访问
+
+{/* Diagram: link to the shared self-hosted Engine architecture diagram when it includes GitHub. Show browser authorization and callback, LangSmith services calling the GitHub API, sandbox hosts cloning and pushing over HTTPS, and GitHub sending pull-request webhooks to LangSmith. Keep GitHub separate from the model-provider path. If the shared diagram is not added, retain the table below as the complete network reference. */}
+
+所有连接均使用 HTTPS。请为每个来源配置 DNS、路由和证书信任：
+
+| 来源 | 目标 | 用途 |
+| --- | --- | --- |
+| 用户的浏览器 | GitHub Web 主机和 LangSmith 授权回调 URL | 登录、App 授权和安装。 |
+| LangSmith 服务和 Engine workers | GitHub Web 和 API 主机 | 授权、仓库信息、分支和 diff 操作、PR 创建/状态，以及 App 身份。 |
+| Sandbox 主机 | GitHub Web 主机 | 克隆仓库并推送 fix 分支。 |
+| GitHub | LangSmith webhook URL | 将 PR 关联到 issue，并在合并后完成 issue。 |
+
+关于 API 访问，请为你的 GitHub 环境放行相应主机：
+
+- **GitHub.com**：`api.github.com`。
+- **支持数据驻留的 Enterprise Cloud**：Web 地址为 `https://example.ghe.com` 时为 `api.example.ghe.com`。
+- **GHES**：与 Web 地址相同的主机，`<ghes-hostname>`。
+
+GitHub.com 和 `ghe.com` 从你的网络外部发送 webhook；GHES 从你的 GHES 环境发送 webhook。该 webhook URL 必须可以从对应来源访问。通过 VPN 进行的浏览器访问无法建立 webhook 访问。
+
+关于 GitHub IP allow list，请包含 LangSmith 服务和 sandbox 主机的出站地址，包括任何 NAT 网关地址。
+
+Sandbox Git 流量需要到 GitHub 的直接路由。不支持强制的上游 HTTP/HTTPS 正向代理；LangSmith API pods 上的 `HTTPS_PROXY` 不会配置 sandbox Git 访问。
+
+对于私有 IP 地址或私有 CA，请在下方配置 LangSmith 时包含[私有 GHES 设置](#private-ghes-deployments)。
+
+<a id="create-a-github-app"></a>
+
+### 注册 GitHub App
+
+在托管你的仓库的 GitHub 实例上注册该 App。在 GitHub.com 上注册的 App 不能在 GHES 或 `ghe.com` 企业上复用。
+
+对于 `ghe.com`，请通过你企业的身份提供方登录。在整个注册和安装过程中使用该站点；你个人的 GitHub.com 账户及其 App 是相互独立的。
+
+#### 选择 App 的所有者
+
+App 的**所有者**（owner）管理其注册和凭据。**安装（installation）**会授予对组织或账户中所选仓库的访问权限。
+
+请根据 Engine 需要的仓库选择所有权和可见性：
+
+| 要连接的仓库 | App 配置 |
+| --- | --- |
+| 一个组织中的仓库 | 在该组织中创建 App。如果它不需要在其他地方安装，选择 **Only on this account**。 |
+| 企业内多个组织中的仓库 | 创建一个企业拥有的 App，并将其安装到每个组织。这会将安装限制在企业内。 |
+| 多个组织中的仓库，或组织与个人账户的混合，且没有 managed users | 创建一个 **Any account** 的组织拥有的 App，然后将其安装到每个目标账户。在 GHES 上，**Any account** 仅在该服务器内适用。 |
+| 由一个个人账户拥有的仓库，且没有 managed users | 在该个人账户中创建 App 并选择 **Only on this account**。 |
+
+公开可见性允许其他账户安装该 App。它不会将仓库设为公开，也不会在没有安装的情况下授予访问权限。
+
+企业拥有的 App 具有内部可见性，不能安装到个人账户。请安装到每个组织；企业账户的安装不会授予仓库访问权限。
+
+<Accordion title="企业可见性与 managed users" id="enterprise-managed-users">
+  只有企业成员才能授权企业拥有的 App。如果外部协作者需要连接仓库，请在选择该所有权类型之前审查他们的企业访问权限。请参阅 GitHub 的 [App visibility rules](https://docs.github.com/en/enterprise-cloud@latest/apps/creating-github-apps/registering-a-github-app/making-a-github-app-public-or-private) 或 [GHES equivalent](https://docs.github.com/en/enterprise-server@3.20/apps/creating-github-apps/registering-a-github-app/making-a-github-app-public-or-private)，并选择你服务器的文档版本。
+
+  [GitHub Enterprise Cloud with data residency](https://docs.github.com/en/enterprise-cloud@latest/admin/data-residency/about-github-enterprise-cloud-with-data-residency) 使用 Enterprise Managed Users (EMU)。GitHub.com 上的 Enterprise Cloud 也可以使用 EMU；仅 SSO 并不意味着该企业使用 EMU。
+
+  对于 EMU，请连接组织拥有的仓库。managed user 可以注册 App，但此 Engine App 不能安装到 managed user 的个人账户。请参阅 GitHub 的 [managed-user restrictions](https://docs.github.com/en/enterprise-cloud@latest/admin/managing-iam/understanding-iam-for-enterprises/abilities-and-restrictions-of-managed-user-accounts#github-apps)。
+
+  在 EMU 企业中，GitHub 可能显示 **This enterprise** 而不是 **Any account**。**Only on this account** 会将组织拥有的 App 限制在该组织内。每个目标组织都需要自己的安装。
+
+  组织所有者可以安装该 App。在 EMU 企业中，仓库管理员只有在该 App 不请求组织权限且企业政策允许安装时才能安装它。
+
+  {/* Screenshot: show the organization-owned App visibility choices on an EMU enterprise, including "Only on this account" and "This enterprise" if offered. Use a test organization and crop out personal account details. This image should illustrate the choice, not replace the visibility table. */}
+</Accordion>
+
+#### 打开注册表单
+
+选择拥有该 App 的账户对应的标签页。以下路径适用于上文选择的 GitHub 实例：
+
+<Tabs>
+  <Tab title="组织">
+    你必须是组织所有者，或拥有管理其 App 的权限。
+
+    要打开注册表单：
+
+    1. 打开你的个人资料菜单，选择 **Your organizations**。
+    2. 在应拥有该 App 的组织旁边，选择 **Settings**。
+    3. 打开 **Developer settings** > **GitHub Apps** > **New GitHub App**。
+  </Tab>
+  <Tab title="企业">
+    企业所有者完成这些步骤。在 GHES 上，企业拥有的 App 需要 3.17 或更高版本。在更早的版本上，请使用具有仓库所需可见性的组织拥有的 App。
+
+    要打开注册表单：
+
+    1. 打开你的个人资料菜单。使用 managed users 时，选择 **Your enterprise**。使用个人账户时，选择 **Your enterprises**，然后打开该企业的 **Settings**。
+    2. 在企业侧边栏的 **Settings** 下，选择 **GitHub Apps**。
+    3. 选择 **New GitHub App**。
+
+    关于 GitHub 的说明，请参阅 [Create an App for your enterprise](https://docs.github.com/en/enterprise-cloud@latest/admin/managing-github-apps-for-your-enterprise/creating-github-apps-for-your-enterprise)。
+
+    {/* Screenshot: show Enterprise settings > GitHub Apps and the New GitHub App action on GHEC with data residency. If GHES navigation differs, add a second image labeled with its GHES version. Use test account names; omit account identifiers and credentials. */}
+  </Tab>
+  <Tab title="个人账户">
+    对于没有 managed users 的个人账户，请使用此选项。
+
+    打开你的个人资料菜单，选择 **Settings** > **Developer settings** > **GitHub Apps** > **New GitHub App**。
+  </Tab>
+</Tabs>
+
+#### 完成注册表单
+
+所有 GitHub 环境和 App 所有者都使用这些设置。关于字段定义，请参阅 [Register a GitHub App](https://docs.github.com/en/enterprise-cloud@latest/apps/creating-github-apps/registering-a-github-app/registering-a-github-app)。将 `https://langsmith.example.com` 替换为你的 LangSmith 部署面向浏览器的 URL。
+
+GitHub 将授权回调字段标注为 **Callback URL** 或 **Redirect URI**。两个名称都指 GitHub 在授权后返回用户的 URL。
+
+如果 LangSmith 使用 base path，请将其包含在内。例如，部署在 `https://langsmith.example.com/langsmith` 的部署使用 `https://langsmith.example.com/langsmith/api-host/v1/integrations/forge/github/callback` 作为其授权回调 URL。
+
+| GitHub 设置 | 值 |
+| --- | --- |
+| **GitHub App name** | 你的部署的唯一名称，例如 `acme-langsmith-engine`。 |
+| **Homepage URL** | 你的 LangSmith URL，例如 `https://langsmith.example.com`。 |
+| **Callback URL** / **Redirect URI** | `https://langsmith.example.com/api-host/v1/integrations/forge/github/callback` |
+| **Allow wildcard matching** | 如显示该选项，保持禁用。 |
+| **Request user authorization (OAuth) during installation** | 启用。Engine 需要授权回调来完成安装的连接。 |
+| **Expire user authorization tokens** | 如显示该选项，保持启用。 |
+| **Enable Device Flow** | 保持禁用。 |
+| **Setup URL** | 保持未设置。当安装期间的 OAuth 启用时，GitHub 会使用授权回调 URL，并可能禁用此字段。 |
+| **Redirect on update** | 启用。用户更新安装后将其返回 LangSmith。 |
+| **Webhook: Active** | 启用。 |
+| **Webhook URL** | `https://langsmith.example.com/api-host/v1/integrations/forge/github/webhook` |
+| **Webhook secret** | 单独生成的随机 secret，也在 LangSmith 中配置。 |
+| **SSL verification** | 启用。 |
+| **Where can this GitHub App be installed?** | 在[选择 App 的所有者](#choose-who-owns-the-app)中选择的可见性。企业拥有的 App 不显示此字段。 |
+
+对于已有的 App，请在 **Optional Features** > **User-to-server token expiration** 下管理 token 过期。请参阅 [GitHub 的 token 过期设置](https://docs.github.com/en/enterprise-cloud@latest/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens#configuring-your-app-to-use-user-access-tokens-that-expire)。
+
+{/* Screenshot: show the authorization callback field labeled "Redirect URI" on GHEC or "Callback URL" on GHES, with "Request user authorization (OAuth) during installation" enabled. If shown, include "Allow wildcard matching" disabled and Setup URL unavailable. Use https://langsmith.example.com for the URL. Exclude client secrets, private keys, and webhook-secret values. */}
+
+使用加密安全的生成器或你的 secret manager 生成 webhook secret，至少使用 32 个随机字节。保存它供 LangSmith 配置使用。
+
+在 **Permissions** > **Repository permissions** 下，配置：
+
+| 权限 | 访问级别 | 用途 |
+| --- | --- | --- |
+| **Contents** | Read and write | 读取代码并推送 Engine 的 fix 分支。 |
+| **Pull requests** | Read and write | 创建 draft PR 并读取其状态。 |
+| **Metadata** | Read-only, selected automatically | 识别仓库。 |
+
+保持组织、账户和企业权限为未设置。Engine 的标准调查和修复工作流不需要 administration、workflow 或 Checks 权限。
+
+在 **Subscribe to events** 下，选择 **Pull request**。这些事件让 Engine 可以关联包含 Engine issue 引用的外部创建的 PR，并在合并后标记 issue 完成。
+
+{/* Screenshot: show Contents and Pull requests set to Read and write, Metadata set to Read-only, and the Pull request event selected. Crop to these settings; do not include any credentials. */}
+
+选择 **Create GitHub App**。
+
+#### 保存 App 的值
+
+创建 App 之后，打开其设置并准备凭据：
+
+1. 在 **Client secrets** 下，选择 **Generate a new client secret** 并立即保存。
+2. 在 **Private keys** 下，选择 **Generate a private key**。保留下载的 PEM 文件；LangSmith 需要其完整内容，包括换行符。
+3. 使用你的 secret manager 或加密安全生成器生成一个至少 32 个随机字节的独立 **OAuth state secret**。只在 LangSmith 中使用它；不要将其输入 GitHub，也不要复用 webhook secret。
+
+配置 LangSmith 时使用以下映射：
+
+| 值 | LangSmith 环境变量 |
+| --- | --- |
+| GitHub 实例的 Web 地址 | `ENGINE_GITHUB_WEB_BASE_URL` |
+| **App ID**（数字） | `ENGINE_GITHUB_APP_ID` |
+| **Public link**（完整 URL） | `ENGINE_GITHUB_APP_PUBLIC_LINK` |
+| **Client ID** | `ENGINE_GITHUB_APP_CLIENT_ID` |
+| **Client secret** | `ENGINE_GITHUB_APP_CLIENT_SECRET` |
+| **Private key**（PEM 内容） | `ENGINE_GITHUB_APP_PRIVATE_KEY` |
+| **Callback URL** / **Redirect URI** | `ENGINE_GITHUB_OAUTH_REDIRECT_URI` |
+| **Webhook secret** | `ENGINE_GITHUB_APP_WEBHOOK_SECRET` |
+| **OAuth state secret** | `ENGINE_GITHUB_OAUTH_STATE_SECRET` |
+
+复制数字 **App ID**，而不是 Client ID 或安装 ID。原样复制 **Public link**，包括其完整路径；不要使用 developer settings URL 或以 `/installations/new` 结尾的安装 URL。
+
+使用在 GitHub 中输入的确切授权回调 URL 和 webhook secret。在回调 URL 中包含任何 LangSmith base path。GitHub Web 地址是在[选择你的 GitHub 环境](#choose-your-github-environment)中选择的那个。
+
+### 配置 LangSmith
+
+#### 存储凭据
+
+使用你[现有的 secret 管理工作流](/langsmith/self-host-using-an-existing-secret)，在 LangSmith namespace 中为 Client secret、private key、webhook secret 和 OAuth state secret 创建一个 Kubernetes Secret。Helm 示例引用了一个名为 `langsmith-engine-github` 的 Secret。你可以选择不同的 Secret 名称和 key；更新 `secretKeyRef` 条目以保持一致。
+
+将凭据存储在 Secrets 中，而不是提交到版本控制的 Helm values 或命令行参数中。App ID、Client ID 和 URL 可以包含在 Helm values 中。
+
+<a id="enable-the-github-integration-routes"></a>
+
+#### 设置 Helm values
+
+启用 `hostBackend`，并将所有 `ENGINE_GITHUB_*` 设置放入 `commonEnv`。将以下内容与你的现有 Helm values 合并，保留无关条目。替换占位符和示例 URL：
+
+```yaml
+commonEnv:
+  - name: ENGINE_GITHUB_WEB_BASE_URL
+    value: "https://<ghes-hostname>"
+  - name: ENGINE_GITHUB_APP_ID
+    value: "<app-id>"
+  - name: ENGINE_GITHUB_APP_PUBLIC_LINK
+    value: "<public-link-copied-from-github>"
+  - name: ENGINE_GITHUB_APP_CLIENT_ID
+    value: "<client-id>"
+  - name: ENGINE_GITHUB_OAUTH_REDIRECT_URI
+    value: "https://langsmith.example.com/api-host/v1/integrations/forge/github/callback"
+  - name: ENGINE_GITHUB_APP_CLIENT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: langsmith-engine-github
+        key: client_secret
+  - name: ENGINE_GITHUB_APP_PRIVATE_KEY
+    valueFrom:
+      secretKeyRef:
+        name: langsmith-engine-github
+        key: private_key
+  - name: ENGINE_GITHUB_OAUTH_STATE_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: langsmith-engine-github
+        key: oauth_state_secret
+  - name: ENGINE_GITHUB_APP_WEBHOOK_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: langsmith-engine-github
+        key: webhook_secret
+
+hostBackend:
+  enabled: true
+```
+
+从组件特定的 `extraEnv` 列表中移除这些变量，包括 `hostBackend.deployment.extraEnv`，以避免重复定义。共享配置会向 API 和后台工作负载提供相同的值。
+
+chart 的 `config.hostname`、使用的 `config.frontendHostname`，以及 `config.basePath` 也必须描述用户在浏览器中打开的 URL。
+
+#### 私有 GHES 部署
+
+如果 GHES 使用私有 IP 地址或私有 CA，请在应用 values 文件之前包含下面适用的设置。
+
+<a id="ghes-on-a-private-network"></a>
+
+**私有网络上的 GHES**
+
+对于解析为私有 IP 地址的 GHES 主机名，请配置从 LangSmith 和 sandbox 主机出发的私有 DNS 和网络路由。同时通过列出的 Helm values 设置以下环境变量：
+
+| Helm 环境变量列表 | 变量 | 值 |
+| --- | --- | --- |
+| `platformBackend.deployment.extraEnv` | `SSRF_ALLOW_PRIVATE_IPS_ENGINE` | `"true"` |
+| `ingestQueue.deployment.extraEnv` | `SSRF_ALLOW_PRIVATE_IPS_ENGINE` | `"true"` |
+| `sandboxes.sandboxHost.deployment.extraEnv` | `SSRF_ALLOW_PRIVATE_IPS_EGRESS` | `"true"` |
+
+这些设置允许相应组件访问私有地址；它们不会创建 DNS 记录或网络路由。它们影响的范围不止这个 GitHub 主机名。请为你的部署实际需要的目标保留网络限制，并保持对 metadata、loopback 和 Kubernetes 内部地址的保护处于启用状态。
+
+<a id="ghes-with-a-private-certificate-authority"></a>
+
+**使用私有证书颁发机构的 GHES**
+
+LangSmith 服务和 sandbox 主机必须信任签署你的 GHES 证书的 CA。只在浏览器中或在 sandbox 内部配置信任是不够的。
+
+按照[挂载内部 CA 以进行 TLS](/langsmith/self-host-custom-tls-certificates#mount-internal-cas-for-tls) 配置 `config.customCa.secretName` 和 `config.customCa.secretKey`。在 bundle 中包含你的私有 CA，以及其他出站连接所需的任何公共根证书。
+
+同时在 `hostBackend.deployment.extraEnv` 中将 `REQUESTS_CA_BUNDLE` 设置为 `/etc/ssl/certs/custom-ca-certificates.crt`，即 chart 挂载该 bundle 的路径。除了 chart 的 TLS 配置之外，GitHub 集成还需要此设置。
+
+检查 bundle 是否到达 GitHub 集成、平台 API 和 workers、Engine 执行 workers，以及 sandbox 主机。保持 TLS 验证启用。sandbox proxy 自己的 CA 与用于验证 GHES 的 CA 相互独立。
+
+#### 应用配置
+
+使用匹配的 LangSmith 镜像和 chart release，通过你正常的部署流程应用完整的 values 文件。关于 Helm 升级，请参阅[升级自托管部署](/langsmith/self-host-upgrades)。
+
+在连接仓库之前，等待受影响的 API 和 worker rollout 完成。就地更新 Secret 不会重新加载运行中容器里的环境变量；在凭据更改后重启受影响的工作负载。
+
+<a id="verify-the-integration"></a>
+
+### 验证 webhook 投递
+
+rollout 完成后，[连接一个测试仓库并验证连接](/langsmith/engine-repositories#verify-the-connection)。在创建和合并测试 PR 的过程中，检查该 App 的 webhook 投递：
+
+1. 在 GitHub App 的设置中，打开 **Advanced** > **Recent deliveries**。
+2. 确认 **pull_request** 投递成功到达 LangSmith。LangSmith 在接受有效的签名投递时返回 HTTP 202。
+
+仅凭成功的 webhook 响应并不能证明该事件匹配了某个 Engine issue。请完成[验证连接](/langsmith/engine-repositories#verify-the-connection)中的合并检查。
+
+### 排查设置问题
+
+| 症状 | 检查什么 |
+| --- | --- |
+| **GitHub is not configured** | 确认 App ID、Client ID、Client secret、private key、state secret 和该 App 的 public link 已设置。检查 GitHub URL 格式并完成 rollout。此提示用于标识缺失的配置；它不会测试凭据是否有效。 |
+| 授权后 GitHub 暂时不可用 | 确认 Client secret 和 private key 属于已配置的 App ID 和 Client ID。检查 GitHub 连通性和证书信任，然后重新开始 **Connect GitHub**。 |
+| GitHub 授权在错误的实例上打开 | 检查共享配置中的 `ENGINE_GITHUB_WEB_BASE_URL`，并移除冲突的组件覆盖。 |
+| 回调返回 HTML 或 404 | 检查 `/api-host` 路由、LangSmith base path 和确切的授权回调 URL。 |
+| 安装未返回 LangSmith | 启用 **Request user authorization (OAuth) during installation**。检查确切的授权回调 URL，并确认 Client ID 和 Client secret 属于此 App。然后在 LangSmith 中重新开始 **Connect GitHub**。 |
+| 仓库出现，但克隆或推送失败 | 检查 sandbox 主机的 DNS、路由、私有 IP 设置、证书信任，以及 GitHub IP/push 政策。 |
+| 推送成功后 PR 创建失败 | 检查 **Pull requests: Read and write**、draft PR 可用性和所选的基础分支。 |
+| 合并未完成 issue | 检查 **Pull request** 事件订阅、webhook 可达性、匹配的 webhook secret 和 **Recent deliveries**。修正原因后重新投递失败的事件。 |
+
+如果 GitHub 无法投递 webhook，仓库读取、修复方案和 PR 创建仍然可以工作。由 webhook 驱动的 PR 关联和合并后自动完成 issue 则无法工作。从 GitHub 的 App 设置恢复投递并重新投递错失的事件。
+
+对于使用外部 coding assistant 创建的 PR，请在 PR 描述中保留来自 **Copy Fix Context** 的 issue 引用。该引用让 Engine 可以将 PR 关联到 issue。
+
+关于缺失的组织或仓库，请参阅[排查仓库选择问题](/langsmith/engine-repositories#troubleshoot-repository-selection)。
+
+寻求帮助时，请提供你的 LangSmith 和 Helm chart 版本、GitHub 环境和 GHES 版本（如适用）、App 所有权类型，以及失败的步骤。不要提供 private key、client secret、webhook secret 或访问 token。
+
+### 更改或轮换配置
+
+轮换 private key 时，请在 GitHub 中添加新 key，更新 deployment Secret，并重启受影响的工作负载。在移除旧 key 之前验证连接。在 GitHub 支持多个 client secret 的情况下，遵循相同的重叠方法。
+
+轮换 webhook secret 时，请协调 GitHub 和 LangSmith 两边的值。不匹配期间的投递会未通过签名验证。在两边都使用新 secret 之后，查看 **Recent deliveries** 并重新投递失败的事件。
+
+更换 App 需要安装替换的 App 并重新连接受影响的 LangSmith workspace。在仓库访问恢复之前，请为中断做好规划。转移 App 所有权也可能改变它可以安装的位置及其 public link；在做出更改之前，请审查 GitHub 的转移行为。
+
+不要在已连接的现有部署上把更改 `ENGINE_GITHUB_WEB_BASE_URL` 当作迁移流程。更改 URL 不会迁移仓库连接或现有的 PR 引用。在切换 GitHub 实例之前，请与 LangChain 支持团队规划迁移。
+
+## 另请参阅
+
+- [将 Engine 连接到你的仓库](/langsmith/engine-repositories)：GitHub App 配置完成后连接仓库。
+- [自托管和 BYOC 上的 Engine](/langsmith/engine-self-hosted)：安装 Engine 并选择它运行模型的方式。
+- [Engine security](/langsmith/engine-security)：Engine 如何处理你的数据和仓库访问。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/engine-self-hosted-github.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

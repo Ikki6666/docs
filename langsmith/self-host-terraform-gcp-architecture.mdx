@@ -11,7 +11,7 @@ description: LangSmith self-hosted 在 GKE 上的平台分层、服务、Workloa
 - 平台分层与部署档位（light 与 production）。
 - module 描述与依赖。
 - 网络、Workload Identity 与流量流向。
-- Add-on：LangSmith Deployment、Fleet、Insights 和 Polly。
+- Add-on：LangSmith Deployment、Fleet、Insights、Polly、SmithDB 和 Sandboxes。
 - GCP 托管服务与 Secret Manager 集成。
 
 如果已准备好安装，请从[部署流程指南](/langsmith/self-host-terraform-gcp-deploy)开始。
@@ -27,11 +27,13 @@ LangSmith 在 GCP 上最多分五个阶段部署。每个阶段都在前一阶�
 | 1 | GCP infrastructure | VPC、GKE、Cloud SQL、Memorystore、GCS、K8s bootstrap、cert-manager、KEDA、Envoy Gateway |
 | 2 | LangSmith base | frontend、backend、platform-backend、queue、ace-backend、clickhouse、playground |
 | 3 | LangSmith Deployment | host-backend、listener、operator + 每个 deployment 的 pods |
-| 4 | Fleet | standalone-fleet-api-server、standalone-fleet-tool-server、standalone-fleet-trigger-server、standalone-fleet-queue |
-| 5 | Insights + Polly | Clio analytics（基于 ClickHouse）、Polly eval agent |
+| 4 | Fleet | standalone-fleet-api-server、standalone-fleet-queue、fleet-tool-server、fleet-trigger-server |
+| 5 | Insights + Polly | Insights analytics（基于 ClickHouse）、Polly eval agent |
+
+SmithDB（`enable_smithdb`）和 Sandboxes（`enable_sandboxes`）是这些阶段之外的可选 add-on。两者都会向同一个集群和 namespace 添加自己的 node pool 和托管服务。
 
 <Note>
-Fleet（chart v0.15+）是原名为 Agent Builder 的功能的当前形态。使用 `enable_fleet` 启用它。与已弃用的 `enable_agent_builder` 路径不同，它不要求 LangSmith Deployment 层。这两个开关互斥，且共享同一个加密 key。参见部署指南中的[启用 add-on](/langsmith/self-host-terraform-gcp-deploy#enable-add-ons)。
+Fleet 是原名为 Agent Builder 的功能的当前形态。使用 `enable_fleet` 启用它。与已弃用的 `enable_agent_builder` 路径不同，它不要求 LangSmith Deployment 层。这两个开关互斥，且共享同一个加密 key。参见部署指南中的[启用 add-on](/langsmith/self-host-terraform-gcp-deploy#enable-add-ons)。
 </Note>
 
 ## module 描述
@@ -43,11 +45,15 @@ Fleet（chart v0.15+）是原名为 Agent Builder 的功能的当前形态。使
 | `postgres` | `infra/modules/postgres/` | Cloud SQL PostgreSQL 实例、regional HA 备用实例、私有 IP、删除保护 |
 | `redis` | `infra/modules/redis/` | Memorystore Redis STANDARD_HA 层级、VPC 内私有 IP |
 | `storage` | `infra/modules/storage/` | 带版本控制和 lifecycle 规则的 GCS bucket，针对 `ttl_s/`（14 天）和 `ttl_l/`（400 天）前缀 |
-| `k8s-bootstrap` | `infra/modules/k8s-bootstrap/` | `langsmith` namespace、用于 Postgres 和 Redis URL 的 Kubernetes Secrets、cert-manager 和 KEDA Helm release |
-| `ingress` | `infra/modules/ingress/` | Envoy Gateway Helm release、GatewayClass、HTTPRoute、可选的 HTTPS Gateway listener |
+| `k8s-bootstrap` | `infra/modules/k8s-bootstrap/` | `langsmith` namespace 和 `langsmith-ksa` ServiceAccount、用于 Postgres、Redis、license key、ClickHouse 和 TLS 的 Kubernetes Secrets、resource quotas 和 network policies、cert-manager 和 KEDA Helm release |
+| `ingress` | `infra/modules/ingress/` | Envoy Gateway Helm release、Gateway API CRD、GatewayClass，以及 Gateway（HTTP 和可选的 HTTPS listener） |
 | `iam` | `infra/modules/iam/` | 用于 GCS 访问的 GCP service account 和 Workload Identity 绑定（默认启用） |
 | `dns` | `infra/modules/dns/` | Cloud DNS managed zone 和托管证书（可选，使用 `enable_dns_module` 启用） |
 | `secrets` | `infra/modules/secrets/` | Secret Manager secret 捆绑包（可选，使用 `enable_secret_manager_module` 启用） |
+| `smithdb` | `infra/modules/smithdb/` | SmithDB Cloud SQL metastore、GCS object-store bucket，以及 Workload Identity service account（可选，使用 `enable_smithdb` 启用） |
+| `smithdb-nodes` | `infra/modules/smithdb-nodes/` | SmithDB 的缓存与计算 node pool（仅限 GKE Standard，`smithdb_sizing = "minimal"` 时不创建）。缓存池使用 Local SSD，或在 `smithdb_cache_storage = "network-disk"` 时使用带 Hyperdisk 卷的 C3 节点。在 chart 0.16 上，缓存池始终使用 Local SSD。 |
+
+当 `enable_sandboxes = true` 时，Terraform 还会复用 `redis` module 来创建一个专用的 Memorystore 实例，用于存放 JuiceFS metadata，同时 `k8s-cluster` module 会添加一个支持嵌套虚拟化的 sandbox-host node pool。
 
 ## 部署档位
 
@@ -118,7 +124,7 @@ In-cluster ClickHouse 仅适用于 dev/POC（单 pod、无副本、无备份）�
 </Warning>
 
 <Note>
-[SmithDB](https://www.langchain.com/blog/introducing-smithdb?utm_source=docs) 是 LangSmith 专用的 observability 后端，self-hosted 版本 0.16.0 起可用于 Self-hosted（参见 [self-hosted support](/langsmith/smithdb-sdk-migration#about-self-hosted)）。这些 Terraform module 预配的是 ClickHouse，因此前几节中的指引适用于当前部署。
+[SmithDB](https://www.langchain.com/blog/introducing-smithdb?utm_source=docs) 是 LangSmith 专用的 observability 后端，self-hosted 版本 0.16.0 起可用于 Self-hosted（参见 [self-hosted support](/langsmith/smithdb-sdk-migration#about-self-hosted)）。设置 `enable_smithdb = true` 来预配其 metastore、object-store bucket 和 node pool。SmithDB 与 ClickHouse 并行运行，因此前几节中的 ClickHouse 指引仍然适用。有关分阶段 rollout，请参阅部署指南中的 [SmithDB](/langsmith/self-host-terraform-gcp-deploy#smithdb)。
 </Note>
 
 ### 一次性任务
@@ -161,14 +167,15 @@ In-cluster ClickHouse 仅适用于 dev/POC（单 pod、无副本、无备份）�
 
 - Trace payloads：大输入输出和附件。
 - 随附的 Helm values 使用原生 GCS 模式（`engine: GCS`、`apiURL: https://storage.googleapis.com`），通过 Workload Identity 认证，无需 HMAC keys。
-- 同样支持 S3 兼容模式（`engine: S3`），示例见 `helm/values/examples/langsmith-values.yaml`。它需要 HMAC keys：在 Cloud Storage → Settings → Interoperability 下创建一个，并通过 `config.blobStorage.accessKey` 和 `config.blobStorage.accessKeySecret` 传给 Helm。
+- 同样支持 S3 兼容模式（`engine: S3`），示例见 `helm/values/examples/langsmith-values.yaml`。它需要 HMAC keys：在 **Cloud Storage** > **Settings** > **Interoperability** 下创建一个，并通过 `config.blobStorage.accessKey` 和 `config.blobStorage.accessKeySecret` 传给 Helm。
 - Lifecycle 规则：`ttl_s/` 前缀（默认 14 天）、`ttl_l/` 前缀（默认 400 天）。
 - 无论哪种档位，GCS bucket 都是必需的。
 
-### Secret Manager（可选 module）
+### Secret Manager
 
-- 当 `enable_secret_manager_module = true` 时，存储一个 JSON secret 捆绑包（生成的 LangSmith secret key、Postgres 密码、Redis 密码）。
-- 无论是否启用该 module，核心 secrets（`langsmith-postgres-credentials`、`langsmith-redis-credentials`）都由 `k8s-bootstrap` 存储在 Kubernetes Secrets 中。Secret Manager 为必须在集群重建后仍然存活的 secrets 提供额外的持久化存储。
+- `infra/scripts/setup-env.sh` 把 license key、密码、salt 和加密 key 以 `langsmith-<name_prefix>-<environment>-<key>` 的形式存入 Secret Manager，并将它们导出为 `TF_VAR_*` 变量。
+- 可选的 `secrets` module（`enable_secret_manager_module = true`）会额外添加一个单独的 JSON 捆绑包，包含生成的 LangSmith secret key 以及 Postgres 和 Redis 密码。
+- Kubernetes Secrets 由 Terraform 和部署脚本写入，而不是从 Secret Manager 同步。参见 [Secret Manager 集成](#secret-manager-集成)。
 
 ## 集群基础设施
 
@@ -203,10 +210,14 @@ GKE pod
 | `langsmith-host-backend` | 同上 | GCS `storage.objectAdmin` |
 | `langsmith-listener` | 同上 | GCS `storage.objectAdmin` |
 | `langsmith-ksa`（operator pods） | 同上 | GCS `storage.objectAdmin` |
+| `langsmith-sandbox-host`（juicefs-format Job） | 同上 | GCS `storage.objectAdmin` |
+| `juicefs-csi-node-sa` | 同上 | GCS `storage.objectAdmin`。由 chart 0.16 的 JuiceFS CSI driver 使用；Terraform 保留该绑定，以便旧的挂载 pods 在升级移除该 driver 之前仍能读取 bucket。 |
+
+sandbox-host 运行在宿主机网络上，GKE 不会在那里提供 Workload Identity。它以 sandbox 节点的 service account 身份读写 JuiceFS 数据，Terraform 向该 service account 授予了仅限于 bucket 中 JuiceFS 前缀的 `storage.objectAdmin` 权限。
 
 GSA 由 `iam` module 定义，并作为 `workload_identity_annotation` 输出。`init-values.sh` 会自动将这些 annotation 写入 `values-overrides.yaml`。
 
-在原生 GCS 模式（随附的默认值）下，上述 GSA 绑定已经足够。可选的 S3 兼容模式（`engine: S3`）还需要 HMAC keys：在 Cloud Storage → Settings → Interoperability 下创建一个，并传给 Helm。
+在原生 GCS 模式（随附的默认值）下，上述 GSA 绑定已经足够。可选的 S3 兼容模式（`engine: S3`）还需要 HMAC keys：在 **Cloud Storage** > **Settings** > **Interoperability** 下创建一个，并传给 Helm。
 
 ## 网络拓扑
 
@@ -217,7 +228,7 @@ GSA 由 `iam` module 定义，并作为 `workload_identity_annotation` 输出。
 | Services | `10.8.0.0/20` | GKE ClusterIP service（次要范围） |
 | Private service connection | 由 Google 分配的 `/16` | Cloud SQL、Memorystore 私有 IP |
 
-Cloud SQL 和 Memorystore 只能通过私有 IP 访问。只要 `postgres_source = "external"` 或 `redis_source = "external"`，networking module 就会建立私有服务连接（VPC peering 到 Google 托管网络）。
+Cloud SQL 和 Memorystore 只能通过私有 IP 访问。只要 `postgres_source = "external"`、`redis_source = "external"`、`enable_sandboxes = true`，或 SmithDB 创建自己的 metastore（`enable_smithdb = true` 且 `smithdb_metastore_source = "create"`），networking module 就会建立私有服务连接（VPC peering 到 Google 托管网络）。
 
 ## 流量流向
 
@@ -252,43 +263,39 @@ Internal traffic (private IPs, never leaving VPC):
 
 ## Secret Manager 集成
 
-不使用 Secret Manager 时：
-
 ```txt
-terraform.tfvars → terraform apply → kubernetes_secret (postgres, redis)
+source setup-env.sh → Secret Manager → shell 中的 TF_VAR_*
+  ├─→ terraform apply → kubernetes_secret（postgres、redis、license、ClickHouse、TLS）
+  └─→ make deploy     → langsmith-config Secret（license、salt、JWT、admin、加密 key）
 ```
 
-使用 Secret Manager 时：
-
-```txt
-terraform.tfvars → terraform apply ─┬─→ kubernetes_secret (postgres, redis)
-                                    └─→ Secret Manager (durable copy, survives cluster recreation)
-```
-
-两种情况下 Terraform 都会直接写入 Kubernetes Secrets。启用 Secret Manager 会在集群外为 Postgres 密码、Redis 密码和生成的 secret key 额外保存一份持久化副本。没有任何机制把 Secret Manager 同步回集群，因此 GCP 上不安装 External Secrets Operator（不同于 AWS modules，后者用它从 SSM Parameter Store 同步）。
+Terraform 负责写入基础设施的 Kubernetes Secrets，`deploy.sh` 则根据导出的 `TF_VAR_*` 值和 `LANGSMITH_ADMIN_EMAIL` 构建 `langsmith-config` Secret。没有任何机制把 Secret Manager 同步到集群中，因此 GCP 上不安装 External Secrets Operator。在运行 `make apply`、`make deploy` 或 `make destroy` 之前，请在新 shell 中重新 source `setup-env.sh`。
 
 ## Terraform module 依赖图
 
+下图简化为主要的依赖边。
+
 ```txt
 google_project_service (APIs enabled)
-  └── module.networking
-        ├── module.gke_cluster
-        │     └── time_sleep.wait_for_cluster
-        │           ├── module.cloudsql      (count = postgres_source == "external")
-        │           ├── module.redis         (count = redis_source    == "external")
-        │           ├── module.storage
-        │           ├── module.iam           (count = enable_gcp_iam_module)
-        │           ├── module.secrets       (count = enable_secret_manager_module)
-        │           ├── module.dns           (count = enable_dns_module)
-        │           ├── module.k8s_bootstrap
-        │           └── module.ingress       (count = install_ingress)
-        └── (private_service_connection when external services)
+  └── module.networking                (private service connection when external services)
+        ├── module.cloudsql              (count = postgres_source == "external")
+        ├── module.redis                 (count = redis_source    == "external")
+        ├── module.sandbox_juicefs_redis (count = enable_sandboxes)
+        ├── module.smithdb               (count = enable_smithdb)
+        └── module.gke_cluster
+              ├── module.smithdb_nodes   (count = enable_smithdb, not Autopilot, not minimal)
+              └── time_sleep.wait_for_cluster
+                    └── module.k8s_bootstrap   (also waits on module.cloudsql and module.iam)
+                          ├── Fleet, Polly, Insights, and SmithDB secrets (when enabled)
+                          └── module.ingress   (count = install_ingress)
+
+module.storage
+  └── module.iam                       (count = enable_gcp_iam_module; k8s_bootstrap waits on it)
+
+module.secrets (count = enable_secret_manager_module), module.dns (count = enable_dns_module)
 ```
 
-`infra` 层不安装 LangSmith chart。应用阶段通过以下两种方式之一安装它，两者都使用 `helm/values/` 下相同的分层 values 文件：
-
-- 部署脚本：`make init-values && make deploy` 运行 `helm upgrade --install`。
-- Terraform `app` 层：`make init-values && make init-app && make apply-app` 将 chart 作为 `helm_release` 资源管理。`make init-app` 会把 `infra` 的输出（cluster、bucket、Workload Identity annotation）写入 `app/infra.auto.tfvars.json`，因此 `app` 层无需 remote-state data source 即可读取它们。
+Terraform 不安装 LangSmith chart。`make init-values && make deploy` 会使用 `helm/values/` 下的分层 values 文件，通过 `helm upgrade --install` 安装它。
 
 ## 验证命令
 

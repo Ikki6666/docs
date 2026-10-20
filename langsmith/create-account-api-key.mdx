@@ -10,12 +10,15 @@ import SaasRegionUrls from '/snippets/python/langsmith/saas-region-urls.mdx';
 
 ## API 密钥
 
-LangSmith 支持两种 API 密钥。两种令牌都可以用于向 LangSmith API 发起认证请求，但适用场景不同：
+LangSmith 支持三种 API 密钥，它们具有不同的权限和生命周期：
 
 - [**个人访问令牌（PAT）**](/langsmith/administration-overview#personal-access-tokens-pats) 会继承创建它的用户权限。适用于个人脚本或工具。
+- [**Tracing 密钥**](#tracing-keys) 在所选的工作区中提交 traces，无法访问已存储的 traces，也无法执行管理操作。
 - [**服务密钥**](/langsmith/administration-overview#service-keys) 可以限定到特定[工作区](/langsmith/administration-overview#workspaces)或整个[组织](/langsmith/administration-overview#organizations)。适用于应用程序和生产服务。
 
-要使用 LangSmith 记录 [traces](/langsmith/observability-concepts#traces) 并运行[评估](/langsmith/evaluation)，请创建一个 API 密钥来认证你的请求。
+使用 tracing 密钥记录 [traces](/langsmith/observability-concepts#traces)。对于[评估](/langsmith/evaluation)和其他 API 操作，请使用具备所需权限的 PAT 或服务密钥。
+
+要在 UI 中创建 PAT 或服务密钥：
 
 <Steps>
   <Step title="打开 API Keys 设置" icon="settings">
@@ -67,6 +70,59 @@ LangSmith 支持两种 API 密钥。两种令牌都可以用于向 LangSmith API
 [审计日志](/langsmith/audit-logs)会将停用记录为 `revoke_personal_access_token`，将重新启用记录为 `reinstate_personal_access_token`。
 
 Service keys 只能删除，不能停用。打开 **Service** 标签页，在 **Actions** 列中选择 **Delete key**，然后像删除 PAT 一样输入描述进行确认。
+
+## Tracing 密钥
+
+Tracing 密钥是归组织所有的凭据，用于在所选的工作区中提交 traces。它们将应用程序的访问权限限制为 `runs:create` 和 `projects:create`。
+
+tracing 密钥可以通过 tracing 摄取 API 创建项目并提交 run 更新。它无法读取已存储的 traces、更新项目配置、创建保存的视图、运行实验或管理密钥。项目 upsert 请求也会被拒绝。对于需要这些权限的操作，请使用单独的凭据。
+
+### 创建 tracing 密钥
+
+创建 tracing 密钥需要有效的组织成员身份，以及在每一个所选工作区中的有效成员身份。你需要在每个工作区中拥有 `workspaces:tracing-keys:create` 权限，包括通过团队授予的权限。内置的 Workspace Admin 和 Workspace Editor 角色拥有此权限；Workspace Viewer 则没有。管理员必须将该权限显式授予自定义角色。你自己不需要拥有 `runs:create`。
+
+要在 LangSmith 中创建密钥：
+
+1. 前往 **Settings** > **API Keys**，选择 **API Key**。
+2. 选择 **Tracing Only** 并输入描述。
+3. 选择工作区和过期日期，然后选择 **Create API Key**。
+4. 在关闭对话框之前复制该密钥。
+
+tracing 选项需要受支持的部署。对于 BYOC 工作区，数据平面也必须支持 tracing 密钥。只有你拥有创建权限且部署支持 tracing 密钥的工作区才可供选择。
+
+你也可以使用 `POST /api/v1/orgs/current/tracing-keys` 创建密钥。以用户身份进行认证，包括在组织政策允许 API 密钥创建密钥的情况下通过 PAT 认证。服务账户密钥无法创建 tracing 密钥。
+
+该请求接受以下参数：
+
+- **`workspaces`**：必需，包含一个或多个工作区 ID 的列表。该密钥没有组织级作用域。
+- **`description`**：可选，密钥的标签。
+- **`expires_at`**：可选，过期时间戳，受服务密钥过期限制的约束。
+
+响应返回 `201 Created`、一个 `Location` header，以及 `key` 中的 secret。请在创建时复制该 secret；列表响应不会返回它。tracing 密钥带有 `lsv2_tr_` 前缀。
+
+将此密钥用作 `LANGSMITH_API_KEY`，并配合下方的 [SDK 配置](#configure-the-sdk)。对于作用域为多个工作区的密钥，请将 `LANGSMITH_WORKSPACE_ID` 设置为所选的某个工作区。直接调用 API 时请使用 `X-Tenant-Id`。
+
+### 作用域和生命周期
+
+tracing 密钥在其所选的所有工作区中拥有固定的权限。它不会继承创建者的角色或项目标签访问策略。它的工作区作用域和权限无法编辑。要更改作用域，请新建一个替代密钥。
+
+移除或禁用创建者不会禁用使用该密钥进行的 tracing。删除某个所选的工作区会移除对该工作区的访问权限；这不会增加对其他工作区的访问权限。密钥过期和删除会停止认证，但受认证缓存的影响。
+
+### 列出和删除 tracing 密钥
+
+在 **Settings** > **API Keys** 中选择 **Tracing** 以查看密钥。要删除某个密钥，请选择其删除操作，并输入其描述进行确认。只有在你拥有删除该密钥的权限时，删除操作才会出现。
+
+`GET /api/v1/orgs/current/tracing-keys` 会列出已认证用户可见的密钥。它返回 `items` 和 `next_cursor`。使用 `page_size` 请求每页 1–100 个密钥；默认值为 50。将 `next_cursor` 作为 `cursor` 传递以请求下一页。可选的 `workspace_ids` 过滤器会将结果限制为匹配的可见工作区。
+
+能够列出某个密钥并不一定意味着有权删除它。对于无权访问完整作用域的调用者，隐藏的工作区 ID 和名称会被省略。请检查 `can_delete` 以确认删除权限。
+
+`DELETE /api/v1/orgs/current/tracing-keys/{api_key_id}` 会删除一个 tracing 密钥。重复删除会返回 `204 No Content`。以下用户允许删除：
+
+- **创建者**：创建者必须始终是有效的组织成员。
+- **组织密钥管理员**：拥有 `organization:service-key:manage` 的调用者，包括服务账户自动化。
+- **工作区密钥管理员**：在剩余的每个所选工作区中拥有 `workspaces:manage-keys` 的有效成员。
+
+创建、列出和删除端点可通过 HTTP 访问。生成的 SDK 密钥管理方法不会暴露这些端点。已签发的 tracing 密钥可与 SDK 的 tracing API 配合使用。
 
 ## 配置 SDK
 

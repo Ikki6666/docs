@@ -36,18 +36,19 @@ helm search repo langchain/langsmith --versions
 你应该会看到类似下面的输出：
 
 ```bash
-langchain/langsmith     0.10.14         0.10.32         Helm chart to deploy the langsmith application ...
-langchain/langsmith     0.10.13         0.10.32         Helm chart to deploy the langsmith application ...
-langchain/langsmith     0.10.12         0.10.32         Helm chart to deploy the langsmith application ...
-langchain/langsmith     0.10.11         0.10.29         Helm chart to deploy the langsmith application ...
-langchain/langsmith     0.10.10         0.10.29         Helm chart to deploy the langsmith application ...
-langchain/langsmith     0.10.9          0.10.29         Helm chart to deploy the langsmith application ...
+langchain/langsmith              	0.17.2       	0.17.30    	Helm chart to deploy the langsmith application ...
+langchain/langsmith              	0.17.1       	0.17.30    	Helm chart to deploy the langsmith application ...
+langchain/langsmith              	0.17.0       	0.17.29    	Helm chart to deploy the langsmith application ...
+langchain/langsmith              	0.16.41      	0.16.70    	Helm chart to deploy the langsmith application ...
+langchain/langsmith              	0.16.40      	0.16.70    	Helm chart to deploy the langsmith application ...
 ```
 
 选择你想升级到的版本（通常推荐最新版本），并记下版本号：
 
 <Note>
 如果你的安装版本比最新 chart 落后超过一个 major version，请一次只升级一个 major version。不要跳过 major versions。需要针对中间每一个 major version 重复本升级流程，最后再升级到当前受支持的最新版本。
+
+例如，要从 0.15 升级到 0.17，请先升级到最新的 0.16 chart，再升级到最新的 0.17 chart。
 </Note>
 
 ```bash
@@ -105,6 +106,32 @@ langsmith-queue-d58cb64f7-87d68          1/1     Running     0          15h
 1. 在浏览器中访问 `langsmith-frontend` service 的 external IP。LangSmith UI 应该可以正常访问和操作。
 
    ![LangSmith UI](/langsmith/images/langsmith-ui.png)
+
+## 从 v16 升级到 v17
+
+Chart v17 更改了 SmithDB、sandboxes 和 Engine 的 values。请在运行 `helm upgrade` 之前更新你的 values 文件。在你修改之前，Chart v17 无法渲染下方的 SmithDB、sandbox 和 Engine values。如果你使用 Terraform modules 部署，请按照 [AWS](/langsmith/self-host-terraform-aws-deploy#upgrade-from-chart-v16-to-v17)、[GCP](/langsmith/self-host-terraform-gcp-deploy) 或 [Azure](/langsmith/self-host-terraform-azure-deploy) 部署指南中的升级步骤操作，这些步骤会将这些更改应用到 module 的 values 文件。
+
+<Warning>
+不支持从 chart v17 降级到 v16。升级前请备份数据库。
+</Warning>
+
+- **SmithDB**：将 `smithdb.migration.deployment` 移到 `smithdb.migration.job`。在 `smithdb.enabled: true` 时，将 `query`、`ingestion`、`mutations`、`runRules`、`statsQuery` 和 `compactionWorker` 上的扁平 autoscaling keys（`enabled`、`minReplicas`、`maxReplicas` 等）移到 `autoscaling.hpa.*` 下。对于 `compactionWorker`，也可以改用 `autoscaling.keda.*`，但只能启用一个 scaler。缓存卷的更改请参见 [Cache storage](/langsmith/self-host-smithdb-infrastructure#cache-storage)。
+- **Sandboxes**：Chart v17 移除了捆绑的 JuiceFS CSI driver，由 `sandbox-host` 自行挂载 JuiceFS。Chart v17 会忽略遗留的 `sandboxes.juicefs.csi` 块，并且其校验随后会失败，报 `sandboxes.juicefs.redis.metaURL is required when sandboxes.enabled is true and sandboxes.juicefs.existingSecretName is not set.` 请移动以下设置：
+  - `sandboxes.juicefs.csi.existingSecretName` 变为 `sandboxes.juicefs.existingSecretName`。Secret 保留其键。
+  - `sandboxes.juicefs.csi.mountPodPatch` 中的缓存选项移到 `sandboxes.juicefs.hostMount`。`cacheDirs` 设置 JuiceFS 缓存的主机路径，默认为 `/var/cache/juicefs`。如果覆盖它，请至少列出一个绝对路径。其他 JuiceFS 选项请以 `--flag=value` 形式设置在 `mountOptions` 中，并且不要在那里设置 `--cache-dir`。默认缓存大小从 300 GiB（`cache-size=307200`）降至 50 GiB（`--cache-size=51200`）。
+  - 将 IRSA 或 Workload Identity 注解从 `sandboxes.juicefs.csi.node.serviceAccount.annotations` 移到 `sandboxes.sandboxHost.serviceAccount.annotations`。在 GKE 上，`sandbox-host` 运行在 host 网络中，而 GKE 不会向 host 网络 pod 授予 Workload Identity，因此该注解只服务于 `juicefs-format` Job。此外，请授予 sandbox node pool 的 service account 对 bucket 的 `roles/storage.objectAdmin` 权限，并通过 IAM condition 限制在 JuiceFS 前缀内。没有该授权时，挂载会从 Cloud Storage 收到 403。
+
+  在升级之前，趁 CSI driver 仍在运行时 drain JuiceFS 卷。否则旧的 `sandbox-host` pod 会停留在 `Terminating` 状态。使用默认 release name 时：
+
+  ```bash
+  kubectl delete -n langsmith deployment.apps/langsmith-sandbox-host
+  kubectl delete -n langsmith persistentvolumeclaim/smithbox-juicefs-csi
+  kubectl delete -n langsmith persistentvolumeclaim/smithbox-juicefs-csi-host
+  kubectl get pods -n langsmith | grep juicefs   # wait until only juicefs-csi-* pods remain
+  ```
+
+  运行中的 Sandboxes 会停止。它们的数据保留在 object storage 和 Redis 中，因为 chart v16 的两个 PersistentVolume 都使用 `Retain` 回收策略。
+- **Engine**：启用 Engine 时，将 `engine.usageSigningSecret` 设置为至少 32 个字符的值（使用 `openssl rand -hex 32` 生成一个），或者在使用 `config.existingSecretName` 时，改为向该 Secret 添加 `engine_usage_signing_secret` 键。默认的 `engine.intelligenceBaseUrl` 更改为 `https://beacon.langchain.com/intelligence`，它只记录使用情况。要在 LangSmith Intelligence models 上继续运行 Engine（如 chart v16 那样），请保留 `https://beacon.aws.langchain.com/intelligence`，并在 **Settings** > **Engine** > **Model providers** 下选择 LangSmith Intelligence。详情请参见 [LangSmith Engine on Self-hosted](/langsmith/engine-self-hosted)。
 
 ---
 

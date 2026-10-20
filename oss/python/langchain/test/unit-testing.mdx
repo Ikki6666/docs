@@ -29,6 +29,110 @@ model.invoke("hello, again!")
 # AIMessage(content='bar', ...)
 ```
 
+## 使用 `FakeListChatModel` 返回纯文本
+
+对于只需要文本响应的测试，请使用 `FakeListChatModel`。它接收一个字符串列表，因此你不需要构造 `AIMessage` 对象：
+
+```python
+from langchain_core.language_models import FakeListChatModel
+
+model = FakeListChatModel(responses=["Paris", "The Eiffel Tower"])
+
+model.invoke("What is the capital of France?")
+# AIMessage(content='Paris', ...)
+
+model.invoke("What is a famous landmark there?")
+# AIMessage(content='The Eiffel Tower', ...)
+```
+
+`FakeListChatModel` 会循环使用它的响应。当调用次数超过列表中的条目数时，它会从第一个响应重新开始。当你需要精确控制每一轮（例如工具调用）时，请使用 `GenericFakeChatModel`。
+
+## 测试工具调用循环
+
+智能体通常会调用一个工具，然后用结果来回答。要脚本化这个循环，请给 fake model 两个响应：一个工具调用，然后一个最终答案。
+
+`GenericFakeChatModel` 没有实现 `bind_tools`，而当你传入工具时，[`create_agent`](https://reference.langchain.com/python/langchain/agents/factory/create_agent) 会调用它。请子类化它，让 `bind_tools` 原样返回模型：
+
+```python
+from langchain.agents import create_agent
+from langchain.messages import AIMessage, HumanMessage, ToolCall
+from langchain.tools import tool
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+
+class FakeToolCallingModel(GenericFakeChatModel):
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+@tool
+def get_weather(city: str) -> str:
+    """Get the weather for a city."""
+    return f"72°F and sunny in {city}"
+
+
+def test_agent_calls_tool_then_answers():
+    model = FakeToolCallingModel(messages=iter([
+        # Turn 1: the model calls the tool
+        AIMessage(
+            content="",
+            tool_calls=[ToolCall(name="get_weather", args={"city": "Tokyo"}, id="call_1")],
+        ),
+        # Turn 2: the model answers using the tool result
+        AIMessage(content="It is 72°F and sunny in Tokyo."),
+    ]))
+    agent = create_agent(model, tools=[get_weather])
+
+    result = agent.invoke({"messages": [HumanMessage(content="Weather in Tokyo?")]})
+
+    tool_call_messages = [
+        m for m in result["messages"] if isinstance(m, AIMessage) and m.tool_calls
+    ]
+    assert len(tool_call_messages) == 1
+    assert tool_call_messages[0].tool_calls[0]["name"] == "get_weather"
+    assert "Tokyo" in result["messages"][-1].text
+```
+
+## 使用 pytest fixture 共享 fake model
+
+要在多个测试之间复用 fake model，请从 `pytest` fixture 中返回它。这个示例使用上一节中的 `FakeToolCallingModel` 和 `get_weather`：
+
+```python
+import pytest
+from langchain.agents import create_agent
+from langchain.messages import AIMessage, HumanMessage, ToolCall
+
+
+@pytest.fixture
+def weather_model():
+    return FakeToolCallingModel(messages=iter([
+        AIMessage(
+            content="",
+            tool_calls=[ToolCall(name="get_weather", args={"city": "Tokyo"}, id="call_1")],
+        ),
+        AIMessage(content="It is 72°F and sunny in Tokyo."),
+    ]))
+
+
+def test_tool_is_called(weather_model):
+    agent = create_agent(weather_model, tools=[get_weather])
+    result = agent.invoke({"messages": [HumanMessage(content="Weather in Tokyo?")]})
+    tool_call_messages = [
+        m for m in result["messages"] if isinstance(m, AIMessage) and m.tool_calls
+    ]
+    assert tool_call_messages[0].tool_calls[0]["name"] == "get_weather"
+
+
+def test_final_response(weather_model):
+    agent = create_agent(weather_model, tools=[get_weather])
+    result = agent.invoke({"messages": [HumanMessage(content="Weather in Tokyo?")]})
+    assert "Tokyo" in result["messages"][-1].text
+```
+
+<Note>
+`GenericFakeChatModel` 从迭代器中读取响应，而耗尽的迭代器无法复用。请把 fixture 保持在默认的 `function` 作用域，它为每个测试构建一个新的模型。`module` 或 `session` 作用域会共享一个迭代器，一旦用尽，后续测试就会失败。
+</Note>
+
 ## InMemorySaver checkpointer
 
 要在测试中启用持久化，你可以使用 [`InMemorySaver`](https://reference.langchain.com/python/langgraph/checkpoints/#langgraph.checkpoint.memory.InMemorySaver) checkpointer。这样你就能模拟多轮对话，测试依赖状态的行为：
@@ -56,6 +160,7 @@ agent.invoke(
     config={"configurable": {"thread_id": "session-1"}}
 )
 ```
+
 
 
 

@@ -9,7 +9,7 @@ Sandbox mounts 会在 sandbox 创建时，把外部数据源挂载到 sandbox �
 Mounts 在 Python 中通过 `mount_config` 配置，在 TypeScript 中通过 `mountConfig` 配置。SDK 会把 mount 规格发送给 LangSmith，并为 provider 凭据自动组合所需的 [auth proxy](/langsmith/sandbox-auth-proxy) 规则。
 
 <Note>
-Sandbox mounts 要求 Python 使用 `langsmith[sandbox]>=0.8.16`，或 TypeScript 使用 `langsmith>=0.7.10`。Context Hub 挂载要求 Python 使用 `langsmith[sandbox]>=0.11.0`，或 TypeScript 使用 `langsmith>=0.8.11`。
+Sandbox mounts 要求 Python 使用 `langsmith>=0.8.16`，或 TypeScript 使用 `langsmith>=0.7.10`。Context Hub 挂载要求 Python 使用 `langsmith>=0.11.0`，或 TypeScript 使用 `langsmith>=0.8.11`。
 </Note>
 
 <Warning>
@@ -185,7 +185,7 @@ LangSmith principal 也需要有承担客户角色的权限。对于自托管部
 只读挂载会拒绝文件系统写入，但不会阻止该角色被允许的直接 S3 API 写入。请使用该角色的 IAM policy 来强制执行只读的 AWS 访问。
 </Warning>
 
-请使用商业 AWS 角色和受支持的 AWS HTTPS endpoints。S3 permissions 示例不包含 KMS 权限；请检查你的 bucket 加密设置所需的权限。
+请使用商业 AWS 角色和受支持的 AWS HTTPS endpoints。S3 permissions 示例不包含 KMS 权限。对于使用 KMS key 加密的 bucket，请参阅[使用 KMS key 加密上传](#encrypt-uploads-with-a-kms-key)。
 
 #### 在 SDK 中使用共享角色
 
@@ -336,6 +336,50 @@ Mount 专属的 `mount_config.auth.aws` API 接受 `role_arn` 或静态的 `acce
 LangSmith 会在 AWS 请求需要时续期临时凭据，包括在 sandbox 停止并恢复之后。你不需要提供保存的 STS token，也不需要手动续期。要持续访问，请保持该角色的 trust 和 access permissions 有效。
 
 如果续期暂时不可用，挂载只能使用缓存的凭据，直到它们过期。授权被拒绝或凭据过期会导致经过认证的 S3 请求失败；挂载不会回退到静态 keys。
+
+### 使用 KMS key 加密上传
+
+在 S3 挂载上设置 `encryption`，用客户管理的 AWS KMS key（SSE-KMS）加密 sandbox 通过该挂载上传的每个对象。当 bucket policy 要求上传时指定特定的 key，或者你希望自行选择 key 而不是依赖 bucket 的默认加密时，可以使用它。
+
+<Note>
+挂载加密要求 Python 使用 `langsmith>=0.14.8`，或 TypeScript 使用 `langsmith>=0.10.12`。自托管部署要求 LangSmith v0.17.35 或更高版本。
+</Note>
+
+<CodeGroup>
+
+```python Python
+s3_mount(
+    id="customer_data",
+    mount_path="/mnt/mounts/customer-data",
+    bucket="example-bucket",
+    region="us-east-1",
+    encryption={
+        "kms_key": "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+    },
+)
+```
+
+```ts TypeScript
+s3Mount({
+  id: "customer_data",
+  mountPath: "/mnt/mounts/customer-data",
+  bucket: "example-bucket",
+  region: "us-east-1",
+  encryption: {
+    kms_key:
+      "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+  },
+});
+```
+
+</CodeGroup>
+
+- **Key 格式**：`kms_key` 必须是该挂载所在 region 和 AWS partition 中的 KMS key ARN。LangSmith 会拒绝 key 别名和裸 key ID。
+- **挂载类型**：只有 S3 挂载接受 `encryption`。LangSmith 会在 GCS、Git 和 Context Hub 挂载上拒绝它。
+- **静态 keys 和共享角色**：为 IAM 身份授予该 key 上的 `kms:GenerateDataKey`（用于上传）和 `kms:Decrypt`（用于读取和 multipart 上传）。key policy 也必须允许该身份。
+- **挂载范围角色**：session policy 允许 S3（且仅允许 S3）使用配置的 key：对每个挂载授予 `kms:Decrypt`，仅当可写挂载使用该 key 时才授予 `kms:GenerateDataKey`。一个 sandbox 中所有基于角色的挂载必须指定同一个 key。客户角色和 key policy 仍然必须授予这两个权限。
+
+当挂载的 AWS 身份可以使用 bucket 的默认 key 时，默认加密为 SSE-KMS 的 bucket 无需 `encryption` 即可工作。此时上传会使用该默认 key。挂载范围角色认证会为没有 `encryption` 的挂载拒绝 KMS 访问，因此这些挂载无法读取或写入使用 KMS key 加密的对象。
 
 ## 挂载一个 GCS bucket
 
@@ -694,6 +738,8 @@ const mountCfg = mountConfig({
 ## 限制
 
 - Mounts 在 sandbox 创建时挂载。要更改 mounts，请创建一个新的 sandbox。
+- 中国（`cn-*`）和 AWS GovCloud（`us-gov-*`）区域中的 S3 挂载必须将 `endpoint_url` / `endpointUrl` 设置为该区域的 S3 endpoint。默认 endpoint `https://s3.amazonaws.com` 只服务商业区域。
+- 挂载范围角色认证必须符合 AWS 的 2,048 字符 session policy 限制。多个挂载、较长的 bucket 名称或 prefix，或者一个 KMS key 都可能超出该限制，此时 LangSmith 会拒绝该 sandbox。
 - 在每个 sandbox 单独的一个认证界面中配置各云 provider 的凭据。如果挂载认证提供了 AWS 或 GCP 凭据，就不要再为同一 provider 添加 auth proxy 规则。
 - Git ref 可以省略，或设置为 branch 或 tag。不支持 commit ref。
 - Git 挂载不支持 `read_only` / `readOnly` 或缓存设置。

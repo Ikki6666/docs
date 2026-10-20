@@ -13,61 +13,70 @@ description: LangSmith self-hosted 在 AKS 上的 make 目标、Terraform、kube
 | 阶段 | 部署的内容 | 命令 |
 |---|---|---|
 | Infrastructure | AKS + Postgres + Redis + Blob + Key Vault + cert-manager + KEDA + ingress | `make apply` |
+| App secrets | 写入 Key Vault 的 LangSmith 应用机密。不覆盖已存在的机密 | `make seed-secrets` |
 | Cluster credentials | Kubeconfig + 来自 Key Vault 的 Kubernetes Secrets | `make kubeconfig && make k8s-secrets` |
-| LangSmith（Helm 路径） | LangSmith Helm（约 17 个 pods），通过 shell 脚本 | `make init-values && make deploy` |
-| LangSmith（Terraform 路径） | Secrets + SA + Helm release 纳入 Terraform state 管理 | `make init-app && make apply-app` |
+| LangSmith | LangSmith Helm release，通过 shell 脚本 | `make init-values && make deploy` |
 | LangSmith Deployment add-on | host-backend、listener、operator。需先将 `default_node_pool_min_count` 提高到 5 | `make apply && make init-values && make deploy` |
-| Agent Builder add-on | tool-server、trigger-server、agent-builder LGP | `make init-values && make deploy` |
-| Insights + Polly add-on | Clio 分析、Polly eval agent | `make init-values && make deploy` |
+| Fleet add-on | Fleet tool server 和 trigger server，外加专属的 `langsmith_fleet` Postgres 数据库。要求 `enable_deployments` 和 `postgres_source = "external"` | `make apply && make init-values && make deploy` |
+| Agent Builder add-on | Fleet 取代的旧版路径：tool server 和 trigger server | `make init-values && make deploy` |
+| Insights + Polly add-on | Insights 分析、Polly eval agent | `make init-values && make deploy` |
+| SmithDB | PostgreSQL 18 metastore、Blob container、Workload Identity。要求 chart 0.17，`v0.17.*` module tag 上的默认值 | `make apply && make init-values && make deploy` |
+| LLM Gateway add-on | Gateway pod，外加带 PII 脱敏的 Presidio analyzer。处于 beta | `make init-values && make deploy` |
+| SSO with OIDC | OIDC 登录，会禁用基本认证。先把三个 `langsmith-oauth-*` 机密存入 Key Vault | `make k8s-secrets && make init-values && make deploy` |
 
 ## 首次设置
 
 ```bash
 cd terraform/modules/azure
+git checkout "$(git tag -l 'v0.17.*' --sort=-v:refname | head -1)"   # newest v0.17 release
 
 # 1. Generate terraform.tfvars (interactive wizard)
 make quickstart
 
-# 2. Bootstrap secrets (prompts on first run, reads from Key Vault on repeat)
+# 2. Write Terraform inputs (Postgres password, license key, admin email)
+#    to secrets.auto.tfvars. Re-runs offer the previous values as defaults
 make setup-env
 
 # 3. Preflight (Azure CLI, RBAC, providers)
 make preflight
 
 # 4. Deploy infrastructure (~15 to 20 min)
-#    Skip `make plan` on a fresh deploy — kubernetes_manifest needs a live cluster
+#    make apply runs three stages, and each prompts for confirmation
 make init
 make apply
 
-# 5. Cluster credentials + Kubernetes Secrets
+# 5. Write the LangSmith app secrets into Key Vault (never overwrites)
+make seed-secrets
+
+# 6. Cluster credentials + Kubernetes Secrets
 make kubeconfig
 make k8s-secrets
 
-# 6. Generate Helm values from Terraform outputs
+# 7. Generate Helm values from Terraform outputs
 make init-values
 
-# 7. Deploy LangSmith (~10 min)
+# 8. Deploy LangSmith (~10 min)
 make deploy
 
-# 8. Health check
+# 9. Health check
 make status
 ```
 
-或一次性运行整个流程：
+或在 `make init` 之后，一次性运行第 4 到第 8 步的剩余部分：
 
 ```bash
-make deploy-all      # apply → kubeconfig → k8s-secrets → init-values → deploy
-make deploy-all-tf   # apply → init-values → init-app → apply-app (Terraform path)
+make deploy-all   # apply → seed-secrets → kubeconfig → k8s-secrets → init-values → deploy
 ```
 
 ## Day-2 运维
 
 ```bash
-make status         # 10-section health check
-make status-quick   # skip Key Vault + K8s secret queries (faster)
+make status         # health check that prints the next command to run
+make status-quick   # skip the Key Vault, kubeconfig, Kubernetes, and Helm checks (faster)
 make deploy         # re-deploy after any Helm value changes
 make init-values    # re-generate values after Terraform changes
 make kubeconfig     # refresh cluster credentials
+make seed-secrets   # write any missing app secrets into Key Vault
 make k8s-secrets    # re-create langsmith-config-secret from Key Vault
 
 # Manage Key Vault secrets
@@ -82,15 +91,19 @@ make keyvault                                       # interactive menu
 
 ## add-on
 
-add-on 阶段（3 到 5）由 `infra/terraform.tfvars` 中的开关控制。设置开关后，重新运行 `init-values && deploy`。`init-values.sh` 会自动把对应的示例文件复制到 `helm/values/`。
+add-on 由 `infra/terraform.tfvars` 中的开关控制。设置开关后，再重新运行 `make init-values && make deploy`。`enable_fleet` 和 `enable_smithdb` 还会创建 Terraform 资源，因此先运行 `make apply`。`init-values.sh` 会自动把对应的 overlay 写入 `helm/values/`。
 
 ```hcl
 # infra/terraform.tfvars
 sizing_profile       = "production"   # minimum | dev | production | production-large
 enable_deployments   = true           # LangSmith Deployment add-on (listener + operator + host-backend)
-enable_agent_builder = true           # Agent Builder add-on (requires enable_deployments)
-enable_insights      = true           # Insights / Clio analytics add-on
-enable_polly         = true           # Polly AI eval add-on (requires enable_deployments)
+enable_fleet         = true           # Fleet add-on (requires enable_deployments and postgres_source = "external")
+enable_agent_builder = false          # legacy Agent Builder (requires enable_deployments); cannot be combined with enable_fleet
+enable_insights      = true           # Insights analytics add-on
+enable_polly         = true           # Polly AI eval add-on (needs enable_deployments)
+enable_llm_gateway   = false          # LLM Gateway, in beta (chart 0.17)
+enable_gateway_pii_redaction = false  # Presidio PII redaction (requires enable_llm_gateway)
+enable_sso_oidc      = false          # OIDC SSO; enable only after logging in as the org admin with basic auth
 ```
 
 <Warning>
@@ -121,11 +134,15 @@ kubectl logs <pod-name> -n langsmith --previous --tail=50
 # Backend logs (live)
 kubectl logs -n langsmith deploy/langsmith-backend --tail=100 -f
 
-# Ingress
+# Envoy Gateway (default ingress_controller)
+kubectl get gateway,httproute -n langsmith
+kubectl get svc -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=langsmith-gateway
+
+# Ingress (nginx, istio, agic)
 kubectl get ingress -n langsmith
 kubectl describe ingress -n langsmith
 
-# NGINX LoadBalancer external IP
+# NGINX LoadBalancer external IP (ingress_controller = "nginx")
 kubectl get svc ingress-nginx-controller -n ingress-nginx
 
 # TLS
@@ -164,9 +181,9 @@ az aks get-credentials --name <cluster> --resource-group <rg>
 az postgres flexible-server list
 az postgres flexible-server show --name <server> --resource-group <rg>
 
-# Redis
-az redis list
-az redis show --name <cache> --resource-group <rg>
+# Azure Managed Redis
+az redisenterprise list
+az redisenterprise show --cluster-name <cluster> --resource-group <rg>
 
 # Blob Storage
 az storage account list
@@ -183,40 +200,52 @@ az network application-gateway list
 
 ## Terraform
 
+通过 `make` 从 `modules/azure/` 运行 Terraform。`ARGS` 会追加到 Terraform 命令后面，因此不需要 `-chdir`。
+
 ```bash
-cd modules/azure/infra
+make init ARGS="-upgrade"                  # re-resolve provider versions
+make plan                                  # plan the full infrastructure
+make plan ARGS="-out=tfplan"               # save a plan file
+make apply ARGS="-auto-approve"            # three stages, no prompts
+make tf ARGS="apply tfplan"                # apply a saved plan
+make plan ARGS="-target=module.aks"        # plan one module
 
-terraform init
-terraform plan        # skip on first run, see deploy notes
-terraform apply
-terraform apply -target=module.aks
+make tf ARGS="output"
+make tf ARGS="output -raw aks_cluster_name"
+make tf ARGS="output -raw keyvault_name"
+make tf ARGS="output -raw storage_account_name"
 
-terraform output
-terraform output -raw aks_cluster_name
-terraform output -raw keyvault_name
-terraform output -raw storage_account_name
-
-terraform state list
+make tf ARGS="state list"
 ```
 
 ## 关键约束
 
-- 全新部署时跳过 `make plan`。`kubernetes_manifest` 资源需要可用的集群 API。直接使用 `make apply`。
+- `make apply` 分三个目标阶段运行（Azure 基础设施、Kubernetes 引导，然后是其余内容），每个阶段都会提示确认。`ARGS="-auto-approve"` 会跳过全部三个提示。
 - 在 `terraform destroy` 之前先卸载 Helm。Azure Load Balancer 持有子网引用；不先卸载会阻塞 VNet 删除。先运行 `make uninstall`。
 - `config.deployment.url` 必须包含 `https://`。缺少它，operator 派生的 agent 会卡在 `DEPLOYING`。
 - LangSmith Deployment add-on 必须设置 `config.deployment.enabled: true`。只设置 URL 而没有 `enabled: true`，会静默跳过 `listener` 和 `operator`。
 - 加密密钥在首次启用后绝不能更改。轮换 `insights_encryption_key` 或 `polly_encryption_key` 会永久损坏现有的已加密数据。
-- 首次启用 Polly 后重启 frontend。`agentBootstrap` 在注册之后才创建 `langsmith-polly-config`；更早启动的 frontend pods 不会拾取它。
-- `letsencrypt`（HTTP-01）仅适用于 `nginx`、`istio`（自托管）和 `envoy-gateway`。对于 `istio-addon` 或 `agic`，请使用自定义域名的 `dns01`，或仅 HTTP 的 `none`。
+- 首次启用 Polly 后重启 frontend。`langsmith-polly-config` ConfigMap 在 Polly 注册之后才出现；更早启动的 frontend pods 不会拾取它。
+- `letsencrypt`（HTTP-01）仅适用于 `nginx`、`istio`（自托管）和 `envoy-gateway`。对于 `istio-addon` 或 `agic`，请使用自定义域名的 `dns01`、自有证书的 `existing`，或仅 HTTP 的 `none`。
+- 在第一次 apply 之前设置 `aks_private_cluster_enabled`、`aks_private_dns_zone_id` 和 `aks_control_plane_identity`。对已有集群更改其中任何一个，plan 都会拒绝。
+- `v0.17.*` module tag 只部署 chart 0.17 线，`v0.16.*` tag 只部署 0.16。在 `v0.16.*` tag 上，`enable_smithdb = true` 要求 0.17 线，因此设置它时要用 `langsmith_helm_chart_version = "~0.17.0"`。已运行 chart 0.17 的部署无法回退到 0.16。
+- 仅在以 org admin 身份用基本认证登录过之后再启用 `enable_sso_oidc`。该开关会禁用基本认证。
 - 销毁后 Key Vault 进入 90 天 soft-delete。当 `keyvault_purge_protection = false` 时，运行 `az keyvault purge` 可立即回收该名称。
 
 ## 拆除
 
 ```bash
-make uninstall   # removes Helm release + LGP resources; prompts to delete namespace
+make uninstall   # removes Helm release + LangSmith Deployment resources; prompts to delete namespace
+helm uninstall ingress-nginx -n ingress-nginx --wait   # only with ingress_controller = "nginx"
 make destroy     # destroys all Azure infrastructure via terraform destroy
 make clean       # removes local secrets, config, helm values, and tfstate files
 ```
+
+`make destroy-force` 和 `make clean-force` 运行相同的步骤，但跳过确认提示。
+
+<Warning>
+`make clean-force` 也会替你确认那个保护仍在跟踪资源的 state 文件的提示，然后删除 `terraform.tfstate`。使用默认的本地 backend 时，该文件是唯一的 state，因此在 `make destroy` 成功之前运行它会让 Azure 资源变成孤儿。仅在 `make destroy` 成功之后运行 `make clean-force`。
+</Warning>
 
 ---
 

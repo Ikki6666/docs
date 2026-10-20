@@ -152,13 +152,12 @@ Schedule 声明会在编译时提取，因此配置必须是静态可序列化�
 
 ## 本地测试 schedules
 
-`mda dev` 会编译 `schedules/` 并在其启动横幅中列出每个 schedule，但不会创建它们。Schedules 只在 deployment 上运行。
 
-<Warning>
-Schedules 在 `mda dev` 下永远不会触发。本地服务器不会报告任何错误，因此启动时列出的 schedule 仍然处于非活动状态。
-</Warning>
+
+TypeScript dev server 不会运行 cron jobs。`mda dev` 会在启动时列出每个 schedule，并警告 schedules 在本地不处于活动状态。
 
 要测试 schedule 触发的 agent 行为，可以在本地 Studio 中直接把该 schedule 的 `prompt` 或 `input` 发送给 agent。要测试 schedule 本身，请把项目部署到一个开发 deployment。
+
 
 ## 部署 schedules
 
@@ -176,7 +175,7 @@ Schedules 在 `mda dev` 下永远不会触发。本地服务器不会报告任�
 运行时 schedules 需要 `managed-deepagents` 0.9.0 或更高版本。
 </Note>
 
-`schedules/` 中的声明在部署时就固定了。`schedules` API 会在 agent 运行时创建 schedules，因此 agent 可以在对话中设置定期或一次性工作。可以从 tool 或 [middleware](/langsmith/javascript/managed-deep-agents-middleware) 中调用它。每个 schedule 属于当前用户或 agent。
+`schedules/` 中的声明在部署时就固定了。`runtime.schedules` 会在 agent 运行时创建 schedules，因此 agent 可以在对话中设置定期或一次性工作。tools 和 [middleware](/langsmith/javascript/managed-deep-agents-middleware) 收到的 runtime 上都有这个 API，它以当前 run 的调用者身份执行操作。每个 schedule 属于当前用户或 agent。
 
 agent 只能通过你编写的 tools 访问这个 API。只暴露 agent 需要的调用，把它不应该访问的留在外面。
 
@@ -185,6 +184,8 @@ agent 只能通过你编写的 tools 访问这个 API。只暴露 agent 需要�
 
 
 `newThread` 决定 schedule 使用这两者中的哪一个。
+
+Managed Deep Agents 会在每个 tool 和 middleware runtime 上设置 `runtime.schedules`。它的 TypeScript 类型之所以是可选的，只是因为带注解的 tools 必须仍然匹配 LangChain 原生的 runtime 类型，因此示例中使用 `runtime.schedules!`。
 
 
 ### 创建定期 schedule
@@ -196,11 +197,11 @@ agent 只能通过你编写的 tools 访问这个 API。只暴露 agent 需要�
 ```ts tools/schedules.ts
 import { tool } from "langchain";
 import { z } from "zod";
-import { schedules } from "managed-deepagents";
+import type { ManagedDeepAgentRuntime } from "managed-deepagents";
 
 export const remindMe = tool(
-  async ({ prompt, cron, timezone }) => {
-    const item = await schedules.create({
+  async ({ prompt, cron, timezone }, runtime: ManagedDeepAgentRuntime) => {
+    const item = await runtime.schedules!.create({
       owner: { type: "user" },
       cron,
       timezone,
@@ -232,11 +233,11 @@ export const remindMe = tool(
 ```ts tools/follow-up.ts
 import { tool } from "langchain";
 import { z } from "zod";
-import { schedules } from "managed-deepagents";
+import type { ManagedDeepAgentRuntime } from "managed-deepagents";
 
 export const followUpLater = tool(
-  async ({ prompt, hours }) => {
-    const item = await schedules.create({
+  async ({ prompt, hours }, runtime: ManagedDeepAgentRuntime) => {
+    const item = await runtime.schedules!.create({
       owner: { type: "user" },
       at: new Date(Date.now() + hours * 60 * 60_000),
       prompt,
@@ -303,17 +304,17 @@ export const followUpLater = tool(
 
 ### 管理 schedules
 
-`list`、`get`、`update` 和 `delete` 覆盖 schedule 生命周期的其余部分。当 agent 应该管理它创建的 schedules 时，把它们暴露为 tools。拥有 `list` 和 `delete` 的 agent 可以回答"我有哪些提醒？"并按请求取消一个。当对方以后还想要某个提醒时，用 `update` 暂停 schedule 而不是删除它。
+`runtime.schedules` 上的 `list`、`get`、`update` 和 `delete` 覆盖 schedule 生命周期的其余部分。当 agent 应该管理它创建的 schedules 时，把它们暴露为 tools。拥有 `list` 和 `delete` 的 agent 可以回答"我有哪些提醒？"并按请求取消一个。当对方以后还想要某个提醒时，用 `update` 暂停 schedule 而不是删除它。
 
 
 
 ```ts
 const owner = { type: "user" } as const;
 
-const page = await schedules.list({ owner, limit: 20 });
-const item = await schedules.get(page.items[0].id, { owner });
-await schedules.update(item.id, { paused: true }, { owner });
-await schedules.delete(item.id, { owner });
+const page = await runtime.schedules!.list({ owner, limit: 20 });
+const item = await runtime.schedules!.get(page.items[0].id, { owner });
+await runtime.schedules!.update(item.id, { paused: true }, { owner });
+await runtime.schedules!.delete(item.id, { owner });
 ```
 
 
@@ -321,6 +322,21 @@ await schedules.delete(item.id, { owner });
 
 `update` 接受 `cron`、`at`、`timezone`、`prompt`、`input`、`paused` 和 `metadata`。channel 和 thread 选择在创建时就固定了。除非传入 `includeExpired: true`，否则 `list` 会隐藏已过期的一次性 schedules。对于 agent owner，`list` 和 `get` 还会返回 `schedules/` 中的 schedules，这些你在代码中更改。
 
+
+### Schedule 限制
+
+每个 owner 在每个 agent 下最多可以有 20 个运行时 schedules。处于暂停状态的 schedules 会计入限制。已过期的一次性 schedules 和 `schedules/` 中的 schedules 不计入。超过限制的创建或更新操作会失败，并返回 `Schedule limit reached`。
+
+要更改该限制，请在 deployment 环境中设置以下变量：
+
+| 变量 | 限制对象 |
+| --- | --- |
+| `MDA_MAX_AGENT_SCHEDULES` | agent 拥有的 schedules |
+| `MDA_MAX_USER_SCHEDULES` | 每个用户拥有的 schedules |
+
+<Note>
+Schedule 限制需要 `managed-deepagents>=0.9.3`。
+</Note>
 
 ## 排查 schedules 问题
 
@@ -334,7 +350,12 @@ await schedules.delete(item.id, { owner });
 - `schedule is not static`：请把计算值替换为 literals 或顶层 literal constants。
 - `failed to create cron for schedule`：请在 LangSmith 中打开 deployment URL，确认部署后的 Agent Server 处于健康状态。
 - `Invalid thread ID: must be a UUID (HTTP 422)`：persistent schedule 声明的 thread ID 不是 UUID。请替换为一个已有 thread 的 UUID。参见[选择 thread 行为](#选择-thread-行为)。
-- **schedule 在本地开发期间不运行**：`mda dev` 不会创建 schedules。参见[本地测试 schedules](#本地测试-schedules)。
+- `Schedule limit reached`：该 owner 已达到运行时 schedule 限制。请删除一个 schedule，或提高该限制。参见 [Schedule 限制](#schedule-限制)。
+
+
+
+- **schedule 在本地开发期间不运行**：TypeScript dev server 不会运行 schedules。参见[本地测试 schedules](#本地测试-schedules)。
+
 
 ## 下一步
 

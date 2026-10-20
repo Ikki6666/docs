@@ -17,7 +17,7 @@ description: LangSmith self-hosted 在 AWS EKS 上的 Terraform 变量完整参�
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
-| `name_prefix` | — | 是 | 所有资源名称的前缀。最长 15 个字符：小写字母、数字和连字符，以字母开头。格式：`{prefix}-{environment}-{resource}`。 |
+| `name_prefix` | none | 是 | 所有资源名称的前缀。最长 15 个字符：小写字母、数字和连字符，以字母开头。格式：`{prefix}-{environment}-{resource}`。 |
 | `environment` | `dev` | 否 | 环境标签：`dev`、`staging`、`prod`、`test` 或 `uat`。 |
 | `region` | `us-west-2` | 否 | 所有资源所在的 AWS region。 |
 | `owner` | `""` | 否 | 负责该部署的团队或个人。作为标签应用。 |
@@ -31,7 +31,7 @@ description: LangSmith self-hosted 在 AWS EKS 上的 Terraform 变量完整参�
 | `create_vpc` | `true` | 否 | 创建新的 VPC。设为 `false` 可使用已有的 VPC。 |
 | `vpc_id` | `null` | 当 `!create_vpc` 时 | 已有的 VPC ID。 |
 | `private_subnets` | `[]` | 当 `!create_vpc` 时 | 已有的私网子网 ID。 |
-| `public_subnets` | `[]` | 当 `!create_vpc` 时 | 已有的公网子网 ID。 |
+| `public_subnets` | `[]` | 当 `!create_vpc` 且 `alb_scheme = "internet-facing"` 时 | 已有的公网子网 ID。`internal` ALB 不需要。 |
 | `vpc_cidr_block` | `null` | 当 `!create_vpc` 时 | 已有的 VPC CIDR block。 |
 | `vpc_private_subnets` | `[]` | 否 | 当 `create_vpc = true` 时覆盖私网子网的 CIDR。留空使用 module 默认值。 |
 | `vpc_public_subnets` | `[]` | 否 | 当 `create_vpc = true` 时覆盖公网子网的 CIDR。留空使用 module 默认值。 |
@@ -42,13 +42,14 @@ description: LangSmith self-hosted 在 AWS EKS 上的 Terraform 变量完整参�
 |---|---|---|---|
 | `enable_public_eks_cluster` | `true` | 否 | 启用公网 EKS API endpoint。设为 `false` 可获得私有集群，并启用 `create_bastion`，通过 SSM 从 bastion 运行 Terraform 和 Helm。 |
 | `eks_public_access_cidrs` | `["0.0.0.0/0"]` | 否 | 允许访问公网 EKS API endpoint 的 CIDR。限制为公司 VPN 出站 CIDR 可收紧访问。 |
-| `eks_cluster_version` | `1.33` | 否 | EKS Kubernetes 版本。 |
+| `eks_cluster_version` | `1.34` | 否 | EKS Kubernetes 版本，`X.Y` 格式。设置 `enable_smithdb = true` 时，请使 `smithdb_karpenter_chart_version` 与其保持兼容。 |
 | `eks_managed_node_group_defaults` | `{ami_type = "AL2023_x86_64_STANDARD"}` | 否 | 应用于所有托管节点组的默认配置。 |
 | `eks_managed_node_groups` | 一个 `default` 组：`m5.4xlarge`，最少 3 个 / 最多 10 个 | 否 | 托管节点组定义。省略 `desired_size` 时默认为 `min_size`。 |
 | `create_gp3_storage_class` | `true` | 否 | 创建 `gp3` 并将其设为启用卷扩容的默认 `StorageClass`。 |
 | `eks_cluster_enabled_log_types` | `["api", "audit", "authenticator", "controllerManager", "scheduler"]` | 否 | 发送到 CloudWatch 的 EKS control plane 日志类型。设为 `[]` 可禁用。 |
 | `eks_addons` | `{}` | 否 | EKS 托管 add-on 配置（`coredns`、`kube-proxy`、`vpc-cni` 等）。 |
 | `create_langsmith_irsa_role` | `true` | 否 | 为 LangSmith pods 创建 IRSA 角色（S3 访问）。 |
+| `enable_bedrock_access` | `false` | 否 | 为 LangSmith IRSA 角色附加 Bedrock `InvokeModel` 策略，使 LangSmith pods 能通过 workload identity 调用 Bedrock 模型，而不是静态 AWS 密钥。要求 `create_langsmith_irsa_role = true`。 |
 
 ## PostgreSQL (RDS)
 
@@ -60,11 +61,13 @@ description: LangSmith self-hosted 在 AWS EKS 上的 Terraform 变量完整参�
 | `postgres_max_storage_gb` | `100` | 否 | RDS 最大存储大小（GB，自动扩容）。 |
 | `postgres_username` | `langsmith` | 否 | RDS 数据库用户名。 |
 | `postgres_engine_version` | `16` | 否 | PostgreSQL 引擎版本。PG 14 将于 2026 年 11 月停止支持；新部署推荐使用 16。 |
-| `postgres_password` | `""` | 外部时 | RDS 密码。通过 `TF_VAR_postgres_password` 设置，或由 `setup-env.sh` 自动生成并存入 SSM。 |
+| `postgres_password` | `""` | 外部时 | RDS master password。`setup-env.sh` 会生成它（`openssl rand -hex 32`），并在参数尚不存在时存入 SSM；首次运行时要提供自己的值，请在 source 脚本之前导出 `TF_VAR_postgres_password`。要轮换它，请运行 `manage-ssm.sh set`，然后 `unset TF_VAR_postgres_password` 或打开新 shell，重新 source `setup-env.sh`，并运行 `make apply`，使 Terraform 更新 RDS 和 `langsmith-postgres` Secret。然后运行 `kubectl rollout restart deployment -n langsmith`，让 pods 读取新密码。必须为 8 到 128 个字符，且不包含 `/`、`@`、`"`、`'` 或空格。 |
 | `postgres_iam_database_authentication_enabled` | `true` | 否 | 在 RDS 上启用 IAM 数据库认证。 |
 | `postgres_iam_database_user` | `null` | 否 | 用于 IAM 认证的数据库用户。必须已存在于 PostgreSQL 中，并执行过 `GRANT rds_iam TO <user>`。 |
 | `postgres_deletion_protection` | `true` | 否 | 防止意外删除 RDS。dev/test 环境可设为 `false`。 |
 | `postgres_backup_retention_period` | `7` | 否 | 自动 RDS 备份的保留天数。`0` 表示禁用备份。 |
+| `postgres_skip_final_snapshot` | `false` | 否 | 销毁 RDS 实例时跳过最终快照。以相同名称重建的 dev/test stack 可设为 `true`；否则 destroy 会留下一个 `<name>-final` 快照。 |
+| `postgres_existing_security_group_id` | `null` | 否 | 为 RDS 实例挂载已有的安全组，而不是新建一个。Terraform 不会管理其规则；它必须已允许来自 VPC CIDR 的 TCP 5432。 |
 
 ## Redis (ElastiCache)
 
@@ -72,7 +75,8 @@ description: LangSmith self-hosted 在 AWS EKS 上的 Terraform 变量完整参�
 |---|---|---|---|
 | `redis_source` | `external` | 否 | `external`（带私有访问的 ElastiCache）或 `in-cluster`（通过 Helm 部署）。 |
 | `redis_instance_type` | `cache.m6g.xlarge` | 否 | ElastiCache 节点类型。 |
-| `redis_auth_token` | `""` | 外部时 | ElastiCache auth token。由 `setup-env.sh` 自动生成并存入 SSM。通过 `TF_VAR_redis_auth_token` 设置。 |
+| `redis_auth_token` | `""` | 外部时 | ElastiCache auth token，至少 16 个字符。`setup-env.sh` 会生成它（`openssl rand -hex 32`），并在参数尚不存在时存入 SSM；首次运行时要提供自己的值，请在 source 脚本之前导出 `TF_VAR_redis_auth_token`。要轮换它，请运行 `manage-ssm.sh set`，然后 `unset TF_VAR_redis_auth_token` 或打开新 shell，重新 source `setup-env.sh`，并运行 `make apply`，使 Terraform 更新 ElastiCache 和 `langsmith-redis` Secret。然后运行 `kubectl rollout restart deployment -n langsmith`，让 pods 读取新 token。 |
+| `redis_existing_security_group_id` | `null` | 否 | 为 ElastiCache replication group 挂载已有的安全组，而不是新建一个。Terraform 不会管理其规则；它必须已允许来自 VPC CIDR 的 TCP 6379。 |
 
 ## S3
 
@@ -89,9 +93,11 @@ description: LangSmith self-hosted 在 AWS EKS 上的 Terraform 变量完整参�
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
 | `tls_certificate_source` | `acm` | 否 | TLS source：`acm`、`letsencrypt`（经 ALB 解决的 cert-manager HTTP-01 ACME）或 `none`。对于经 Route 53 的 DNS-01 challenge（集群内 gateway），请改用 `create_cert_manager_irsa`；两者互斥。 |
-| `acm_certificate_arn` | `""` | 当 `acm` 时 | 已有的 ACM 证书 ARN。 |
-| `letsencrypt_email` | `""` | 当 `letsencrypt` 时 | 用于 Let's Encrypt ACME 注册的邮箱。 |
-| `langsmith_domain` | `""` | 否 | 自定义域名。设置后（且 `acm_certificate_arn` 为空），会预配 Route 53 hosted zone、ACM 证书和 alias 记录。留空使用 ALB hostname。 |
+| `acm_certificate_arn` | `""` | 当 `acm` 且 `langsmith_domain` 为空时 | 已有的 ACM 证书 ARN。留空并设置 `langsmith_domain`，让 Terraform 申请并验证证书。 |
+| `letsencrypt_email` | `""` | 当 `letsencrypt` 或 `create_cert_manager_irsa` 时 | 用于 Let's Encrypt ACME 注册的邮箱。 |
+| `langsmith_domain` | `""` | 当 `acm` 且 `acm_certificate_arn` 为空时 | 自定义域名。设置后（且 `acm_certificate_arn` 为空），Terraform 会创建 Route 53 hosted zone（或使用 `dns_existing_zone_id`）、申请 ACM 证书并创建 ALB alias 记录。留空使用 ALB hostname。 |
+| `dns_create_zone` | `true` | 否 | 为 `langsmith_domain` 创建公共 Route 53 hosted zone。设为 `false` 可将验证记录和 alias 记录写入 `dns_existing_zone_id`。 |
+| `dns_existing_zone_id` | `""` | 当 `dns_create_zone = false`、已设置 `langsmith_domain` 且 `acm_certificate_arn` 为空时 | `langsmith_domain` 或其父域名的已有公共 Route 53 hosted zone ID（以 `Z` 开头）。 |
 | `dns_include_wildcard_san` | `false` | 否 | 在 ACM 证书中添加 wildcard SAN（`*.<langsmith_domain>`）。子域名 HTTPS 需要它。 |
 | `langsmith_namespace` | `langsmith` | 否 | LangSmith 的 Kubernetes namespace。 |
 
@@ -102,29 +108,74 @@ description: LangSmith self-hosted 在 AWS EKS 上的 Terraform 变量完整参�
 | `alb_scheme` | `internet-facing` | 否 | ALB scheme：`internet-facing`（公网子网）或 `internal`（私网子网，可通过 VPN、peering 或 PrivateLink 访问）。 |
 | `alb_allowed_cidr_blocks` | `["0.0.0.0/0"]` | 否 | 允许通过 HTTP/HTTPS 访问 ALB 的 CIDR。受限访问部署可限制为 VPN 或办公网 CIDR。 |
 | `alb_access_logs_enabled` | `false` | 否 | 启用 ALB 访问日志，写入专用的 S3 bucket。 |
-| `enable_envoy_gateway` | `false` | 否 | 安装 Envoy Gateway（Kubernetes Gateway API）以替代 ALB Ingress。多 namespace dataplane 部署必需。 |
-| `enable_nginx_ingress` | `false` | 否 | 安装 NGINX ingress controller。ALB 通过 `TargetGroupBinding` 转发到 NGINX controller pods。 |
-| `enable_istio_gateway` | `false` | 否 | 在节点安全组上开放 15017 端口，供 istiod sidecar-injector webhook 使用。在 EKS 上运行 Istio 时必需。 |
-| `istio_nlb_scheme` | `internet-facing` | 否 | Istio ingress gateway NLB 的 scheme：`internet-facing` 或 `internal`。由 setup 向导写入 `tfvars`，但尚未被任何 module 消费；Istio 路径目前使用 ALB `TargetGroupBinding` 后面的 ClusterIP service。 |
-| `create_cert_manager_irsa` | `false` | 否 | 为 cert-manager 经 Route 53 的 DNS-01 challenge 创建 IRSA 角色。Istio Gateway 使用 Let's Encrypt 时必需。apply 之后运行 `make tls`。 |
+| `alb_existing_security_group_id` | `null` | 否 | 为 ALB 挂载已有的安全组，而不是新建一个。Terraform 不会管理其规则；它必须已允许来自 `alb_allowed_cidr_blocks` 的 HTTP 和 HTTPS。 |
+| `enable_envoy_gateway` | `null` | 否 | 安装 Envoy Gateway；chart 会在 ALB 后面创建 Gateway API `HTTPRoute` 资源。未设置时，除非 `enable_istio_gateway` 或 `enable_nginx_ingress` 为 `true`，否则等同于 `true`。设为 `false` 可使用普通的 ALB Ingress。支持跨 namespace 的分离式 dataplane 路由。 |
+| `enable_nginx_ingress` | `false` | 否 | 安装 NGINX ingress controller。ALB 通过 `TargetGroupBinding` 转发到 NGINX controller pods。会关闭默认的 Envoy Gateway。 |
+| `enable_istio_gateway` | `false` | 否 | 安装 Istio（`istio-base`、`istiod`，以及位于 ALB `TargetGroupBinding` 后面的 ingress gateway），并在节点安全组上开放 15017 端口，供 istiod sidecar-injector webhook 使用。会关闭默认的 Envoy Gateway。 |
+| `create_cert_manager_irsa` | `false` | 否 | 为 cert-manager 经 Route 53 的 DNS-01 challenge 创建 IRSA 角色，以及 `letsencrypt-prod` DNS-01 `ClusterIssuer`（需要 `langsmith_domain` 和 `cert_manager_hosted_zone_id`）。与 Istio Gateway 配合使用。与 `tls_certificate_source = "letsencrypt"` 互斥。 |
 | `cert_manager_hosted_zone_id` | `""` | 当 `create_cert_manager_irsa` 时 | 用于 cert-manager DNS-01 TXT 记录的 Route 53 hosted zone ID。 |
+
+Terraform 会拒绝将 `enable_envoy_gateway`、`enable_istio_gateway` 和 `enable_nginx_ingress` 中的多个设置为 `true` 的配置。
 
 ## ClickHouse
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
-| `clickhouse_source` | `in-cluster` | 否 | `in-cluster`（仅限 dev/POC）或 `external`（LangChain Managed ClickHouse，生产环境推荐）。 |
+| `clickhouse_source` | `in-cluster` | 否 | `in-cluster` 或 `external`（LangChain Managed ClickHouse）。 |
+
+## SmithDB
+
+`enable_smithdb` 预配 SmithDB 的依赖。三个开关都要求 `enable_smithdb = true`，且 `smithdb_migration_enabled` 和 `smithdb_query_enabled` 各自要求 `smithdb_ingestion_enabled = true`。
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `enable_smithdb` | `false` | 否 | 预配 SmithDB 依赖：专用的 metastore RDS、一个 S3 bucket、一个 IRSA 角色，以及基于本地 NVMe 实例的 Karpenter node pool。 |
+| `smithdb_ingestion_enabled` | `false` | 否 | 将新的写入路由到 SmithDB。要求 `enable_smithdb`。 |
+| `smithdb_migration_enabled` | `false` | 否 | 启用历史 ClickHouse 到 SmithDB 的迁移。要求 `smithdb_ingestion_enabled`。 |
+| `smithdb_query_enabled` | `false` | 否 | 由 SmithDB 提供查询服务。要求 `smithdb_ingestion_enabled`。 |
+| `langsmith_release_name` | `langsmith` | 否 | Helm release 名称；将 SmithDB IRSA 信任范围限定为 `<release>-langsmith-smithdb`。必须与 `deploy.sh` 使用的 release 一致。 |
+| `smithdb_metastore_source` | `create` | 否 | `create`（专用 RDS）或 `external`。必须与应用数据库分开。 |
+| `smithdb_metastore_instance_class` | `db.m6g.large` | 否 | Metastore RDS 实例规格。 |
+| `smithdb_metastore_engine_version` | `18` | 否 | Metastore PostgreSQL 版本。 |
+| `smithdb_metastore_allocated_storage` | `50` | 否 | Metastore 存储大小（GB）。 |
+| `smithdb_metastore_multi_az` | `false` | 否 | 以 Multi-AZ 方式运行 metastore。 |
+| `smithdb_metastore_deletion_protection` | `true` | 否 | 防止 metastore 被删除；销毁前请设为 `false`。 |
+| `smithdb_metastore_backup_retention_period` | `7` | 否 | Metastore 备份保留天数；`0` 表示禁用备份。 |
+| `smithdb_metastore_skip_final_snapshot` | `false` | 否 | 销毁时跳过最终快照。 |
+| `smithdb_metastore_use_ssl` | `true` | 否 | 通过 SSL 连接 metastore。 |
+| `smithdb_metastore_master_username` | `smithdb` | 否 | 所创建 metastore 的 master 用户名。密码由 Terraform 生成。 |
+| `smithdb_external_metastore_host` | `null` | 当 `enable_smithdb` 且为 `external` 时 | 已有的 metastore hostname。 |
+| `smithdb_external_metastore_port` | `5432` | 否 | 已有的 metastore 端口。 |
+| `smithdb_external_metastore_database` | `smithdb` | 否 | 已有的 metastore 数据库名称。 |
+| `smithdb_external_metastore_username` | `null` | 当 `enable_smithdb` 且为 `external` 时 | 已有的 metastore 用户名。 |
+| `smithdb_external_metastore_password` | `null` | 当 `enable_smithdb` 且为 `external` 时 | 已有的 metastore 密码。敏感值；使用 `TF_VAR_smithdb_external_metastore_password` 设置。 |
+| `smithdb_existing_metastore_security_group_id` | `null` | 否 | 为所创建的 metastore 挂载已有的安全组。 |
+| `smithdb_manage_byo_security_group_rules` | `false` | 否 | 让 Terraform 向已有安全组添加来自 EKS 节点的 TCP 5432 规则。 |
+| `smithdb_bucket_name` | `""` | 否 | Bucket 名称；留空则生成 `{name_prefix}-{environment}-smithdb-{suffix}`。 |
+| `smithdb_s3_versioning_enabled` | `false` | 否 | 启用 bucket versioning。 |
+| `smithdb_s3_force_destroy` | `false` | 否 | 允许删除非空 bucket。仅用于测试 stack。 |
+| `smithdb_karpenter_chart_version` | `1.6.3` | 否 | Karpenter chart 版本；必须与 `eks_cluster_version` 匹配（1.34 需要 1.6 或更高版本，1.35 需要 1.9 或更高版本，1.36 需要 1.13）。 |
+| `smithdb_karpenter_ami_alias` | `al2023@latest` | 否 | `EC2NodeClass` AMI alias。 |
+| `smithdb_node_arch` | `amd64` | 否 | `amd64` 或 `arm64`。 |
+| `smithdb_capacity_type` | `["on-demand"]` | 否 | Karpenter 容量类型；推荐 on-demand。 |
+| `smithdb_instance_store_sizes` | `["4xlarge", "8xlarge", "16xlarge"]` | 否 | instance-store 池中允许的规格。 |
+| `smithdb_instance_store_min_local_nvme_gib` | `800` | 否 | 每个 instance-store 节点的最小本地 NVMe 容量（GiB）。 |
+| `smithdb_instance_store_limits` | `{cpu = 512, memory = "4096Gi"}` | 否 | Instance-store 池的 CPU 和内存上限。 |
+| `smithdb_compute_sizes` | `["2xlarge", "4xlarge", "8xlarge"]` | 否 | 计算池中允许的规格。 |
+| `smithdb_compute_limits` | `{cpu = 256, memory = "1024Gi"}` | 否 | 计算池的 CPU 和内存上限。 |
+| `smithdb_node_root_volume_size_gb` | `100` | 否 | SmithDB 节点的根 EBS 大小（GB）。 |
 
 ## Bastion（私有集群）
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
-| `create_bastion` | `false` | 否 | 在公网子网中创建一台 EC2 bastion，通过 SSM Session Manager 或 SSH 访问私有集群。 |
+| `create_bastion` | `false` | 否 | 创建一台 EC2 bastion，通过 SSM Session Manager 或 SSH 访问私有集群。除非设置 `bastion_enable_ssh = true`，否则它运行在私网子网中。 |
 | `bastion_instance_type` | `t3.micro` | 否 | bastion 的 EC2 实例类型。 |
 | `bastion_key_name` | `null` | 否 | 用于 SSH 的 EC2 key pair。留空则仅使用 SSM Session Manager。 |
-| `bastion_enable_ssh` | `false` | 否 | 在 bastion 安全组上开放 22 端口。 |
+| `bastion_enable_ssh` | `false` | 否 | 在 bastion 安全组上开放 22 端口，并将 bastion 放到带公网 IP 的公共子网中。 |
 | `bastion_ssh_allowed_cidrs` | `[]` | 否 | 允许 SSH 访问 bastion 的 CIDR。仅在 `bastion_enable_ssh = true` 时使用。 |
 | `bastion_root_volume_size_gb` | `20` | 否 | bastion 根 EBS 卷大小（GB）。 |
+| `bastion_existing_security_group_id` | `null` | 否 | 为 bastion 挂载已有的安全组，而不是新建一个。Terraform 不会管理其规则。 |
 
 ## 安全与审计
 
@@ -136,38 +187,68 @@ description: LangSmith self-hosted 在 AWS EKS 上的 Terraform 变量完整参�
 | `create_waf` | `false` | 否 | 为 ALB 挂载 WAFv2 Web ACL（AWS 托管规则：OWASP Top 10、IP 信誉、恶意输入）。成本：基础约 `$8` 到 `$10`/月。 |
 | `create_firewall` | `false` | 否 | 部署 AWS Network Firewall，进行基于 FQDN 的出站过滤。需要 `create_vpc = true`。成本：每个 endpoint 约 `$0.395/hr`，另加 `$0.065/GB`。 |
 | `firewall_allowed_fqdns` | `["beacon.langchain.com"]` | 否 | 当 `create_firewall = true` 时允许出站的域名。按 TLS SNI 和 HTTP Host 头匹配。其余目的地一律丢弃。 |
-| `firewall_subnet_cidr` | `10.0.64.0/21` | 否 | 防火墙子网的 CIDR。必须在 VPC CIDR 内，且不得与公网或私网子网重叠。 |
+| `firewall_subnet_cidr` | `10.0.64.0/21` | 否 | 防火墙子网的 CIDR。必须在 VPC CIDR 内，且不得与私网子网（默认 `10.0.0.0/21`、`10.0.8.0/21` 和 `10.0.16.0/21`）或公网子网（默认 `10.0.40.0/21`、`10.0.48.0/21` 和 `10.0.56.0/21`）重叠。 |
 
 ## 容量与功能开关
 
-`sizing_profile` 和大多数 `enable_*` 开关由 `init-values.sh` 和 `deploy.sh` 读取；Terraform 不会直接处理它们。它们影响脚本生成的 Helm overlay 文件。三个独立开关（`enable_fleet`、`enable_standalone_polly`、`enable_standalone_insights`）是例外：Terraform 会读取它们以创建 database-init Job 和 Kubernetes secret，并对其所需的外部 Postgres 和 Redis 输入执行 plan 时前置条件检查。
+`sizing_profile` 和本表中的 `enable_*` 开关由 `init-values.sh` 和 `deploy.sh` 读取，由它们选择 Helm overlay 文件。只有当开关需要专用数据库时，Terraform 才会处理它：使用 `fleet_storage = "external"` 的 `enable_fleet`、使用各自 `*_storage = "external"` 的 `enable_insights` 或 `enable_polly`，以及 `enable_standalone_insights` 或 `enable_standalone_polly`。对于这些开关，Terraform 会创建 database-init Job 和 Kubernetes secret，并且 plan 时前置条件要求 `postgres_source` 和 `redis_source` 为 `external`。
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
 | `sizing_profile` | `default` | 否 | Helm 容量规格：`production`、`production-large`、`dev`、`minimum` 或 `default`。 |
+| `langsmith_helm_chart_version` | `""` | 否 | 将 LangSmith Helm chart 固定到确切的 `0.17.x` 补丁版本。留空则部署最新的 v17 补丁版本。验证会拒绝其他版本线。`CHART_VERSION` 环境变量会覆盖它。在 `v0.16.*` module release 上请使用 `0.16.x` 补丁版本。 |
 | `enable_deployments` | `false` | 否 | 启用 LangSmith Deployment（listener、operator、host-backend）。需要 Deployments license entitlement。 |
-| `enable_agent_builder` | `false` | 否 | 启用 Agent Builder。需要 `enable_deployments = true` 和 Agent Builder entitlement。 |
-| `enable_insights` | `false` | 否 | 启用 Insights（基于 ClickHouse 的分析）。需要 Insights entitlement。 |
-| `enable_polly` | `false` | 否 | 启用 Polly（AI 评估与监控）。需要 `enable_deployments = true` 和 Polly entitlement。 |
+| `enable_fleet` | `false` | 否 | 启用 Fleet 及其所需的 host-backend。不要求 `enable_deployments`。使用默认的 `fleet_storage = "external"` 时，要求 `postgres_source` 和 `redis_source` 为 `external`。取代 `enable_agent_builder`。 |
+| `fleet_storage` | `external` | 否 | Fleet 的 PostgreSQL 和 Redis 数据存放位置：`external`（要求 `postgres_source` 和 `redis_source` 为 `external`）或 `in-cluster`。 |
+| `enable_insights` | `false` | 否 | 启用 Insights（AI 驱动的 trace 分析）。需要 Insights entitlement。存储位置由 `insights_storage` 决定。 |
+| `insights_storage` | `in-cluster` | 否 | Insights 的 PostgreSQL 和 Redis 数据存放位置：`in-cluster`（chart StatefulSets）或 `external`（共享 RDS 和 ElastiCache 上的专用数据库；要求 `postgres_source` 和 `redis_source` 为 `external`）。 |
+| `enable_polly` | `false` | 否 | 启用 LangSmith Chat（原 Polly）。不要求 `enable_deployments`。需要 LangSmith Chat entitlement。存储位置由 `polly_storage` 决定。 |
+| `polly_storage` | `in-cluster` | 否 | LangSmith Chat 的 PostgreSQL 和 Redis 数据存放位置：`in-cluster` 或 `external`（规则与 `insights_storage` 相同）。 |
+| `enable_standalone_polly` | `false` | 否 | `enable_polly = true` 加 `polly_storage = "external"` 的旧版简写：共享 RDS 和 ElastiCache 上的专用数据库。要求 `postgres_source` 和 `redis_source` 为 `external`。 |
+| `enable_standalone_insights` | `false` | 否 | `enable_insights = true` 加 `insights_storage = "external"` 的旧版简写：共享 RDS 和 ElastiCache 上的专用数据库。仍需要 ClickHouse。要求 `postgres_source` 和 `redis_source` 为 `external`。 |
 | `enable_usage_telemetry` | `false` | 否 | 启用扩展的使用量 telemetry 上报。 |
-| `enable_fleet` | `false` | 否 | 启用 Fleet 独立部署（chart v0.15+）。需要 `enable_deployments = true` 以及外部 Postgres 和 Redis。 |
-| `enable_standalone_polly` | `false` | 否 | 启用 Polly 独立部署（chart v0.15+）。不要求 `enable_deployments`。需要外部 Postgres 和 Redis。 |
-| `enable_standalone_insights` | `false` | 否 | 启用 Insights 独立部署（chart v0.15+）。不要求 `enable_deployments`。需要外部 Postgres 和 Redis。 |
+| `enable_sso_oidc` | `false` | 否 | 通过任意 OIDC provider 启用 SSO，并关闭 basic auth。先使用 `infra/scripts/manage-ssm.sh set` 将 `oauth-client-id`、`oauth-client-secret` 和 `oauth-issuer-url` 存入 SSM；缺少它们时 `make init-values` 会失败。仅在首次安装之后、确认拥有 org-admin 访问权限后再开启。 |
+
+<Warning>
+`enable_agent_builder` 在 chart v16 中已被移除。将其设置为 `true` 会在 `terraform plan` 时验证失败，请将 `enable_agent_builder = true` 替换为 `enable_fleet = true`。
+</Warning>
+
+## Sandboxes
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `enable_sandboxes` | `false` | 否 | 预配 LangSmith Sandboxes 前提条件：专用的 JuiceFS metadata ElastiCache、一个 `sandbox-host` 节点组，以及 JuiceFS config secret。Sandbox host 需要可用的 KVM（`/dev/kvm`）：裸金属或支持嵌套虚拟化的 x86_64 实例类型。要求 LangSmith Helm chart v16 或更高版本。 |
+| `sandbox_host_node_count` | `1` | 否 | sandbox-host 节点的固定数量。至少为 `1`。 |
+| `sandbox_host_instance_types` | `["m5d.metal"]` | 否 | sandbox-host 节点组的实例类型。必须支持 KVM。在没有 instance store 的实例类型上，请设置 `sandbox_host_local_nvme_bootstrap_enabled = false`。 |
+| `sandbox_host_local_nvme_bootstrap_enabled` | `true` | 否 | 格式化本地 NVMe instance-store 设备：第一个用作 swap，其余用作 JuiceFS 缓存。 |
+| `sandbox_host_local_nvme_expected_device_count` | `4` | 否 | 每台 host 必须拥有的 instance-store NVMe 设备数量。必须与实例类型匹配。 |
+| `sandbox_host_node_group_overrides` | `{}` | 否 | 合并到生成的 sandbox-host 节点组中的高级覆盖配置。 |
+| `sandbox_juicefs_name` | `sandbox-juicefs` | 否 | 用于 sandbox 快照和文件系统状态的 JuiceFS 卷名称。 |
+| `sandbox_juicefs_redis_instance_type` | `cache.m6g.large` | 否 | JuiceFS metadata Redis 的 ElastiCache 节点类型。 |
+| `sandbox_juicefs_redis_snapshot_retention_limit` | `7` | 否 | JuiceFS metadata Redis 的自动快照保留天数，`0` 到 `35`。 |
+| `sandbox_juicefs_csi_config_secret_name` | `juicefs-csi-config` | 否 | Terraform 在 LangSmith namespace 中创建的 JuiceFS config secret 的名称，包含 `name`、`metaurl`、`storage` 和 `bucket` key。作为 `sandboxes.juicefs.existingSecretName` 传给 chart（chart v16 为 `sandboxes.juicefs.csi.existingSecretName`）。 |
+| `sandbox_juicefs_csi_config_secret_revision` | `1` | 否 | 递增以重写只写的 JuiceFS config secret。重写不会重启 `sandbox-host`，因此请在 apply 之后重启它，例如使用默认 release 名称和 namespace 时运行 `kubectl rollout restart deployment/langsmith-sandbox-host -n langsmith`。 |
+| `sandbox_service_url_base_url` | `""` | 否 | sandbox 内运行的 HTTP 服务的 base URL。需要该 host 的 wildcard DNS 和 TLS。 |
 
 ## 敏感值（通过 `setup-env.sh` 设置）
 
-source `infra/scripts/setup-env.sh` 会把这些值写入 AWS SSM Parameter Store。External Secrets Operator 将其同步为集群中的 Kubernetes secret。它们不是声明的 Terraform 变量，不应出现在 `terraform.tfvars` 中；只能通过 SSM 设置。
+source `infra/scripts/setup-env.sh` 会从 SSM Parameter Store 中 `/langsmith/{name_prefix}-{environment}/` 下读取每个值。首次运行时它会生成或提示输入该值，并将其存入 SSM；External Secrets Operator 将 SSM 同步到集群。Terraform 只读取 `postgres_password`、`redis_auth_token` 和 `sandbox_juicefs_redis_auth_token`；其他 `TF_VAR_*` 值虽有声明但不被使用，因此 `terraform.tfvars` 中的值永远不会到达 SSM。要提供自己的值，请在 source 脚本之前导出它，脚本只在该参数尚不存在时才将其写入 SSM。对 Terraform 而言，导出的值也优先于 SSM。要更改已存储的值，请运行 `manage-ssm.sh set`。对于 Terraform 读取的三个值，`setup-env.sh` 不会重新读取已导出的变量，因此请 unset 它或打开新 shell，重新 source `setup-env.sh` 并运行 `make apply`，使 RDS 和 ElastiCache 凭证保持一致。然后重启读取该凭证的 deployments。
 
 | 变量 | 描述 |
 |---|---|
-| `langsmith_license_key` | LangSmith enterprise license key。 |
-| `langsmith_admin_password` | 初始组织 admin 密码。至少 12 个字符，需包含小写、大写字母和一个符号。 |
-| `langsmith_api_key_salt` | 用于哈希 API key 的 salt。首次部署后必须保持稳定。 |
-| `langsmith_jwt_secret` | 用于 Basic Auth 会话的 JWT secret。必须保持稳定。 |
-| `langsmith_deployments_encryption_key` | LangSmith Deployment 的 Fernet key。绝不能更改。 |
-| `langsmith_agent_builder_encryption_key` | Agent Builder 的 Fernet key。绝不能更改。 |
-| `langsmith_insights_encryption_key` | Insights 的 Fernet key。绝不能更改。 |
-| `langsmith_polly_encryption_key` | Polly 的 Fernet key。绝不能更改。 |
+| `LANGSMITH_LICENSE_KEY` | 环境变量，不是 Terraform 变量。Enterprise license key。首次运行时提示输入。 |
+| `LANGSMITH_ADMIN_PASSWORD` | 环境变量。初始组织 admin 密码。提示输入。至少 12 个字符，需包含一个小写字母、一个大写字母和一个符号。 |
+| `LANGSMITH_ADMIN_EMAIL` | 环境变量。初始组织 admin 邮箱。提示输入。 |
+| `postgres_password` | RDS master password。自动生成。由 Terraform 读取。 |
+| `redis_auth_token` | ElastiCache auth token。自动生成。由 Terraform 读取。 |
+| `langsmith_api_key_salt` | 用于哈希 API key 的 salt。自动生成。更改它会使所有 API key 失效。 |
+| `langsmith_jwt_secret` | 用于 Basic Auth 会话的 JWT secret。自动生成。更改它会使所有用户登出。 |
+| `langsmith_deployments_encryption_key` | LangSmith Deployment 的 Fernet key。自动生成。绝不能更改。 |
+| `langsmith_agent_builder_encryption_key` | Fleet 的 Fernet key（为兼容保留名称）。自动生成。绝不能更改。 |
+| `langsmith_insights_encryption_key` | Insights 的 Fernet key。自动生成。绝不能更改。 |
+| `langsmith_polly_encryption_key` | LangSmith Chat（原 Polly）的 Fernet key。自动生成。绝不能更改。 |
+| `sandbox_juicefs_redis_auth_token` | JuiceFS metadata Redis 的 auth token。在 `enable_sandboxes = true` 时自动生成。由 Terraform 读取。 |
+| `sandbox_callback_signing_jwk` | 用于 sandbox 回调的 Ed25519 私钥 JWK。在 `enable_sandboxes = true` 时自动生成。 |
 
 ---
 

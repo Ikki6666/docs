@@ -1,15 +1,15 @@
 ---
 title: Azure Terraform 变量参考
 sidebarTitle: 变量
-description: LangSmith self-hosted 在 Azure AKS 上的 Terraform 变量完整参考。
+description: LangSmith self-hosted 在 Azure AKS 上的主要 Terraform 变量参考。
 ---
 
-这是 [Azure Terraform modules](https://github.com/langchain-ai/terraform/tree/main/modules/azure) 暴露的每个输入变量的完整参考。可在首次填写 `terraform.tfvars` 或调整现有部署时使用。
+这是在 [Azure Terraform module](https://github.com/langchain-ai/terraform/tree/main/modules/azure) 中设置的输入变量的参考。可在首次填写 `terraform.tfvars` 或调整现有部署时使用。此处未列出的命名覆盖和其他高级输入，请参考 [`infra/variables.tf`](https://github.com/langchain-ai/terraform/blob/main/modules/azure/infra/variables.tf)。
 
 变量分为两类：
 
 - **非敏感**（region、容量、功能开关）：在 `infra/terraform.tfvars` 中设置。
-- **敏感**（license key、密码、加密密钥）：通过 `make setup-env` 设置，它会把这些值写入 `infra/secrets.auto.tfvars`（被 gitignore，由 Terraform 自动加载）并存储在 Azure Key Vault 中。
+- **敏感**（license key、PostgreSQL 密码）：通过 `make setup-env` 设置，它会把这些值写入 `infra/secrets.auto.tfvars`（被 gitignore，由 Terraform 自动加载）。应用机密不是 Terraform 变量。`make seed-secrets` 会把它们写入 Azure Key Vault，如本页末尾的敏感变量一节所述。
 
 端到端安装请参见[部署指南](/langsmith/self-host-terraform-azure-deploy)。各 module 如何协同工作请参见[架构参考](/langsmith/self-host-terraform-azure-architecture)。
 
@@ -17,39 +17,72 @@ description: LangSmith self-hosted 在 Azure AKS 上的 Terraform 变量完整�
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
-| `subscription_id` | — | 是 | 该部署的 Azure subscription ID。 |
+| `subscription_id` | none | 是 | 该部署的 Azure subscription ID（GUID）。可用 `az account show --query id -o tsv` 获取。 |
 | `location` | `eastus` | 否 | 该部署的 Azure region。 |
-| `identifier` | `""` | 否 | 追加到每个资源名称后的后缀，用于区分环境（例如 `-prod`、`-staging`）。必须以连字符开头或为空。 |
-| `environment` | `dev` | 否 | 应用到所有资源的环境标签。 |
+| `azure_environment` | `public` | 否 | Azure 云：`public`（商业 Azure）或 `usgovernment`（Azure Government）。设置 provider environment 以及两个云之间不同的 DNS 和 Blob endpoint 名称。覆盖 `ARM_ENVIRONMENT`。Azure Government 不提供 Azure Managed Redis，因此 `usgovernment` 要求 `redis_source = "in-cluster"`。 |
+| `name_prefix` | `""` | 否 | 该部署的名称，追加到每个资源名称后，并用作默认的 `environment` 标签。书写时不要带连字符：`prod` 生成 `langsmith-rg-prod`，设为 `unique_resource_names = true` 时生成 `ls-rg-prod`。小写字母和数字，以单个连字符分隔。留空表示没有后缀。 |
+| `unique_resource_names` | `false` | 否 | 使用抗冲突命名方案（`ls-` 基础名，加上全局唯一名称上按订阅的哈希）。每个 `terraform.tfvars` 模板都设为 `true`。已有部署请保持 `false`：开启它会重命名每个资源，Terraform 会销毁并重建 PostgreSQL 和 Storage，并丢失其数据。 |
+| `name_suffix_salt` | `""` | 否 | 混入全局唯一的 PostgreSQL、Redis、Storage 和 Key Vault 名称哈希中的轮换计数器。当更早的部署仍占用这些名称时提高它（先 `"2"`，再 `"3"`），例如 soft-deleted Key Vault。设为 `unique_resource_names = false` 时无效果。在已有部署上更改它会重命名全部四个，Terraform 会销毁并重建 PostgreSQL 和 Storage，并丢失其数据。 |
+| `create_resource_group` | `true` | 否 | 创建资源组。设为 `false` 可部署到由 `existing_resource_group_name` 指定的现有组，这样部署者只需要该组上的权限。Terraform 不改变该组的标签、锁和策略分配，`terraform destroy` 也会保留该组。 |
+| `existing_resource_group_name` | `""` | 当 `!create_resource_group` 时 | 要部署到的现有资源组的名称。 |
+| `environment` | `""` | 否 | 所有资源上 `environment` 标签的值。留空使用 `name_prefix`。仅当标签需要不同于部署名称时才设置。 |
 | `owner` | `""` | 否 | 资源所有者的邮箱或团队名称。作为标签应用。 |
 | `cost_center` | `""` | 否 | 成本中心或计费代码。作为标签应用。 |
+
+`name_prefix` 取代了 `identifier`。仍设置 `identifier` 的 `terraform.tfvars` 会使 plan 失败。重命名该变量并去掉前导连字符：`identifier = "-prod"` 改为 `name_prefix = "prod"`。资源名称不会改变。
 
 ## 网络
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
-| `create_vnet` | `true` | 否 | 创建新的 VNet。设为 `false` 可使用已有的 VNet 和子网。 |
-| `vnet_id` | `""` | 当 `!create_vnet` 时 | 已有的 VNet 资源 ID。 |
-| `aks_subnet_id` | `""` | 当 `!create_vnet` 时 | AKS 集群已有的子网 ID。 |
-| `postgres_subnet_id` | `""` | 当 `!create_vnet` 时 | PostgreSQL 服务器已有的子网 ID。 |
-| `redis_subnet_id` | `""` | 当 `!create_vnet` 时 | Redis 实例已有的子网 ID。 |
-| `postgres_subnet_address_prefix` | `["10.0.32.0/20"]` | 否 | PostgreSQL 子网的 CIDR 前缀。可以是不连续的范围。 |
-| `redis_subnet_address_prefix` | `["10.0.48.0/20"]` | 否 | Redis 子网的 CIDR 前缀。可以是不连续的范围。 |
-| `aks_authorized_ip_ranges` | `[]` | 否 | 允许访问 AKS API server 的外部 CIDR。留空时 API server 保持公网可达，Terraform 驱动的 Helm 和 `kubectl` 步骤可从任意执行主机运行。生产环境应填入 operator 和 CI 的出站 CIDR。 |
+| `create_vnet` | `true` | 否 | 创建新的 VNet。设为 `false` 可使用你自己的 VNet。 |
+| `vnet_address_space` | `["10.0.0.0/17"]` | 否 | Terraform 创建的 VNet 的地址空间。设为 `create_vnet = false` 时忽略。选择的范围不得与你通过对等连接、ExpressRoute 或 VPN 连接或访问的任何网络重叠。plan 会拒绝该空间之外的子网前缀，因此移动它时也要一并移动子网前缀。 |
+| `vnet_id` | `""` | 当 `!create_vnet` 时 | 已有的 VNet 资源 ID。Terraform 创建的任何子网都位于该 VNet 的资源组中。 |
+| `aks_subnet_id` | `""` | 当 `!create_cluster` 时 | AKS 集群已有的子网 ID。留空会在 `vnet_id` 中创建子网。已有子网必须携带 `Microsoft.Storage` 和 `Microsoft.KeyVault` service endpoint，plan 会检查。设置 `manage_byo_subnet_service_endpoints = true` 可让 Terraform 添加它们。设为 `keyvault_private_endpoint_enabled = true` 时，仅要求 `Microsoft.Storage`。 |
+| `postgres_subnet_id` | `""` | 否 | PostgreSQL 服务器已有的子网 ID。留空会在 `vnet_id` 中创建子网。已有子网必须委派给 `Microsoft.DBforPostgreSQL/flexibleServers` 且不承载其他资源。 |
+| `redis_subnet_id` | `""` | 否 | Redis 私有 endpoint 已有的子网 ID。留空会在 `vnet_id` 中创建子网。该子网不得被委派。 |
+| `agic_subnet_id` | `""` | 当 `agic` 且 `!create_vnet` 时 | Application Gateway 已有的子网 ID。在 Terraform 不拥有的 VNet 中，Terraform 不会创建该子网。该子网必须是专用的，并委派给 `Microsoft.Network/applicationGateways`。 |
+| `bastion_subnet_id` | `""` | 当 `create_bastion` 且 `!create_vnet` 时 | Azure Bastion 已有的子网 ID。Azure 要求名称为 `AzureBastionSubnet`，范围为 `/26` 或更大。 |
+| `postgres_subnet_address_prefix` | `["10.0.32.0/20"]` | 否 | PostgreSQL 子网的 CIDR 前缀。可以是不连续的范围。设为 `create_vnet = false` 时，必须落在你 VNet 的地址空间内。 |
+| `redis_subnet_address_prefix` | `["10.0.48.0/20"]` | 否 | Redis 子网的 CIDR 前缀。可以是不连续的范围。设为 `create_vnet = false` 时，必须落在你 VNet 的地址空间内。 |
+| `aks_authorized_ip_ranges` | `[]` | 否 | 允许访问 AKS API server 的外部 CIDR。留空时 API server 可从任意执行主机公网访问。生产环境应填入 operator 和 CI 的出站 CIDR。不能与 `aks_private_cluster_enabled` 组合。 |
+| `aks_outbound_type` | `loadBalancer` | 否 | 节点访问互联网的方式。`loadBalancer` 使用 AKS 托管负载均衡器上的出站公网 IP。`userDefinedRouting` 通过 `aks_subnet_id` 上的路由表把出站流量发送到防火墙、网络虚拟设备或本地网络；`0.0.0.0/0` 路由的下一跳必须是 `VirtualAppliance` 或 `VirtualNetworkGateway`。`userAssignedNATGateway` 通过 `aks_subnet_id` 上的 NAT 网关发送出站流量。两种自定义类型都要求 `create_vnet = false`、提供 `aks_subnet_id`，且集群由 Terraform 创建。plan 会检查该子网。 |
+| `aks_nat_gateway` | `none` | 当 `userAssignedNATGateway` 时 | `aks_subnet_id` 上的 NAT 网关：`none`、`existing`（plan 检查是否已挂载一个）或 `create`（Terraform 创建 Standard NAT 网关和公网 IP，并将它们关联到子网）。要求 `aks_outbound_type` 设为 `userAssignedNATGateway` 或 `userDefinedRouting`。`aks_nat_gateway_public_ip` output 提供创建的 IP。 |
+| `aks_nat_gateway_idle_timeout_minutes` | `4` | 否 | `aks_nat_gateway = "create"` 创建的 NAT 网关的 TCP 空闲超时，4 到 120 分钟。 |
+| `aks_allow_outbound_type_change` | `false` | 否 | 允许在已有集群上更改 `aks_outbound_type`。该更改会移动集群的出站 IP 并断开现有连接，因此请更新指定旧 IP 的防火墙规则和 `aks_authorized_ip_ranges`。 |
 
 ## AKS
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
-| `default_node_pool_vm_size` | `Standard_D8s_v3` | 否 | 默认节点池的 VM 规格。搭配外部 Postgres 和 Redis 时，`Standard_D8s_v3`（8 vCPU / 32 GiB）是核心平台的推荐基线。搭配 in-cluster 数据库的轻量或演示部署，才使用 `Standard_D4s_v3`（4 vCPU / 16 GiB）。 |
-| `default_node_pool_min_count` | `1` | 否 | 默认节点池的最小节点数。autoscaler 不会缩到该下限以下。生产环境设为 3（核心平台约需 14.4 vCPU，三个 `Standard_D8s_v3` 节点即可覆盖）。minimum 或 dev 部署设为 1。 |
-| `default_node_pool_max_count` | `10` | 否 | 默认节点池的最大节点数。核心平台使用 4 到 6 个节点；启用 add-on 时请增加余量（LangSmith Deployment 约 6、Agent Builder 约 8、Insights 10 到 12）。提高该值立即生效，无需节点重启。 |
+| `create_cluster` | `true` | 否 | 创建新的 AKS 集群。设为 `false` 可附加到现有集群，这还要求 `create_vnet = false` 和 `aks_subnet_id`。`istio-addon` ingress 要求 `true`。 |
+| `existing_cluster_name` | `""` | 当 `!create_cluster` 时 | 要附加到的现有 AKS 集群的名称。 |
+| `existing_cluster_resource_group_name` | `""` | 当 `!create_cluster` 时 | 持有现有 AKS 集群的资源组。 |
+| `aks_kube_auth` | `auto` | 否 | Terraform 的 Kubernetes 和 Helm provider 登录集群的方式：`auto`、`entra` 或 `certificate`。`auto` 在集群有 Entra ID 集成时通过 kubelogin 使用 Microsoft Entra ID，否则使用客户端证书。Entra 登录需要 `PATH` 上有 kubelogin，且 `az login` 具备 cluster-admin 权限。 |
+| `aks_private_cluster_enabled` | `false` | 否 | 为 API server 提供集群 VNet 中的私有 endpoint，且没有公网地址。apply 主机随后需要能访问该 endpoint 的网络路径（跳板机、VPN 或对等 VNet 中的 runner），且 DNS 能解析私有 zone。不能与 `aks_authorized_ip_ranges` 组合。请在首次 apply 之前设置：plan 拒绝在已有集群上更改。 |
+| `aks_private_dns_zone_id` | `""` | 否 | 私有 API server 的私有 DNS zone。留空或 `System`：AKS 在节点资源组中创建 zone。`None`：AKS 不创建私有 zone，module 会开启公网 FQDN，这是 Azure 对 `None` 的要求。此时 API server 名称通过公网 DNS 解析到其私有 IP，因此节点和 operator 的 DNS 必须能解析公网名称。v0.17.0 不会开启公网 FQDN；之后的 `v0.17.*` tag 会添加。zone 资源 ID：AKS 在该 zone 中注册 API server，这要求 `aks_control_plane_identity = "user"`。要求 `aks_private_cluster_enabled = true`。请在首次 apply 之前设置。 |
+| `aks_entra_only` | `false` | 否 | Entra ID 集成加 Azure RBAC for Kubernetes 授权，并禁用本地账号。Terraform 的 provider 随后通过 kubelogin 以 `az` 身份登录，这需要通过 `aks_entra_admin_group_object_ids` 或 Azure Kubernetes Service RBAC Cluster Admin 角色获得 cluster-admin。不能与 `aks_kube_auth = "certificate"` 组合。Azure 无法关闭 Entra 集成，因此对拥有该集成的集群设为 `false` 时 plan 会拒绝。要在已有集群上开启，单独 apply 该更改：同一次 apply 中的 Helm 或 Kubernetes 更改会因 401 失败。 |
+| `aks_entra_admin_group_object_ids` | `[]` | 否 | 获得 cluster-admin 的 Entra 组的对象 ID。要求 `aks_entra_only = true`。 |
+| `aks_control_plane_identity` | `system` | 否 | control plane 运行使用的身份。`system`：系统分配的身份，只在集群创建后才存在。`user`：用户分配的身份，可以是 `aks_control_plane_identity_id` 或 `<cluster_name>-control-plane`，Terraform 会在部署资源组中创建后者。请在首次 apply 之前设置：plan 拒绝在已有集群上更改。 |
+| `aks_control_plane_identity_id` | `""` | 当授权不受管理时 | 已有的用户分配 control plane 身份的资源 ID。要求 `aks_control_plane_identity = "user"`。当 `aks_control_plane_identity_manage_grants` 解析为 `false` 时必填。请在首次 apply 之前设置。 |
+| `aks_control_plane_identity_manage_grants` | `null` | 否 | Terraform 是否为该用户分配身份授予 AKS 子网上的 Network Contributor，以及在 `aks_private_dns_zone_id` 设置了 zone ID 时授予 VNet 上的 Network Contributor 和 zone 上的 Private DNS Zone Contributor。`null` 跟随 `create_vnet`。设为 `false` 时，plan 会检查授权，并为每个缺失的授权打印对应的 `az role assignment create` 命令。要求 `aks_control_plane_identity = "user"`。参见 [PERMISSIONS.md](https://github.com/langchain-ai/terraform/blob/main/modules/azure/PERMISSIONS.md#control-plane-identity-grants)。 |
+| `install_cert_manager` | `true` | 否 | 安装 cert-manager。已有集群已在运行 cert-manager 时设为 `false`，因为 Helm 不会接管它不拥有的 release。`tls_certificate_source = "dns01"` 要求 `true`。 |
+| `install_keda` | `true` | 否 | 安装 KEDA，它按 Redis queue 深度对 LangSmith queue worker 进行扩缩容。已有集群已在运行 KEDA 时设为 `false`。 |
+| `aks_sku_tier` | `Standard` | 否 | AKS control plane 层级：`Free`（无 SLA）、`Standard`（运行时间 SLA）或 `Premium`（通过 `aks_support_plan = "AKSLongTermSupport"` 允许长期 Kubernetes 版本支持）。可原地更新。 |
+| `aks_kubernetes_version` | `1.35` | 否 | AKS 集群的 Kubernetes 版本。使用你所在区域支持 `KubernetesOfficial` 的版本，因为 Azure 会把较旧的次要版本转为仅 LTS。 |
+| `aks_network_mode` | `node-subnet` | 否 | Azure CNI IP 地址模式：`overlay` 或 `node-subnet`。每个 `terraform.tfvars` 模板都设置 `overlay`（Microsoft 的推荐），其中 pods 从 `aks_pod_cidr` 取地址，AKS 子网仅承载节点。默认值保持已有集群不变。在集群创建时固定。 |
+| `aks_pod_cidr` | `10.244.0.0/16` | 否 | `overlay` 模式下的 pod 地址范围；`node-subnet` 模式下忽略。不得与 VNet、对等或本地网络、或 `aks_service_cidr` 重叠。每个节点占用一个 `/24`，因此 `/16` 可承载 256 个节点。 |
+| `aks_os_sku` | `Ubuntu` | 否 | 默认节点池和未设置 `os_sku` 的附加节点池的节点 OS 镜像：`Ubuntu`、`AzureLinux`、`AzureLinux3` 或 `Ubuntu2204`。更改会原地重装该节点池的节点镜像。 |
+| `default_node_pool_vm_size` | `Standard_D8s_v5` | 否 | 默认节点池的 VM 规格。搭配外部 Postgres 和 Redis 时，`Standard_D8s_v5`（8 vCPU / 32 GiB）是核心平台的推荐基线。搭配 in-cluster 数据库的轻量或演示部署，才使用 `Standard_D4s_v5`（4 vCPU / 16 GiB）。 |
+| `default_node_pool_min_count` | `1` | 否 | 默认节点池的最小节点数。生产环境设为 3（核心平台约需 14.4 vCPU，三个 `Standard_D8s_v5` 节点即可覆盖）。minimum 或 dev 部署设为 1。 |
+| `default_node_pool_max_count` | `10` | 否 | 默认节点池的最大节点数。核心平台使用 4 到 6 个节点；启用 add-on 时请增加余量（LangSmith Deployment 约 6、Fleet 约 8、Insights 10 到 12）。提高该值立即生效，无需节点重启。 |
 | `default_node_pool_max_pods` | `60` | 否 | 默认节点池中每个节点的最大 pods 数。Azure CNI 默认的 30 对 LangSmith 来说太低；60 可让完整部署放进单个节点。不可变：修改它会重建节点池。 |
-| `additional_node_pools` | `large: Standard_D16s_v3, 0–2` | 否 | 附加节点池。默认的 `large` 节点池（`Standard_D16s_v3`，16 vCPU / 64 GiB）是 ClickHouse（请求 3.5 vCPU / 15 GiB）和 LangSmith Deployment agent pods 所必需的。`min_count = 0` 使其在空闲时缩到零。Agent Builder 有多个并发 deployment 时，请把 `max_count` 提高到 3 或更多。 |
-| `aks_service_cidr` | `10.0.64.0/20` | 否 | Kubernetes service CIDR。不得与 VNet 重叠。 |
-| `aks_dns_service_ip` | `10.0.64.10` | 否 | CoreDNS service IP。必须位于 `aks_service_cidr` 内。 |
-| `aks_deletion_protection` | `true` | 否 | 防止意外删除 AKS 集群。dev/test 可设为 `false`。 |
-| `availability_zones` | `["1"]` | 否 | 要部署到的可用区。跨可用区冗余 HA 请使用 `["1", "2", "3"]`。 |
+| `additional_node_pools` | `large: Standard_D16s_v5, 0 到 2` | 否 | 附加节点池。默认的 `large` 节点池（`Standard_D16s_v5`，16 vCPU / 64 GiB）是 in-cluster ClickHouse（根据 `sizing_profile` 请求最多 4 vCPU / 16 GiB）和 LangSmith Deployment agent pods 所必需的。`min_count = 0` 使其在空闲时缩到零。Fleet 有多个并发 deployment 时，请把 `max_count` 提高到 3 或更多。未设置 `os_sku` 的节点池使用 `aks_os_sku`。 |
+| `aks_service_cidr` | `""` | 当 `!create_vnet` 时 | Kubernetes service CIDR。Terraform 创建 VNet 时留空使用 `10.0.64.0/20`。不得与 VNet 或任何连接到它的内容重叠。建议大小 `/20`。在集群创建时固定。 |
+| `aks_dns_service_ip` | `""` | 否 | CoreDNS service IP。必须位于 `aks_service_cidr` 内。留空使用 `aks_service_cidr` 的第十一个地址（默认范围为 `10.0.64.10`）。 |
+| `availability_zones` | `[]` | 否 | AKS 节点池和 PostgreSQL 服务器的可用区。留空由 Azure 放置，这是 SKU 不在区域中每个 zone 都可用时唯一有效的设置。跨可用区冗余 HA 请使用 `["1", "2", "3"]`。仅在创建时应用。 |
+
+私有 API server、Entra 和 control plane identity 变量只适用于 Terraform 创建的集群。在附加的集群上（`create_cluster = false`），Terraform 不创建 control plane 授权，`aks_kube_auth = "auto"` 会检测集群自身的 Entra ID。
 
 ## 数据源
 
@@ -65,16 +98,21 @@ description: LangSmith self-hosted 在 Azure AKS 上的 Terraform 变量完整�
 |---|---|---|---|
 | `postgres_admin_username` | `langsmith` | 否 | PostgreSQL 管理员用户名。 |
 | `postgres_admin_password` | `""` | 外部时 | PostgreSQL 管理员密码。通过 `make setup-env` 设置。 |
-| `postgres_database_name` | `langsmith` | 否 | LangSmith 连接的数据库的名称。必须与服务器上已存在的数据库一致。 |
-| `postgres_deletion_protection` | `true` | 否 | 防止意外删除 PostgreSQL 服务器。dev/test 可设为 `false`。 |
+| `postgres_database_name` | `langsmith` | 否 | LangSmith 数据库的名称。设为 `postgres_source = "external"` 时，Terraform 会在 Flexible Server 上创建它。设为 `in-cluster` 时无效果。 |
+| `postgres_version` | `16` | 否 | PostgreSQL 主版本，11 到 18。LangSmith 要求 14 或更高。在已有服务器上提高它会执行不可逆的原地主版本升级。降低它会销毁并重建服务器。 |
+| `postgres_sku_name` | `GP_Standard_D2ds_v4` | 否 | PostgreSQL Flexible Server 的 SKU。`LocationIsOfferRestricted` 错误或零 vCPU 配额可能只限于一个 SKU 系列，因此换一个系列可以无需变更区域即可解决。 |
+| `postgres_high_availability` | `false` | 否 | PostgreSQL 的跨可用区冗余 HA（主节点和备用节点位于不同 zone）。要求 General Purpose 或 Memory Optimized SKU。 |
 | `postgres_geo_redundant_backup` | `false` | 否 | 为 PostgreSQL 启用异地冗余备份。 |
-| `postgres_standby_availability_zone` | `""` | 否 | PostgreSQL 跨可用区冗余 HA 的备用可用区。留空禁用 HA 备用节点。 |
+| `postgres_standby_availability_zone` | `""` | 否 | 将 HA 备用节点固定到某个 zone。留空由 Azure 选择。设置 zone 也会开启 HA。仅在与固定的 `availability_zones` 一起时固定备用节点。 |
+| `postgres_private_dns_zone_id` | `""` | 否 | PostgreSQL 服务器（包括 SmithDB metastore）已有的 `privatelink.postgres` 私有 DNS zone。留空会在部署资源组中创建 zone 并将其链接到 VNet。提供 zone 时，Terraform 不创建 zone 和 VNet 链接，由 zone 的所有者完成链接。位于其他订阅中的 zone 需要在该订阅注册 `Microsoft.DBforPostgreSQL` 资源 provider。要求 `postgres_source = "external"` 或 `enable_smithdb = true`。 |
 
 ## Redis
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
-| `amr_sku` | `Balanced_B0` | 否 | Azure Managed Redis SKU。`Balanced_B0` 是最小的。如果 region 报告 `AllocationFailed`，请向上调整（`Balanced_B1`、`Balanced_B3` 等）。取代旧式的 `redis_capacity`。 |
+| `amr_sku` | `Balanced_B1` | 否 | Azure Managed Redis SKU。`Balanced_B1` 为 1 GB。`Balanced_B0` 位于容量最受限的池上，不支持 HA。需要更多内存时向上调整（`Balanced_B3`、`Balanced_B5` 等）。更大的 SKU 不能解决 `InsufficientCapacity`，那是区域性的问题；改用 `redis_location`。取代旧式的 `redis_capacity`。 |
+| `redis_high_availability` | `false` | 否 | Azure Managed Redis 的跨可用区冗余 HA。Azure Managed Redis SLA 要求它，因此生产环境设为 `true`。`Balanced_B0` 不支持。 |
+| `redis_location` | `null` | 否 | Redis 集群的 region。`null` 使用 `location`。仅当 Azure Managed Redis 在你的区域报告 `InsufficientCapacity` 时设置。私有 endpoint 仍位于 `location`。 |
 
 ## Blob storage
 
@@ -83,38 +121,53 @@ description: LangSmith self-hosted 在 Azure AKS 上的 Terraform 变量完整�
 | `blob_ttl_enabled` | `true` | 否 | 在 blob container 上启用生命周期 TTL 规则。 |
 | `blob_ttl_short_days` | `14` | 否 | 短生命周期 trace blob 的 TTL（天）。 |
 | `blob_ttl_long_days` | `400` | 否 | 长生命周期 trace blob 的 TTL（天）。 |
+| `storage_replication_type` | `LRS` | 否 | trace blob 账户的冗余类型：`LRS`、`GRS`、`RAGRS`、`ZRS`、`GZRS` 或 `RAGZRS`。跨可用区冗余部署使用 `ZRS`。在跨可用区与非 zonal 组之间更改需要先进行 Azure 账户转换。参见 README 的 [Storage redundancy](https://github.com/langchain-ai/terraform/blob/main/modules/azure/README.md#storage-redundancy) 一节。 |
 | `storage_allowed_ips` | `[]` | 否 | 允许通过 storage account 默认拒绝防火墙的公网 IP 或 CIDR。AKS pod 流量会通过 `Microsoft.Storage` service endpoint 自动加入 allowlist。只需添加需要 blob data plane 的外部客户端（operator 工作站、CI runner）。 |
+| `storage_private_endpoint_enabled` | `false` | 否 | 通过 Private Endpoint 访问 Blob Storage 并关闭公网 endpoint。适用于 trace blob 账户和 SmithDB 对象存储。`false` 保留 service endpoint 防火墙。 |
+| `storage_private_endpoint_subnet_id` | `""` | 否 | blob Private Endpoint 的子网。留空使用 AKS 子网。 |
+| `storage_private_dns_zone_id` | `""` | 否 | 用于附加 endpoint 的已有 `privatelink.blob` 私有 DNS zone。留空会创建 zone 并将其链接到 VNet。当 VNet 已解析该名称时，提供中心 zone。 |
 
 ## Key Vault
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
-| `keyvault_name` | `""` | 否 | Key Vault 名称。必须全局唯一，3 到 24 个字符。留空时 `main.tf` 会计算 `langsmith-kv<identifier>`。遇到命名冲突时可覆盖。 |
+| `create_keyvault` | `true` | 否 | 创建新的 Key Vault。设为 `false` 可附加到现有 vault。Terraform 随后会把它的机密写入该 vault，并忽略 `keyvault_default_action`、`keyvault_allowed_ips` 和 `keyvault_purge_protection`。默认情况下，Terraform 不会向现有 vault 授予自身访问权限，因此在 `keyvault_manage_secrets = true` 期间，请在 `make apply` 之前向部署者授予 vault 上的 Key Vault Secrets Officer，否则机密写入会因 403 失败。 |
+| `existing_keyvault_name` | `""` | 当 `!create_keyvault` 时 | 要附加到的现有 Key Vault 的名称。 |
+| `existing_keyvault_resource_group_name` | `""` | 当 `!create_keyvault` 时 | 持有现有 Key Vault 的资源组。 |
+| `keyvault_name` | `""` | 否 | Key Vault 名称。必须全局唯一，3 到 24 个字符。留空时由命名方案派生。仅在 `create_keyvault = true` 时使用。 |
 | `keyvault_purge_protection` | `true` | 否 | 启用清除保护。dev/test 可设为 `false`，以便销毁后立即复用名称。 |
-| `keyvault_default_action` | `Allow` | 否 | Key Vault data-plane 防火墙的默认动作。`Allow` 可保持首次 apply（通过 data plane 创建机密）正常工作。生产环境设置 `Deny` 并填入 `keyvault_allowed_ips`。 |
-| `keyvault_allowed_ips` | `[]` | 否 | 当 `keyvault_default_action = "Deny"` 时允许通过 Key Vault 防火墙的公网 IP 或 CIDR。AKS 子网会通过 `Microsoft.KeyVault` service endpoint 自动加入 allowlist。 |
+| `keyvault_default_action` | `Allow` | 否 | Key Vault data-plane 防火墙的默认动作。`Allow` 可保持 `make apply` 和 `make seed-secrets` 正常工作，因为两者都通过 data plane 写入机密。生产环境设置 `Deny` 并填入 `keyvault_allowed_ips`。 |
+| `keyvault_manage_secrets` | `true` | 否 | Terraform 将 `postgres-admin-password` 和 `langsmith-license-key` 写入 vault。`false` 两者都不写，因此 `make apply` 不需要 Key Vault data-plane 访问，随后 `make seed-secrets` 会写入全部九个机密。当部署者无法持有 Key Vault Secrets Officer，或 `keyvault_default_action = "Deny"` 阻挡 apply 主机时设为 `false`。在 apply 之后改为 `false` 会从 vault 中删除这两个机密，因此先从 state 中移除它们。 |
+| `keyvault_manage_terraform_admin_assignment` | `null` | 否 | Terraform 是否在 vault 上创建部署者的 Key Vault Secrets Officer 授权。`null` 跟随 `create_keyvault`：Terraform 创建的 vault 会获得该授权，现有 vault 不会。当授权已存在，或 `principalType` 上的 ABAC 条件拒绝请求时设为 `false`。随后必须由租户 admin 在 apply 之前授予该角色，否则机密写入会因 403 失败。 |
+| `terraform_principal_type` | `null` | 否 | 运行 `terraform apply` 的身份的主体类型，设置在其 Key Vault Secrets Officer 授权上：`User`、`Group` 或 `ServicePrincipal`。`null` 让 Azure 推断。当订阅通过 `principalType` 上的 ABAC 条件委派角色分配写入（拒绝省略该字段的请求）时设置：交互式 `az login` 用 `User`，CI 用 `ServicePrincipal`。 |
+| `keyvault_allowed_ips` | `[]` | 否 | 当 `keyvault_default_action = "Deny"` 时允许通过 Key Vault 防火墙的公网 IP 或 CIDR。AKS 子网会通过 `Microsoft.KeyVault` service endpoint 自动加入 allowlist。不能与 `keyvault_private_endpoint_enabled` 组合。 |
+| `keyvault_private_endpoint_enabled` | `false` | 否 | 通过 Private Endpoint 访问 vault 并关闭其公网访问。plan、apply、`make seed-secrets` 和 `make k8s-secrets` 都会读写 vault，因此请从能解析 vault 的 `privatelink.vaultcore` 记录的机器上运行它们，例如 VNet 或对等网络中的跳板机或 runner。`keyvault_manage_secrets = false` 让 plan 和 apply 可以从网络外部运行。要求 `create_keyvault = true`。 |
+| `keyvault_private_endpoint_subnet_id` | `""` | 否 | vault 的 Private Endpoint 的子网。留空使用 `storage_private_endpoint_subnet_id`，后者默认为 AKS 子网。 |
+| `keyvault_private_dns_zone_id` | `""` | 否 | endpoint 的已有 `privatelink.vaultcore` 私有 DNS zone。留空会创建 zone 并将其链接到 VNet。提供 zone 时，Terraform 不创建 zone 和 VNet 链接，部署者需要该 zone 上的 `Microsoft.Network/privateDnsZones/join/action`。参见 [PERMISSIONS.md](https://github.com/langchain-ai/terraform/blob/main/modules/azure/PERMISSIONS.md#private-dns-zones-you-own)。 |
 
 ## Ingress
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
-| `ingress_controller` | `nginx` | 否 | Ingress controller：`nginx`、`istio`（自托管 Helm）、`istio-addon`（Azure 托管的 Istio，Azure 上推荐）、`agic`（Application Gateway Ingress Controller）、`envoy-gateway`（Gateway API）或 `none`。TLS 兼容性矩阵请参见 [`INGRESS_CONTROLLERS.md`](https://github.com/langchain-ai/terraform/blob/main/modules/azure/INGRESS_CONTROLLERS.md)。 |
+| `ingress_controller` | `envoy-gateway` | 否 | Ingress controller：`envoy-gateway`（Gateway API）、`nginx`（兼容旧版 Ingress）、`istio`（自托管 Helm）、`istio-addon`（Azure 托管的 Istio，用于 mTLS 或多 dataplane）、`agic`（Application Gateway Ingress Controller）或 `none`。在已有部署上更改它会移除旧 controller 及其负载均衡器 IP。TLS 兼容性矩阵请参见 [`INGRESS_CONTROLLERS.md`](https://github.com/langchain-ai/terraform/blob/main/modules/azure/INGRESS_CONTROLLERS.md)。 |
 | `istio_version` | `1.29.1` | 否 | Istio Helm chart 版本。仅在 `ingress_controller = "istio"` 时使用。 |
-| `istio_addon_revision` | `asm-1-27` | 否 | Azure Service Mesh 版本（`asm-1-<minor>`）。可用版本请用 `az aks mesh get-upgrades` 列出。仅在 `ingress_controller = "istio-addon"` 时使用。 |
+| `istio_addon_revision` | `asm-1-27` | 否 | Azure Service Mesh 版本（`asm-1-<minor>`）。可用版本请用 `az aks mesh get-revisions --location <region>` 列出。仅在 `ingress_controller = "istio-addon"` 时使用。 |
 | `agic_subnet_address_prefix` | `["10.0.96.0/24"]` | 否 | Application Gateway 专用子网的 CIDR。必须是 `/24` 或更大。仅在 `ingress_controller = "agic"` 时使用。 |
-| `agw_sku_tier` | `Standard_v2` | 否 | Application Gateway SKU 层级：`Standard_v2` 或 `WAF_v2`（启用 WAF）。仅在 `ingress_controller = "agic"` 时使用。 |
+| `agw_sku_tier` | `Standard_v2` | 否 | Application Gateway SKU 层级。仅在 `ingress_controller = "agic"` 时使用。要开启 WAF，设置 `create_waf = true` 而不是 `WAF_v2`。 |
 | `envoy_gateway_version` | `v1.2.0` | 否 | Envoy Gateway Helm chart 版本。仅在 `ingress_controller = "envoy-gateway"` 时使用。 |
-| `ingress_ip` | `""` | 否 | ingress 负载均衡器的公网 IP，DNS module 用它创建 A 记录。可用 `kubectl get svc -n ingress-nginx` 获取。 |
+| `ingress_ip` | `""` | 否 | ingress 负载均衡器的公网 IP，DNS module 用它创建 A 记录。使用 `envoy-gateway` 时，用 `kubectl get svc -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=langsmith-gateway` 获取。使用 `nginx` 时，用 `kubectl get svc -n ingress-nginx`。 |
 
 ## DNS 与 TLS
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
-| `dns_label` | `""` | 否 | ingress 负载均衡器的 Azure 公网 IP DNS label。结果为 `<label>.<region>.cloudapp.azure.com`。适用于 nginx、istio、istio-addon 和 envoy-gateway。留空则跳过。 |
-| `langsmith_domain` | `""` | 否 | LangSmith 的自定义 hostname（例如 `langsmith.example.com`）。用于 Helm values 和 ingress TLS。优先级高于 `dns_label`。 |
-| `tls_certificate_source` | `letsencrypt` | 否 | `letsencrypt`（经 cert-manager 的 HTTP-01）、`dns01`（经 cert-manager 的 DNS-01）、`existing`（自带证书）或 `none`（仅 HTTP，demo/dev）。 |
+| `dns_label` | `""` | 否 | ingress 负载均衡器的 Azure 公网 IP DNS label。结果为 `<label>.<region>.cloudapp.azure.com`（Azure Government 中为 `cloudapp.usgovcloudapi.net`）。适用于除 `none` 之外的所有 controller。使用 `agic` 时，它仅支持 HTTP。留空则跳过。 |
+| `langsmith_domain` | `""` | 当 `dns01` 或 `create_dns_zone` 时 | LangSmith 的自定义 hostname（例如 `langsmith.example.com`）。用于 Helm values 和 ingress TLS。优先级高于 `dns_label`。 |
+| `tls_certificate_source` | `letsencrypt` | 否 | `letsencrypt`（经 cert-manager 的 HTTP-01）、`dns01`（经 cert-manager 的 DNS-01）、`existing`（你自己的证书，存放在 LangSmith namespace 中名为 `langsmith-tls` 的 `kubernetes.io/tls` Secret 内，`deploy.sh` 会检查它）或 `none`（仅 HTTP，demo/dev）。 |
 | `letsencrypt_email` | `""` | 当 `letsencrypt` 或 `dns01` 时 | 用于 Let's Encrypt 证书通知的邮箱。 |
 | `create_dns_zone` | `false` | 否 | 为 LangSmith 域名创建 Azure DNS zone 和 A 记录。DNS-01 签发必需。 |
+| `langsmith_custom_ca_secret_name` | `""` | 否 | LangSmith namespace 中保存 CA bundle 的 Secret，用于私有 CA 签名的 endpoint。chart 会将其挂载到 LangSmith 服务中，但不会挂载到 operator 或它创建的 agent deployment 中。由 `init-values.sh` 和 `deploy.sh` 读取；Terraform 忽略它。 |
+| `langsmith_custom_ca_secret_key` | `ca.crt` | 否 | `langsmith_custom_ca_secret_name` 中保存 PEM bundle 的 key。 |
 
 ## LangSmith 应用
 
@@ -122,29 +175,55 @@ description: LangSmith self-hosted 在 Azure AKS 上的 Terraform 变量完整�
 |---|---|---|---|
 | `langsmith_namespace` | `langsmith` | 否 | LangSmith 的 Kubernetes namespace。用于限定 blob storage 的 Workload Identity 作用域。 |
 | `langsmith_release_name` | `langsmith` | 否 | Helm release 名称。用于 Workload Identity federated credential 的 subject。 |
-| `langsmith_domain` | `""` | 否 | 参见 [DNS 与 TLS](#dns-and-tls)。 |
-| `langsmith_helm_chart_version` | `""` | 否 | 锁定 chart 版本以获得可复现的部署。部署脚本的优先级是 `CHART_VERSION` 环境变量，其次是该变量，最后是锁定行默认值 `~0.15.1`（最新的 `0.15.x` 补丁版本）。 |
+| `langsmith_domain` | `""` | 当 `dns01` 或 `create_dns_zone` 时 | 参见 [DNS 与 TLS](#dns-and-tls)。 |
+| `langsmith_helm_chart_version` | `""` | 否 | 锁定 chart 版本以获得可复现的部署。部署脚本的优先级是 `CHART_VERSION` 环境变量，其次是该变量，最后是锁定行默认值 `~0.17.0`（最新的 `0.17.x` 补丁版本）。部署会因任何其他 chart 线而失败。在 `v0.16.*` module tag 上，默认值为 `~0.16.0`，且只部署 0.16 线，除非 `enable_smithdb = true`（它要求 0.17 线：将该变量设为 `~0.17.0`）。 |
 | `langsmith_admin_email` | `""` | 否 | 初始组织 admin 邮箱（Helm values 中的 `initialOrgAdminEmail`）。通过 `make setup-env` 设置。 |
 
 ## 容量与 add-on 开关
 
-`init-values.sh` 和 `deploy.sh` 读取这些开关；Terraform 忽略它们。它们控制脚本生成哪些 Helm overlay。
+`init-values.sh` 和 `deploy.sh` 读取这些开关。Terraform 忽略它们，但 `enable_fleet` 以及 `enable_gateway_pii_redaction` 要求 `enable_llm_gateway` 的校验除外。它们控制脚本生成哪些 Helm overlay。`enable_llm_gateway`、`enable_gateway_pii_redaction` 和 `enable_sso_oidc` 开关只存在于 `v0.17.*` module tag 上。
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
 | `sizing_profile` | `production` | 否 | Helm 容量 overlay：`minimum`、`dev`、`production` 或 `production-large`。 |
 | `enable_deployments` | `false` | 否 | 启用 LangSmith Deployment（host-backend、listener、operator）。 |
-| `enable_agent_builder` | `false` | 否 | 启用 Agent Builder UI。需要 `enable_deployments = true`。 |
-| `enable_insights` | `false` | 否 | 启用 Insights（基于 ClickHouse 的分析）。需要 `enable_deployments = true`。 |
-| `enable_polly` | `false` | 否 | 启用 Polly（AI 评估与监控）。需要 `enable_deployments = true`。 |
+| `enable_agent_builder` | `false` | 否 | 启用旧版 Agent Builder UI，Fleet 已取代它。需要 `enable_deployments = true`。不能与 `enable_fleet` 组合。 |
+| `enable_fleet` | `false` | 否 | 启用 Fleet（Agent Builder 的后继者）。需要 `enable_deployments = true` 和 `postgres_source = "external"`。不能与 `enable_agent_builder` 组合。Terraform 还会创建 `langsmith_fleet` 数据库和 `langsmith-fleet-postgres` Kubernetes secret，因此部署前先运行 `make apply`。 |
+| `enable_insights` | `false` | 否 | 启用 Insights（基于 ClickHouse 的分析）。 |
+| `enable_polly` | `false` | 否 | 启用 Polly（AI 评估与监控）。Polly 运行在 LangSmith Deployment 上，因此也要设置 `enable_deployments = true`。部署脚本不会检查这一点。 |
+| `enable_llm_gateway` | `false` | 否 | 部署 [LLM Gateway](/langsmith/llm-gateway)（处于 beta）。要求 chart 0.17。参见 [LLM Gateway](/langsmith/self-host-terraform-azure-deploy#llm-gateway)。 |
+| `enable_gateway_pii_redaction` | `false` | 否 | 在 LLM Gateway 旁运行 Presidio analyzer，对 gateway 流量中的 PII 进行脱敏，并为新组织开启脱敏。要求 `enable_llm_gateway = true`。 |
+| `enable_sso_oidc` | `false` | 否 | 将登录切换为通过 OIDC provider 的 SSO 并禁用基本认证。`make k8s-secrets` 会把 client ID、client secret 和 issuer URL 从 Key Vault 复制到 `langsmith-config-secret`。仅在以 org admin 身份用基本认证登录过之后再启用。参见 [SSO with OIDC](/langsmith/self-host-terraform-azure-deploy#sso-with-oidc)。 |
+
+## SmithDB
+
+SmithDB 是可选的。`enable_smithdb` 会预配 Azure 资源，因此部署前先运行 `make apply`。它要求 chart 0.17 线，`v0.17.*` module tag 默认部署的就是该线。在 `v0.16.*` tag 上，SmithDB 需要 v0.16.56 或更高版本，并设置 `langsmith_helm_chart_version = "~0.17.0"`。完整要求请参考 [`SMITHDB.md`](https://github.com/langchain-ai/terraform/blob/main/modules/azure/SMITHDB.md)。
+
+| 变量 | 默认值 | 是否必填 | 描述 |
+|---|---|---|---|
+| `enable_smithdb` | `false` | 否 | 预配 SmithDB 基础设施：专属的 PostgreSQL 18 metastore、一个 Blob container、Workload Identity 和 Premium SSD v2 缓存卷。要求非空的 `availability_zones`，因为 Premium SSD v2 在大多数区域只能挂载到 zonal VM。 |
+| `smithdb_ingestion_enabled` | `false` | 否 | 基础设施健康后，启用 LangSmith 写入 SmithDB。要求 `enable_smithdb = true`。 |
+| `smithdb_migration_enabled` | `false` | 否 | 启用 ClickHouse 到 SmithDB 的迁移 Job。要求 `smithdb_ingestion_enabled = true`。 |
+| `smithdb_query_enabled` | `false` | 否 | 启用基于 SmithDB 的查询。要求 `smithdb_ingestion_enabled = true`。 |
+| `smithdb_metastore_admin_username` | `smithdb` | 否 | SmithDB PostgreSQL metastore 的管理员用户名。 |
+| `smithdb_metastore_admin_password` | `null` | 否 | metastore 的可选管理员密码。`null` 通过 Microsoft Entra Workload Identity 认证。敏感。 |
+| `smithdb_metastore_sku_name` | `GP_Standard_D2ds_v5` | 否 | metastore 的 PostgreSQL Flexible Server SKU。 |
+| `smithdb_metastore_storage_mb` | `32768` | 否 | 分配给 metastore 的存储量（MiB）。 |
+| `smithdb_metastore_backup_retention_days` | `7` | 否 | metastore 的自动备份保留天数。 |
+| `smithdb_storage_account_name` | `""` | 否 | SmithDB 的全局唯一 Storage Account 名称。留空时从部署名称派生。 |
+| `smithdb_storage_replication_type` | `LRS` | 否 | SmithDB 对象存储的冗余类型。取值和规则与 `storage_replication_type` 相同。 |
+| `smithdb_storage_container_name` | `smithdb` | 否 | SmithDB 持久数据的 Blob container。 |
+| `smithdb_cache_storage_class_name` | `""` | 否 | SmithDB 缓存卷的 Premium SSD v2 StorageClass 名称。留空时派生一个按部署的名称。 |
+| `smithdb_cache_disk_iops` | `7000` | 否 | 每个缓存卷预配的 IOPS，3000 到 80000。默认值需要至少 14 GiB 的缓存卷。 |
+| `smithdb_cache_disk_throughput_mbps` | `1000` | 否 | 每个缓存卷预配的吞吐量（MB/s），125 到 1200。Azure 每预配 IOPS 最多允许 0.25 MB/s。 |
 
 ## 安全与审计
 
 | 变量 | 默认值 | 是否必填 | 描述 |
 |---|---|---|---|
-| `create_waf` | `false` | 否 | 部署 Azure WAF 策略（OWASP 3.2 + bot 防护）。创建后挂载到 Application Gateway 或 Front Door。 |
-| `waf_mode` | `Prevention` | 否 | WAF 执行模式：`Detection`（仅记录日志）或 `Prevention`（拦截）。 |
-| `create_diagnostics` | `false` | 否 | 部署 Log Analytics 工作区，以及 AKS、Key Vault 和 PostgreSQL 的诊断设置。 |
+| `create_waf` | `false` | 否 | 部署 Azure WAF 策略（OWASP 3.2 + bot 防护）。设为 `ingress_controller = "agic"` 时，Terraform 会将其挂载到 Application Gateway 并设置 `WAF_v2` 层级。使用其他 controller 时，策略保持未挂载状态，供你自己的 Application Gateway 引用。Azure Front Door 无法使用此策略类型。 |
+| `waf_mode` | `Detection` | 否 | WAF 执行模式：`Detection`（仅记录日志）或 `Prevention`（拦截）。OWASP 规则会匹配 prompts 和 traces 中合法出现的 SQL 和脚本片段，因此请先查看防火墙日志中的误报并添加排除项，再切换到 `Prevention`。 |
+| `create_diagnostics` | `false` | 否 | 部署 Log Analytics 工作区，以及 AKS、Key Vault、PostgreSQL 的诊断设置（`ingress_controller = "agic"` 时还包括 Application Gateway）。 |
 | `log_retention_days` | `90` | 否 | Log Analytics 工作区的保留天数。 |
 | `create_bastion` | `false` | 否 | 部署跳板 VM，通过 `az ssh vm` 访问私有 AKS。 |
 | `bastion_vm_size` | `Standard_B2s` | 否 | bastion 主机的 VM SKU。 |
@@ -153,52 +232,11 @@ description: LangSmith self-hosted 在 Azure AKS 上的 Terraform 变量完整�
 
 ## 敏感变量（通过 `setup-env.sh` 设置）
 
-`make setup-env` 把这些值写入 `secrets.auto.tfvars`，Terraform 将其存储在 Azure Key Vault 中。切勿在 `terraform.tfvars` 中内联设置。
+`make setup-env` 会把 `postgres_admin_password`、`langsmith_license_key` 和 `langsmith_admin_email` 写入 `secrets.auto.tfvars`。`make apply` 将 license key 和 PostgreSQL 密码存储在 Azure Key Vault 中。设为 `keyvault_manage_secrets = false` 时，改由 `make seed-secrets` 存储它们。切勿在 `terraform.tfvars` 中内联设置这些值。
 
-`make setup-env` 还会管理 `postgres_admin_password` 和 `langsmith_admin_email`，它们记录在 [PostgreSQL](#postgresql) 和 [LangSmith 应用](#langsmith-application)章节中。本表只列出本参考中未在其他位置出现的敏感变量。
+`langsmith_license_key` 保存 LangSmith enterprise license key。[PostgreSQL](#postgresql) 和 [LangSmith 应用](#langsmith-application)章节记录了另外两个。
 
-| 变量 | 描述 |
-|---|---|
-| `langsmith_license_key` | LangSmith enterprise license key。 |
-| `langsmith_admin_password` | 初始组织 admin 密码。 |
-| `langsmith_api_key_salt` | 用于哈希 API key 的 salt。首次部署后必须保持稳定。 |
-| `langsmith_jwt_secret` | 用于 Basic Auth 会话的 JWT secret。必须保持稳定。 |
-| `langsmith_deployments_encryption_key` | LangSmith Deployment 的 Fernet key。绝不能更改。 |
-| `langsmith_agent_builder_encryption_key` | Agent Builder 的 Fernet key。绝不能更改。 |
-| `langsmith_insights_encryption_key` | Insights 的 Fernet key。绝不能更改。 |
-| `langsmith_polly_encryption_key` | Polly 的 Fernet key。绝不能更改。 |
-
-## App module 变量（Terraform 路径）
-
-Terraform 路径（先 `make init-app` 再 `make apply-app`）把 LangSmith Helm release、其 Kubernetes Secret 和 Workload Identity ServiceAccount 纳入 Terraform state 管理，而不是通过 Helm shell 脚本。它的变量位于 `app/terraform.tfvars`。这条路径可作为 `make init-values && make deploy` 的替代方案。路径选择请参见 [Azure 部署指南](/langsmith/self-host-terraform-azure-deploy)。
-
-`make init-app` 会根据 infra module outputs 自动填充基础设施透传变量（`subscription_id`、`resource_group_name`、`cluster_name`、`keyvault_name`、`storage_account_name`、`storage_container_name`、`workload_identity_client_id`、`langsmith_namespace`、`tls_certificate_source`、`ingress_controller` 和 `dns_label`）。每个变量的默认值为 `null`，缺失时会在 plan 阶段因前置条件错误而失败，错误信息会指明缺失的内容。仅当把 app module 运行在你另行预配的基础设施上时才覆盖它们。
-
-在 `app/terraform.tfvars` 中设置以下内容：
-
-| 变量 | 默认值 | 是否必填 | 描述 |
-|---|---|---|---|
-| `sizing` | `production` | 否 | 资源容量 profile：`production`、`production-large`、`dev` 或 `none`（chart 默认值）。 |
-| `postgres_source` | `external` | 否 | `external`（Azure Database for PostgreSQL）或 `in-cluster`（Helm）。与 infra 值保持一致。 |
-| `redis_source` | `external` | 否 | `external`（Azure Managed Redis）或 `in-cluster`（Helm）。与 infra 值保持一致。 |
-| `hostname` | `null` | 否 | LangSmith hostname。未设置时从 `dns_label` 自动检测。 |
-| `admin_email` | `admin@example.com` | 否 | 初始组织 admin 邮箱。 |
-| `release_name` | `langsmith` | 否 | Helm release 名称。 |
-| `chart_version` | `""` | 否 | LangSmith Helm chart 版本。留空使用最新版本。 |
-| `helm_timeout` | `1200` | 否 | Helm 安装和升级超时时间（秒）。 |
-| `helm_force_update` | `false` | 否 | 每次 apply 都强制执行 Helm upgrade，即使 values 未变化。 |
-| `enable_agent_deploys` | `false` | 否 | 启用 LangSmith Deployment。 |
-| `enable_agent_builder` | `false` | 否 | 启用 Agent Builder。需要 `enable_agent_deploys = true`。 |
-| `enable_insights` | `false` | 否 | 启用 Insights。需要外部 ClickHouse。 |
-| `enable_polly` | `false` | 否 | 启用 Polly AI 评估与监控。需要 `enable_agent_deploys = true`。 |
-| `enable_usage_telemetry` | `false` | 否 | 启用扩展的使用量 telemetry 上报。 |
-| `tls_enabled_for_deploys` | `null` | 否 | agent deployment endpoint 是否使用 HTTPS。未设置时从 `tls_certificate_source` 自动检测。 |
-| `clickhouse_host` | `""` | 当 `enable_insights` 时 | ClickHouse hostname 或 endpoint。 |
-| `clickhouse_port` | `8123` | 否 | ClickHouse HTTP 端口。 |
-| `clickhouse_database` | `default` | 否 | ClickHouse 数据库名称。 |
-| `clickhouse_username` | `default` | 否 | ClickHouse 用户名。 |
-| `clickhouse_password` | `""` | 否 | ClickHouse 密码。带认证的 ClickHouse 需设置。 |
-| `clickhouse_tls` | `true` | 否 | 为 ClickHouse 连接启用 TLS。 |
+应用机密不是 Terraform 变量，因此它们的值永远不会进入 Terraform state。`make seed-secrets` 会在 `make apply` 之后把它们写入 Key Vault：初始组织 admin 密码、API key salt、JWT secret，以及 LangSmith Deployment、Agent Builder、Insights 和 Polly 的 Fernet 加密 key。它不覆盖已存在的机密，因为更改其中任何一个都会破坏正在运行的部署。要刻意轮换某个机密，使用 `make keyvault`。
 
 ---
 
