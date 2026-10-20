@@ -5,7 +5,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from pipeline.commands.build import build_command
-from scripts.zh.overlay import build_overlay, scan_status, stamp_translations
+from scripts.zh.overlay import (
+    build_overlay,
+    scan_status,
+    stamp_translations,
+    translate_navigation_labels,
+)
 
 
 def test_build_overlay_replaces_translated_files_and_keeps_fallbacks(
@@ -31,6 +36,146 @@ def test_build_overlay_replaces_translated_files_and_keeps_fallbacks(
     ) == "# Guide\n"
 
 
+def test_build_overlay_translates_navigation_labels(tmp_path: Path) -> None:
+    """Translate display labels in docs.json while keeping navigation intact."""
+    src_dir = tmp_path / "src"
+    translations_src_dir = tmp_path / "translations" / "zh" / "src"
+    output_src_dir = tmp_path / ".generated" / "zh" / "src"
+
+    src_dir.mkdir()
+    translations_src_dir.mkdir(parents=True)
+    (src_dir / "index.mdx").write_text("# Home\n", encoding="utf-8")
+    docs = {
+        "navigation": {
+            "products": [
+                {
+                    "product": "AGENT DEVELOPMENT LIFECYCLE",
+                    "menu": [
+                        {
+                            "item": "Home",
+                            "icon": "home",
+                            "description": "Get started",
+                            "pages": ["index"],
+                        },
+                        {
+                            "item": "Build",
+                            "description": "Build agents with open source",
+                            "dropdowns": [
+                                {
+                                    "dropdown": "Python",
+                                    "tabs": [
+                                        {
+                                            "tab": "Get started",
+                                            "pages": ["build-overview"],
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+    (src_dir / "docs.json").write_text(json.dumps(docs), encoding="utf-8")
+    (translations_src_dir.parent / "nav-labels.json").write_text(
+        json.dumps(
+            {
+                "fields": [
+                    "product",
+                    "item",
+                    "description",
+                    "dropdown",
+                    "tab",
+                    "group",
+                ],
+                "labels": {
+                    "AGENT DEVELOPMENT LIFECYCLE": "agent 开发生命周期",
+                    "Home": "首页",
+                    "Get started": "快速开始",
+                    "Build": "构建",
+                    "Build agents with open source": "使用开源框架构建 agent",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    build_overlay(src_dir, translations_src_dir, output_src_dir)
+
+    product = json.loads(
+        (output_src_dir / "docs.json").read_text(encoding="utf-8")
+    )["navigation"]["products"][0]
+    assert product["product"] == "agent 开发生命周期"
+    assert product["menu"][0]["item"] == "首页"
+    assert product["menu"][0]["description"] == "快速开始"
+    assert product["menu"][0]["icon"] == "home"
+    assert product["menu"][0]["pages"] == ["index"]
+    assert product["menu"][1]["item"] == "构建"
+    assert product["menu"][1]["dropdowns"][0]["dropdown"] == "Python"
+    assert product["menu"][1]["dropdowns"][0]["tabs"][0]["tab"] == "快速开始"
+
+
+def test_translate_navigation_labels_respects_configured_fields(
+    tmp_path: Path,
+) -> None:
+    """Only replace labels in the fields listed by the dictionary."""
+    docs_json = tmp_path / "docs.json"
+    docs_json.write_text(
+        json.dumps(
+            {
+                "navigation": {
+                    "products": [
+                        {
+                            "product": "AGENT DEVELOPMENT LIFECYCLE",
+                            "menu": [{"item": "Home", "icon": "home"}],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    labels_path = tmp_path / "nav-labels.json"
+    labels_path.write_text(
+        json.dumps(
+            {
+                "fields": ["item"],
+                "labels": {
+                    "AGENT DEVELOPMENT LIFECYCLE": "agent 开发生命周期",
+                    "Home": "首页",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    replaced = translate_navigation_labels(docs_json, labels_path)
+
+    product = json.loads(docs_json.read_text(encoding="utf-8"))["navigation"][
+        "products"
+    ][0]
+    assert replaced == 1
+    assert product["product"] == "AGENT DEVELOPMENT LIFECYCLE"
+    assert product["menu"][0]["item"] == "首页"
+
+
+def test_translate_navigation_labels_skips_missing_dictionary(
+    tmp_path: Path,
+) -> None:
+    """Leave docs.json untouched when no label dictionary exists."""
+    docs_json = tmp_path / "docs.json"
+    original = '{"navigation": {"products": [{"product": "PRODUCTS AND SETUP"}]}}'
+    docs_json.write_text(original, encoding="utf-8")
+
+    replaced = translate_navigation_labels(docs_json, tmp_path / "missing.json")
+
+    assert replaced == 0
+    assert docs_json.read_text(encoding="utf-8") == original
+
+
 def test_scan_status_reports_untranslated_needs_update_and_removed_upstream(
     tmp_path: Path,
 ) -> None:
@@ -44,6 +189,7 @@ def test_scan_status_reports_untranslated_needs_update_and_removed_upstream(
 
     (src_dir / "index.mdx").write_text("# Home v2\n", encoding="utf-8")
     (src_dir / "oss" / "guide.mdx").write_text("# Guide\n", encoding="utf-8")
+    (src_dir / "docs.json").write_text("{}", encoding="utf-8")
     (src_dir / "code-samples").mkdir()
     (src_dir / "code-samples" / "package.json").write_text("{}", encoding="utf-8")
     (translations_src_dir / "index.mdx").write_text("# 首页\n", encoding="utf-8")
@@ -65,6 +211,7 @@ def test_scan_status_reports_untranslated_needs_update_and_removed_upstream(
     assert status.needs_update == ["src/index.mdx"]
     assert status.untranslated == ["src/oss/guide.mdx"]
     assert status.removed_upstream == ["src/oss/removed.mdx"]
+    assert "src/docs.json" not in status.untranslated
 
 
 def test_stamp_translations_records_current_source_hash(tmp_path: Path) -> None:

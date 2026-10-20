@@ -20,6 +20,12 @@ DEFAULT_SRC_DIR = Path("src")
 DEFAULT_TRANSLATIONS_SRC_DIR = Path("translations/zh/src")
 DEFAULT_OUTPUT_SRC_DIR = Path(".generated/zh/src")
 DEFAULT_MANIFEST_PATH = Path("translations/zh/manifest.json")
+DEFAULT_NAV_LABELS_PATH = Path("translations/zh/nav-labels.json")
+
+# Only display strings are translated. Paths, hrefs, icons, and API identifiers
+# keep their upstream values so the generated navigation stays valid. Add
+# "tab" or "group" here to translate those labels as well.
+NAV_LABEL_FIELDS = ("product", "item", "description", "dropdown")
 
 
 @dataclass(frozen=True)
@@ -45,6 +51,7 @@ def build_overlay(
     src_dir: Path = DEFAULT_SRC_DIR,
     translations_src_dir: Path = DEFAULT_TRANSLATIONS_SRC_DIR,
     output_src_dir: Path = DEFAULT_OUTPUT_SRC_DIR,
+    nav_labels_path: Path | None = None,
 ) -> None:
     """Generate a source tree that overlays Chinese files on top of English."""
     if not src_dir.exists():
@@ -56,17 +63,111 @@ def build_overlay(
     output_src_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src_dir, output_src_dir)
 
-    if not translations_src_dir.exists():
-        _link_node_modules(output_src_dir)
-        return
+    if translations_src_dir.exists():
+        for translated_file in _iter_files(translations_src_dir):
+            relative_path = translated_file.relative_to(translations_src_dir)
+            output_file = output_src_dir / relative_path
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(translated_file, output_file)
 
-    for translated_file in _iter_files(translations_src_dir):
-        relative_path = translated_file.relative_to(translations_src_dir)
-        output_file = output_src_dir / relative_path
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(translated_file, output_file)
-
+    if nav_labels_path is None:
+        nav_labels_path = translations_src_dir.parent / DEFAULT_NAV_LABELS_PATH.name
+    translate_navigation_labels(output_src_dir / "docs.json", nav_labels_path)
     _link_node_modules(output_src_dir)
+
+
+def translate_navigation_labels(
+    docs_json_path: Path,
+    labels_path: Path = DEFAULT_NAV_LABELS_PATH,
+) -> int:
+    """Translate display-only labels in a generated ``docs.json``.
+
+    The dictionary is intentionally separate from ``src/docs.json`` so upstream
+    navigation changes (new pages, reordered groups, refreshed OpenAPI entries)
+    pass through untouched. Only the fields listed in ``fields`` are replaced,
+    and only when the English value has an exact entry in ``labels``.
+
+    Returns the number of replaced values.
+    """
+    if not docs_json_path.exists():
+        logger.warning("docs.json not found for label translation: %s", docs_json_path)
+        return 0
+    if not labels_path.exists():
+        logger.debug("Navigation label dictionary not found: %s", labels_path)
+        return 0
+
+    fields, labels = _load_nav_labels(labels_path)
+    docs = json.loads(docs_json_path.read_text(encoding="utf-8"))
+    replaced = _replace_nav_labels(docs.get("navigation", {}), fields, labels)
+    if not replaced:
+        return 0
+
+    docs_json_path.write_text(
+        json.dumps(docs, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    logger.info("Translated %d navigation label(s) from %s", replaced, labels_path)
+    return replaced
+
+
+def _load_nav_labels(path: Path) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Load and validate the navigation label dictionary."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        msg = f"Invalid navigation label dictionary: {path}"
+        raise ValueError(msg) from error
+
+    if not isinstance(payload, dict):
+        msg = f"Navigation label dictionary must be a JSON object: {path}"
+        raise TypeError(msg)
+
+    # Accept either {"fields": [...], "labels": {...}} or a flat mapping.
+    if "labels" in payload:
+        raw_fields = payload.get("fields", NAV_LABEL_FIELDS)
+        raw_labels = payload["labels"]
+    else:
+        raw_fields = NAV_LABEL_FIELDS
+        raw_labels = payload
+
+    if not isinstance(raw_fields, list) or not all(
+        isinstance(field, str) for field in raw_fields
+    ):
+        msg = f"Navigation label 'fields' must be a list of strings: {path}"
+        raise TypeError(msg)
+    if not isinstance(raw_labels, dict):
+        msg = f"Navigation label 'labels' must be a JSON object: {path}"
+        raise TypeError(msg)
+    if not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in raw_labels.items()
+        if not key.startswith("_")
+    ):
+        msg = f"Navigation label values must be strings: {path}"
+        raise TypeError(msg)
+
+    labels = {
+        key: value for key, value in raw_labels.items() if not key.startswith("_")
+    }
+    return tuple(raw_fields), labels
+
+
+def _replace_nav_labels(node: Any, fields: tuple[str, ...], labels: dict[str, str]) -> int:
+    """Recursively replace display labels in a navigation tree."""
+    replaced = 0
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in fields and isinstance(value, str):
+                translated = labels.get(value)
+                if translated is not None and translated != value:
+                    node[key] = translated
+                    replaced += 1
+            else:
+                replaced += _replace_nav_labels(value, fields, labels)
+    elif isinstance(node, list):
+        for item in node:
+            replaced += _replace_nav_labels(item, fields, labels)
+    return replaced
 
 
 def _link_node_modules(output_src_dir: Path) -> None:
@@ -191,7 +292,9 @@ def _is_translatable_doc(path: Path, root: Path) -> bool:
     relative_path = path.relative_to(root)
     if relative_path.parts[0] in IGNORED_DOC_DIRS:
         return False
-    return path.suffix in DOC_EXTENSIONS or relative_path.as_posix() == "docs.json"
+    # docs.json is not a page. Its navigation labels are handled separately by
+    # translate_navigation_labels(), so a full translated copy is unnecessary.
+    return path.suffix in DOC_EXTENSIONS
 
 
 def _source_key(path: Path, root: Path) -> str:
@@ -241,6 +344,15 @@ def main() -> int:
         type=Path,
         default=DEFAULT_OUTPUT_SRC_DIR,
     )
+    build_parser.add_argument(
+        "--nav-labels-path",
+        type=Path,
+        default=None,
+        help=(
+            "Navigation label dictionary. Defaults to nav-labels.json next to "
+            "the translations source directory."
+        ),
+    )
 
     status_parser = subparsers.add_parser("status")
     status_parser.add_argument("--src-dir", type=Path, default=DEFAULT_SRC_DIR)
@@ -271,7 +383,12 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command == "build":
-        build_overlay(args.src_dir, args.translations_src_dir, args.output_src_dir)
+        build_overlay(
+            args.src_dir,
+            args.translations_src_dir,
+            args.output_src_dir,
+            args.nav_labels_path,
+        )
         return 0
     if args.command == "status":
         status = scan_status(
