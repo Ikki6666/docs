@@ -13,10 +13,17 @@ import AsyncSubagentsDescriptionsBadPy from '/snippets/code-samples/async-subage
 import AsyncSubagentsDescriptionsJs from '/snippets/code-samples/async-subagents-descriptions-js.mdx';
 import AsyncSubagentsTroubleshootingPollingPy from '/snippets/code-samples/async-subagents-troubleshooting-polling-py.mdx';
 import AsyncSubagentsTroubleshootingPollingJs from '/snippets/code-samples/async-subagents-troubleshooting-polling-js.mdx';
+import AsyncSubagentsNotificationsPy from '/snippets/code-samples/async-subagents-notifications-py.mdx';
+import AsyncSubagentsAnswerWaitingPy from '/snippets/code-samples/async-subagents-answer-waiting-py.mdx';
+import AsyncSubagentsParentThreadPy from '/snippets/code-samples/async-subagents-parent-thread-py.mdx';
 
 异步子代理允许 supervisor agent 启动会立即返回的后台任务，因此 supervisor 可以在子代理并发工作的同时继续与用户交互。supervisor 可以在任何时点检查进度、发送后续指令，或取消任务。
 
 这建立在 [子代理](/oss/deepagents/subagents) 之上；后者是同步运行的，会阻塞 supervisor，直到完成。对于耗时较长、可并行化，或者需要在执行过程中动态调整的任务，请使用异步子代理。
+
+:::python
+在 Agent Server 上，supervisor 还会在任务完成、失败或需要输入时自动收到通知，因此无需主动检查。
+:::
 
 ```mermaid
 graph TB
@@ -131,12 +138,55 @@ sequenceDiagram
 - **Cancel** 会调用 server 上的 `runs.cancel()`，并把任务标记为 `"cancelled"`。
 - **List** 会遍历所有已跟踪任务。对于非终态任务，它会并行从 server 获取实时状态。终态状态（`success`、`error`、`cancelled`）从缓存返回。
 
+:::python
+如果子代理因等待输入或审批而暂停，**check** 和 **list** 会把它报告为 `waiting`。更新一个 `waiting` 任务会丢弃其待处理的请求；取消它只会标记为 `"cancelled"`，因为它没有活跃的 run。参见[处理等待输入的子代理](#handle-subagents-waiting-for-input)。
+:::
+
+:::python
+
+在 [Agent Protocol](https://github.com/langchain-ai/agent-protocol) server 上运行时，子代理会在完成时自动向 supervisor 发送更新。如果 supervisor 和子代理使用[单一部署](#single-deployment)，子代理会在 supervisor 空闲时唤醒它；否则 supervisor 会在下一次 run 开始时收到更新。
+
+<Note>
+    任务通知需要 `deepagents>=0.7.26`。它处于 [**beta**](/oss/versioning) 阶段；API 和行为可能在版本之间发生变化。
+</Note>
+
+通知以 `HumanMessage` 的形式返回给 supervisor。它们可以包含图像和其他多模态媒体。消息在 `additional_kwargs["deepagents_notification"]` 中携带 @[`TaskEvent`]（`task_id`、`agent_name`、`status`、`run_id`），因此你的应用可以用不同于用户消息的方式展示通知：
+
+<AsyncSubagentsNotificationsPy />
+
+## 处理等待输入的子代理
+
+<Note>
+    `waiting` 状态需要 `deepagents>=0.7.26`。它处于 [**beta**](/oss/versioning) 阶段；API 和行为可能在版本之间发生变化。
+</Note>
+
+当子代理通过 `interrupt()` 或 [human-in-the-loop](/oss/deepagents/human-in-the-loop) 暂停以等待输入或审批时，**check** 和 **list** 工具会把它报告为 `waiting`，并附上待处理的 interrupt。supervisor 不能代替用户回答或批准。这个请求是给用户的。
+
+你的应用在子代理自己的线程上作答。task ID 就是子代理的 thread ID：
+
+<AsyncSubagentsAnswerWaitingPy />
+
+子代理在得到回答后完成时，supervisor 会照常收到通知。如果子代理需要的信息来自 supervisor 而不是用户，可以让它在结果中提出。supervisor 会用 `update_async_task` 回复。
+:::
+
 ## 了解状态管理
 
 :::python
 任务元数据存储在 supervisor graph 上一个专用的 state channel（`async_tasks`）中，与消息历史分离。这一点很关键，因为 deep agents 在上下文窗口装满时会 [压缩消息历史](/oss/deepagents/context-engineering#summarization)。如果 task ID 只存在于工具消息里，压缩时就会丢失。这个专用 channel 能确保 supervisor 即使经过多轮总结，仍然可以通过 `list_async_tasks` 找回任务。
 
 每个被跟踪的任务都会记录 task ID、agent 名称、thread ID、run ID、状态以及时间戳（`created_at`、`last_checked_at`、`last_updated_at`）。
+
+### 查找 supervisor 的子代理线程
+
+<Note>
+    线程标记需要 `deepagents>=0.7.26`。它处于 [**beta**](/oss/versioning) 阶段；API 和行为可能在版本之间发生变化。
+</Note>
+
+`start_async_task` 创建每个子代理线程时会附带 `metadata={"parent_thread_id": ...}`，即 supervisor 的 thread ID。可以用它来查找某个 supervisor 的子代理线程，或者在子代理的 graph factory 中读取 supervisor 的线程：
+
+<AsyncSubagentsParentThreadPy />
+
+例如，子代理可以通过 `parent_thread_id` 查找并复用 supervisor 的 [线程级 sandbox](/oss/deepagents/sandboxes#thread-scoped-default)。请先确认调用方有权访问该线程，因为任何有权访问该线程的人都可以编辑其 metadata。
 :::
 
 :::js
