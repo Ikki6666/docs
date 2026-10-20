@@ -294,6 +294,8 @@ help:
 	@echo "  make dev-zh             - Start development mode from the Chinese overlay"
 	@echo "  make build              - Build documentation to ./build directory"
 	@echo "  make build-zh           - Build documentation from the Chinese overlay"
+	@echo "  make mintlify-deploy-zh - Build Chinese docs and sync to the Mintlify deploy branch"
+	@echo "                            (optional: MINT_DEPLOY_ARGS=--no-build)"
 	@echo "  make start-static       - Start static server (pre-built docs, fast)"
 	@echo "  make start-dev          - Start development server (live reload, slow page switching)"
 	@echo "  make zh-status          - Show Chinese translation coverage and stale files"

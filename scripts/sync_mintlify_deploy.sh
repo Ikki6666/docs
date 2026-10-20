@@ -19,6 +19,21 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="${BRANCH:-mintlify-deploy-zh}"
 BUILD_TARGET="${BUILD_TARGET:-build-zh}"
+TMP_DIR=""
+WORKTREE=""
+
+cleanup() {
+  cd "$ROOT"
+  if [[ -n "$WORKTREE" ]]; then
+    git worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$TMP_DIR" ]]; then
+    rm -rf "$TMP_DIR"
+  fi
+  # Remove metadata for worktrees whose directories are already gone.
+  git worktree prune
+}
+trap cleanup EXIT
 
 cd "$ROOT"
 
@@ -31,15 +46,26 @@ if [[ ! -f build/docs.json ]]; then
   exit 1
 fi
 
-git fetch origin "$BRANCH" 2>/dev/null || true
+git worktree prune
 
-WORKTREE="$(mktemp -d)/$BRANCH"
-if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
-  git worktree add "$WORKTREE" "$BRANCH"
-elif git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
-  git worktree add -b "$BRANCH" "$WORKTREE" "origin/$BRANCH"
+if ! remote_ref=$(git ls-remote --heads origin "refs/heads/$BRANCH"); then
+  echo "Error: cannot query origin for branch $BRANCH." >&2
+  exit 1
+fi
+
+if [[ -n "$remote_ref" ]]; then
+  git fetch origin "$BRANCH"
+fi
+
+TMP_DIR="$(cd "$(mktemp -d)" && pwd -P)"
+WORKTREE="$TMP_DIR/$BRANCH"
+
+if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+  # The deploy branch is generated content, so rebuild it from origin instead
+  # of trusting a local branch that may be stale.
+  git worktree add -q -B "$BRANCH" "$WORKTREE" "origin/$BRANCH"
 else
-  git worktree add --orphan -b "$BRANCH" "$WORKTREE"
+  git worktree add -q --orphan -b "$BRANCH" "$WORKTREE"
 fi
 
 rsync -a --delete --exclude .git build/ "$WORKTREE"/
@@ -51,10 +77,8 @@ cd "$WORKTREE"
 git add -A
 if git diff --cached --quiet; then
   echo "No changes; deploy branch $BRANCH is up to date with build/ from $SRC_SHA."
-else
-  git commit -m "Mintlify deploy: $BUILD_TARGET output from $SRC_SHA ($STAMP)"
-  git push -u origin "$BRANCH"
+  exit 0
 fi
 
-cd "$ROOT"
-git worktree remove "$WORKTREE"
+git commit -m "Mintlify deploy: $BUILD_TARGET output from $SRC_SHA ($STAMP)"
+git push -u origin "$BRANCH"
