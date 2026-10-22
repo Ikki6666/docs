@@ -1,0 +1,326 @@
+---
+title: 在受限网络上设置 build machine
+sidebarTitle: 在受限网络上构建
+icon: "world-off"
+description: 配置 pip、uv、Python 和 LangGraph CLI，从内部 registry 拉取所有包、解释器和镜像，然后在无法访问公共互联网的情况下构建 Python 或 JavaScript Agent Server 镜像。
+---
+
+受限网络中的 build machine 无法访问 pypi.org、npmjs.org、GitHub 或 Docker Hub。每个包、工具、解释器和容器镜像都来自内部 registry，例如 Artifactory 或 Nexus。在该机器上配置每个工具以使用内部 registry，然后使用 [LangGraph CLI](/langsmith/cli) 构建 [Agent Server](/langsmith/agent-server) 镜像。
+
+pip、uv、uv 的 Python 下载以及镜像构建各自读取自己的设置。只配置其中一个，其他项仍会指向公共互联网。请按顺序完成各节，然后运行[验证设置](#验证设置)中的检查。LangGraph CLI 是一个 Python 包，因此 JavaScript 项目也需要完成 pip 和 uv 的设置。
+
+<Tip>
+本页介绍 build machine。要运行你构建的镜像，请参阅[使用 control plane 部署](/langsmith/deploy-with-control-plane)或[Self-host 独立服务器](/langsmith/deploy-standalone-server)。关于运行中的 deployment 所需的 egress，请参阅[用于计费与运维遥测的 egress](/langsmith/self-host-egress)。
+</Tip>
+
+## 前置要求
+
+开始之前，请先向你的平台团队收集以下信息：
+
+- **PyPI repository URL**：代理或托管 Python 包的内部 index，本页中写作 `<PYPI_INDEX_URL>`。例如 `https://pypi.example.internal/simple`。
+- **Container registry**：registry 主机，如果有端口也包括端口，写作 `<DOCKER_REGISTRY>`。其中必须存有 Agent Server base image 的镜像副本。请参阅 [Agent Server 构建所需的额外镜像](/langsmith/self-host-mirroring-images#additional-images-for-agent-server-builds)。
+- **npm registry URL（仅 JavaScript）**：代理或托管 npm 包的内部 registry，写作 `<NPM_REGISTRY_URL>`。例如 `https://npm.example.internal`。不要带末尾斜杠，因为 Corepack 会向它追加路径。
+- **CA bundle**：内部证书颁发机构（CA）的 PEM 文件路径，写作 `<CA_BUNDLE_PATH>`。内部 registry 通常提供由你组织自己的 CA 签名的证书，操作系统和工具默认不信任这些证书。
+- **Root 访问权限**：你在 build machine 上是否拥有 `sudo`。如果没有 sudo，请使用本页中按用户划分的文件位置。请平台团队安装 OS 包和 CA。
+- **Python 版本**：OS 包仓库提供哪些版本。
+
+## 信任内部 CA
+
+后续每个步骤都会通过 HTTPS 连接内部 registry。在机器信任内部 CA 之前，这些连接会因证书错误而失败，因此请先安装 CA：
+
+1. 将 `<CA_BUNDLE_PATH>` 添加到操作系统信任存储。具体命令取决于 OS。例如，在 Debian 和 Ubuntu 上，将该文件复制到 `/usr/local/share/ca-certificates/`，并使用 `.crt` 扩展名。然后运行 `sudo update-ca-certificates`。
+1. 在 Linux 上，将 CA 复制到 `/etc/docker/certs.d/<DOCKER_REGISTRY>/ca.crt`，以便 Docker 信任内部 registry。详情请参阅 Docker 的 [Verify repository client with certificates](https://docs.docker.com/engine/security/certificates/)。
+
+pip 和 uv 各自需要自己的 CA 设置，详见[配置 pip](#配置-pip) 和[配置 uv](#配置-uv)。
+
+## 配置 pip
+
+在 pip 配置文件中设置一次 index。在每条命令中通过 `--index-url` 传入长 URL 很容易出错，两个标志之间缺少空格会产生误导性的 `404`。
+
+创建 `~/.config/pip/pip.conf`。要将该设置应用到机器上的所有用户，请改为创建 `/etc/pip.conf`：
+
+```ini
+[global]
+index-url = <PYPI_INDEX_URL>
+cert = <CA_BUNDLE_PATH>
+```
+
+- **`index-url`**：替换 pypi.org 作为包 index。
+- **`cert`**：pip 用来验证 index 的 CA bundle。较旧的 pip 版本不会读取操作系统信任存储，因此请显式设置它。
+
+如果 index 使用纯 HTTP，请添加 `trusted-host = <host>`，值为 index 的主机名。完整的文件位置和键列表请参阅 pip 的 [Configuration](https://pip.pypa.io/en/stable/topics/configuration/) 文档。
+
+## 从内部 index 安装 uv
+
+从内部 index 将 uv 安装为 Python 包。uv 安装脚本（`curl ... | sh`）在受限网络中无法使用，因为它会从 `releases.astral.sh` 或 GitHub 下载 uv 二进制文件。
+
+PyPI 将 uv 作为包含该二进制文件的 wheel 托管。在某些发行版上，`venv` 作为单独的 OS 包提供，例如 Debian 和 Ubuntu 上的 `python3-venv`。
+
+将 uv 安装到它自己的 virtual environment 中，以免影响系统 Python。然后将这些二进制文件链接到你的 `PATH`：
+
+```bash
+python3 -m venv ~/.local/share/uv-bootstrap
+~/.local/share/uv-bootstrap/bin/pip install uv
+mkdir -p ~/.local/bin
+ln -s ~/.local/share/uv-bootstrap/bin/uv ~/.local/bin/uv
+ln -s ~/.local/share/uv-bootstrap/bin/uvx ~/.local/bin/uvx
+```
+
+`pip install` 会读取上一节中的 `pip.conf`，因此它会针对 `<PYPI_INDEX_URL>` 进行解析。
+
+`uv self update` 仅适用于通过安装脚本安装的 uv。要升级此 uv，请运行 `~/.local/share/uv-bootstrap/bin/pip install --upgrade uv`。
+
+## 配置 uv
+
+uv 不会读取 `pip.conf` 或 `PIP_INDEX_URL`。如果没有自己的设置，uv 会针对 pypi.org 进行解析。
+
+在 shell 配置文件（例如 `~/.bashrc`）中设置以下内容一次：
+
+```bash
+export UV_DEFAULT_INDEX="<PYPI_INDEX_URL>"
+export UV_SYSTEM_CERTS=true
+export UV_PYTHON_DOWNLOADS=never
+```
+
+- **`UV_DEFAULT_INDEX`**：替换 pypi.org 作为默认 index。
+- **`UV_SYSTEM_CERTS`**：从操作系统信任存储加载证书，其中包含内部 CA。默认情况下，uv 只信任其捆绑的根证书。
+- **`UV_PYTHON_DOWNLOADS`**：阻止 uv 下载 Python。[提供 Python 解释器](#提供-python-解释器)说明了原因。
+
+<Note>
+`UV_SYSTEM_CERTS` 需要 uv 0.11.0 或更高版本。更早的版本使用 `UV_NATIVE_TLS=true`，后续版本仍然接受它，但会给出弃用警告。
+</Note>
+
+要只信任内部 CA，请使用 `SSL_CERT_FILE=<CA_BUNDLE_PATH>` 代替 `UV_SYSTEM_CERTS`。`SSL_CERT_FILE` 会同时替换 uv 捆绑的根证书和操作系统信任存储。关于所有设置，请参阅 uv 的[环境变量参考](https://docs.astral.sh/uv/reference/environment/)。
+
+## 提供 Python 解释器
+
+Agent Server 镜像自带 Python。build machine 只需要 Python 3.10 或更高版本来运行 pip、uv 和 LangGraph CLI。请从 OS 仓库安装它，例如在 RHEL 系列发行版上：
+
+```bash
+sudo dnf install python3.12
+```
+
+uv 会在 `PATH` 上查找解释器。请保留 `UV_PYTHON_DOWNLOADS=never`：没有它，uv 会尝试从 GitHub 下载缺失的解释器，并在没有明确错误的情况下反复重试。如果 OS 仓库不提供受支持的版本，请参阅 uv 的 [Installing Python](https://docs.astral.sh/uv/guides/install-python/) 指南。
+
+## 构建 Agent Server 镜像
+
+镜像构建在 Docker 中运行，因此 build machine 上的 pip 和 uv 设置以及操作系统信任存储不会应用于它。请改为在 `langgraph.json` 中设置 base image、包 registry 和内部 CA。
+
+要准备构建：
+
+1. 安装 LangGraph CLI。它会针对 `UV_DEFAULT_INDEX` 进行解析：
+
+    ```bash
+    uv tool install langgraph-cli
+    ```
+
+1. 登录内部 registry：
+
+    ```bash
+    docker login <DOCKER_REGISTRY>
+    ```
+
+1. 将 CA bundle 复制到项目目录中，与 `langgraph.json` 放在一起。构建只能从项目目录复制文件：
+
+    ```bash
+    cp <CA_BUNDLE_PATH> internal-ca.pem
+    ```
+
+然后按照你的项目语言执行相应步骤。
+
+### 构建 Python 项目
+
+<Warning>
+不要只依赖 `pip_config_file`。默认情况下，CLI 使用 `uv pip install` 安装依赖（`pip_installer` 设置为 `auto`），而 uv 不会读取 pip 配置文件。这样构建会针对 pypi.org 进行解析并失败。将 `pip_installer` 设置为 `pip` 也无法解决：安装 server 包的步骤仍然会读取默认 index。请改为在 `dockerfile_lines` 中设置 `UV_DEFAULT_INDEX` build argument。
+</Warning>
+
+要构建镜像：
+
+1. 在 `langgraph.json` 中设置 `base_image` 和 `dockerfile_lines`：
+
+    ```json
+    {
+      "dependencies": ["."],
+      "graphs": {
+        "agent": "./agent.py:graph"
+      },
+      "python_version": "3.12",
+      "base_image": "<DOCKER_REGISTRY>/langchain/langgraph-api",
+      "dockerfile_lines": [
+        "COPY internal-ca.pem /tmp/internal-ca.pem",
+        "RUN cat /tmp/internal-ca.pem >> /etc/ssl/certs/ca-certificates.crt && rm /tmp/internal-ca.pem",
+        "ARG SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+        "ARG UV_DEFAULT_INDEX=<PYPI_INDEX_URL>"
+      ]
+    }
+    ```
+
+    - **`base_image`**：镜像同步后的 Agent Server image，不带 tag。CLI 会追加一个根据 `python_version` 构建的 tag，并在你设置时加上 `api_version` 或 `image_distro`。使用上述配置，构建会拉取 `<DOCKER_REGISTRY>/langchain/langgraph-api:3.12`，因此该 tag 必须存在于 registry 中。
+    - **`dockerfile_lines`**：CLI 在 `FROM` 之后插入的行。`COPY` 和 `RUN` 行会将内部 CA 追加到镜像的系统 CA bundle，同时保留公共根证书。两个 `ARG` 行会应用于构建中的每个安装步骤，包括从 `uv.lock` 文件进行的安装。`SSL_CERT_FILE` 将 uv 指向系统 bundle（uv 原本会忽略它），`UV_DEFAULT_INDEX` 将 uv 指向内部 index。`ARG` 值在 `docker history` 中可见，因此不要把凭据放入 `<PYPI_INDEX_URL>`。
+
+    如果 index 使用来自公共 CA 的证书，请省略 `COPY`、`RUN` 和 `SSL_CERT_FILE` 行。
+
+1. 构建镜像：
+
+    ```bash
+    langgraph build -t my-agent
+    ```
+
+### 构建 JavaScript 项目
+
+构建会使用与项目 lockfile 匹配的包管理器安装包。Node.js 不会读取系统 CA bundle，因此构建改为通过 `NODE_EXTRA_CA_CERTS` 信任内部 CA。
+
+要构建镜像：
+
+1. 在 `langgraph.json` 中设置 `base_image` 和 `dockerfile_lines`：
+
+    ```json
+    {
+      "dependencies": ["."],
+      "graphs": {
+        "agent": "./src/agent.ts:graph"
+      },
+      "node_version": "20",
+      "base_image": "<DOCKER_REGISTRY>/langchain/langgraphjs-api",
+      "dockerfile_lines": [
+        "COPY internal-ca.pem /etc/ssl/certs/internal-ca.pem",
+        "ARG NODE_EXTRA_CA_CERTS=/etc/ssl/certs/internal-ca.pem",
+        "ARG NPM_CONFIG_REGISTRY=<NPM_REGISTRY_URL>"
+      ]
+    }
+    ```
+
+    - **`base_image`**：镜像同步后的 JavaScript Agent Server image，不带 tag。使用上述配置，构建会拉取 `<DOCKER_REGISTRY>/langchain/langgraphjs-api:20`，因此该 tag 必须存在于 registry 中。
+    - **`dockerfile_lines`**：`COPY` 行将内部 CA 放入镜像，`NODE_EXTRA_CA_CERTS` 会将它添加到 Node.js 信任的根证书中。`NPM_CONFIG_REGISTRY` 将 npm 和 pnpm 指向内部 registry。`ARG` 值在 `docker history` 中可见，因此不要把凭据放入 `<NPM_REGISTRY_URL>`。
+
+    如果 registry 使用来自公共 CA 的证书，请省略 `COPY` 和 `NODE_EXTRA_CA_CERTS` 行。
+
+1. 为你的包管理器添加设置。镜像通过 Corepack 运行 pnpm 和 Yarn，而 Corepack 会从 npm registry 下载包管理器本身：
+
+    - **npm**（`package-lock.json`，或无 lockfile）：无需其他设置。即使 `package-lock.json` 记录了公共 URL，npm 仍会从 `NPM_CONFIG_REGISTRY` 获取。
+    - **pnpm**（`pnpm-lock.yaml`）：将 `"ARG COREPACK_NPM_REGISTRY=<NPM_REGISTRY_URL>"` 添加到 `dockerfile_lines`。在 `package.json` 中固定 pnpm 版本，例如 `"packageManager": "pnpm@9.15.9"`。
+    - **Yarn 1**（`yarn.lock`）：添加相同的 `COREPACK_NPM_REGISTRY` 行，并固定 Yarn 版本，例如 `"packageManager": "yarn@1.22.22"`。Yarn 1 会从 `yarn.lock` 中记录的 URL 下载，因此请针对 `<NPM_REGISTRY_URL>` 重新生成 lockfile。
+    - **Yarn 2 或更高版本**（`yarn.lock`）：将 `NPM_CONFIG_REGISTRY` 行替换为 `"ARG YARN_NPM_REGISTRY_SERVER=<NPM_REGISTRY_URL>"`，添加 `COREPACK_NPM_REGISTRY` 行，并固定 Yarn 版本，例如 `"packageManager": "yarn@4.9.2"`。
+
+    构建会将整个项目目录复制到镜像中，包括任何 `.npmrc` 文件。不要在项目的 `.npmrc` 中存储 registry token。
+
+1. 构建镜像：
+
+    ```bash
+    langgraph build -t my-agent
+    ```
+
+关于每个 `langgraph.json` 键，请参阅 [LangGraph CLI 配置文件](/langsmith/cli#configuration-file)的参考文档。
+
+## 验证设置
+
+在完成设置后以及每个工作会话开始时运行这些检查。每项检查验证一节内容，并显示预期输出。
+
+### 检查 CA 信任
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' <PYPI_INDEX_URL>/
+```
+
+```text
+200
+```
+
+此处的证书错误意味着 CA 不在操作系统信任存储中。
+
+### 检查 pip
+
+```bash
+python3 -m pip download --no-deps -d /tmp/pip-check idna
+```
+
+```text
+Looking in indexes: <PYPI_INDEX_URL>
+Collecting idna
+...
+Successfully downloaded idna
+```
+
+第一行必须显示 `<PYPI_INDEX_URL>`。如果缺少它，说明 pip 正在使用 pypi.org。
+
+### 检查 uv 安装
+
+```bash
+uv --version
+```
+
+```text
+uv 0.13.0
+```
+
+输出显示已安装的版本。出现 `command not found` 错误意味着 `~/.local/bin` 不在你的 `PATH` 中。
+
+### 检查 uv 配置
+
+```bash
+echo idna | uv pip compile - --emit-index-url
+```
+
+```text
+# This file was autogenerated by uv via the following command:
+#    uv pip compile - --emit-index-url
+--index-url <PYPI_INDEX_URL>
+
+idna==3.20
+```
+
+`--index-url` 行必须显示 `<PYPI_INDEX_URL>`，并且解析出的版本可确认 TLS 正常工作。
+
+### 检查 Python 解释器
+
+```bash
+uv python find 3.12
+```
+
+输出是解释器的路径，例如 `/usr/bin/python3.12`。要确认缺失的版本会立即失败：
+
+```bash
+uv venv --python 3.99 /tmp/uv-check
+```
+
+```text
+error: No interpreter found for Python 3.99 in managed installations or search path
+```
+
+### 检查镜像构建
+
+```bash
+langgraph dockerfile Dockerfile
+grep -E '^(FROM|COPY|RUN cat|ARG)' Dockerfile
+```
+
+对于 Python 项目：
+
+```text
+FROM <DOCKER_REGISTRY>/langchain/langgraph-api:3.12
+COPY internal-ca.pem /tmp/internal-ca.pem
+RUN cat /tmp/internal-ca.pem >> /etc/ssl/certs/ca-certificates.crt && rm /tmp/internal-ca.pem
+ARG SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ARG UV_DEFAULT_INDEX=<PYPI_INDEX_URL>
+```
+
+对于使用 npm 的 JavaScript 项目：
+
+```text
+FROM <DOCKER_REGISTRY>/langchain/langgraphjs-api:20
+COPY internal-ca.pem /etc/ssl/certs/internal-ca.pem
+ARG NODE_EXTRA_CA_CERTS=/etc/ssl/certs/internal-ca.pem
+ARG NPM_CONFIG_REGISTRY=<NPM_REGISTRY_URL>
+```
+
+`FROM` 必须指明内部 registry，且 `dockerfile_lines` 中的每一行都必须存在。
+
+## 后续步骤
+
+`langgraph build` 会将镜像留在 build machine 上。要运行它：
+
+- **[推送镜像](/langsmith/deploy-with-control-plane#step-3-push-to-container-registry)**：将镜像推送到你的集群或主机可以拉取的 registry。
+- **[使用 control plane 部署](/langsmith/deploy-with-control-plane#step-4-deploy-with-the-control-plane-ui)**：在 LangSmith UI 中从推送的镜像创建 deployment。
+- **[Self-host 独立服务器](/langsmith/deploy-standalone-server)**：在没有 control plane 的情况下，在 Kubernetes、Docker 或 Docker Compose 上运行该镜像。
+- **[用于计费与运维遥测的 egress](/langsmith/self-host-egress)**：允许运行中的 deployment 所需的 egress，或咨询离线（air-gapped）许可证。
+- **[自定义 TLS 证书](/langsmith/self-host-custom-tls-certificates)**：在你的 LangSmith 安装中挂载内部 CA。
