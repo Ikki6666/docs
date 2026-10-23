@@ -468,6 +468,96 @@ uv run mda deploy
 
 将签名 key 和任何回复凭据放入项目 `.env`，`mda deploy` 会将它们作为 deployment secrets 转发。然后在外部服务中将 `https://<deployment-url>/channels/<name>/events` 注册为它的 webhook 目标。
 
+## 以 package 形式共享 channel adapter
+
+可复用的 channel adapter 是一个创建 HTTP channel 的 package。将 provider 相关的代码单独发布，其他项目无需复制 callbacks 或修改 Managed Deep Agents SDK 即可直接安装使用。
+
+该 package 负责请求验证、事件解析，以及可选的回复投递。Managed Deep Agents 仍然负责 agent run 和可信交接。
+
+### 打包 adapter
+
+要将本指南中的 orders adapter 打包，请把 `verify`、`parse`、`post` 及其辅助函数移入该 package。将 secrets 保存在环境变量中，而不是发布出去的源码里。导出一个返回 HTTP channel 声明的工厂函数：
+
+:::python
+在 `pyproject.toml` 中声明对 `managed-deepagents` 的普通 Python 依赖。将 callbacks 放在 `mda_orders/orders.py` 中并导出工厂函数：
+
+```python mda_orders/__init__.py
+from managed_deepagents import HttpChannel, channels
+
+from .orders import parse, post, verify
+
+
+def orders_channel() -> HttpChannel:
+    return channels.http(
+        provider="orders",
+        verify=verify,
+        parse=parse,
+        post=post,
+    )
+```
+:::
+
+:::js
+在 `package.json` 中将 `managed-deepagents` 声明为 `peerDependencies` 条目，由应用程序提供 SDK。只从公开的 `managed-deepagents` 入口导入。工厂函数返回 `HttpChannel`。在为 `verify`、`parse` 和 `post` 标注类型时，使用 `HttpChannelAdapter` 以及 request、parse-result 和 post-input 类型。
+
+将 callbacks 放在 `src/orders.ts` 中，并从 package 的入口导出工厂函数：
+
+```ts src/index.ts
+import { channels, type HttpChannel } from "managed-deepagents";
+
+import { parse, post, verify } from "./orders.js";
+
+export function ordersChannel(): HttpChannel {
+  return channels.http({
+    provider: "orders",
+    verify,
+    parse,
+    post,
+  });
+}
+```
+
+发布编译后的 JavaScript 和 TypeScript 声明文件，并将 package 的入口指向这些文件。不要把单独一份 `managed-deepagents` 打进 adapter。
+:::
+
+在 package 元数据中声明支持的 `managed-deepagents` 版本。发布前请针对这些版本进行测试。
+
+### 在项目中使用该 package
+
+`mda-orders` 是示例 package 名称，并非已发布的集成。将它安装为应用依赖，并在 `channels/` 下声明一个 channel：
+
+:::python
+```python channels/orders.py
+from mda_orders import orders_channel
+
+channel = orders_channel()
+```
+:::
+
+:::js
+```ts channels/orders.ts
+import { ordersChannel } from "mda-orders";
+
+export const channel = ordersChannel();
+```
+:::
+
+:::python
+channel 文件名 `channels/orders.py` 决定了 endpoint：`/channels/orders/events`。
+:::
+
+:::js
+channel 文件名 `channels/orders.ts` 决定了 endpoint：`/channels/orders/events`。
+:::
+
+请在各版本之间保持 `provider` 值（`"orders"`）不变，因为它为调用方身份划分命名空间。
+
+### 发布之前
+
+测试有效和无效的签名、被忽略的事件、会话到线程的映射，以及回复投递。记录所需的环境变量、支持的事件类型，以及任何 provider 限制。发布 adapter 并不会带来 provider 的托管开通。请说明如何创建 provider 应用、配置凭据，以及注册 webhook。
+
+关于 deployment secrets 和 webhook 注册，请参见[部署 agent](#部署-agent)。
+
 ## 另请参阅
 
 - [Channels overview](/langsmith/managed-deep-agents-channels)：了解 channels 如何将消息服务连接到 agent。

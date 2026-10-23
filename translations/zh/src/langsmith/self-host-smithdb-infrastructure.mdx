@@ -20,7 +20,7 @@ SmithDB 为自托管 LangSmith deployment 添加了三个基础设施依赖：Po
 - 一个用于 SmithDB 持久数据的**专用 object-storage bucket**。
 - 供 query、ingestion 和 compaction worker 使用的 **cache storage**：网络挂载磁盘，或为获得最佳缓存性能使用本地 SSD。
 - 到数据库和 object store 的私有网络连通性，外加两者的凭证或 workload identity。
-- 如果 LangSmith 使用 HTTP proxy，请为分配给 SmithDB pods 的 IP 范围和集群的内部 service domain 添加 `NO_PROXY` 条目。
+- LangSmith 到 SmithDB pod IP 的网络访问。如果 LangSmith 使用 HTTP proxy 或运行在 service mesh 中，请参见 [Pod 网络访问](#pod-网络访问)。
 
 ## PostgreSQL metastore
 
@@ -1154,3 +1154,67 @@ smithdb:
 
 </Tab>
 </Tabs>
+
+## Pod 网络访问
+
+SmithDB cluster manager 会告知客户端哪个 ingestion 或 query pod 持有它需要的数据，客户端通过该 pod 的 IP 连接到它。这些连接会绕过 Kubernetes Services，因此集群网络必须允许连接到 SmithDB pod IP。
+
+下表展示了客户端如何访问各个 SmithDB 组件：
+
+| SmithDB 组件（端口） | 客户端连接方式 | 客户端 |
+|---|---|---|
+| Ingestion（`8082`） | Pod IP | `ingest-queue`、`queue` 和 SmithDB query |
+| Query（`8080`） | Pod IP | `platform-backend`、`ingest-queue` 和 `queue` |
+| Cluster manager（`8091`） | Service 名称 | LangSmith 和 SmithDB 组件 |
+| Compaction（`8071`） | Service 名称 | SmithDB compaction worker |
+
+可选的 mutations、run rules 和 stats query deployments 同样监听 `8080` 端口，客户端通过 pod IP 连接它们。通过 Service 名称进行的连接无需额外配置。
+
+### HTTP proxy
+
+如果 LangSmith 使用 HTTP proxy，请将分配给 SmithDB pods 的 IP 范围和集群的内部 service domain 加入 `NO_PROXY`。
+
+### Service mesh
+
+如果 LangSmith 运行在 service mesh 中，mesh 必须转发目标为 `8082` 和 `8080` 端口上 SmithDB pod IP 的连接。mesh 在两种情况下会丢弃这类连接：
+
+- mesh 只允许发往其 service registry 中目的地的流量，而 SmithDB pods 未被注册。
+- mesh 按主机名路由这些端口。目标是 pod IP 的连接无法匹配任何主机名。将这些端口按 TCP 处理可以避免按主机名路由。
+
+<Accordion title="示例：用 headless Services 注册 SmithDB pods">
+
+基于 Kubernetes Services 构建 service registry 的 mesh 会注册 [headless Service](https://kubernetes.io/docs/concepts/services-networking/service/#headless-services) 之后的每一个 pod IP。下面的清单为 SmithDB ingestion 和 query 创建 headless Service。这些名称假定 Helm release 名为 `langsmith`。
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: langsmith-smithdb-ingestion-headless
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/component: langsmith-smithdb-ingestion
+  ports:
+    - name: tcp-grpc
+      port: 8082
+      targetPort: grpc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: langsmith-smithdb-query-headless
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/component: langsmith-smithdb-query
+  ports:
+    - name: tcp-grpc
+      port: 8080
+      targetPort: grpc
+```
+
+每个端口名称中的 `tcp-` 前缀将该端口标记为 TCP，供根据端口名称选择协议的 mesh 使用。
+
+如果启用了 mutations、run rules 或 stats query deployments，请为每一个在 `8080` 端口上添加一个 Service，分别选择 `langsmith-smithdb-mutations`、`langsmith-smithdb-run-rules` 或 `langsmith-smithdb-stats-query`。
+
+</Accordion>
