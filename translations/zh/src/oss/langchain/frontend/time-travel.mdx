@@ -3,7 +3,7 @@ title: 时间旅行
 description: 检查、导航并从对话历史中的任意检查点恢复
 ---
 
-LangGraph 智能体中的每次状态变更都会创建一个 **checkpoint**，也就是该时刻智能体状态的完整快照。时间旅行允许你检查任意 checkpoint、查看智能体当时持有的精确状态，并且**从该点恢复执行**，从而探索其他路径。它是调试器、撤销按钮和审计日志的合体。
+[checkpoint](/oss/langgraph/persistence#checkpoints) 是 LangGraph 智能体状态的一个已保存快照。时间旅行允许你检查 checkpoint，并从该保存状态继续执行，从而探索其他路径。
 
 import { PatternEmbed } from "/snippets/pattern-embed.jsx"
 
@@ -16,18 +16,20 @@ import UseStreamTypeInference from '/snippets/oss/use-stream-type-inference.mdx'
 
 ## checkpoint 如何工作
 
-LangGraph 会在每次节点执行后持久化智能体状态。每个持久化状态都是一个 @[ThreadState][ThreadStateJS] 对象，包含：
+LangGraph 会在 super-step 边界持久化智能体状态。在同一个 super-step 中并行运行的节点共享一个 checkpoint 边界。每个持久化状态都是一个 @[ThreadState][ThreadStateJS] 对象，包含：
 
-- **checkpoint**：标识该快照的元数据（ID、时间戳）
+- **checkpoint**：checkpoint 标识符，包括其 ID 和命名空间
+- **created_at**：快照创建时间
+- **parent_checkpoint**：该路径上的上一个 checkpoint
 - **values**：此时刻的完整智能体状态（消息、自定义键）
 - **tasks**：接下来要运行的图节点
 - **next**：执行计划中即将运行的节点名称
 
-这会形成一条线性时间线，记录智能体做出的每个决策、调用的每个工具和生成的每个响应。你的 UI 可以把这条时间线渲染出来，并让用户跳到任意一点。
+历史中可以包含多条执行路径，而不只是一条线性对话。`getHistory()` 按最新在前返回 checkpoint，默认上限为 10 条。请使用 `parent_checkpoint` 来追溯祖先关系，而不是把相邻条目当作父与子。下面的示例展示返回的这一页历史。
 
 ## 设置 `useStream`
 
-先为你的智能体创建 stream，然后从 LangGraph client 显式获取当前线程的 checkpoint 历史。从 checkpoint 恢复时使用 `forkFrom: { checkpointId }`。
+先为你的智能体创建 stream，然后从 LangGraph client 显式获取当前线程的 checkpoint 历史。从 checkpoint 恢复时使用 `forkFrom: checkpointId`。
 
 <UseStreamTypeInference />
 
@@ -54,8 +56,9 @@ export function TimeTravelChat() {
   }, [stream.client, threadId, stream.isLoading]);
 
   function resumeFrom(cp: ThreadState) {
-    stream.submit({}, {
-      forkFrom: { checkpointId: cp.checkpoint.checkpoint_id },
+    if (!cp.checkpoint.checkpoint_id) return;
+    stream.submit(undefined, {
+      forkFrom: cp.checkpoint.checkpoint_id,
     });
   }
 
@@ -96,8 +99,9 @@ watch(
 );
 
 function resumeFrom(cp: ThreadState) {
-  stream.submit({}, {
-    forkFrom: { checkpointId: cp.checkpoint.checkpoint_id },
+  if (!cp.checkpoint.checkpoint_id) return;
+  stream.submit(undefined, {
+    forkFrom: cp.checkpoint.checkpoint_id,
   });
 }
 </script>
@@ -137,8 +141,9 @@ function resumeFrom(cp: ThreadState) {
   });
 
   function resumeFrom(cp: ThreadState) {
-    stream.submit({}, {
-      forkFrom: { checkpointId: cp.checkpoint.checkpoint_id },
+    if (!cp.checkpoint.checkpoint_id) return;
+    stream.submit(undefined, {
+      forkFrom: cp.checkpoint.checkpoint_id,
     });
   }
 </script>
@@ -192,8 +197,9 @@ export class TimeTravelChatComponent {
   }
 
   resumeFrom(cp: ThreadState) {
-    this.stream.submit({}, {
-      forkFrom: { checkpointId: cp.checkpoint.checkpoint_id },
+    if (!cp.checkpoint.checkpoint_id) return;
+    this.stream.submit(undefined, {
+      forkFrom: cp.checkpoint.checkpoint_id,
     });
   }
 }
@@ -202,7 +208,7 @@ export class TimeTravelChatComponent {
 
 ## 构建 checkpoint 时间线
 
-时间线侧边栏会把每个 checkpoint 显示成可点击条目。每个条目会展示当时运行的节点，以及那个时刻存在多少条消息：
+时间线侧边栏会把每个 checkpoint 显示成可点击条目。每个条目会展示已调度的节点，以及那个时刻存在多少条消息。`tasks` 描述的是下一步要做的工作，而不是产生该 checkpoint 的节点。请使用 `next` 来标注所有已调度的节点，包括并行的工作：
 
 ```tsx
 function TimelineSidebar({
@@ -219,7 +225,7 @@ function TimelineSidebar({
       </h2>
       <div className="space-y-2">
         {history.map((cp, i) => {
-          const taskName = cp.tasks?.[0]?.name ?? "unknown";
+          const nextNodes = cp.next?.join(", ") || "Complete";
           const msgCount = (cp.values?.messages as unknown[])?.length ?? 0;
 
           return (
@@ -231,9 +237,9 @@ function TimelineSidebar({
             >
               <div className="flex items-center justify-between">
                 <span className="text-xs text-gray-400">#{i + 1}</span>
-                <NodeBadge name={taskName} />
+                <NodeBadge name={nextNodes} />
               </div>
-              <p className="mt-1 text-sm font-medium">{taskName}</p>
+              <p className="mt-1 text-sm font-medium">Next: {nextNodes}</p>
               <p className="text-xs text-gray-500">
                 {msgCount} message{msgCount !== 1 ? "s" : ""}
               </p>
@@ -258,7 +264,7 @@ function CheckpointInspector({ checkpoint }: { checkpoint: ThreadState }) {
     <div className="rounded-lg border bg-white p-4">
       <div className="flex items-center justify-between">
         <h3 className="font-semibold">
-          Checkpoint {checkpoint.checkpoint.checkpoint_id.slice(0, 8)}...
+          Checkpoint {checkpoint.checkpoint.checkpoint_id?.slice(0, 8)}...
         </h3>
         <button
           onClick={() => setExpanded(!expanded)}
@@ -269,10 +275,6 @@ function CheckpointInspector({ checkpoint }: { checkpoint: ThreadState }) {
       </div>
 
       <div className="mt-2 space-y-1 text-sm">
-        <p>
-          <strong>Node:</strong>{" "}
-          {checkpoint.tasks?.[0]?.name ?? "—"}
-        </p>
         <p>
           <strong>Next:</strong>{" "}
           {checkpoint.next?.join(", ") || "—"}
@@ -301,25 +303,22 @@ function CheckpointInspector({ checkpoint }: { checkpoint: ThreadState }) {
 
 ## 从 checkpoint 恢复
 
-时间旅行的核心能力是**从任意先前 checkpoint 恢复执行**。当用户选择一个 checkpoint 时，调用 `submit`，传入 `null` 输入和 checkpoint ID：
+时间旅行的核心能力是**从任意先前 checkpoint 恢复执行**。当用户选择一个 checkpoint 时，调用 `submit`，传入 `undefined` 输入，并把 checkpoint ID 作为 `forkFrom` 传入：
 
 ```ts
-stream.submit({}, {
-  forkFrom: { checkpointId: selectedCheckpoint.checkpoint.checkpoint_id },
-});
+const checkpointId = selectedCheckpoint.checkpoint.checkpoint_id;
+if (checkpointId) {
+  stream.submit(undefined, { forkFrom: checkpointId });
+}
 ```
 
-这会告诉 LangGraph：
+SDK 会把 `undefined` 或 `null` 输入作为 `null` 发送，也就是从所选 checkpoint 继续执行，而不提供新输入。空对象（`{}`）表示新输入，并不是同样的继续信号。如果 checkpoint 没有下一个节点，就没有待重放的工作。
 
-1. 回滚到所选 checkpoint 的状态
-2. 从该点重新执行图
-3. 把新的结果流式发送给客户端
+新的运行会在同一线程中创建另一条路径。UI 会显示该路径；原始 checkpoints 仍然可以在历史中访问。
 
-所选 checkpoint 之后的现有消息会被新的执行路径替换。这实际上就在对话时间线上创建了一条**分支**。
-
-<Note>
-从 checkpoint 恢复不会删除原始时间线。之前的 checkpoints 仍然可以在历史中访问。这意味着用户可以随时返回并尝试不同路径，而不会丢失之前的工作。
-</Note>
+<Warning>
+重放 checkpoint 可能会再次执行下游的工具和 API 调用。它不会撤销早前产生的外部影响，例如已发送的消息或数据库写入。重放一次运行之前，请先核对这些影响。
+</Warning>
 
 ## SplitView 布局
 
@@ -367,11 +366,12 @@ function TimeTravelLayout() {
           history={history}
           selected={selectedCheckpoint}
           onSelect={setSelectedCheckpoint}
-          onResume={(cp) =>
-            stream.submit({}, {
-              forkFrom: { checkpointId: cp.checkpoint.checkpoint_id },
-            })
-          }
+          onResume={(cp) => {
+            if (!cp.checkpoint.checkpoint_id) return;
+            stream.submit(undefined, {
+              forkFrom: cp.checkpoint.checkpoint_id,
+            });
+          }}
         />
         {selectedCheckpoint && (
           <CheckpointInspector checkpoint={selectedCheckpoint} />
@@ -391,7 +391,7 @@ function formatCheckpoints(history: ThreadState[]) {
   return history.map((cp, index) => ({
     index,
     id: cp.checkpoint?.checkpoint_id,
-    taskName: cp.tasks?.[0]?.name ?? "unknown",
+    nextLabel: cp.next?.join(", ") || "Complete",
     messageCount: (cp.values?.messages as unknown[])?.length ?? 0,
     hasInterrupts: cp.tasks?.some((t) => t.interrupts?.length) ?? false,
     nextNodes: cp.next ?? [],
@@ -406,7 +406,7 @@ function formatCheckpoints(history: ThreadState[]) {
 时间旅行在很多场景都非常有用：
 
 - **调试智能体行为**：逐步查看智能体的决策，理解它为什么选择了某条路径
-- **撤销动作**：如果智能体走错了路，可以从更早的 checkpoint 恢复并重试
+- **尝试另一条路径**：从更早的保存状态继续执行，而不删除原始 checkpoints
 - **探索替代路径**：从对话中间的 checkpoint 分叉，看看不同输入会如何改变结果
 - **审计**：查看智能体动作的完整历史，用于合规、质量保证或事故复盘
 - **教学**：逐步讲解智能体执行过程，帮助别人理解多步推理是如何工作的
@@ -448,7 +448,7 @@ function TimelineEntry({
         )}
       </div>
       <p className="mt-1 text-sm font-medium">
-        {checkpoint.tasks?.[0]?.name ?? "—"}
+        Next: {checkpoint.next?.join(", ") || "Complete"}
       </p>
     </div>
   );
@@ -458,8 +458,8 @@ function TimelineEntry({
 ## 最佳实践
 
 - **懒加载历史**：对于有数百个 checkpoint 的线程，可以分页或只加载最近 N 条，以保持 UI 响应速度
-- **展示有意义的标签**：显示节点名称和消息数量，而不是原始 checkpoint ID。用户需要上下文，不需要 UUID
-- **恢复前先确认**：从旧 checkpoint 恢复会替换当前执行路径。显示确认对话框，避免用户不小心丢失当前对话状态
+- **展示有意义的标签**：显示已调度的下一个节点和消息数量，而不是原始 checkpoint ID。用户需要上下文，不需要 UUID
+- **恢复前先确认**：在开始另一条路径之前显示确认对话框，尤其是当下游节点会产生外部影响时
 - **高亮当前 checkpoint**：让用户一眼看出哪个 checkpoint 对应当前对话状态
 - **支持键盘导航**：高级用户会想用方向键在 checkpoints 之间切换。给时间线加上键盘处理逻辑，体验会更顺滑
 - **比较 checkpoints 之间的状态差异**：对高级用户来说，展示相邻两个 checkpoint 之间发生了什么变化，可以准确揭示智能体状态是如何逐步演化的

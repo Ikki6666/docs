@@ -148,7 +148,7 @@ LangSmith 发送的 webhook 通知格式与 [Run](/langsmith/runs) 一致。请�
 | `run_id` | `string` (UUID) | 该 run 的唯一标识符。 |
 | `thread_id` | `string` (UUID) | 该 run 所属 thread 的标识符。 |
 | `assistant_id` | `string` | 执行该 run 的 assistant 标识符。 |
-| `status` | `string` | run 的最终状态，例如 `"success"`、`"error"`。 |
+| `status` | `string` | run 的最终状态：`"success"`、`"error"`、`"timeout"`、`"interrupted"` 或 `"rollback"`。见下方的[状态值](#状态值)。 |
 | `created_at` | `string` (datetime) | run 创建时间戳。 |
 | `updated_at` | `string` (datetime) | run 最近更新时间戳。 |
 | `run_started_at` | `string` (datetime) | run 开始执行的时间戳。 |
@@ -158,7 +158,7 @@ LangSmith 发送的 webhook 通知格式与 [Run](/langsmith/runs) 一致。请�
 | `kwargs` | `JSON object` | run 输入、配置和其他调用参数。 |
 | `values` | `JSON object` | thread 最近一次 checkpoint 的 state values。仅在有状态 run 中出现。 |
 | `multitask_strategy` | `string` | 该 run 使用的 multitask strategy。 |
-| `error` | `JSON object \| null` | 仅在 run 失败时出现。包含 `error`，错误类型，和 `message`，错误详情，字段。 |
+| `error` | `JSON object \| null` | 仅在 run 以异常结束时出现，即任何非 `"success"` 状态。包含 `error`，错误类型，和 `message`，错误详情，字段。 |
 
 payload 示例：
 
@@ -190,7 +190,7 @@ payload 示例：
 }
 ```
 
-当 run 失败时，`error` 字段会包含失败详情：
+当 run 超时时，`status` 字段为 `"timeout"`，`error` 字段会包含失败详情：
 
 ```json
 {
@@ -200,6 +200,22 @@ payload 示例：
   }
 }
 ```
+
+## 状态值
+
+`status` 字段取以下五种值之一：
+
+| Value | When it is sent |
+|-------|----------------|
+| `"success"` | run 正常完成。当 run 在 @[`interrupt()`][interrupt] 调用处暂停、等待人工输入时，也会发送该状态。payload 中看不到待处理的 interrupt，因此需要读取 thread state 来检测。 |
+| `"error"` | run 抛出了未处理的异常。payload 中的 `error` 字段包含错误类型和消息。 |
+| `"timeout"` | run 超出了后台任务的超时时间，该时间由 `BG_JOB_TIMEOUT_SECS` 环境变量设置（默认 86400 秒）。 |
+| `"interrupted"` | run 在执行过程中被取消，要么是被某个 `multitask_strategy: "interrupt"` 策略为更新的 run 抢占，要么是被一次采用默认 `interrupt` 动作的 `runs.cancel` 调用取消。 |
+| `"rollback"` | run 在执行过程中被取消，且其 checkpoints 被删除，要么是被某个 `multitask_strategy: "rollback"` 策略取消，要么是被一次采用 `action="rollback"` 的 `runs.cancel` 调用取消。此时 `values` 字段为 `null`。 |
+
+仍在等待中即被取消的 run 永远不会开始执行，因此服务器不会为其发送 webhook。
+
+单个 thread 可能收到不止一次 webhook 调用。例如，当一个新 run 抢占了正在执行的 run 时，服务器会为被抢占的 run 发送一条 `"interrupted"` webhook，并在新 run 结束时为它单独发送一条 webhook。
 
 ## 保护 webhooks
 
@@ -289,8 +305,24 @@ https://my-server.app/my-webhook-endpoint?token=YOUR_SECRET_TOKEN
 | `allowed_domains` | 主机名 allowlist。支持对子域名使用通配符，例如 `*.mycompany.com`。 |
 | `require_https` | 为 `true` 时，拒绝 `http://` URL。 |
 | `allowed_ports` | 显式端口 allowlist。默认值为 443，https，和 80，http。 |
-| `disable_loopback` | 为 `true` 时，禁止相对 URL，内部 loopback 调用。 |
+| `disable_loopback` | 为 `true` 时，禁止 loopback 地址和相对 URL。在 `langgraph-api` 0.10.0 及更高版本中默认为 `true`。 |
 | `max_url_length` | URL 允许的最大字符长度。 |
+
+由于 `disable_loopback` 默认为 `true`，发往 `localhost`、`127.0.0.1`、`host.docker.internal` 或相对 URL 的 webhook 会被拒绝。这通常会影响与 `langgraph dev` 搭配使用的本地接收端。要允许这些地址，请把 `disable_loopback` 设置为 `false`：
+
+```json
+{
+  "webhooks": {
+    "url": {
+      "disable_loopback": false
+    }
+  }
+}
+```
+
+<Note>
+服务器还会应用 SSRF 策略，默认阻止发往 cloud-metadata 端点（例如 `169.254.169.254`）和集群内部主机的请求。`disable_loopback` 选项是在这条基线之上，对 loopback 和相对 URL 的额外控制。匹配某个 `allowed_domains` 条目的主机会跳过这些 SSRF 检查。
+</Note>
 
 ## 禁用 webhooks
 

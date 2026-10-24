@@ -1,0 +1,264 @@
+---
+title: 为 Managed Deep Agent 构建自定义 frontend
+sidebarTitle: 自定义 frontend
+description: 从你自己的浏览器或服务器应用调用 Managed Deep Agents deployment，而不是通过 channel 或 LangSmith Studio 访问 agent。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/langsmith/managed-deep-agents-public-beta-note.mdx';
+
+自定义 frontend 是你编写的、直接调用 deployment 的任何应用，而不是通过 [channel](/langsmith/managed-deep-agents-channels) 或 [LangSmith Studio](/langsmith/managed-deep-agents-local-development#start-local-studio) 访问 agent。当 agent 需要嵌入到你控制的产品界面中时，例如支持控制台、内部 dashboard 或面向客户的聊天页面，请使用自定义 frontend。
+
+Managed Deep Agents deployments 运行在 [LangSmith Agent Server](/langsmith/agent-server-overview) 上。Frontend 与每个 Agent Server client 使用的 threads、runs 和 streaming endpoints 通信。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+## 选择 identity provider
+
+发往 deployment 的每个请求都要指名一个调用方，而由 frontend 提供这个名称。哪种 [identity provider](/langsmith/managed-deep-agents-identity) 合适，取决于 frontend 代码在哪里运行，而不是它用什么语言编写。
+
+| Frontend 从哪里调用 deployment | Identity provider |
+| --- | --- |
+| 用户的浏览器 | 外部 auth provider。浏览器发送 access token，deployment 验证它。参见 [Supabase](/langsmith/managed-deep-agents-identity#configure-identity-with-supabase)。 |
+| 你自己的服务器，已经对用户完成认证 | [Your own backend](/langsmith/managed-deep-agents-identity#configure-identity-with-your-own-backend)。你的服务器在共享 ingress secret 的保护下断言用户 ID。 |
+| 你自己的服务器，自身没有最终用户账户 | [LangSmith API key](/langsmith/managed-deep-agents-identity#configure-identity-with-a-langsmith-api-key) 默认方式。该 key 本身就是调用方。 |
+
+表中任意一个服务器行都适用于任何语言的服务器端渲染应用。Streamlit、Gradio 和 Dash 的代码都运行在服务器上，Next.js route handler 和 Express 代理也是如此。指向 [`mda dev`](/langsmith/managed-deep-agents-local-development#understand-local-behavior) 的 frontend 在你配置 provider 之前就能工作，因为本地服务器会提供一个测试用户。
+
+<Warning>
+LangSmith API key 可以访问 workspace 中的所有资源，而不仅仅是这个 deployment，因此绝不能将它放进浏览器 JavaScript 中。当浏览器直接调用 deployment 时，请使用外部 auth provider；当你自己的服务器代表用户调用 deployment 时，请使用 backend identity。
+</Warning>
+
+## 连接到 deployment
+
+Frontend 需要两个值。
+
+**Deployment API URL。** `mda deploy` 打印的是 LangSmith deployment dashboard URL，而不是 API URL。打开该 dashboard，然后在 deployment 详情视图中复制 **API URL**。[`mda dev`](/langsmith/managed-deep-agents-local-development) 启动的本地服务器会在 CLI 打印的 URL 上提供相同的路由。
+
+**Assistant ID。** Client 传入 [agent definition](/langsmith/managed-deep-agents-agent-definition#parameters) 中 agent 的 `name`。Managed Deep Agents 还将该名称用作 graph ID：
+
+:::python
+```python agent.py
+from managed_deepagents import define_deep_agent
+
+agent = define_deep_agent(
+    name="research-assistant",  # [!code highlight]
+    model="openai:gpt-5.5",
+)
+```
+:::
+
+:::js
+```ts agent.ts
+import { defineDeepAgent } from "managed-deepagents";
+
+export const agent = defineDeepAgent({
+  name: "research-assistant", // [!code highlight]
+  model: "openai:gpt-5.5",
+});
+```
+:::
+
+Client 用同一个字符串 `research-assistant` 寻址该 agent。重命名 agent 会改变 client 发送的值，因此请把这个名称当作 deployment 公共接口的一部分。
+
+## 构建 web frontend
+
+[LangChain frontend SDKs](/oss/langchain/frontend/overview) 将浏览器应用连接到 Agent Server deployment。`useStream` 以响应式值的形式暴露 messages、tool 调用、interrupts 和 thread state：
+
+| Framework | Package | Entry point |
+| --- | --- | --- |
+| React | `@langchain/react` | `useStream` |
+| Vue | `@langchain/vue` | `useStream` |
+| Svelte | `@langchain/svelte` | `useStream` |
+| Angular | `@langchain/angular` | `injectStream` |
+
+Frontend 运行在浏览器中，因此即使 agent 是用 Python 编写的，这些示例也是 TypeScript。
+
+在使用外部 auth provider 的情况下，浏览器发送来自已登录会话的 access token。该 token 会轮换，因此请在会话变化时重新读取它，而不是只在挂载时捕获一次：
+
+```ts useAuthHeaders.ts
+import { useEffect, useState } from "react";
+
+import { supabase } from "./supabase";
+
+export function useAuthHeaders() {
+  const [headers, setHeaders] = useState<Record<string, string>>();
+
+  useEffect(() => {
+    const refresh = async () => {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      setHeaders(token ? { Authorization: `Bearer ${token}` } : undefined);
+    };
+
+    void refresh();
+    const { data } = supabase.auth.onAuthStateChange(() => void refresh()); // [!code highlight]
+    return () => data.subscription.unsubscribe();
+  }, []);
+
+  return headers;
+}
+```
+
+高亮的订阅会在登录、退出和 token 刷新时触发。没有它，该 hook 会一直持有挂载时捕获的 token，一旦该 token 过期，请求就会开始以 401 失败。
+
+将 stream 指向 deployment API URL、agent 名称和这些请求头：
+
+```tsx Chat.tsx
+import { useStream } from "@langchain/react";
+import { useState } from "react";
+
+import { useAuthHeaders } from "./useAuthHeaders";
+
+export function Chat() {
+  const [input, setInput] = useState("");
+  const headers = useAuthHeaders();
+  const stream = useStream({
+    apiUrl: import.meta.env.VITE_DEPLOYMENT_API_URL,
+    assistantId: "research-assistant",
+    defaultHeaders: headers,
+  });
+
+  return (
+    <main>
+      {stream.messages.map((message) => (
+        <p key={message.id}>{message.text}</p>
+      ))}
+
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          stream.submit({ messages: [{ type: "human", content: input }] });
+          setInput("");
+        }}
+      >
+        <input value={input} onChange={(event) => setInput(event.target.value)} />
+        <button type="submit" disabled={stream.isLoading}>
+          Send
+        </button>
+      </form>
+    </main>
+  );
+}
+```
+
+在使用 backend identity 时，浏览器永远不会直接访问 deployment。将 `apiUrl` 指向你自己的服务器，并从那里转发 Agent Server 路由，在每个上游请求上附加 `x-mda-ingress-secret` 以及你的 auth 层解析出的用户 ID。关于请求头和共享 secret，请参见 [Configure identity with your own backend](/langsmith/managed-deep-agents-identity#configure-identity-with-your-own-backend)。
+
+同样的 frontend 模式也适用于 Managed Deep Agents deployment。参见 [tool-call rendering](/oss/langchain/frontend/tool-calling)、[generative UI](/oss/langchain/frontend/generative-ui-overview)、[human-in-the-loop approval](/oss/langchain/frontend/human-in-the-loop)、[queued submissions](/oss/langchain/frontend/message-queues) 和 [durable rejoin](/oss/langchain/frontend/join-rejoin)。
+
+### 处理授权 interrupt
+
+当 agent 需要一个调用方尚未授权的 [user-owned connection](/langsmith/managed-deep-agents-connections) 时，run 会暂停，`stream.interrupt` 会携带 credential gate payload。浏览器 frontend 渲染 consent 链接，并用 `stream.respond` 恢复。关于 payload 的结构和完整示例，请参见 [Handle the authorization interrupt](/langsmith/managed-deep-agents-connections#handle-the-authorization-interrupt)。
+
+:::python
+## 构建 Python frontend
+
+Streamlit、Gradio 和 Dash 都在服务器上渲染，因此不会有任何凭据到达浏览器，API key 默认方式无需额外配置即可使用。三者都使用同一个 [LangGraph SDK](https://reference.langchain.com/python/langgraph-sdk) client，因此下面的连接代码适用于其中任何一个。
+
+将 SDK 与你的应用框架一起安装：
+
+```bash
+uv add langgraph-sdk streamlit
+```
+
+创建一个 client，然后针对某个 thread 流式执行 run：
+
+```python
+from langgraph_sdk import get_sync_client
+
+client = get_sync_client(
+    url=DEPLOYMENT_API_URL,
+    api_key=LANGSMITH_API_KEY,
+)
+
+thread = client.threads.create()
+
+for chunk in client.runs.stream(
+    thread["thread_id"],
+    "research-assistant",
+    input={"messages": [{"role": "user", "content": "Summarize this week's incidents."}]},
+    stream_mode="messages",
+):
+    ...
+```
+
+三个细节决定该循环的行为：
+
+- **`api_key`**：设置 `x-api-key` 请求头。如果改为传入 `headers={"x-api-key": ...}`，会引发 `ValueError: Cannot set reserved header 'x-api-key'`。
+- **环境回退**：省略 `api_key` 时，client 会依次尝试 `LANGGRAPH_API_KEY`、`LANGSMITH_API_KEY`、`LANGCHAIN_API_KEY`。对于 Supabase 或 backend identity，请显式传入 `api_key=None`，并把 token 放进 `headers`。否则，一个遗留的环境变量会附加上第二份凭据。
+- **`messages/partial`**：携带到目前为止的完整消息，而不是增量。请在每个事件上替换已渲染的文本，而不是追加，否则输出会自我重复。
+
+### 流式输出到 Streamlit chat
+
+这个应用为每个浏览器会话保留一个 thread，并在每个事件到达时重写 assistant 气泡：
+
+```python app.py
+import os
+
+import streamlit as st
+from langgraph_sdk import get_sync_client
+
+ASSISTANT_ID = "research-assistant"
+
+
+@st.cache_resource
+def get_agent_client():
+    return get_sync_client(
+        url=os.environ["DEPLOYMENT_API_URL"],
+        api_key=os.environ["LANGSMITH_API_KEY"],
+    )
+
+
+def text_of(message):
+    return "".join(
+        block.get("text", "")
+        for block in message.get("content", [])
+        if block.get("type") == "text"
+    )
+
+
+client = get_agent_client()
+
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = client.threads.create()["thread_id"]
+    st.session_state.history = []
+
+for role, text in st.session_state.history:
+    st.chat_message(role).markdown(text)
+
+if prompt := st.chat_input("Message the agent"):
+    st.session_state.history.append(("user", prompt))
+    st.chat_message("user").markdown(prompt)
+
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        answer = ""
+        for chunk in client.runs.stream(
+            st.session_state.thread_id,
+            ASSISTANT_ID,
+            input={"messages": [{"role": "user", "content": prompt}]},
+            stream_mode="messages",
+        ):
+            if chunk.event != "messages/partial":
+                continue
+            for message in chunk.data:
+                if message.get("type") == "ai":
+                    answer = text_of(message)
+                    placeholder.markdown(answer)  # [!code highlight]
+
+    st.session_state.history.append(("assistant", answer))
+```
+
+高亮的行会在每个事件上替换气泡内容。在那里追加会产生重复文本，因为每个事件都会从头开始重复该消息。
+
+`text_of` 读取的是 content blocks，而不是纯字符串。Agent 消息以带类型的 block 列表形式到达，因此如果 frontend 期望 `message["content"]` 是文本，就渲染不出任何内容。Web SDK 会把每个事件反序列化为一个暴露 `text` 访问器的 message 对象，这就是上面的 React 示例读取 `message.text` 的原因。LangGraph SDK 产出的是普通字典，因此 Python frontend 需要自行提取文本。
+
+Gradio 和 Dash 使用同一个 client 和同一个循环。请用它们的流式原语替代 Streamlit 的 placeholder：为 `gr.ChatInterface` 提供生成器函数，或为 Dash 提供 `dcc.Interval` 回调。
+:::
+
+## 另请参阅
+
+- [Identity](/langsmith/managed-deep-agents-identity)：配置调用方如何向 deployment 认证。
+- [Frontend overview](/oss/langchain/frontend/overview)：消息渲染、tool 调用、interrupts 和 generative UI 模式。
+- [Connections](/langsmith/managed-deep-agents-connections)：在 UI 中处理凭据授权 interrupt。
+- [MCP endpoint](/langsmith/managed-deep-agents-mcp-endpoint)：将 agent 暴露给 MCP client，而不是调用 API。
+- [Channels](/langsmith/managed-deep-agents-channels)：从 Slack 或你自己的 HTTP 服务访问 agent。
