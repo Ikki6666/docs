@@ -3,13 +3,15 @@ title: 条件式 tracing
 sidebarTitle: 条件式 tracing
 ---
 
+import AgentTracingPrerequisite from '/snippets/langsmith/agent-tracing-prerequisite.mdx';
+
 当你在全局设置了环境变量 `LANGSMITH_TRACING=true` 时，traces 会自动发送到 LangSmith。本指南介绍如何为特定请求有选择地关闭 tracing，或自定义 tracing 行为。
 
 在以下场景中，你会需要条件式 tracing：
 
 - **满足数据保留策略**：有些客户出于合规或隐私原因，要求完全零数据保留。
 - **处理敏感操作**：对于涉及 PII、凭据或机密数据的操作，关闭 tracing。
-- **实现按 tenant 定制配置**：根据不同客户，把 traces 路由到不同项目，或应用不同设置。
+- **实现按 tenant 定制配置**：根据不同客户，把 traces 路由到不同 agent environments，或应用不同设置。
 - **控制成本**：为低价值请求关闭 tracing，同时保留关键操作的可观测性。
 - **配合 feature flags**：只有在特定功能或实验性代码路径启用时才打开 tracing。
 
@@ -20,8 +22,12 @@ sidebarTitle: 条件式 tracing
 @[`tracing_context`][tracing_context] context manager（Python）和 @[`tracingEnabled`][tracingEnabled] 选项（TypeScript）都允许你在运行时覆盖全局 tracing 设置，无需重构代码，也不必修改环境变量。
 
 <Note>
-下面的章节分别提供了按语言区分的示例，你可以结合自己的应用逻辑和业务需求进行调整。
+下面的章节分别提供了按语言区分的示例，你可以结合自己的 agent 逻辑和业务需求进行调整。
 </Note>
+
+<AgentTracingPrerequisite />
+
+在启用动态路由前，请先注册每个 agent。replica 配置需要每个目标环境的 `tracer_session_name`。请先获取这些值，再启用 replication。
 
 <Tabs>
 <Tab title="Python" icon="brand-python">
@@ -98,7 +104,7 @@ handle_request("client-a", "some input")  # Traced or not based on client settin
 
 ## 为每个请求自定义 tracing 配置
 
-你还可以动态定制 tracing 配置，例如把 traces 路由到不同项目，或添加请求级别的 metadata。
+你还可以动态定制 tracing 配置，例如把 traces 路由到不同 agents，或添加请求级别的 metadata。
 
 ```python
 import langsmith as ls
@@ -110,13 +116,13 @@ def my_function(input_text: str):
 
 def handle_request(client_id: str, user_input: str, region: str):
     """
-    Route traces to client-specific projects with custom metadata.
+    Route traces to registered client-specific agents with custom metadata.
     """
     client_tier = get_client_tier(client_id)  # e.g., "enterprise", "standard"
 
     with ls.tracing_context(
         enabled=True,
-        project_name=f"client-{client_id}",
+        address=ls.agent_address(f"client-{client_id}", "production"),
         tags=["production", f"tier-{client_tier}", f"region-{region}"],
         metadata={
             "client_id": client_id,
@@ -126,15 +132,15 @@ def handle_request(client_id: str, user_input: str, region: str):
     ):
         return my_function(user_input)
 
-# Traces go to "client-abc" project with custom tags and metadata
+# Register client-abc first; traces go to its Production environment
 handle_request("abc", "some input", "us-west")
 ```
 
 这种方式适合：
 
-- **多租户应用**：把不同客户的 traces 隔离到各自项目中
+- **多租户服务**：把不同客户的 traces 隔离到各自 agents 下
 - **多区域部署**：按地理区域追踪性能和行为
-- **功能分支**：把实验性特性的 traces 路由到专用项目
+- **功能分支**：把实验性特性的 traces 路由到 agent 的 Development 环境
 - **用户分群**：按用户等级、cohort 或 A/B test 分组分析行为
 
 ## 配合自动 tracing 使用
@@ -162,9 +168,9 @@ with ls.tracing_context(enabled=False):
 # Override global setting - enable with custom config
 with ls.tracing_context(
     enabled=True,
-    project_name="special-project"
+    address=ls.agent_address("<your-agent-id>", "staging")
 ):
-    process_data("important")  # Traced to "special-project"
+    process_data("important")  # Traced to the registered agent's Staging environment
 ```
 
 ## 嵌套 tracing contexts
@@ -224,7 +230,7 @@ def handle_request(tenant_id: str, user_input: str) -> str:
 你可以在 `updates` 中使用任意子集的 run fields，例如 `{"inputs": {"redacted": True}}` 用于保留一个标记，或 `{"outputs": {}}` 只隐藏 outputs。同样的方式也适用于把不同隐藏策略写入不同目标，每个 replica 都可以单独指定 `project_name`、`api_key` 和 `updates`。关于 replica 的完整说明，请参阅[使用 replicas 将 traces 写入多个目标](/langsmith/trace-replicas)。
 
 <Note>
-当你用 `updates` 来隐藏 inputs 或 outputs 时，请务必在 replica 上设置 `project_name`。如果 replica 的 `project_name` 和当前会话的 active project 相同，`updates` 可能会被丢弃，导致未隐藏的 inputs / outputs 被直接发送出去。
+当你用 `updates` 来隐藏 inputs 或 outputs 时，请务必在 replica 上设置 `project_name`。如果 replica 的 `project_name` 与当前 trace 的目标相同，`updates` 可能会被丢弃，导致未隐藏的 inputs / outputs 被直接发送出去。
 </Note>
 
 ## 在已部署 agents 中自定义 tracing
@@ -244,7 +250,7 @@ async def make_graph(runtime: ServerRuntime):
     graph = build_my_graph()
 
     # You can use tracing_context to dynamically enable/disable tracing,
-    # set metadata or tags, override the tracing project, etc.
+    # set metadata or tags, select an agent environment, etc.
     with ls.tracing_context(enabled=False, metadata={"foo": "bar"}):
         yield graph
 ```
@@ -256,25 +262,25 @@ import contextlib
 import langsmith as ls
 from langgraph_sdk.runtime import ServerRuntime
 
-def get_project_for_user(user_id: str) -> str | None:
+def get_agent_for_user(user_id: str) -> str | None:
     ...
-    return "my-project"
+    return "<your-agent-id>"
 
 graph = build_my_graph()
 
 @contextlib.asynccontextmanager
 async def make_graph(runtime: ServerRuntime):
     user = runtime.user
-    # Route traces to a different project depending on user or disable tracing entirely
-    project_name = get_project_for_user(user.identity)
+    # Select a registered agent for the user or disable tracing
+    agent_id = get_agent_for_user(user.identity)
 
-    if project_name is None:
+    if agent_id is None:
         with ls.tracing_context(enabled=False):
             yield graph
     else:
         with ls.tracing_context(
             enabled=True,
-            project_name=project_name,
+            address=ls.agent_address(agent_id, "production"),
             metadata={"user_id": user.identity, "foo": "bar"},
         ):
             yield graph
@@ -363,7 +369,7 @@ await myFunctionNoTrace("sensitive data");  // not traced
 
 ## 基于业务逻辑启用条件式 tracing
 
-在很多应用里，你都需要根据运行时条件动态控制 tracing，比如客户隐私要求、合规规则或 feature flags。
+你可能需要根据运行时条件动态控制 tracing，比如客户隐私要求、合规规则或 feature flags。
 
 在 TypeScript 中，最有效率的做法，是预先创建 traced 和 non-traced 两个函数版本，然后在运行时根据业务逻辑挑一个使用。这样可以避免每次请求都重新创建 traced wrapper 的性能开销，同时仍然保留足够细粒度的 tracing 控制。例如：
 
@@ -415,6 +421,7 @@ await handleRequest("client-a", "some input");  // Traced or not based on client
 @[`tracingEnabled`][tracingEnabled] 选项可以与自动 tracing 无缝配合。你可以继续在全局设置 `LANGSMITH_TRACING=true`，再用 `tracingEnabled` 去覆盖某些特定函数的行为。
 
 ```typescript
+import { AgentAddress } from "langsmith";
 import { traceable } from "langsmith/traceable";
 
 // Global tracing enabled via environment
@@ -447,12 +454,12 @@ const processDataCustom = traceable(
     },
     {
         name: "process_data",
-        project_name: "special-project",
+        address: new AgentAddress("<your-agent-id>", "staging"),
         tracingEnabled: true
     }
 );
 
-await processDataCustom("important");  // Traced to "special-project"
+await processDataCustom("important");  // Traced to the registered agent's Staging environment
 ```
 
 </Tab>

@@ -3,7 +3,11 @@ title: 优化分类器
 sidebarTitle: 优化分类器
 ---
 
+import AgentTracingPrerequisite from '/snippets/langsmith/agent-tracing-prerequisite.mdx';
+
 本教程将演示如何基于用户反馈来优化一个分类器。分类器非常适合做优化，因为它通常很容易收集期望输出，因此也很容易基于用户反馈构建 few-shot 示例。本例中我们就会这么做。
+
+<AgentTracingPrerequisite />
 
 ## 目标
 
@@ -11,14 +15,15 @@ sidebarTitle: 优化分类器
 
 ## 开始
 
-首先，我们把所有 traces 都发送到一个指定 project 中。可以通过设置环境变量来实现：
+首先注册分类器 agent，然后配置它的标识符和环境：
 
 ```python
 import os
-os.environ["LANGSMITH_PROJECT"] = "classifier"
+os.environ["LANGSMITH_AGENT_ID"] = "<your-agent-id>"
+os.environ["LANGSMITH_AGENT_ENVIRONMENT"] = "production"
 ```
 
-接着创建初始应用。这里会是一个非常简单的函数，只接收 GitHub issue title，并尝试给它打上标签。
+接着创建初始 agent。这里会是一个非常简单的函数，只接收 GitHub issue title，并尝试给它打上标签。
 
 ```python
 import openai
@@ -59,7 +64,7 @@ def topic_classifier(
 
 然后就可以开始与它交互了。在交互时，我们会预先生成 LangSmith run id，并把它传进函数。这样做是为了后续能把反馈附加到这个 run 上。
 
-下面是调用应用的方式：
+下面是调用 agent 的方式：
 
 ```python
 from langsmith import uuid7
@@ -75,13 +80,18 @@ topic_classifier(
 首先是“正向”反馈，也就是模型答对了的例子：
 
 ```python
+import asyncio
+from langsmith import agent_address
+
 ls_client = Client()
 run_id = uuid7()
 topic_classifier(
     "fix bug in LCEL",
     langsmith_extra={"run_id": run_id})
-# Resolve the UUID of the project that owns the trace
-session_id = ls_client.create_project(project_name="classifier", upsert=True).id
+# Resolve the session_id for the agent environment
+address = agent_address(os.environ["LANGSMITH_AGENT_ID"], os.environ["LANGSMITH_AGENT_ENVIRONMENT"])
+resolved = asyncio.run(ls_client.sessions.resolve(**address))
+session_id = resolved.session_id
 ls_client.create_feedback(
     run_id,
     key="user-score",
@@ -93,12 +103,17 @@ ls_client.create_feedback(
 接下来，我们也可以收集对应“纠正结果”的反馈。比如这个示例中，模型会把它分类为 bug，但我实际上希望它被归到 documentation。
 
 ```python
+import asyncio
+from langsmith import agent_address
+
 ls_client = Client()
 run_id = uuid7()
 topic_classifier(
     "fix bug in documentation",
     langsmith_extra={"run_id": run_id})
-session_id = ls_client.create_project(project_name="classifier", upsert=True).id
+address = agent_address(os.environ["LANGSMITH_AGENT_ID"], os.environ["LANGSMITH_AGENT_ENVIRONMENT"])
+resolved = asyncio.run(ls_client.sessions.resolve(**address))
+session_id = resolved.session_id
 ls_client.create_feedback(
     run_id,
     key="correction",
@@ -118,7 +133,9 @@ ls_client.create_feedback(
 
 ![Optimization Positive](/langsmith/images/class-optimization-pos.png)
 
-## 更新应用
+<a id="update-the-application"></a>
+
+## 更新 agent
 
 接下来可以更新代码，让它拉取我们正在往里写入 runs 的 dataset。拉取后，我们把示例整理成一个字符串，再把这个字符串拼进 prompt 中。
 
@@ -181,9 +198,12 @@ def topic_classifier(
     ).choices[0].message.content
 ```
 
-如果现在再用和之前相似的输入运行应用，就会看到它已经正确学会了：任何和 docs 相关的内容，即使本质上是 bug，也应该被归类为 `documentation`。
+如果现在再用和之前相似的输入运行 agent，就会看到它已经正确学会了：任何和 docs 相关的内容，即使本质上是 bug，也应该被归类为 `documentation`。
 
 ```python
+import asyncio
+from langsmith import agent_address
+
 ls_client = Client()
 run_id = uuid7()
 topic_classifier(
@@ -210,9 +230,12 @@ def find_similar(examples, topic, k=5):
     return examples
 ```
 
-然后在应用中使用它：
+然后在 agent 中使用它：
 
 ```python
+import asyncio
+from langsmith import agent_address
+
 ls_client = Client()
 
 def create_example_string(examples):
