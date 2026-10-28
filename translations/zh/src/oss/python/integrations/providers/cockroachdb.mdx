@@ -289,6 +289,78 @@ TTL 删除是 **eventual** 的，也就是说，即使行已过期，在 Cockroa
 - **Connection pools (v0.4.1+)**：对于长期运行的服务，请传入 `psycopg_pool` 连接池，而不是单个连接。基于连接池的 saver 会并发执行操作，每个操作使用各自的池化连接，因此一个 saver 即可服务多个 agent；请将连接池的 `max_size` 设置为同时运行的 agent 数量。基于单个连接的 saver 一次只能执行一个操作，且该连接一旦断开便无法恢复，`from_conn_string(..., pipeline=True)` 也是如此
 - **Atomic writes (v0.4.1+)**：包含多条语句的 checkpoint 写入会作为一个批次发送到数据库，因此中途取消的写入不会保存任何内容。它仍然只需一次往返
 
+### LangGraph Store
+
+将 LangGraph 长期记忆持久化到 CockroachDB：这些记忆的生命周期长于对话 thread，例如用户偏好和 agent 习得的事实。
+
+同时提供同步（`CockroachDBStore`）和异步（`AsyncCockroachDBStore`）实现。它们要求 `langchain-cockroachdb` v0.5.0 或更高版本，并遵循 `PostgresStore` 的 API，因此可与 `create_agent(store=...)` 和 `StateGraph.compile(store=...)` 配合使用。
+
+<Tip>
+首次使用 CockroachDB store 时，请调用 `store.setup()`（或 `await store.setup()`）以创建所需的表。
+</Tip>
+
+**快速示例：**
+
+```python
+import os
+
+from langchain_cockroachdb import CockroachDBStore
+
+DB_URI = os.environ["COCKROACHDB_URI"]
+
+with CockroachDBStore.from_conn_string(DB_URI, pool_config={"max_size": 10}) as store:
+    store.setup()
+
+    namespace = ("user", "alice", "memories")
+    store.put(namespace, "seat", {"text": "Prefers window seats"})
+    item = store.get(namespace, "seat")
+    results = store.search(("user", "alice"))
+```
+
+#### 语义搜索
+
+传入 `index`，即可在写入条目时为其生成 embedding，并按与 `query` 的相似度对搜索结果排序。沿用上面的 `DB_URI`：
+
+```python
+from langchain_openai import OpenAIEmbeddings
+
+with CockroachDBStore.from_conn_string(
+    DB_URI,
+    index={
+        "dims": 1536,
+        "embed": OpenAIEmbeddings(model="text-embedding-3-small"),
+        "fields": ["text"],
+    },
+) as store:
+    store.setup()
+    store.put(("user", "alice", "memories"), "seat", {"text": "Prefers window seats"})
+    results = store.search(("user", "alice", "memories"), query="Where does Alice sit?")
+```
+
+`setup()` 会创建一个 C-SPANN 向量索引，并以 namespace 作为前缀列，因此在某个用户 namespace 下搜索时只会读取该部分索引。`distance_type` 可以是 `"cosine"`（默认值）、`"l2"` 或 `"inner_product"`。
+
+#### 用 TTL 让记忆过期
+
+传入 `ttl` 可为条目设置以分钟为单位的过期时间。随后 `setup()` 会开启 CockroachDB 的行级 TTL job，由服务器删除过期条目，因此不需要清理线程：
+
+```python
+with CockroachDBStore.from_conn_string(DB_URI, ttl={"default_ttl": 60 * 24 * 30}) as store:
+    store.setup()
+    store.put(("user", "alice", "memories"), "status", {"text": "In a meeting"}, ttl=10)
+```
+
+读取、搜索和列表操作会忽略已过期但尚未被 job 删除的条目。`get` 或 `search` 会将它返回条目的过期时间后延，除非 `refresh_on_read` 为 `False`。若要关闭该 job，请调用 `store.disable_ttl()`，在 `AsyncCockroachDBStore` 上则调用 `await store.adisable_ttl()`。
+
+#### 删除 namespace
+
+`delete_namespace` 会在一个事务中删除某个 namespace 及其所有后代 namespace 中的每个条目及其 vector，并返回删除的条目数：
+
+```python
+deleted = store.delete_namespace(("user", "alice"))
+```
+
+在 `AsyncCockroachDBStore` 上，请使用 `await store.adelete_namespace(...)`。
+
 ### Multi-tenancy
 
 通过可选的 namespace 列按租户隔离向量数据。启用后，所有 CRUD 和搜索操作都会限定在指定 namespace 范围内。

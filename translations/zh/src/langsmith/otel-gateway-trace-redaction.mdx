@@ -6,11 +6,11 @@ description: 使用 OpenTelemetry collector，在 traces 落到 LangSmith 之前
 
 import AgentTracingPrerequisite from '/snippets/langsmith/agent-tracing-prerequisite.mdx';
 
-import OtlpAgentAddressing from '/snippets/langsmith/otlp-agent-addressing-note.mdx';
-
 使用 [LangChain](/langsmith/trace-with-langchain)、[LangGraph](/langsmith/trace-with-langgraph) 或 [Deep Agents](/langsmith/trace-deep-agents) 构建的 agent 支持基于 [OpenTelemetry 的 tracing](/langsmith/trace-with-opentelemetry)。你可以不把 traces 直接发往 LangSmith，而是先把它们路由到你自己控制的 OpenTelemetry collector，在那里应用脱敏规则，移除敏感字段，然后再把清洗后的 traces 转发到 LangSmith。
 
 Traces 会通过 OTLP/HTTP 从 agent 流向 collector。collector 上会运行一个 transform processor，在把清洗后的 spans 转发到 LangSmith API 之前，对敏感的 span attributes，例如 prompt 输入和模型 completion，执行脱敏。
+
+你可以通过两种方式把 traces 发送到 collector：[通过 LangChain、LangGraph 或 Deep Agents 集成](#使用-langchain-或-langgraph-tracing)，或[直接配置 OpenTelemetry SDK](#直接使用-opentelemetry-sdk-tracing)。
 
 ```mermaid
 flowchart TD
@@ -33,7 +33,7 @@ flowchart TD
 
 ## 前置条件
 
-下面两种方式都需要以下环境变量。把 `OTEL_EXPORTER_OTLP_ENDPOINT` 设置为你的 collector 地址：
+两种方式都需要以下环境变量。把 `OTEL_EXPORTER_OTLP_ENDPOINT` 设置为你的 collector 地址：
 
 ```bash
 LANGSMITH_OTEL_ENABLED="true"
@@ -44,9 +44,7 @@ LANGSMITH_AGENT_ENVIRONMENT="production"
 OTEL_EXPORTER_OTLP_ENDPOINT="http://<my-otel-collector-endpoint>:4318"
 ```
 
-关于目标配置，请参阅[将 traces 记录到 agent](/langsmith/log-traces-to-agent)。
-
-<OtlpAgentAddressing />
+`LANGSMITH_AGENT_ID` 和 `LANGSMITH_AGENT_ENVIRONMENT` 用于指定这些 traces 所属的 agent 和环境。更多信息，请参阅[将 traces 记录到 agent](/langsmith/log-traces-to-agent)。
 
 ## 配置 collector
 
@@ -87,6 +85,19 @@ service:
       exporters: [otlphttp/langsmith]
 ```
 
+collector 会从自身所在的环境读取 `LANGSMITH_API_KEY`、`LANGSMITH_AGENT_ID` 和 `LANGSMITH_AGENT_ENVIRONMENT`，而不是从你的应用环境读取。请在运行 collector 的环境中设置这些变量；如果你的 API key 未限定到特定 workspace，还需要设置 `LANGSMITH_TENANT_ID`。
+
+### 将 traces 发送到 agent
+
+决定哪些 agent 和环境接收 traces 的是 collector，而不是你的应用。collector 会向 LangSmith 发送自己的请求头，默认不会转发你的应用发送的请求头。前面配置中的 `otlphttp/langsmith` exporter 会同时设置两个 agent 请求头：
+
+- **`Langsmith-Agent-Id`**：agent 的标识符。必须由 1 到 63 个小写字母、数字或连字符组成，以字母开头，并以字母或数字结尾。
+- **`Langsmith-Agent-Environment`**：traces 所属的环境。取值为 `local`、`development`、`staging` 或 `production`。
+
+两个 agent 请求头必须同时发送，或都不发送。如果只设置其中一个，或将其中任意一个与 `Langsmith-Project` 一起设置，LangSmith 会返回 `400` 错误拒绝请求。
+
+这些请求头会应用于该 exporter 发送的每个 span。若要将 traces 发送到多个 agent 或环境，请为每个 agent 或环境定义一个 exporter，并将每个 agent 的 spans 路由到对应的 exporter。span attributes（包括 `gen_ai.agent.name`）不会把 traces 发送到某个 agent。要详细了解如何将 traces 发送到 agent，请参阅[将 traces 记录到 agent](/langsmith/log-traces-to-agent)。
+
 ## 使用 LangChain 或 LangGraph tracing
 
 如果你的 agent 已经在使用 [LangChain](/langsmith/trace-with-langchain)、[LangGraph](/langsmith/trace-with-langgraph) 或 [Deep Agents](/langsmith/trace-deep-agents)，请使用这种方式。tracing 集成会基于环境变量自动处理 span 创建，因此不需要额外编写 instrumentation 代码：
@@ -124,12 +135,12 @@ print(result["messages"][-1].content)
 
 ## 直接使用 OpenTelemetry SDK tracing
 
-如果你需要对 tracer provider 和 exporter 做编程式控制，请使用这种方式。例如，想在运行时设置 agent 目的地，或配置自定义请求头。你需要在代码中显式配置 provider，而不是只依赖环境变量：
+如果你需要对 tracer provider 和 exporter 做编程式控制，例如指定运行哪些 span processor，或指定 exporter 把 spans 发送到哪里，请使用这种方式。你需要在代码中显式配置 provider，而不是只依赖环境变量。决定由哪个 agent 接收 traces 的是 collector 的 exporter，而不是你的代码：
 
 ```python
 import os
 
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -137,8 +148,6 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 
-agent_id = os.environ["LANGSMITH_AGENT_ID"]
-agent_environment = os.environ["LANGSMITH_AGENT_ENVIRONMENT"]
 otlp_endpoint = os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"]
 
 
@@ -147,10 +156,6 @@ provider.add_span_processor(
    BatchSpanProcessor(
        OTLPSpanExporter(
            endpoint=otlp_endpoint+"/v1/traces",
-           headers={
-               "Langsmith-Agent-Id": agent_id,
-               "Langsmith-Agent-Environment": agent_environment,
-           },
        )
    )
 )

@@ -1,0 +1,521 @@
+---
+title: 通过 MCP 实现 human-in-the-loop
+sidebarTitle: 通过 MCP 实现 human-in-the-loop
+description: 当通过 Agent Server MCP 端点暴露的 agent 暂停时，向 MCP 客户端请求输入，然后用答案恢复工具调用。
+---
+
+当通过 [MCP 端点](/langsmith/server-mcp) 暴露的 agent 调用 @[`interrupt`] 时，[Agent Server](/langsmith/agent-server) 会使用 [elicitation](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation) 向 MCP 客户端请求答案。客户端作答后，Agent Server 会恢复 agent 运行。用户无需离开 MCP 客户端，即可回答问题、审查工具调用或完成登录流程。如果你想改为通过 Agent Server API 回答 interrupt，请参见 [使用 server API 实现 human-in-the-loop](/langsmith/add-human-in-the-loop)。
+
+<Note>
+通过 MCP 实现 human-in-the-loop 需要 `langgraph-api>=0.18.0`，以及一个使用协议修订版 `2026-07-28` 并声明 `elicitation` 能力的 MCP 客户端。
+</Note>
+
+## 暂停并恢复工具调用
+
+每次暂停都对应客户端与 Agent Server 之间的一次往返：
+
+1. 客户端调用 tool。Agent Server 在一个新 thread 上运行 agent。
+2. agent 调用 `interrupt()`。工具调用返回 `"resultType": "input_required"`，其中 `inputRequests` 里每个问题对应一个 `elicitation/create` 请求，并带有一个不透明的 `requestState`。
+3. 客户端询问用户。然后，它使用相同的参数、`inputResponses` 中以相同 key 提供的答案，以及收到的 `requestState`，再次调用同一个 tool。
+4. Agent Server 恢复 agent 运行。结果要么是带新 `requestState` 的新一轮问题，要么是工具结果。
+
+例如，[转发 elicitation 请求](#relay-elicitation-requests) 中的 `greeter` agent 会询问姓名：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "inputRequests": {
+      "user_name": {
+        "method": "elicitation/create",
+        "params": {
+          "message": "What is your name?",
+          "mode": "form",
+          "requestedSchema": {
+            "properties": {
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    "requestState": "01a17b0e-645a-7262-9006-0c9a99e8410d.ZpGdPvXznSjaWLC1pzPMkfnCABBCtiZuYMjERmZUaDM",
+    "resultType": "input_required",
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": {
+        "name": "LangGraph",
+        "version": "0.18.0"
+      }
+    }
+  }
+}
+```
+
+客户端通过再次调用 tool 来作答：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "greeter",
+    "arguments": {},
+    "inputResponses": {
+      "user_name": {
+        "action": "accept",
+        "content": {
+          "name": "Ada"
+        }
+      }
+    },
+    "requestState": "01a17b0e-645a-7262-9006-0c9a99e8410d.ZpGdPvXznSjaWLC1pzPMkfnCABBCtiZuYMjERmZUaDM",
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {
+        "elicitation": {
+          "form": {}
+        }
+      }
+    }
+  }
+}
+```
+
+工具结果是 agent 的最终输出，形式为 JSON 文本 `{"greeting":"Hello, Ada!"}`。
+
+这些示例展示的是请求和响应体。在 `2026-07-28` 中，MCP 客户端还会发送 `MCP-Protocol-Version: 2026-07-28` header，以及与请求体匹配的 `Mcp-Method` 和 `Mcp-Name` headers。如果没有版本 header，Agent Server 会将请求视为来自较旧的客户端。此时暂停会返回 [支持无法进行 elicitation 的客户端](#support-clients-without-elicitation) 中描述的错误结果。
+
+Agent Server 对每一轮都应用以下规则：
+
+- **多个问题**：当同时有多个 interrupt 待处理（例如来自并行 node）时，Agent Server 会在同一轮中询问所有问题。
+- **缺失答案**：当 `inputResponses` 中缺少某个问题的答案时，Agent Server 会使用相同的 `requestState` 再次询问相同的问题。它会忽略对未询问问题的答案。
+- **首次调用中的答案**：在没有 `requestState` 的首次调用中发送的答案，用于回答第一轮问题。
+- **重复答案**：即使客户端多次发送相同的答案，Agent Server 也只会恢复 agent 一次。
+- **无效答案**：不符合其问题的答案会失败，返回 JSON-RPC 错误 `-32602` 和 HTTP 状态码 400。如果答案带有 `requestState`，则该轮保持打开，客户端可以再次作答。首次调用中没有 `requestState` 的无效答案会删除该调用的 thread，客户端需要从头再次调用 tool。
+- **无效 state**：被修改过的 `requestState`，或者与其他 tool 名称或其他参数一起发送的 `requestState`，会失败，返回 JSON-RPC 错误 `-32602`（`Invalid or expired requestState`）和 HTTP 状态码 400。
+- **Runtime context**：请求可以在 `arguments` 旁携带一个 `context` 对象，它会成为 agent 的 [runtime context](/oss/langgraph/graph-api#runtime-context)。当某个请求回答一轮问题时，恢复的 run 会获得该请求的 `context`。
+- **生命周期**：当没有 `requestState` 的请求完成工具调用时，Agent Server 会删除 thread。当带有 `requestState` 的请求完成工具调用时，Agent Server 会保留 thread 10 分钟。在此期间重新发送最后答案的客户端会得到相同的结果。一直保持暂停的调用会在其最新一轮问题之后 24 小时过期。[thread TTL 配置](/langsmith/configure-ttl#configuring-thread-and-checkpoint-ttl) 中较短的 `default_ttl` 会缩短这两个时间。
+
+## 提出文本问题
+
+当 interrupt 的值是字符串时，Agent Server 会将其作为一个带单个文本字段的表单来询问：
+
+```python
+from langgraph.graph import START, StateGraph
+from langgraph.types import interrupt
+from typing_extensions import TypedDict
+
+
+class State(TypedDict, total=False):
+    region: str
+
+
+def choose_region(state: State) -> State:
+    region = interrupt("Which region should the service deploy to?")
+    return {"region": region}
+
+
+graph = (
+    StateGraph(State)
+    .add_node(choose_region)
+    .add_edge(START, "choose_region")
+    .compile()
+)
+```
+
+客户端在 `inputRequests` 中收到该问题：
+
+```json
+{
+  "answer-9ef115e0cbdb4042": {
+    "method": "elicitation/create",
+    "params": {
+      "message": "Which region should the service deploy to?",
+      "mode": "form",
+      "requestedSchema": {
+        "properties": {
+          "response": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "response"
+        ],
+        "type": "object"
+      }
+    }
+  }
+}
+```
+
+客户端在 `response` 字段中作答，例如 `{"action": "accept", "content": {"response": "eu-west-1"}}`，然后 agent 会以字符串 `eu-west-1` 恢复运行。`decline` 或 `cancel` 答案会以错误结果结束工具调用：`The request for input was declined.` 或 `The request for input was cancelled.`
+
+Agent Server 根据问题推导出 key，因此当客户端从头再次发送该调用时，key 保持不变。当两个待处理的 interrupt 询问相同的文本问题时，一个答案会同时恢复两者。
+
+## 请求类型化输入
+
+要请求结构化输入，请向 `interrupt()` 传入 [`response_schema`](/oss/langgraph/interrupts#define-an-interrupt-response-schema)。Response schema 需要 `langgraph>=1.2.12`。Agent Server 会将 schema 转换为表单，并根据它检查每个答案。当 schema 是一个类型（例如 Pydantic 模型）时，LangGraph 还会在 agent 恢复之前校验答案：
+
+```python
+from typing import Literal
+
+from langgraph.graph import START, StateGraph
+from langgraph.types import interrupt
+from pydantic import BaseModel, Field
+from typing_extensions import TypedDict
+
+
+class Deployment(BaseModel):
+    region: Literal["us-east-1", "eu-west-1"]
+    replicas: int = Field(ge=1, le=10)
+
+
+class State(TypedDict, total=False):
+    region: str
+    replicas: int
+
+
+def plan_deployment(state: State) -> State:
+    deployment = interrupt(
+        "Where should the service deploy?", response_schema=Deployment
+    )
+    return {"region": deployment.region, "replicas": deployment.replicas}
+
+
+graph = (
+    StateGraph(State)
+    .add_node(plan_deployment)
+    .add_edge(START, "plan_deployment")
+    .compile()
+)
+```
+
+客户端收到以下问题：
+
+```json
+{
+  "answer-8a201eb4b84bf9bc": {
+    "method": "elicitation/create",
+    "params": {
+      "message": "Where should the service deploy?",
+      "mode": "form",
+      "requestedSchema": {
+        "properties": {
+          "region": {
+            "enum": [
+              "us-east-1",
+              "eu-west-1"
+            ],
+            "title": "Region",
+            "type": "string"
+          },
+          "replicas": {
+            "maximum": 10,
+            "minimum": 1,
+            "title": "Replicas",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "region",
+          "replicas"
+        ],
+        "type": "object"
+      }
+    }
+  }
+}
+```
+
+诸如 `{"region": "eu-west-1", "replicas": 3}` 的答案会恢复 agent，工具结果为 `{"region":"eu-west-1","replicas":3}`。不符合 schema 的答案（例如 `"replicas": 20`）会失败，返回错误 `-32602`（`Form content does not match requestedSchema`），客户端可以再次作答。使用 Pydantic 模型时，`interrupt()` 会返回该模型的实例。
+
+当 schema 描述的不是对象（例如 `int`）时，表单只有一个 `response` 字段，agent 会以该字段的值恢复运行。当 interrupt 的值不是字符串时，问题会以 JSON 形式显示该值。如果某个 interrupt 的值不是字符串且没有 `response_schema`，Agent Server 无法询问它。
+
+Agent Server 接受遵循 MCP elicitation 规则的表单 schema：
+
+- **字段**：schema 是一个扁平对象。每个属性是 string、number、integer、boolean、单选 enum，或由字符串选项组成的多选数组。
+- **字符串格式**：字符串可以使用 `email`、`uri`、`date` 或 `date-time` 格式。
+- **字段关键字**：每个字段可以带有 `title`、`description` 和 `default`，并在适用时带有 `minLength`、`maxLength`、`minimum`、`maximum`、`minItems` 和 `maxItems`。如果某个问题的字段使用了其他关键字，例如 `pattern`、`multipleOf` 或来自 Pydantic `gt` 的 `exclusiveMinimum`，Agent Server 无法询问该问题。
+- **大小**：一个表单包含 1 到 100 个字段，其 schema 最大为 1 MiB。
+- **Pydantic schema**：Agent Server 会解析本地 `$defs` 引用，将可选字段转换为普通字段，并丢弃根级的 title 和 description。
+
+当 Agent Server 无法将 interrupt 转换为有效问题时，工具调用会以错误结果结束，其文本以 `This tool needs input that can't be asked over MCP` 开头。
+
+不要在表单中询问密码、API key、access token 或支付凭据。MCP 规范禁止这样做。请改为将用户发送到某个页面，具体方法参见 [将用户发送到 URL](#send-the-user-to-a-url)。
+
+## 转发 elicitation 请求
+
+当 interrupt 值的 `type` 为 `mcp_elicitation` 时，它会携带 MCP elicitation 请求。Agent Server 会按照表单和 URL 的规则检查每个请求，然后将其传递给客户端。当另一个 MCP server 上的 tool 请求输入时，@[`MCPAdapter`] 和 LangChain JavaScript MCP adapter 会引发该 interrupt。使用此类 tool 的 agent 随后会将问题转发给它自己的 MCP 客户端。agent 也可以直接引发该 interrupt，如下面的 `greeter` agent 所示：
+
+```python
+from langgraph.graph import START, StateGraph
+from langgraph.types import interrupt
+from typing_extensions import TypedDict
+
+
+class State(TypedDict, total=False):
+    greeting: str
+
+
+def ask_name(state: State) -> State:
+    reply = interrupt(
+        {
+            "type": "mcp_elicitation",
+            "requests": [
+                {
+                    "key": "user_name",
+                    "message": "What is your name?",
+                    "mode": "form",
+                    "requested_schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                    },
+                }
+            ],
+        }
+    )
+    answer = reply["responses"]["user_name"]
+    if answer["action"] != "accept":
+        return {"greeting": "Hello, stranger!"}
+    return {"greeting": f"Hello, {answer['content']['name']}!"}
+
+
+graph = StateGraph(State).add_node(ask_name).add_edge(START, "ask_name").compile()
+```
+
+`requests` 中的每个条目都有以下字段：
+
+- **`key`**：标识请求。答案会以该 key 返回。
+- **`message`**：要向用户显示的问题。
+- **`mode`**：`form` 或 `url`。
+- **`requested_schema`**：当 `mode` 为 `form` 时的表单 schema。
+- **`url`**：当 `mode` 为 `url` 时要将用户发送到的页面。
+
+`requests` 也可以是一个对象，将每个 key 映射到其请求，并使用 MCP 使用的字段名，例如 `requestedSchema`。在这种形式中，没有 `mode` 的请求是表单。LangChain JavaScript MCP adapter 使用这种形式。Agent Server 会忽略 interrupt 值中的其他 key，例如 `MCPAdapter` 添加的 `tool_name`。
+
+agent 会以 `{"responses": {key: answer}}` 恢复运行，每个请求对应一个答案。每个答案都有一个 `action`，取值为 `accept`、`decline` 或 `cancel`，而针对表单的 `accept` 答案会携带其 `content`。Agent Server 会将拒绝和取消的答案传递给 agent，由 agent 决定接下来发生什么。在示例中，被拒绝的问题会返回 `Hello, stranger!`。
+
+当只有一个 interrupt 待处理时，客户端看到的是 agent 自己的 key。当有多个 interrupt 待处理时，Agent Server 会为每个 key 加上其 interrupt 的摘要前缀，例如 `<digest>.1/user_name`。这样，Agent Server 会将两个使用相同 key 的工具调用作为单独的问题来询问。agent 仍然以其自己的 key 接收答案。
+
+### 将用户发送到 URL
+
+使用 `"mode": "url"` 将用户发送到某个页面（例如 OAuth 同意屏幕），这样敏感数据就绝不会经过 MCP 客户端：
+
+```python
+from langgraph.graph import START, StateGraph
+from langgraph.types import interrupt
+from typing_extensions import TypedDict
+
+
+class State(TypedDict, total=False):
+    status: str
+
+
+def connect_calendar(state: State) -> State:
+    reply = interrupt(
+        {
+            "type": "mcp_elicitation",
+            "requests": [
+                {
+                    "key": "calendar_auth",
+                    "message": "Connect your calendar to continue.",
+                    "mode": "url",
+                    "url": "https://example.com/oauth/calendar/start",
+                }
+            ],
+        }
+    )
+    if reply["responses"]["calendar_auth"]["action"] != "accept":
+        return {"status": "not connected"}
+    return {"status": "connected"}
+
+
+graph = (
+    StateGraph(State)
+    .add_node(connect_calendar)
+    .add_edge(START, "connect_calendar")
+    .compile()
+)
+```
+
+客户端会在问题中收到 URL，而 Agent Server 不会打开它：
+
+```json
+{
+  "calendar_auth": {
+    "method": "elicitation/create",
+    "params": {
+      "message": "Connect your calendar to continue.",
+      "mode": "url",
+      "url": "https://example.com/oauth/calendar/start"
+    }
+  }
+}
+```
+
+`accept` 答案没有 `content`。它确认用户已在该页面上完成流程。
+
+只有当 URL 满足以下规则时，Agent Server 才会询问 URL 问题：
+
+- **Scheme**：HTTPS，或者 `localhost`、`127.0.0.1`、`[::1]` 上的 HTTP。
+- **Host**：URL 指定了 host。
+- **凭据**：URL 不包含用户名或密码。
+- **长度**：URL 最多 4,096 个字符。
+
+客户端必须声明 `elicitation` 能力的 `url` 模式。对于只声明 `form` 的客户端，调用会失败并返回错误 `-32021`：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32021,
+    "message": "This tool asks for human input and needs url elicitation.",
+    "data": {
+      "requiredCapabilities": {
+        "elicitation": {
+          "url": {}
+        }
+      }
+    }
+  }
+}
+```
+
+当后续某一轮需要 `url` 模式时，调用会以相同方式失败。此时 Agent Server 会将暂停的调用保留 10 分钟，而不是 24 小时。在这段时间内，客户端可以声明 `url`，并重新发送相同的答案和 `requestState`，以获取 URL 问题。
+
+## 审查工具调用
+
+当使用 @[`HumanInTheLoopMiddleware`] 构建的 agent 暂停等待审查时，Agent Server 会为每个工具调用提出一个问题。Python 和 JavaScript 中都支持两种 [interrupt 模式](/oss/langchain/human-in-the-loop#set-the-interrupt-mode)：默认的 batched 模式和 per-call 模式。在 Python 中，per-call 模式需要 `langchain>=1.4.6`，并使用 `interrupt_mode="per_call"`。在 JavaScript 中，它需要 `langchain` 包 1.5.18 或更高版本，并使用 `interruptMode: "per_call"`。
+
+问题的 message 是中间件对该调用的描述；如果该调用没有描述，则为 `Run <tool>?`。其表单包含以下字段：
+
+- **`decision`**：必需。取值为该调用允许的决策之一，每个决策都带有 title。
+- **`message`**：拒绝的原因，或代替该 tool 发送的答案。当调用允许 `reject` 或 `respond` 时存在。
+- **`args`**：运行该 tool 时使用的参数，以字符串形式表示 JSON 对象，并预填模型选择的参数。当调用允许 `edit` 时存在。
+
+例如，当 agent 提议调用 `send_email`，并将 `to` 设置为 `ada@example.com`、`subject` 设置为 `Launch` 时，客户端会收到以下问题：
+
+```json
+{
+  "review-7c69d526bcc899c4.1": {
+    "method": "elicitation/create",
+    "params": {
+      "message": "Tool execution requires approval\n\nTool: send_email\nArgs: {'to': 'ada@example.com', 'subject': 'Launch'}",
+      "mode": "form",
+      "requestedSchema": {
+        "properties": {
+          "decision": {
+            "type": "string",
+            "title": "Decision",
+            "oneOf": [
+              {
+                "const": "approve",
+                "title": "Approve"
+              },
+              {
+                "const": "edit",
+                "title": "Edit the arguments"
+              },
+              {
+                "const": "reject",
+                "title": "Reject"
+              },
+              {
+                "const": "respond",
+                "title": "Answer for the tool"
+              }
+            ]
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "Why you reject the call, or the answer to send in its place"
+          },
+          "args": {
+            "type": "string",
+            "title": "Arguments",
+            "description": "The arguments to run the tool with, as a JSON object",
+            "default": "{\"to\":\"ada@example.com\",\"subject\":\"Launch\"}"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "type": "object"
+      }
+    }
+  }
+}
+```
+
+Agent Server 会将每个答案转换为中间件的决策：
+
+| 答案 | 决策 |
+| --- | --- |
+| `approve` | `{"type": "approve"}` |
+| `reject` | `{"type": "reject", "message": ...}`，message 为空白时会省略 |
+| `respond` | `{"type": "respond", "message": ...}`。message 为必需项。 |
+| `edit` | `{"type": "edit", "edited_action": {"name": ..., "args": ...}}`，使用被审查 tool 的名称。在 batched 模式下，JavaScript 中间件收到的是 `editedAction`。 |
+| `decline` action | 当调用允许 `reject` 时，视为拒绝 |
+
+`edit` 可以更改参数，但不能更改 tool。`cancel` 答案，或者对不允许 `reject` 的调用给出 `decline` 答案，会以错误结果结束工具调用。
+
+以下答案会失败并返回错误 `-32602`，客户端可以再次作答：
+
+- 参数不是 JSON 对象。
+- `respond` 决策没有 message。
+- 调用不允许的决策。
+
+在 batched 模式下，Agent Server 只检查编辑后的参数是否为 JSON 对象。tool 会在运行时检查其参数，就像处理模型自己的调用一样。
+
+在 per-call 模式下，interrupt 的 `response_schema` 会列出该调用允许的决策，以及该 tool 声明的参数类型（如果声明了）。Agent Server 会在 agent 恢复之前根据该 schema 检查每个决策。破坏 tool 参数类型的 edit 会失败并返回错误 `-32602`，例如 `The decision does not fit the tool: "subject" is a required property`，并且不会运行任何 tool。Agent Server 绝不会获取该 schema 中的引用。当 schema 引用其外部的文档时，Agent Server 会在不执行检查的情况下提出该问题。
+
+每个工具调用都会得到自己的问题，即使两个调用使用相同的 tool 和相同的参数。当某个调用的参数太大，无法在表单中预填时，Agent Server 会在不提供 `edit` 选项的情况下提出该问题。此时它无法询问只允许 `edit` 的调用。
+
+有关审查决策的更多信息，请参见 [Human-in-the-loop](/oss/langchain/human-in-the-loop)。
+
+## 支持无法进行 elicitation 的客户端
+
+无法进行 elicitation 的客户端在 tool 暂停时会收到明确的错误：
+
+- **使用 `2026-07-28` 但没有 `elicitation` 能力的客户端**：调用会失败，返回 JSON-RPC 错误 `-32021`（`This tool asks for human input and needs form elicitation.`）和 HTTP 状态码 400。`data.requiredCapabilities` 会列出该轮需要的每个模式，例如 `{"elicitation": {"form": {}}}`。声明 `elicitation` 但不指定任何模式的客户端支持 `form`。
+- **使用 `2025-11-25` 或更早版本的客户端**：tool 会返回错误结果。其第一个文本块是 `This tool paused to ask for human input, and this client can't answer it.`，第二个文本块以 JSON 列出待处理的 interrupt。
+- **无法保留 thread 的调用**：tool 会返回错误结果，其第一个文本块是 `This tool paused to ask for human input, and this call can't be resumed.`。当 deployment 禁用 thread 时会发生这种情况。当你的 [自定义认证](/langsmith/custom-auth) 处理器不允许调用方创建或更新该调用的 thread 时，也会发生这种情况。
+
+Agent Server 无法恢复停在 static breakpoint（通过 `interrupt_before` 或 `interrupt_after` 设置）的 graph。对于能够进行 elicitation 的客户端，工具调用会以错误结果结束。其他客户端会收到 breakpoint 处 graph 的 state，作为正常的工具结果。
+
+## 由 LangChain agent 作答
+
+通过 `MCPAdapter`（来自 `langchain[mcp]>=1.4.0`）调用该 tool 的 agent 会以 `mcp_elicitation` interrupt 暂停，并使用用户的答案恢复运行。在 JavaScript 中，`@langchain/mcp-adapters` 2.0.0 或更高版本的行为相同。客户端代码请参见 [Elicitation](/oss/langchain/mcp/tools#elicitation)。
+
+每次作答后，adapter 都会从头再次调用该 tool，且不携带 `requestState`。当 Agent Server 再次询问先前的问题时，adapter 会使用为该 key 存储的答案作答。它会发送该轮的新 `requestState`。tool 背后的 agent 会重新运行到每个问题所在的位置，而先前尝试的 thread 会保持暂停，直到过期。
+
+这种重放之所以可行，是因为 Agent Server 会根据问题推导出每个 key。如果重新运行询问的是不同的问题，key 就会改变，adapter 会引发错误。例如，当 tool 背后的模型提议其他参数时，审查问题就会改变。请将问题放在开销较大的工作或副作用之前。
+
+如果重新运行没有询问任何问题，工具调用会在没有存储答案的情况下完成，adapter 不会引发错误。例如，tool 背后的模型可以跳过用户已批准的调用。
+
+## 保护暂停的调用
+
+Agent Server 通过以下方式保护暂停的调用：
+
+- **绑定 state**：`requestState` 仅对产生它的调用的 agent、tool 名称和参数有效。
+- **授权**：Agent Server 会通过你的 [自定义认证](/langsmith/custom-auth) 处理器，以调用方的身份读取暂停的 thread。来自其他用户的 `requestState` 会失败并返回错误 `-32602`。
+- **存储的值**：thread 只存储 `requestState` 中 token 的带密钥哈希，因此读取 thread metadata 不会暴露可用的值。
+
+## 另请参阅
+
+- [Agent Server 中的 MCP 端点](/langsmith/server-mcp)
+- [使用 server API 实现 human-in-the-loop](/langsmith/add-human-in-the-loop)
+- [Interrupts](/oss/langgraph/interrupts)
+- [Human-in-the-loop](/oss/langchain/human-in-the-loop)
+- [LangChain MCP tools 中的 Elicitation](/oss/langchain/mcp/tools#elicitation)

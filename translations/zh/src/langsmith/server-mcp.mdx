@@ -9,6 +9,12 @@ Model Context Protocol，MCP，是一种开放协议，用于以模型无关的�
 
 MCP 端点位于 [Agent Server](/langsmith/agent-server) 的 `/mcp`。
 
+Agent Server 支持 `2024-11-05` 到 `2026-07-28` 的 MCP 协议修订版本。使用 `2025-11-25` 及更早修订版本的客户端会先进行 `initialize` 握手。在 `2026-07-28` 中，每个请求都通过 `_meta` 和 `MCP-Protocol-Version` header 携带自己的协议元数据，因此客户端无需握手即可连接。当 agent 暂停等待输入时，Agent Server 会向支持 elicitation 的客户端发起询问。更多信息，请参阅 [Human-in-the-loop over MCP](/langsmith/server-mcp-elicitation)。
+
+<Note>
+本页所述的协议修订版本、tool 字段、结果格式、会话行为以及 `Origin` 检查均要求 `langgraph-api>=0.18.0`。
+</Note>
+
 Managed Deep Agents 部署运行在 Agent Server 上，因此它们暴露相同的 `/mcp` 端点。关于 Managed Deep Agents 的 URL 发现和身份 headers，请参见 [Connect MCP clients to a managed deep agent](/langsmith/managed-deep-agents-mcp-endpoint)。
 
 你可以设置[自定义认证中间件](/langsmith/custom-auth)，让用户通过 MCP server 完成认证，从而在 LangSmith deployment 中访问用户作用域的 tools。
@@ -67,6 +73,8 @@ pip install "langgraph-api>=0.2.3" "langgraph-sdk>=0.1.61"
 uv add "langgraph-api>=0.2.3" "langgraph-sdk>=0.1.61"
 ```
 </CodeGroup>
+
+在 `langgraph-api` 0.18.0 或更高版本中，该端点还需要 `mcp` 包，并且版本要落在 `langgraph-api` 要求的范围内。安装 `langgraph-api` 时会一并提供。如果你的依赖固定了另一个版本的 `mcp`，Agent Server 启动时不会启用该端点，并会记录日志 `MCP endpoint disabled: the installed MCP SDK is not supported`。此时 `/info` 响应会在 `flags` 下报告 `"mcp": false`。
 
 ## 使用概览
 
@@ -174,9 +182,17 @@ uv add "langgraph-api>=0.2.3" "langgraph-sdk>=0.1.61"
 
 部署完成后，你的 agent 会以如下配置出现在 MCP 端点中：
 
-* **Tool name**：agent 的名称。
-* **Tool description**：agent 的描述。
+* **Tool name**：agent 的名称。Agent Server 会去除其首尾空白，并将每一段连续空白替换为 `_`。它还会移除 MCP 不允许在 tool 名称中使用的字符，并将名称截断为 128 个字符。
+* **Tool title**：agent 的名称。
+* **Tool description**：agent 的描述；如果 agent 没有描述，则为 `Tool based on the <name> assistant`。
 * **Tool input schema**：agent 的输入 schema。
+* **Tool annotations**：`readOnlyHint`、`destructiveHint` 和 `idempotentHint` 为 `false`，`openWorldHint` 为 `true`。
+
+无法生成输入 schema 的 agent 不会出现在 tool 列表中。
+
+该 tool 会将 agent 的最终输出以 JSON 文本形式返回。当 run 失败时，结果是一个错误，其文本给出异常类型和消息，两者以冒号分隔。
+
+若要设置 agent 的[运行时上下文](/oss/langgraph/graph-api#runtime-context)，请在 `tools/call` 参数中、`arguments` 旁边添加一个 `context` 对象。
 
 ### 设置名称和描述
 
@@ -280,11 +296,13 @@ _也可以通过[在运行时重建 graph](/langsmith/graph-rebuild) 来实现�
 
 ## 会话行为
 
-当前 LangGraph 对 MCP 的实现不支持 sessions。每个 `/mcp` 请求都是无状态且彼此独立的。
+MCP 端点不使用 sessions。每个 `/mcp` 请求都是独立的，Agent Server 会以 JSON（而不是事件流）响应。该端点只接受 `POST` 请求。因等待输入而暂停的 tool 调用会在各请求之间将状态保留在服务器上，并通过 `requestState` 关联。更多信息，请参阅 [Human-in-the-loop over MCP](/langsmith/server-mcp-elicitation)。
 
 ## 认证
 
 `/mcp` 端点使用与 LangGraph API 其他部分相同的认证方式。具体设置请参阅[认证指南](/langsmith/auth)。
+
+包含 `Origin` header 的请求（例如来自浏览器的请求）必须来自允许的 origin。Agent Server 会从 [`http.cors` 配置](/langsmith/cli#customizing-http-middleware-and-headers)中的 `allow_origins` 或 `allow_origin_regex` 读取允许的 origins，也会从 `CORS_ALLOW_ORIGINS` 环境变量读取。通配符（`*`）不会在此端点上允许任何 origin。Agent Server 始终允许来自 `localhost`、`127.0.0.1` 和 `[::1]` 的 origins，并以 HTTP 403 拒绝来自其他任何 origin 的请求。
 
 ## 禁用 MCP
 
@@ -300,3 +318,5 @@ _也可以通过[在运行时重建 graph](/langsmith/graph-rebuild) 来实现�
 ```
 
 这样服务器就不会暴露 `/mcp` 端点了。
+
+该端点会通过 runs API 执行每个 tool 调用。当 `disable_runs` 为 `true` 时，每个 tool 调用都会失败，并返回 JSON-RPC 错误 `-32602`。
