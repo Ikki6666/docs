@@ -1,0 +1,405 @@
+---
+title: 浏览器使用
+description: 为 deep agent 提供浏览器，使其能在网站上执行操作并端到端测试 Web 应用。
+---
+
+浏览器使用为 deep agent 提供一个可通过工具控制的浏览器。agent 会打开页面、读取渲染结果、点击、输入并截屏。它适用于在 Web 上进行的工作：
+
+- **没有公开 API 的操作**：预订餐厅座位、完成结账，或通过跨站点跟踪链接来调研某个主题。
+- **端到端测试**：通过 UI 对 Web 应用进行质量检查。[Open SWE](https://github.com/langchain-ai/open-swe) 是 LangChain 的开源编码 agent，它在每个线程中都有一个浏览器，因此可以打开它更改过的应用并在 UI 中检查更改。
+
+要为托管 agent 添加浏览器，请参阅 [Managed Deep Agents 中的浏览器使用](/langsmith/managed-deep-agents-browser-use)。
+
+## 了解基本概念
+
+agent 使用 Web 需要两个组件：
+
+| 组件 | 选项 |
+| --- | --- |
+| 一个浏览器 | <ul><li><strong>本地</strong>：位于你的机器上或<a href="/oss/deepagents/sandboxes">沙箱</a>中的 Chrome 或 Chromium。可访问其自身 <code>localhost</code> 上的应用，且不需要 provider 账户。Chrome 由你自行安装和更新。</li><li><strong>远程</strong>：来自 <a href="https://www.browserbase.com">Browserbase</a> 等 provider 的云端浏览器。与你的机器隔离，需要 API key，且无法访问你机器上或沙箱中的 <code>localhost</code>。</li></ul> |
+| 浏览器工具 | [Stagehand v4](https://docs.stagehand.dev/v4/integrations/agent-frameworks/deep-agents)（推荐）、[Playwright MCP](https://github.com/microsoft/playwright-mcp)，或 [agent-browser](https://github.com/vercel-labs/agent-browser) CLI。 |
+
+
+### 使用 Stagehand 搭配本地或远程浏览器
+
+[Stagehand](https://docs.stagehand.dev/v4/first-steps/introduction) 提供的浏览器工具既适用于本地 Chrome，也适用于远程 Browserbase 会话。你可以在不更改 agent 所用工具的情况下选择浏览器的运行位置。Stagehand 通过一个持久浏览器暴露三个工具：
+
+| 工具 | 说明 |
+| --- | --- |
+| `snapshot` | 读取活动页面的无障碍树，并为交互元素标注 ID。 |
+| `run` | 通过一批快照操作（`click`、`hover`、`fill`、`type`、`press`、`select`）或使用 Playwright 风格的 `page`、`context` 和 `browser` 对象的 JavaScript 在页面上执行操作。 |
+| `screenshot` | 将渲染后的页面截取为 PNG 或 JPEG。 |
+
+元素 ID 仅对活动页面的最新快照有效，因此 agent 在导航后会重新截取快照。
+
+:::python
+使用 [langchain-stagehand](https://github.com/langchain-ai/langchain-browserbase) 中的 `StagehandMiddleware` 添加这些工具。将配置好的 Stagehand 客户端传给该 middleware，再将其加入 `middleware`。无需 MCP 服务器、自定义工具定义或浏览器系统提示词。
+:::
+
+:::js
+通过 JavaScript MCP 适配器使用 Stagehand 的 Python MCP 服务器。原生 `langchain-stagehand` middleware 仅支持 Python。
+:::
+
+:::python
+完整配置参考请参阅 [Stagehand 集成](/oss/integrations/tools/stagehand)。
+:::
+
+### 其他浏览器工具
+
+- **[Playwright MCP](https://github.com/microsoft/playwright-mcp)**：Microsoft 提供的 MCP 服务器，可暴露 Playwright 浏览器操作。通过 MCP 适配器连接它，命令为 `npx @playwright/mcp@latest`。请参阅 [Model Context Protocol](/oss/langchain/mcp)。
+- **[agent-browser](https://github.com/vercel-labs/agent-browser)**：Vercel Labs 提供的浏览器 CLI。将其安装到[沙箱](/oss/deepagents/sandboxes)中，agent 即可通过 `execute` 工具运行 `agent-browser open` 和 `agent-browser snapshot` 等命令。
+
+## 使用 Stagehand 搭配 Browserbase
+
+本示例为 deep agent 提供驱动 Browserbase 浏览器的 Stagehand 工具。agent 在你的机器上运行，浏览器在 Browserbase 上运行。
+
+:::python
+<Note>
+该 middleware 在 [langchain-browserbase#1](https://github.com/langchain-ai/langchain-browserbase/pull/1) 中提出，尚未发布到 PyPI。本示例从源码安装该修订版本。它需要 Python 3.11 或更高版本、LangChain 1.4.7 或更高版本，以及 Stagehand 4.3.0 或更高版本。
+</Note>
+
+安装该 middleware、Deep Agents 和模型集成：
+
+```bash
+pip install "langchain-stagehand @ git+https://github.com/langchain-ai/langchain-browserbase.git@40d1ae1d5e0543fe1e49b13d0887df40acf1c4c8" deepagents langchain-openai
+```
+
+设置 API key：
+
+```bash
+export OPENAI_API_KEY="your-openai-api-key"
+export BROWSERBASE_API_KEY="your-browserbase-api-key"
+```
+
+创建浏览器，并将其 Stagehand 客户端传给该 middleware：
+
+```python
+import asyncio
+import os
+
+from deepagents import create_deep_agent
+from langchain_stagehand import StagehandMiddleware
+from stagehand import Stagehand, browserbase
+
+
+async def main():
+    browser = await browserbase.launch(api_key=os.environ["BROWSERBASE_API_KEY"])
+    try:
+        stagehand = await Stagehand.create(browser=browser)
+        agent = create_deep_agent(
+            model="openai:gpt-5.5-2026-04-23",
+            middleware=[StagehandMiddleware(stagehand=stagehand)],
+        )
+        result = await agent.ainvoke({
+            "messages": [{
+                "role": "user",
+                "content": (
+                    "On opentable.com, find a table for two in San Francisco this Friday "
+                    "at 7 PM. Stop before confirming, and report the restaurant, time, and booking link."
+                ),
+            }]
+        })
+        print(result["messages"][-1].content_blocks)
+    finally:
+        await browser.close()
+
+
+asyncio.run(main())
+```
+
+请使用 `ainvoke` 或 `astream`：浏览器工具是异步的。浏览器由你的应用持有，并在完成后关闭。可在多次运行之间保持其打开状态，以复用标签页和登录状态。该 middleware 不会更改你的系统提示词，并将浏览器指引包含在工具说明中。
+
+有关本地 Chrome、屏幕截图以及与 LangChain `create_agent` 搭配使用的信息，请参阅 [Stagehand 集成](/oss/integrations/tools/stagehand)。
+:::
+
+:::js
+Stagehand 的 MCP 服务器运行在独立的 Python 环境中。即使 agent 使用 JavaScript 编写，此设置也需要 [uv](https://docs.astral.sh/uv/)。
+
+安装服务器和 agent 包：
+
+```bash
+git clone https://github.com/browserbase/stagehand.git
+cd stagehand/packages/integrations/deepagents
+uv sync --locked
+npm install deepagents @langchain/mcp-adapters@^2.0.1 @langchain/openai
+```
+
+设置 API key：
+
+```bash
+export OPENAI_API_KEY="your-openai-api-key"
+export BROWSERBASE_API_KEY="your-browserbase-api-key"
+```
+
+将 `STAGEHAND_DIR` 设置为 `packages/integrations/deepagents` 的绝对路径，然后创建 agent：
+
+```ts
+import { MCPAdapter } from "@langchain/mcp-adapters";
+import { createDeepAgent } from "deepagents";
+
+const STAGEHAND_DIR = "/path/to/stagehand/packages/integrations/deepagents";
+
+const serverEnv = Object.fromEntries(
+  Object.entries(process.env).filter(
+    ([name, value]) =>
+      value && (name.startsWith("STAGEHAND_") || name.startsWith("BROWSERBASE_")),
+  ),
+) as Record<string, string>;
+serverEnv.STAGEHAND_BROWSER = "browserbase";
+
+const SYSTEM_PROMPT = `You control one persistent browser through three tools:
+- browser_snapshot: read the active page and get bracketed element IDs.
+- browser_run: send snapshot actions, or JavaScript that uses the Playwright-shaped page API.
+- browser_screenshot: look at the rendered page.
+
+Snapshot IDs are valid only for the latest snapshot of the active page.
+Snapshot again after navigation or stale IDs. Do not launch another browser.`;
+
+const adapter = new MCPAdapter({
+  servers: {
+    browser: {
+      mode: "legacy",
+      command: "uv",
+      args: ["run", "--project", STAGEHAND_DIR, "--locked", "stagehand-deepagents-mcp"],
+      env: serverEnv,
+    },
+  },
+});
+
+try {
+  const tools = await adapter.listTools();
+  const agent = createDeepAgent({
+    model: "openai:gpt-5.5-2026-04-23",
+    tools,
+    systemPrompt: SYSTEM_PROMPT,
+  });
+  const result = await agent.invoke({
+    messages: [
+      {
+        role: "user",
+        content:
+          "On opentable.com, find a table for two in San Francisco this Friday " +
+          "at 7 PM. Stop before confirming, and report the restaurant, time, and booking link.",
+      },
+    ],
+  });
+  console.log(result.messages.at(-1)?.contentBlocks);
+} finally {
+  await adapter.close();
+}
+```
+
+默认情况下，适配器会在每个工具名称前加上服务器名称，因此 agent 看到的工具名为 `browser_run`、`browser_snapshot` 和 `browser_screenshot`。如果希望改用不带前缀的名称 `run`、`snapshot` 和 `screenshot`，请设置 `prefixToolNameWithServerName: false`。请更新系统提示词，使其与工具名称匹配。
+
+服务器会收到转发的 `STAGEHAND_*` 和 `BROWSERBASE_*` 变量，以及 MCP 客户端的安全默认值（如 `PATH` 和 `HOME`）。模型 API key 保留在 agent 进程中。
+
+<Warning>
+在整个 agent 运行期间保持适配器打开。浏览器位于服务器进程中。打开的适配器会保持与该进程的一个连接，因此本次运行中的每次工具调用都使用同一个浏览器。
+</Warning>
+:::
+
+<Tip>
+快照内容可能很长。为避免其占用主 agent 的上下文，可将浏览器工具交给[子 agent](/oss/deepagents/subagents)，让主 agent 将浏览器任务委派给它。
+</Tip>
+
+## 选择浏览器作用域
+
+复用浏览器会保留 cookie 和网站登录状态，因此 agent 无需在每一轮都登录。请选择哪些对话共享该状态：
+
+- **线程作用域**：每个对话保留一个浏览器。后续轮次复用其标签页和登录状态；其他对话会获得单独的浏览器。共享线程中的参与者可以使用该线程已登录的账户。
+- **用户作用域**：在同一已认证用户的多个对话之间复用浏览器登录状态。例如，用户登录一次预订网站后，可在新线程中请求另一笔预订。
+
+不要在不相关的用户之间复用个人浏览器会话。任何能通过其 agent 访问该浏览器的人，都可以以已登录账户的身份执行操作。请使用应用身份验证层中的已验证身份，而不是提示词中提供的用户 ID。
+
+:::python
+`StagehandMiddleware` 不选择作用域，也不管理会话存储。由你的应用决定提供哪个 Stagehand 客户端。在预期作用域内的顺序运行中复用该客户端。为并发 agent 提供独立的客户端和浏览器，以避免导航冲突。
+
+浏览器状态不属于 LangGraph checkpoint 的一部分。关闭或替换浏览器可能会丢失登录状态，网站也可能自行使其过期。
+:::
+
+:::js
+MCP 示例在适配器打开的整个生命周期内保持一个浏览器。适配器的复用和清理由你的应用负责；仅凭 LangGraph 线程 ID 无法在适配器关闭后保留浏览器。
+:::
+
+[Managed Deep Agents](/langsmith/managed-deep-agents-browser-use#choose-a-scope) 会为你管理线程作用域和用户作用域，包括在用户作用域下为每个线程提供共享登录状态的独立窗口。
+
+## 在 LangSmith 沙箱中使用 Chrome 测试应用
+
+本示例介绍端到端测试：编码 agent 更改应用后，由 agent 在浏览器中打开该应用并检查更改。Open SWE 从 [Managed Deep Agents](/langsmith/managed-deep-agents-browser-use) 获取浏览器。以下步骤使用 LangSmith 沙箱构建相同的检查。
+
+[LangSmith 沙箱](/langsmith/sandboxes)会同时运行你的应用和 Chrome，因此浏览器可以通过 `localhost` 打开应用。agent 在你的机器上运行，使用 `LangSmithSandbox` 后端进行文件系统访问，并使用 `execute` 工具。
+
+本示例通过 `execute` 使用 agent-browser，而不是 MCP。每次 CLI 调用都会复用沙箱内名为 `qa` 的浏览器会话。你不需要 Browserbase 账户，也不需要在你机器上运行 Docker daemon。
+
+### 准备沙箱快照
+
+[快照](/langsmith/sandbox-snapshots)包含新沙箱的文件系统和依赖项。创建一个包含应用、其依赖项、Node.js 和 curl 的快照。在快照设置期间，安装 agent-browser 和 Chrome for Testing：
+
+```bash
+npm install -g agent-browser@latest
+agent-browser install --with-deps
+```
+
+请以运行浏览器的同一用户执行安装。Linux 依赖项安装程序需要安装系统包的权限。将准备好的文件系统捕获为快照并保留其 ID。有关快照的创建和捕获，请参阅[从运行中的沙箱创建快照](/langsmith/sandbox-snapshots#capture-a-snapshot-from-a-running-sandbox)。
+
+在运行 agent 的机器上设置以下变量：
+
+```bash
+export LANGSMITH_API_KEY="your-langsmith-api-key"
+export OPENAI_API_KEY="your-openai-api-key"
+export QA_SNAPSHOT_ID="your-prepared-snapshot-id"
+export QA_START_COMMAND="cd /app && npm run dev -- --host 0.0.0.0 --port 3000"
+```
+
+将 `QA_START_COMMAND` 替换为你的应用启动命令。示例期望它在沙箱内提供端口 `3000` 的服务。
+
+### 创建 QA agent
+
+代码会启动应用、等待其响应，并打开浏览器。随后 agent 通过 `execute` 与 UI 交互。请在清理前下载屏幕截图：删除沙箱会删除其文件。
+
+:::python
+安装主机侧包：
+
+```bash
+pip install deepagents langsmith langchain-openai
+```
+
+```python
+import os
+from pathlib import Path
+
+from deepagents import create_deep_agent
+from deepagents.backends.langsmith import LangSmithSandbox
+from langsmith.sandbox import SandboxClient
+
+client = SandboxClient()
+sandbox = client.create_sandbox(snapshot_id=os.environ["QA_SNAPSHOT_ID"])
+backend = LangSmithSandbox(sandbox=sandbox)
+
+try:
+    app = sandbox.run(os.environ["QA_START_COMMAND"], wait=False, timeout=0, idle_timeout=-1)
+    for command in [
+        "curl --fail --retry 20 --retry-connrefused --retry-delay 1 "
+        "--retry-max-time 30 http://127.0.0.1:3000",
+        'agent-browser --session qa --args "--no-sandbox" '
+        "open http://127.0.0.1:3000",
+    ]:
+        response = backend.execute(command)
+        if response.exit_code != 0:
+            raise RuntimeError(response.output)
+
+    agent = create_deep_agent(
+        model="openai:gpt-5.5-2026-04-23",
+        backend=backend,
+        system_prompt=(
+            "Test the app through its UI using execute and agent-browser. "
+            "Use agent-browser --session qa for every browser command. "
+            "Use snapshot -i to inspect controls, then click or fill them. "
+            "Take a new snapshot after page changes. Do not edit the app "
+            "or alter its state by executing JavaScript. Save a screenshot "
+            "to /tmp/qa.png before reporting observed results and failures."
+        ),
+    )
+    result = agent.invoke({
+        "messages": [{
+            "role": "user",
+            "content": "Sign up as qa@example.com and confirm that the dashboard loads.",
+        }]
+    })
+    print(result["messages"][-1].content_blocks)
+    image = backend.download_files(["/tmp/qa.png"])[0]
+    if image.error:
+        raise RuntimeError(image.error)
+    Path("qa.png").write_bytes(image.content)
+finally:
+    client.delete_sandbox(sandbox.name)
+    client.close()
+```
+:::
+
+:::js
+安装主机侧包。LangSmith 版本范围与此 Deep Agents 后端匹配；`ws` 支持非阻塞的应用启动：
+
+```bash
+npm install deepagents@^1.15.1 langsmith@^0.9.0 @langchain/openai ws
+```
+
+```ts
+import { writeFile } from "node:fs/promises";
+
+import { createDeepAgent, LangSmithSandbox } from "deepagents";
+import { SandboxClient } from "langsmith/sandbox";
+
+const client = new SandboxClient();
+const sandbox = await client.createSandbox(process.env.QA_SNAPSHOT_ID!);
+const backend = new LangSmithSandbox({ sandbox });
+
+try {
+  const app = await sandbox.run(process.env.QA_START_COMMAND!, {
+    wait: false,
+    timeout: 0,
+    idleTimeout: -1,
+  });
+  for (const command of [
+    "curl --fail --retry 20 --retry-connrefused --retry-delay 1 " +
+      "--retry-max-time 30 http://127.0.0.1:3000",
+    'agent-browser --session qa --args "--no-sandbox" open http://127.0.0.1:3000',
+  ]) {
+    const response = await backend.execute(command);
+    if (response.exitCode !== 0) throw new Error(response.output);
+  }
+
+  const agent = createDeepAgent({
+    model: "openai:gpt-5.5-2026-04-23",
+    backend,
+    systemPrompt:
+      "Test the app through its UI using execute and agent-browser. " +
+      "Use agent-browser --session qa for every browser command. " +
+      "Use snapshot -i to inspect controls, then click or fill them. " +
+      "Take a new snapshot after page changes. Do not edit the app " +
+      "or alter its state by executing JavaScript. Save a screenshot " +
+      "to /tmp/qa.png before reporting observed results and failures.",
+  });
+  const result = await agent.invoke({
+    messages: [{
+      role: "user",
+      content: "Sign up as qa@example.com and confirm that the dashboard loads.",
+    }],
+  });
+  console.log(result.messages.at(-1)?.contentBlocks);
+  const [image] = await backend.downloadFiles(["/tmp/qa.png"]);
+  if (image.error || !image.content) throw new Error(image.error ?? "No screenshot");
+  await writeFile("qa.png", image.content);
+} finally {
+  await backend.close();
+}
+```
+
+`backend.close()` 会删除所包装的 JavaScript 沙箱，因此无需额外调用 `client.deleteSandbox()`。
+:::
+
+这些示例通过 `--no-sandbox` 为以 root 运行的沙箱镜像禁用 Chrome 的内部沙箱。一次性的 LangSmith 沙箱提供外层隔离边界。对于支持 Chrome 内部沙箱的镜像，请省略该标志。
+
+屏幕截图是下载到你机器上的产物，而不是自动展示给模型的图像。有关模型可见的图像，请参阅[多模态输入](/oss/deepagents/multimodal)。要实现确定性的测试结果，请使用独立断言：agent 的报告及其指令不是安全边界。
+
+## 保护浏览器会话安全
+
+在浏览器中运行的代码可以使用该会话已登录的任何账户，以及浏览器可访问的任何站点。在将浏览器交给 agent 之前：
+
+- 对于 Stagehand，请使用 Browserbase 作为不受信任任务的隔离边界。`run` 会在浏览器内执行模型编写的 JavaScript。请参阅 Stagehand 的[安全边界](https://docs.stagehand.dev/v4/integrations/agent-frameworks/overview#security-boundary)。
+- 对于[沙箱 QA 路径](#test-an-app-with-chrome-in-a-langsmith-sandbox)，LangSmith 沙箱是隔离边界。一次性沙箱将 Chrome 和应用与你的机器隔离。
+- 对于结账和表单流程，请使用测试账户和测试支付方式，并在任何会实际完成购买的操作之前[要求批准](/oss/deepagents/human-in-the-loop)。
+- 将页面内容视为不受信任的输入。页面可能包含旨在诱导 agent 执行其他操作的文本。
+- 将凭据保存在应用环境中，而不是提示词或浏览器工具输入中。使用 MCP 时，只向服务器传递其所需的凭据。
+
+## 另请参阅
+
+:::python
+- [Stagehand 集成](/oss/integrations/tools/stagehand)
+- [Browserbase 集成](/oss/integrations/providers/browserbase)
+:::
+- [Managed Deep Agents 中的浏览器使用](/langsmith/managed-deep-agents-browser-use)
+- [沙箱](/oss/deepagents/sandboxes)
+- [人在回路中](/oss/deepagents/human-in-the-loop)
+- [Model Context Protocol (MCP)](/oss/langchain/mcp)
+- [Stagehand Deep Agents 文档](https://docs.stagehand.dev/v4/integrations/agent-frameworks/deep-agents)

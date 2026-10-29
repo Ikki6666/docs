@@ -1,0 +1,207 @@
+---
+title: Relays
+sidebarTitle: Relays
+description: 通过你网络中的 connector，将 sandbox 的出站连接发送到你选择的主机，使这些连接能够访问私有服务，并从你网络的 IP 地址发出。
+---
+
+<Note>
+Relays 目前处于 [alpha](/langsmith/release-stages) 阶段。要为你的组织申请访问权限，请[联系销售团队](https://www.langchain.com/contact-sales)。
+</Note>
+
+Relay 会将 [sandbox](/langsmith/sandboxes) 的部分出站连接经由你自己的网络发送。你在自己的网络内运行 LangSmith connector，并在 sandbox 的 proxy 配置中添加 relay 规则。当 sandbox 连接到该规则匹配的主机时，连接会从 connector 发出，而不是从 LangSmith 发出。使用 relay 可以访问仅在你的网络内部可达的服务，例如内部数据库或 API，也可以从你网络的 IP 地址发起请求。
+
+Relay 的工作方向与 [tunnel](/langsmith/tunnels) 相反，后者让 LangSmith 调用你私有网络上的服务。两者使用相同的 connector，一个 connector 只能服务于一个 tunnel 或一个 relay。
+
+Relays 在每个区域的 [LangSmith Cloud](/langsmith/cloud) 上都可用。self-hosted 或 hybrid 部署不支持 Relays。
+
+## Relays 的工作原理
+
+1. 组织管理员在 LangSmith 中创建 relay。
+2. 你在自己的网络内使用 relay ID 和 API key 运行 connector。Connector 通过 HTTPS（端口 443）出站连接到 LangSmith。没有任何连接会接入你的网络，connector 也不暴露任何端口。
+3. 你向 sandbox 的 `proxy_config` 添加 relay 规则。该规则列出要通过 relay 发送的主机名、IP 地址或 CIDR 块。
+4. 当 sandbox 打开到匹配目的地的连接时，LangSmith 会将连接传递到 connector，由 connector 从你的网络打开该连接。
+5. Connector 在连接前会根据自身策略检查每个目的地。默认情况下，它只能访问 80 和 443 端口上的公共地址。你可以通过 allow 规则放宽范围，通过 deny 规则收窄范围。
+
+## 设置 relay
+
+要创建 relay，你需要 [Organization Admin 或 Organization Operator](/langsmith/rbac#organization-roles) 角色。你还需要在网络内有一个运行 connector 的位置，例如 Kubernetes cluster、Docker host 或装有 [LangSmith CLI](/langsmith/langsmith-cli) 的机器。该位置必须能够访问你要中继的目的地，并能发起出站 HTTPS 连接。
+
+<Steps>
+  <Step title="创建 API key" icon="key">
+    在 **Settings** > **API Keys** 中，[创建一个具有 Organization Admin 或 Organization Operator 角色的组织范围 service key](/langsmith/create-account-api-key)。Connector 使用此 key 连接到 LangSmith。将其存储在 connector 可以读取的位置，并且不要将其提交到版本控制。
+  </Step>
+  <Step title="创建 relay" icon="plus">
+    在 LangSmith 中，进入 **Settings**，然后在 **Infrastructure** 下选择 **Relays**。
+
+    ![Relays settings page with no relays and a Create relay button](/langsmith/images/relays-empty.png)
+
+    选择 **Create relay**，输入名称和可选的描述，然后选择 **Create relay**。名称在你的组织所有 tunnels 和 relays 中必须唯一。
+
+    ![Create relay dialog with a name and a description filled in](/langsmith/images/relays-create-dialog.png)
+
+    新 relay 会显示 **Waiting for connector**，直到有 connector 连接到它。
+
+    如果改用 API 创建 relay，请发送 `POST /v1/connections`，请求体为 `{"name": "corp-network", "kind": "relay"}`。连接的 kind 在创建后无法更改。
+  </Step>
+  <Step title="运行 connector" icon="terminal">
+    在网络内以 relay 模式运行 connector。**Settings** > **Relays** 中的 relay 页面会显示适用于 CLI、Docker 和 Kubernetes (Helm) 的命令，其中已填入 relay ID 和你所在区域的 endpoint。复制其中一条命令并替换 `<your-api-key>`。
+
+    ![Relay details showing Waiting for connector, the relay ID, and the CLI command to run the connector](/langsmith/images/relays-connector-setup.png)
+
+    如果要自行编写配置，且你的组织不在 GCP US 区域，请使用你所在区域的 API URL：
+
+    | 区域 | Endpoint |
+    | --- | --- |
+    | GCP US | `https://api.smith.langchain.com`（默认） |
+    | GCP EU | `https://eu.api.smith.langchain.com` |
+    | GCP APAC | `https://apac.api.smith.langchain.com` |
+    | AWS US | `https://aws.api.smith.langchain.com` |
+
+    这些示例在默认范围之外，还允许 relay 访问 `10.0.0.0/8` 和 `db.corp.internal:5432`；请参见 [Connector policy](#connector-policy)。
+
+    <Tabs>
+      <Tab title="Kubernetes (Helm)">
+        将 API key 存储在一个 Secret 中，然后安装 [`langsmith-connector` chart](https://github.com/langchain-ai/helm/tree/main/charts/langsmith-connector)，版本需为 0.3.0 或更高：
+
+        ```bash
+        kubectl create namespace langsmith-connector
+        kubectl -n langsmith-connector create secret generic langsmith-connector-key \
+          --from-literal=langsmith_api_key=<api key>
+
+        helm repo add langchain https://langchain-ai.github.io/helm/
+        helm repo update
+        helm install langsmith-relay langchain/langsmith-connector \
+          --namespace langsmith-connector \
+          --set config.connectionId=<relay id> \
+          --set config.existingSecretName=langsmith-connector-key \
+          --set config.relay.enabled=true \
+          --set 'config.relay.allow={10.0.0.0/8,db.corp.internal:5432}'
+        ```
+
+        对于 GCP US 以外的区域，请添加 `--set config.endpoint=<endpoint>`；对于 deny 规则，请添加 `config.relay.deny`。像示例中那样，以列表形式传入规则。Relay 不接受 `config.targets`。
+
+        请运行单个 replica。一个 connector 本身就会保持两条到 LangSmith 的冗余连接。
+      </Tab>
+      <Tab title="Docker">
+        ```bash
+        docker run -d --name langsmith-relay --restart unless-stopped \
+          -e LANGSMITH_CONNECTION_ID=<relay id> \
+          -e LANGSMITH_API_KEY=<api key> \
+          -e LANGSMITH_CONNECTOR_RELAY_MODE=true \
+          -e LANGSMITH_CONNECTOR_RELAY_ALLOW="10.0.0.0/8,db.corp.internal:5432" \
+          langchain/langsmith-connector:0.3.0
+        ```
+
+        对于 GCP US 以外的区域，请添加 `-e LANGSMITH_ENDPOINT=<endpoint>`；对于 deny 规则，请添加 `LANGSMITH_CONNECTOR_RELAY_DENY`。两个规则变量都接受逗号分隔的列表。如果改为从文件读取 key，请将 `LANGSMITH_API_KEY_FILE` 设置为该文件的路径。
+      </Tab>
+      <Tab title="LangSmith CLI">
+        ```bash
+        export LANGSMITH_API_KEY=<api key>
+        langsmith relay connect <relay id> --allow 10.0.0.0/8 --allow db.corp.internal:5432
+        ```
+
+        `relay connect` 命令需要 LangSmith CLI 0.3.5 或更高版本。它会一直运行，直到你停止它。对于 GCP US 以外的区域，请设置 `LANGSMITH_ENDPOINT`；对于 deny 规则，请传入 `--deny`。Connector 使用 API key 进行认证，因此使用 OAuth 登录的 profile 不可用。
+      </Tab>
+    </Tabs>
+
+    如果你的网络需要出站代理，connector 会遵循 `HTTPS_PROXY`。连接时，它会记录 `connector registered with LangSmith`。设置 `LOG_LEVEL=debug` 可获取更多详情。使用 Helm 时，通过 `connector.deployment.extraEnv` 进行设置。
+  </Step>
+  <Step title="向 sandbox 添加 relay 规则" icon="route">
+    创建 sandbox 时，向 sandbox 的 `proxy_config` 添加一条 `"type": "relay"` 的规则；也可以更新已有 sandbox 的 `proxy_config`：
+
+    ```json
+    {
+      "rules": [
+        {
+          "name": "corp-network",
+          "type": "relay",
+          "relay_id": "<relay id>",
+          "match_hosts": ["10.0.0.0/8", "db.corp.internal"]
+        }
+      ]
+    }
+    ```
+
+    使用 CLI 时，将配置保存为 `proxy.json`，并在创建 sandbox 时传入：
+
+    ```bash
+    langsmith sandboxes create my-sandbox --proxy-config @proxy.json
+    ```
+
+    关于字段以及 relay 规则如何与其他 proxy 设置组合，请参见 [Relay rules](#relay-rules)。
+  </Step>
+  <Step title="检查 relay 是否正常工作" icon="circle-check">
+    Connector 启动后的几秒内，relay 会在 **Settings** > **Relays** 中显示 **Connected**。
+
+    ![Relay details showing Connected, the relay ID, and the CLI command to run the connector](/langsmith/images/relays-connected.png)
+
+    从 sandbox 中连接到 relay 规则匹配且 connector 策略允许的目的地：
+
+    ```bash
+    langsmith sandboxes exec my-sandbox -- curl -sS http://<host>:<port>/
+    ```
+
+    响应来自你网络中的服务，connector 会记录 `connector opened relay flow` 以及目的地。如果 connector 的策略拒绝该目的地，connector 会记录 `relay policy denied destination`，sandbox 的连接会失败；请为其添加 allow 规则。
+
+    在没有 connector 连接到 relay 时，到匹配目的地的连接会失败。它绝不会回退为直接连接。
+  </Step>
+</Steps>
+
+## Relay 规则
+
+Relay 规则是 sandbox `proxy_config` 中的一条规则（参见 [Configure auth proxy rules](/langsmith/sandbox-auth-proxy#configure-auth-proxy-rules)），包含以下字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `name` | 必填。规则的标识符 |
+| `type` | `relay` |
+| `relay_id` | 必填。承载匹配连接的 relay ID |
+| `match_hosts` | 必填。主机名和 `*.` 通配符（与 header 规则相同），以及 IP 地址和 CIDR 块（`10.0.0.0/8`、`2001:db8::/32`），后者匹配 sandbox 到 IP 地址的连接 |
+| `enabled` | 默认为 `true` |
+| `description` | 可选，最多 1024 个字符。说明此规则允许 sandbox 访问什么 |
+
+Relay 规则只匹配主机，因此不接受 `match_paths`、`headers`、`env_vars`、`aws`、`gcp` 或 `azure`。
+
+- 第一条匹配目的地的已启用 relay 规则会承载该连接。同一主机的 header 规则仍然适用。
+- [访问控制](/langsmith/sandbox-auth-proxy#egress-and-network-access-control)会先执行，因此被访问控制阻止的目的地不会被中继。
+- Relay 规则可以匹配 sandbox 原本拒绝连接的私有地址。Connector 的策略决定它是否可以访问这些地址。
+- Sandbox 只能使用其所在组织中的 relays。
+
+## Connector 策略
+
+无论 sandbox 的规则匹配到什么，connector 决定 relay 可以访问哪些目的地：
+
+- 默认情况下，它只能访问 80 和 443 端口上的公共地址。
+- Allow 规则会增加目的地，deny 规则会移除目的地。Deny 规则优先于 allow 规则。
+- 它绝不会连接到 cloud metadata 地址。
+
+每条规则可以是一个 CIDR 块（`10.0.0.0/8`）、一个 IP 地址、一个主机名（`db.corp.internal`）或一个通配符（`*.corp.internal`），后面可选地跟 `:PORT`。IPv6 地址或范围只有在方括号中才能带端口（`[2001:db8::1]:443`）。
+
+Connector 使用你网络的 DNS 解析主机名。当 allow 规则指定了主机名时，connector 会连接到该主机名解析出的地址，除非 deny 规则匹配这些地址。
+
+要更改策略，请更新 connector 的配置并重启它，例如使用 `helm upgrade`。
+
+## 安全性
+
+### 仅出站连接
+
+Connector 会通过 TLS 在端口 443 上向所在区域的 LangSmith API endpoint 发起出站 WebSocket 连接。你无需为 LangSmith 打开入站端口或更改防火墙规则，connector 也不暴露任何端口。
+
+### 认证与授权
+
+- **Connector**：Connector 使用具有连接 tunnels 和 relays 权限的组织 API key 进行认证。仅当 relay 处于启用状态时，LangSmith 才会接受该 connector。
+- **每个连接**：在 LangSmith 将 sandbox 的连接传递到 connector 之前，它会检查 relay 是否属于 sandbox 的组织并且已启用。
+
+### 你的网络暴露的内容
+
+- Sandbox 只能访问同时满足以下条件的目的地：relay 规则匹配，且 connector 策略允许。Connector 的策略在你的网络内配置，LangSmith 无法更改它。
+- Connector 不会连接到 cloud metadata 地址。
+- 中继的连接从 connector 的地址进入你的网络，因此你的服务会将 connector 视为客户端。
+
+### 日志
+
+Connector 不会记录中继连接的内容。在默认的 `info` 级别下，它会记录每条中继连接的目的地，以及其策略拒绝的每个目的地。
+
+### 撤销访问
+
+要阻止 sandboxes 使用你的网络，请在 **Settings** > **Relays** 中禁用或删除 relay。你也可以停止 connector，或撤销其 API key。

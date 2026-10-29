@@ -1,0 +1,167 @@
+---
+title: 浏览器使用
+sidebarTitle: Browser use
+description: 为 managed deep agent 配置 browser 共享、网站登录和人工接管。
+---
+
+为 managed deep agent 配置一个 browser，让它能在没有公开 API 的网站上执行操作，例如预订餐厅、通过跨站点链接调研主题，或在修改应用代码后通过 UI 测试该应用。Agent 可以导航、点击、填写表单并检查结果。Managed Deep Agents 负责管理 browser 及其 tools。
+
+如果任务有可用的直接 API，请优先使用 API。参见 [Connections](/langsmith/managed-deep-agents-connections)，使用用户已连接的账户对 API 调用进行身份验证。关于 browser 的选项和开源设置，请参见 [Browser use with Deep Agents](/oss/deepagents/browser-use)。
+
+<Note>
+Browser 支持从 Managed Deep Agents SDK 0.10 开始提供。你的 workspace 还需要拥有 LangSmith browser beta 的访问权限。要确认 workspace 是否已有访问权限或申请访问权限，请附上 workspace ID [联系 LangChain 支持团队](https://support.langchain.com)。
+</Note>
+
+## 声明 browser
+
+在[项目根目录](/langsmith/managed-deep-agents-project-structure)导出一个具名的 `browser`：
+
+:::python
+```python browser.py
+from managed_deepagents import define_browser
+
+browser = define_browser(
+    scope="thread",
+    idle_ttl_seconds=600,
+)
+```
+:::
+
+:::js
+```ts browser.ts
+import { defineBrowser } from "managed-deepagents";
+
+export const browser = defineBrowser({
+  scope: "thread",
+  idleTtlSeconds: 600,
+});
+```
+:::
+
+CLI 会发现这个根目录文件。不要把声明放在 `browser/` 或 `sandbox/` 中：这些位置不会启用 browser 支持。
+
+| 选项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `scope` | `"thread"` | 在一个 thread 内共享 browser，或在已登录用户的多个 threads 之间共享 |
+:::python
+| `idle_ttl_seconds` | `600` | browser 停止前的闲置秒数；接受 `60` 到 `86400` |
+:::
+:::js
+| `idleTtlSeconds` | `600` | browser 停止前的闲置秒数；接受 `60` 到 `86400` 的整数 |
+:::
+
+## 选择 scope
+
+| Scope | Browser 状态 | 适用场景 |
+| --- | --- | --- |
+| `"thread"`（默认） | 每个对话一个 browser；获得授权的参与者可在多轮对话之间共享 | 多人协作、预订流程或独立的应用测试 |
+| `"user"` | 每个已认证人员一个 browser，每个 thread 有独立窗口，并共享 cookies 和登录状态 | 在多个对话之间复用网站登录 |
+
+Thread scope 会让每个新对话开始时都不带其他 thread 的 cookies 或登录状态。同一 thread 中的后续 run 会复用其已保存的状态。启动另一个 thread 不会删除之前的 browser。
+
+要使用 user scope，请修改声明：
+
+:::python
+```python browser.py
+from managed_deepagents import define_browser
+
+browser = define_browser(scope="user", idle_ttl_seconds=600)
+```
+:::
+
+:::js
+```ts browser.ts
+import { defineBrowser } from "managed-deepagents";
+
+export const browser = defineBrowser({ scope: "user", idleTtlSeconds: 600 });
+```
+:::
+
+例如，在一个对话中登录预订网站，然后在新 thread 中请求另一个预订。同一用户的新窗口可以复用该登录状态。其他已认证人员会获得不同的 browser。User scope 依据[已验证的调用方身份](/langsmith/managed-deep-agents-identity)，而不是 prompt 中的名称；非人员主体使用 thread scope。
+
+共享登录状态并不等于账户隔离：退出登录或切换账户可能会影响此人的其他 threads。请跨对话协调购买和预订。完成一次 run 只会释放客户端，不会退出登录；闲置超时只会停止 browser，不会退出登录。网站过期或 browser 被替换仍可能使已保存的状态失效。
+
+## Browser 工具
+
+定义 browser 后，Managed Deep Agents 会自动包含以下 tools：
+
+| Tool | 作用 |
+| --- | --- |
+| `browser_snapshot` | 读取活动页面的无障碍树，并为交互元素分配 element ID |
+| `browser_run` | 通过 JavaScript 导航和交互，或针对 snapshot ID 批量执行操作 |
+| `browser_screenshot` | 截取页面；可选的绝对 `path` 会将图像保存到 agent 的 sandbox |
+| `browser_handoff` | 将窗口的控制权交给用户，用于登录、CAPTCHA 或双重身份验证 |
+
+导航后或 element ID 失效时，请重新获取 snapshot。浏览本身不需要 agent 的 [sandbox](/langsmith/managed-deep-agents-sandboxes)；但保存截图文件需要。
+
+## 移交 browser
+
+人工接管让你可以登录，或处理 agent 无法独立完成的页面。Agent 会调用 `browser_handoff(reason)`，将其所在 thread 的 browser 窗口控制权交给你。
+
+自定义客户端必须渲染 handoff artifact，以提供内嵌 browser 或 browser 链接。
+
+要完成登录并交回控制权：
+
+1. 让 agent 执行网站任务。如果登录、CAPTCHA 或双重身份验证需要你输入，agent 会请求接管并说明原因。
+2. 使用内嵌 browser，或打开客户端提供的 browser 链接。Studio 会显示一张 **The agent needs you in the browser** 卡片，其中包含内嵌 browser 以及在新标签页中打开的选项。请直接在网站上输入凭据，不要在聊天中输入，并完成所有必需的身份验证步骤。
+3. 完成后，在 browser 窗口中点击 **Hand back**。
+4. Agent 会收到你已交回控制权的通知。它会检查当前页面以确认登录是否成功，然后继续执行任务。
+
+<Frame caption="Browser 接管动画演示：在网站上登录，然后将控制权交回给 agent。">
+  <img src="/images/managed-deep-agents-browser-handoff-demo.gif" width="760" alt="Animated demo of an agent handing a travel website to a person for login and continuing after control is returned" />
+</Frame>
+
+在 Studio 中，接管卡片会内嵌 browser，并显示你何时拥有控制权。使用 **Hand back** 将控制权交回给 agent：
+
+<Frame caption="Studio 中的 browser 接管，打开了 Hacker News，页面上方显示 Hand back 控件。">
+  <img src="/images/managed-deep-agents-studio-browser-handoff.png" width="657" alt="Studio chat showing The agent needs you in the browser, an embedded Hacker News page, and the Hand back control" />
+</Frame>
+
+在你控制窗口期间，agent 的 browser tools 无法操作该窗口。Handoff 会立即返回，因此 agent 可以执行其他工作。链接会在 15 分钟后过期；过期只结束接管，并不代表网站任务已经完成。
+
+交回控制权后，agent 会收到继续执行的通知。如果对话正在等待另一项审批，请先完成该审批。如果 agent 没有恢复执行，请向它发送一条新消息。再次请求接管会替换之前的链接。
+
+<Warning>
+请对 handoff 链接保密：任何持有有效链接的人都能控制 browser。不要在 prompt、聊天消息或 agent 写入的文件中存储密码。接管期间请直接登录，并避免在 agent 之后可能检查的页面内容中暴露 secret。Browser scope 控制会话复用；它不是密码保险库。
+</Warning>
+
+## 为每次 run 选择 browser
+
+在 [graph factory](/langsmith/managed-deep-agents-agent-definition#select-configuration-per-run) 中显式设置 `browser`，为某次 run 选择 scope 和闲置超时：
+
+:::python
+```python agent.py
+from managed_deepagents import ManagedServerRuntime, define_browser, define_deep_agent
+
+
+def agent(runtime: ManagedServerRuntime):
+    return define_deep_agent(
+        name="browsing",
+        browser=define_browser(scope="user", idle_ttl_seconds=900),
+    )
+```
+:::
+
+:::js
+```ts agent.ts
+import { defineBrowser, defineDeepAgent, type ManagedServerRuntime } from "managed-deepagents";
+
+export function agent(runtime: ManagedServerRuntime) {
+  return defineDeepAgent({
+    name: "browsing",
+    browser: defineBrowser({ scope: "user", idleTtlSeconds: 900 }),
+  });
+}
+```
+:::
+
+即使 factory 选择不同的配置，也要保留根目录的 browser 声明。它会启用 browser 支持，并安装 deployment 的 browser 依赖。没有该文件，factory 无法添加 browser。
+
+要为某次 run 禁用 browser tools，请在 Python 中传入 `browser=None`，或在 TypeScript 中传入 `browser: null`。请传入 browser 定义，而不是 middleware 实例。静态 agent 定义则改为在声明文件中配置 browser 支持。
+
+## 另请参阅
+
+- [Browser use](/oss/deepagents/browser-use)
+- [Project structure](/langsmith/managed-deep-agents-project-structure)
+- [Sandboxes](/langsmith/managed-deep-agents-sandboxes)
+- [Identity](/langsmith/managed-deep-agents-identity)

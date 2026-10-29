@@ -1,0 +1,280 @@
+---
+title: "OpenAI Decisions 集成"
+sidebarTitle: "OpenAI Decisions"
+description: "使用 LangChain JavaScript 集成 OpenAIDecisions 决策模型。"
+---
+
+[OpenAI Decisions API](https://developers.openai.com/api/docs/guides/decisions) 读取自然语言和图像，返回类型化答案和校准后的概率，而不是生成的文本。
+
+`OpenAIDecisions` 将这些决策暴露为 LangChain `Runnable`，因此你可以调用、批处理它们，或将其与其他 runnable 组合。它接受字符串、结构化 JSON 和 [LangChain 消息对象](/oss/langchain/messages)，并在 LangSmith 中记录 trace 和 token 用量。它适用于聚焦型决策，例如路由请求、选择模型，或检查某个工具调用是否可安全运行。
+
+你可以在 LangChain middleware 中使用 OpenAI decisions，在特定生命周期节点控制 `createAgent` 行为，包括使用对 agent 状态进行分类的自定义 middleware。示例请参阅 [Agent middleware](#agent-middleware)。
+
+<Note>
+`OpenAIDecisions` 及其 middleware 处于 beta 阶段，需要 `@langchain/openai>=1.8.0`。该 middleware 还需要 `langchain>=1.6.0`。它们的 API 可能在不另行通知的情况下发生变化。
+</Note>
+
+## 设置
+
+<CodeGroup>
+```bash npm
+npm install @langchain/openai @langchain/core
+```
+
+```bash yarn
+yarn add @langchain/openai @langchain/core
+```
+
+```bash pnpm
+pnpm add @langchain/openai @langchain/core
+```
+</CodeGroup>
+
+在 [OpenAI 控制台](https://platform.openai.com/api-keys)中创建 API key 并导出它：
+
+```bash
+export OPENAI_API_KEY=...
+```
+
+<Note>
+可选：设置 `OPENAI_BASE_URL` 以使用兼容的网关或测试服务器。默认值为 OpenAI API 端点。
+
+```bash
+export OPENAI_BASE_URL=https://gateway.example.com/v1
+```
+
+要通过 [LangSmith LLM gateway](/langsmith/llm-gateway-decision-models#use-openai-decision-models)路由请求，请设置 `LANGSMITH_GATEWAY=true`。网关请求使用 `LANGSMITH_GATEWAY_API_KEY` 或 `LANGSMITH_API_KEY` 进行身份验证：
+
+```bash
+export LANGSMITH_GATEWAY=true
+export LANGSMITH_API_KEY=...
+```
+</Note>
+
+## 快速开始
+
+使用 decisions 模型创建 `OpenAIDecisions` 实例，然后在每次调用中一并传入输入和具名问题。共享同一输入的问题会在一次请求中得到回答：
+
+```typescript
+import { OpenAIDecisions } from "@langchain/openai";
+
+const decisions = new OpenAIDecisions("gpt-6-luna");
+
+const response = await decisions.invoke({
+  input:
+    "The deploy failed twice and customers are seeing 500s. Can someone look now?",
+  questions: {
+    urgent: {
+      type: "predicate",
+      instructions: "Does this need attention right now?",
+    },
+    team: {
+      type: "choice",
+      instructions: "Which team should pick this up?",
+      choices: {
+        infra: "Deploys, availability, and on-call incidents.",
+        billing: "Payments, invoices, and subscriptions.",
+      },
+    },
+    severity: {
+      type: "score",
+      instructions: "How severe is the impact?",
+      levels: [
+        "Cosmetic",
+        { label: "Degraded", description: "Degraded for some users." },
+        { label: "Outage", description: "Full outage." },
+      ],
+    },
+  },
+});
+
+const { urgent, team, severity } = response.answers;
+if (urgent.type === "predicate") console.log(urgent.probability);
+if (team.type === "choice") console.log(team.choice, team.confidence);
+if (severity.type === "score") console.log(severity.score);
+```
+
+答案以你提供的问题名称为键，其类型由问题推断：`team.choice` 的类型为 `"infra" | "billing"`。每个问题要么得到自身类型的答案，要么得到拒绝回答，因此在读取类型化字段前请先检查 `type`。响应还会包含作答的 `model`、`usage_metadata` 中的 token 用量，以及 OpenAI 的 `requestId`。
+
+请求 `input` 可以是字符串、JSON 对象或数组，或 LangChain 消息。消息（包括 system、AI 和 tool 消息）会作为对话原生发送，工具调用和工具结果作为 function call 项。文本和图像内容会保留。其他内容（例如文件或音频）会被占位符替换或省略。JSON 对象和数组会作为结构化 JSON 在单条 user 消息中发送，其中嵌套的任何消息也按相同方式转换。
+
+## 决策类型
+
+每个问题属于以下三种类型之一：
+
+| 类型 | 询问 | 返回 | 适用场景 |
+|---|---|---|---|
+| `predicate` | 这是否属实？ | `probability`，即答案为 yes 的概率 | 你的代码根据 `if` 分支 |
+| `choice` | 其中哪个选项？ | `choice`，以及 `probabilities` 和 `confidence` | 选项对应不同的代码路径 |
+| `score` | 哪个级别？ | `score`，以及 `probabilities` 和 `confidence` | 答案是一个可与阈值比较的连续谱 |
+
+`predicate` 是唯一没有 `confidence` 的类型，因为概率本身就是答案。对于连续谱，请使用 `score` 而不是 `predicate`：概率 `0.5` 表示 yes 和 no 各占一半，而不是“中等”。
+
+`score` 级别从低到高排序，索引从 `0` 开始。仅需标签的级别可传入普通字符串，也可传入包含 `label` 和 `description` 的对象。返回的 `score` 是各级别索引的概率加权平均值，因此可能落在级别之间。`probabilities` 中的每个条目包含以 `value` 表示的级别索引、其 `label` 以及 `probability`。
+
+当模型拒绝回答某个问题时，答案是一个 `RefusalAnswer`，其 `type` 为 `"refusal"`，而不是类型化答案。
+
+## Agent middleware
+
+`langchain` 包包含两个 beta [middleware](/oss/langchain/middleware/overview)，可将 OpenAI decisions 放到 agent 的决策点上。请从 `langchain` 导入它们。使用前请将 `langchain` 与 OpenAI 集成一起安装：
+
+<CodeGroup>
+```bash npm
+npm install langchain @langchain/openai @langchain/core
+```
+
+```bash yarn
+yarn add langchain @langchain/openai @langchain/core
+```
+
+```bash pnpm
+pnpm add langchain @langchain/openai @langchain/core
+```
+</CodeGroup>
+
+| Middleware | Hook | 决策 |
+|---|---|---|
+| [`openAIModelRouterMiddleware`](#model-routing) | `beforeAgent`, `wrapModelCall` | 由哪个模型处理本次运行 |
+| [`openAIAutoModeMiddleware`](#tool-risk-gating) | `wrapToolCall` | 工具调用是否风险过高而不宜运行 |
+
+两个 middleware 都需要一个 `model`：已配置的 `OpenAIDecisions` 实例。
+
+### 模型路由
+
+根据最新的人类消息在你指定的多个模型之间进行分类，并在本次运行的所有模型调用中使用所选模型。每个选项将一个模型与其选择标准配对：
+
+```typescript
+import { createAgent, openAIModelRouterMiddleware } from "langchain";
+import { OpenAIDecisions } from "@langchain/openai";
+
+const router = openAIModelRouterMiddleware({
+  choices: {
+    fast: {
+      model: "openai:gpt-6-luna",
+      criteria:
+        "Direct lookups, extraction, and localized changes with explicit targets.",
+    },
+    powerful: {
+      model: "openai:gpt-6-sol",
+      criteria:
+        "Architecture, novel root-cause reasoning, and high-stakes decisions.",
+    },
+  },
+  instructions: "Choose the least costly model that can complete the task safely.",
+  model: new OpenAIDecisions("gpt-6-luna"),
+});
+
+const agent = createAgent({ model: "openai:gpt-6-luna", middleware: [router] });
+
+const result = await agent.invoke({
+  messages: [
+    {
+      role: "user",
+      content:
+        "Design a Byzantine fault tolerant consensus protocol and prove its safety and liveness properties.",
+    },
+  ],
+});
+console.log(result.modelRoute?.choice);
+```
+
+答案以对象形式存储在 agent 状态的 `modelRoute` 下，包含 `choice`、`probabilities` 和 `confidence`。当模型拒绝回答，或状态中没有人类消息时，`modelRoute` 为 `null`，模型调用将使用 agent 自身的模型。
+
+### 工具风险门控
+
+询问某个工具调用存在风险或授权不足的概率。概率为 `0.5` 或更高的调用会返回错误 `ToolMessage`，而不会运行该工具。只有你列出的工具会被分类。可以传入工具名称或工具对象：
+
+```typescript
+import { createAgent, openAIAutoModeMiddleware, tool } from "langchain";
+import { OpenAIDecisions } from "@langchain/openai";
+import * as z from "zod";
+
+const deleteAllBackups = tool(async () => "Backups deleted.", {
+  name: "delete_all_backups",
+  description: "Delete every backup. This action cannot be undone.",
+  schema: z.object({}),
+});
+
+const agent = createAgent({
+  model: "openai:gpt-6-sol",
+  tools: [deleteAllBackups],
+  middleware: [
+    openAIAutoModeMiddleware({
+      tools: [deleteAllBackups],
+      model: new OpenAIDecisions("gpt-6-luna"),
+    }),
+  ],
+});
+
+const result = await agent.invoke({
+  messages: [{ role: "user", content: "Delete all backups." }],
+});
+console.log(result.messages.at(-1)?.text);
+```
+
+可覆盖 `instructions`，为自定义工具描述其风险。该 middleware 采用失效关闭（fail closed）策略：拒绝回答会阻止调用，API 错误会直接传播而不会运行工具。
+
+<Warning>
+除非可以接受将这些信息发送给 OpenAI，否则不要把机密信息放入工具参数或对话状态。该 middleware 会拒绝有风险的调用，但不会请求批准。如需由人工批准，请将其与 [human-in-the-loop middleware](/oss/langchain/middleware/built-in) 搭配使用。
+</Warning>
+
+### 自定义 middleware
+
+`OpenAIDecisions` 直接接受 LangChain 消息对象，因此自定义 middleware hook 无需先转换即可对 agent 的对话状态进行分类。本示例在每次运行开始时对对话分类一次，并将完整答案存储在 agent 状态中：
+
+```typescript
+import { createAgent, createMiddleware } from "langchain";
+import { OpenAIDecisions } from "@langchain/openai";
+import * as z from "zod";
+
+const decisions = new OpenAIDecisions("gpt-6-luna");
+
+const triageMiddleware = createMiddleware({
+  name: "TriageMiddleware",
+  stateSchema: z.object({
+    triage: z
+      .object({ choice: z.string(), confidence: z.number() })
+      .optional(),
+  }),
+  beforeAgent: async (state) => {
+    const { answers } = await decisions.invoke({
+      input: state.messages,
+      questions: {
+        triage: {
+          type: "choice",
+          instructions: "Which team should handle this conversation?",
+          choices: {
+            billing: "Payments, invoices, and subscriptions.",
+            infra: "Deploys, availability, and incidents.",
+            other: "Requests that belong to another team.",
+          },
+        },
+      },
+    });
+    if (answers.triage.type !== "choice") return;
+    const { choice, confidence } = answers.triage;
+    return { triage: { choice, confidence } };
+  },
+});
+
+const agent = createAgent({
+  model: "openai:gpt-6-luna",
+  middleware: [triageMiddleware],
+});
+const result = await agent.invoke({
+  messages: [{ role: "user", content: "Customers are seeing 500 errors." }],
+});
+console.log(result.triage?.choice, result.triage?.confidence);
+```
+
+使用与你的决策点匹配的任意生命周期 hook。例如，使用 `beforeModel` 在每个工具结果后重新分类，或使用 `wrapToolCall` 对拟执行的操作进行分类。所有 hook 和状态模式请参阅[自定义 middleware](/oss/langchain/middleware/custom)。
+
+## 追踪
+
+OpenAI decisions 会在 [LangSmith](/langsmith/home) 中追踪，因此你可以与 agent 的其他部分一起检查决策和 token 用量。
+
+## 另请参阅
+
+- [OpenAI Decisions 指南](https://developers.openai.com/api/docs/guides/decisions)
+- [OpenAI provider 概览](/oss/integrations/providers/openai)
+- [LangChain OpenAI API 参考](https://reference.langchain.com/javascript/langchain-openai)
