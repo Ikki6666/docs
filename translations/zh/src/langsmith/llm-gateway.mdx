@@ -1,83 +1,51 @@
 ---
 title: LLM Gateway
 sidebarTitle: 概览
-description: 通过 LLM Gateway 把 LLM 调用代理到 LangSmith，强制执行支出限制，脱敏敏感数据，并集中管理 provider 凭证。
+description: 使用一个 LangSmith API key 访问各个 providers 的模型，同时追踪调用并强制执行支出与数据保护策略。
 mode: wide
 ---
 
-<Note>
-**Private beta:** LLM Gateway 当前处于私有 [beta](/langsmith/release-stages) 阶段。我们在持续迭代过程中，API 和功能都可能发生变化。你可以加入[候补名单](https://www.langchain.com/langsmith-llm-gateway-waitlist)来申请访问权限。
-</Note>
+import LLMGatewayBetaNote from '/snippets/langsmith/llm-gateway-beta-note.mdx';
 
-LLM Gateway 是位于你的 agents（或任意 LLM client）与它们所调用的 LLM providers 之间的一层代理。与其让每个 client 在本地保存 provider API key，不如把密钥统一存放在 LangSmith 中，作为 Provider Secrets。客户端则使用 [LangSmith API key](/langsmith/create-account-api-key) 进行认证。
+<LLMGatewayBetaNote />
 
-当一个请求通过 gateway 时，它会：
+LLM Gateway 是位于你的应用与工作区已配置的 model providers 之间的代理。你的应用使用 [LangSmith API key](/langsmith/create-account-api-key) 进行认证。gateway 会把每个请求路由到其 model ID 所指定的 provider，追踪这次调用，并应用你组织的治理策略。
 
-1. 使用调用者的 LangSmith API key 进行认证。
-1. 从你的工作区 Provider Secrets 中解析出真实的 provider API key。
-1. 评估治理策略（支出限制、PII 脱敏、secrets 脱敏）。
-1. 把请求代理到上游 provider。
-1. 将这次调用追踪到 LangSmith。
+如果不使用 gateway，provider keys 会被复制到每个调用模型的应用程序和部署中，而支出和数据控制取决于各个 provider 账户。使用 gateway 后，provider keys 保留在 LangSmith 中，每次调用都会以一条 [LangSmith trace](/langsmith/llm-gateway-traces) 呈现，并且[支出限制](/langsmith/llm-gateway-spend-policies)、[速率限制](/langsmith/llm-gateway-rate-limit-policies)和 [data policies](/langsmith/llm-gateway-data-policy) 会作用于其范围内的每次调用。
 
-每一次经 gateway 代理的调用，都会在 LangSmith 中显示为一条 [trace](/langsmith/observability-concepts#traces)。当某条策略被触发时，该事件还会流入 [LangSmith Engine](/langsmith/engine) 进行分诊，你可以在同一产品里从被拦截请求一路跳转到触发它的 trace，再跳转到修复点。
+## 选择请求格式
 
-## 功能可用性
+gateway 接受 OpenAI Chat Completions、Anthropic Messages 和 OpenAI Responses 请求。请求格式与 provider 相互独立：一个 Chat Completions 请求可以调用 Anthropic 模型，当 provider 使用不同的原生格式时，gateway 会转换请求和响应。请保留应用当前使用的格式，并通过更改 model ID 来切换 provider。有关 endpoint、model ID 语法和转换行为，请参见 [API 格式](/langsmith/llm-gateway-api-formats)。
 
-| 能力 | 说明 |
-| --- | --- |
-| **Spend limits** | 可在[组织](/langsmith/administration-overview#organizations)、[工作区](/langsmith/administration-overview#workspaces)、[API key](/langsmith/administration-overview#api-keys)或用户级别强制硬性拦截。当达到上限时，调用方会收到带有可执行错误信息的 402 响应。 |
-| **Spend visibility** | 提供按工作区、用户和 API key 实时汇总的成本可视化。按模型粒度的可视化可通过 Custom Charts 实现。 |
-| **PII redaction** | 在请求到达模型前，检测并脱敏姓名、地点、国籍、宗教、政治立场和年龄。 |
-| **Secrets redaction** | 在请求到达模型前，检测并脱敏美国电话号码、美国社会安全号、API keys、tokens 和凭证。覆盖 AWS、GitHub、GitLab、OpenAI、Anthropic、GCP、Azure、Slack、Datadog、PyPI、npm、私钥以及 LangSmith tokens。 |
-| **LangSmith Engine integration** | 策略违规会作为问题呈现在 LangSmith Engine 中。你可以从违规事件直接点击进入对应 trace。 |
-| **Audit logging** | 对 gateway 配置的管理操作以及 gateway 调用都会被记录。 |
-| **Tracing** | 每次经过 gateway 代理的调用，都会出现在与你其他 agent traces 相同的 LangSmith 工作区中。通过 gateway 路由不会打碎你的 observability。 |
+LangChain chat models 和 Deep Agents 通过 `LANGSMITH_GATEWAY` 环境变量访问 gateway，该变量使用 [direct model access](/langsmith/llm-gateway-direct-model-access)，采用各 provider 的原生格式，因此不会发生转换。
 
-## 支持的 providers
+## 选择凭证的管理方式
 
-| Provider | Gateway path | Secret name |
-| --- | --- | --- |
-| Anthropic | `/anthropic` | `ANTHROPIC_API_KEY` |
-| AWS Bedrock | `/bedrock` | `AWS_BEARER_TOKEN_BEDROCK` |
-| Baseten | `/baseten` | `BASETEN_API_KEY` |
-| Fireworks | `/fireworks` | `FIREWORKS_API_KEY` |
-| Google Gemini | `/gemini` | `GOOGLE_API_KEY` |
-| Google Vertex AI | `/vertex` | `VERTEX_SERVICE_ACCOUNT_JSON` |
-| OpenAI | `/openai` | `OPENAI_API_KEY` |
+gateway 使用 LangSmith 持有的凭证调用每个 provider：你自己的 provider key（以工作区 secret 的形式存储），或者 [Gateway Credits](/langsmith/llm-gateway-credits)（由 LangChain 计入你的 LangSmith 账户）。关于所有凭证来源及各自的计费方，请参见 [Provider 认证](/langsmith/llm-gateway-provider-authentication#choose-a-credential-source)。
 
-## 已知限制
+## 下一步
 
-- **Claude Desktop:** 不支持 marketplace plugins。Chat 标签页不可见，但 Cowork 可用。
-- **Codex Desktop:** 不支持 marketplace plugins。
-- **Cursor:** 尚不支持 IDE 集成。
-- **ChatGPT Desktop / Gemini Desktop:** 无法配置。
-
-## 资源
+请从适合你角色的指南开始：
 
 <CardGroup cols={2}>
   <Card
-    title="Spend policies"
-    icon="coin"
-    href="/langsmith/llm-gateway-spend-policies"
+    title="为团队设置 gateway"
+    icon="settings"
+    href="/langsmith/llm-gateway-admin-setup"
     arrow="true"
   >
-    为整个组织设置并管理成本上限。
+    完成初始设置，让请求通过 gateway 路由。
   </Card>
 
   <Card
-    title="PII 和 secrets 脱敏"
-    icon="shield-lock"
-    href="/langsmith/llm-gateway-redaction"
+    title="发送第一个请求"
+    icon="rocket"
+    href="/langsmith/llm-gateway-first-request"
     arrow="true"
   >
-    防止敏感数据到达 LLM providers 或被写入 trace 存储。
+    从 Simulator 发送请求，在代码中调用 gateway，并查看 trace。
   </Card>
+
 </CardGroup>
 
-<Tip>
-需要将 gateway 与存储在 Prompt Hub 中的 prompts 一起使用？请参阅[通过 gateway 使用 Prompt Hub](/langsmith/manage-prompts-programmatically#use-with-the-langsmith-gateway)，了解如何通过两个环境变量将 Prompt Hub 的模型调用路由到 gateway。
-
-需要 provider 原生的请求和响应行为？请使用 [Direct model access](/langsmith/llm-gateway-direct-model-access) 来绕过标准化层。这是标准 API 的高级替代方案。
-
-如果你对 LLM Gateway 还有其他问题，请联系 [support.langchain.com](https://support.langchain.com)。
-</Tip>
+如有其他问题，请联系 [LangChain support](https://support.langchain.com)。

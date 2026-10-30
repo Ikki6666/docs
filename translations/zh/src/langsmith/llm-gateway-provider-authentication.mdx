@@ -1,13 +1,105 @@
 ---
 title: Provider 认证
-description: 为 LLM Gateway 与支持 API key 之外认证方式的 model providers 配置基于身份的认证。
+description: 选择 LLM Gateway 向每个 model provider 进行认证的方式，将 provider key 添加为工作区 secret，并修复 provider 凭证错误。
 ---
 
 import LLMGatewayBetaNote from '/snippets/langsmith/llm-gateway-beta-note.mdx';
 
 <LLMGatewayBetaNote />
 
-gateway 会使用存储在你 workspace 的 Provider Secrets 中的凭据向各个 model provider 进行认证。大多数 provider 只需要一个 API key，你可以在 [Admin 设置](/langsmith/llm-gateway-admin-setup#1-add-provider-secrets)中添加。部分 provider 还支持基于身份的认证，即使你的组织禁用了 provider API keys，也依然可以使用 gateway。
+Provider 认证是 [LLM Gateway](/langsmith/llm-gateway) 代表你调用 model provider 时使用的凭证。由于 LangSmith 持有该凭证，开发者和 agents 无需持有 provider key 的副本。
+
+每个 gateway 请求都会经过两层认证：
+
+- 调用方使用 LangSmith API key [向 gateway 认证](/langsmith/llm-gateway-authentication)。
+- 然后，gateway 使用本页讨论的某种凭证来源向 provider 认证。
+
+## 选择凭证来源
+
+每个请求都会使用以下凭证来源之一。每种来源的计费方不同：
+
+| 来源 | 谁持有凭证 | 谁为该调用计费 | 设置 |
+| --- | --- | --- | --- |
+| 你的 provider key | LangSmith，作为工作区 secret | provider，计入你的 account | [添加 provider key](#添加-provider-key) |
+| [模型配置](/langsmith/llm-gateway-model-configurations)（`custom/<name>`） | LangSmith，作为该配置指定的 secret | provider，计入你的 account | 创建该配置 |
+| [Gateway Credits](/langsmith/llm-gateway-credits) | LangChain | LangSmith，计入你的 LangSmith account | 无需 provider 凭证 |
+| [Claude 订阅](/langsmith/llm-gateway-coding-agents#use-claude-subscription-oauth) | 用户的 Claude Code 登录信息，随每个请求发送 | Anthropic，计入用户的订阅 | 仅限 Claude Code |
+
+gateway 会从请求中选择来源：
+
+- **Model ID**：`<provider>/<model>` ID（例如 `anthropic/claude-opus-5`）会使用你为该 provider 配置的 provider key。`custom/<name>` ID 会使用该配置的 secret。[Gateway Credits](/langsmith/llm-gateway-credits#available-models) 上列出的托管模型 ID（例如 `moonshotai/kimi-k3`）会使用 Gateway Credits。
+- **Claude 订阅**：当请求携带 Anthropic OAuth token 时，gateway 会将其转发给 Anthropic，并且不会加载工作区的 `ANTHROPIC_API_KEY`。
+
+## 添加 provider key
+
+gateway 会从调用方 API key 所属工作区的 secrets 中读取 provider key。每个需要调用某个 provider 的工作区，都需要拥有该 provider key 的一份自己的副本。对于 `<provider>/<model>` 调用，gateway 不会回退到组织 secrets。组织 secrets 仅适用于[组织范围的模型配置](/langsmith/llm-gateway-model-configurations)。
+
+添加 provider key 需要在该工作区中[拥有管理 secrets 的权限](/langsmith/rbac#workspace-roles)。如果没有该权限，**Provider secrets** 页面会隐藏添加按钮，并提示你联系工作区管理员。
+
+添加 provider key 的步骤：
+
+1. 在 LangSmith 中，选择调用该 provider 的工作区。
+1. 前往 **Settings > Integrations > Provider secrets**。
+1. 点击 **+ Secret**。在 **Provider** 下选择该 provider，secret 名称会自动填入。
+1. 输入 provider key 作为值，然后点击 **Save**。
+
+如果某个工作区没有某个 provider 的 key，Simulator 会将该 provider 的模型标记为 **Needs key**，并在运行请求前提示你添加 key。你在这里输入的 key 会作为 secret 保存在当前工作区中，与在 **Provider secrets** 页面上添加的 key 相同。
+
+LangSmith 在保存 provider key 时不会进行检查。错误的 key 会在第一次请求时以 provider 错误的形式出现。
+
+gateway 会读取以下 secret 名称：
+
+| Provider | Secret name |
+| --- | --- |
+| Anthropic | `ANTHROPIC_API_KEY` |
+| AWS Bedrock | `AWS_IAM_ROLE_ARN`、access keys 或 `AWS_BEARER_TOKEN_BEDROCK`。请参见[配置 Amazon Bedrock](#配置-amazon-bedrock)。 |
+| Azure Foundry | `AZURE_FOUNDRY_API_KEY` 和 `AZURE_FOUNDRY_RESOURCE_NAME`。关于 Entra ID，请参见[配置 Azure Foundry](#配置-azure-foundry)。 |
+| Baseten | `BASETEN_API_KEY` |
+| Fireworks | `FIREWORKS_API_KEY` |
+| Gemini Enterprise Agent Platform | `GOOGLE_VERTEX_AI_WEB_CREDENTIALS`。请参见[配置 Gemini Enterprise Agent Platform](#配置-gemini-enterprise-agent-platform)。 |
+| Google Gemini | `GOOGLE_API_KEY` |
+| OpenAI | `OPENAI_API_KEY` |
+| ScaleDown | `SCALEDOWN_API_KEY` |
+| TypeSafe | `TYPESAFE_API_KEY` |
+| xAI | `XAI_API_KEY` |
+
+## 配置 Amazon Bedrock
+
+Amazon Bedrock 支持三种凭证方式，每种都可在 provider 表单中使用：
+
+| 方式 | Secrets | 说明 |
+| --- | --- | --- |
+| IAM role（推荐） | `AWS_IAM_ROLE_ARN` | gateway 会代入该 role 并使用短期凭证，因此 LangSmith 不存储长期有效的 AWS secret。 |
+| AWS credentials | `AWS_ACCESS_KEY_ID` 和 `AWS_SECRET_ACCESS_KEY`，临时凭证还需 `AWS_SESSION_TOKEN` | 两个 key 都是必需的。临时凭证在过期后停止工作。 |
+| Bearer token | `AWS_BEARER_TOKEN_BEDROCK` | 一个 [Amazon Bedrock API key](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html)。 |
+
+在自托管 LangSmith 上，当工作区没有 Bedrock secrets 时，gateway 也可以使用其自身 pod 的 AWS 凭证，例如 `agent-gateway` service account 的 IAM role。请在 Helm values 中的 `agentGateway.serviceAccount.annotations` 里设置该 role 的 annotation。
+
+如果一个工作区配置了多种方式的 secrets，gateway 会按以下顺序使用最先找到的一种：bearer token、IAM role、AWS credentials，然后在自托管环境中使用 pod 的凭证。
+
+每种方式还会读取可选的 `AWS_BEDROCK_REGION`，其默认值为 `us-east-1`。请把它设置为纯 Region 名称，而不是 URL。当它未设置且 model ID 是[跨区域推理配置文件](https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html)（例如以 `eu.` 开头）时，gateway 会使用该配置文件所属地理区域中的一个 Region。
+
+### 使用 IAM role
+
+要让 gateway 代入 IAM role：
+
+1. 在 AWS 中创建一个 IAM role，授予调用你所使用 Bedrock 模型的权限。
+1. 在 LangSmith 中，选择调用 Bedrock 的工作区。前往 **Settings > Integrations > Provider secrets** 并点击 **+ Secret**。
+1. 在 **Provider** 下选择 **Amazon Bedrock**，然后选择 **IAM role** 方式。输入 role ARN，并可选择输入 AWS Region。
+1. 复制表单中显示的示例信任策略，并将其添加到 AWS 中的该 role。该策略允许 LangSmith 的 AWS account 代入该 role，并要求以你的工作区 ID 作为 external ID。
+1. 点击 **Save**。
+
+在自托管 LangSmith 上，gateway 会使用其 pod 自身的 AWS 凭证代入该 role，因此该 role 的信任策略必须改为允许该身份。
+
+即使该 role 允许更多操作，gateway 也会把每个会话限制为 Bedrock 操作。会话持续一小时，gateway 会自动续期。在 AWS CloudTrail 中，会话名称为 `langsmith-gw-` 后接工作区 ID。
+
+### 验证 Bedrock 配置
+
+使用来自你的 Bedrock 控制台的 model ID，发送一个带有 `bedrock/<model-id>` model ID 的测试请求。以下错误都与凭证有关：
+
+- **`400` 且返回 `bedrock credentials not found`**：工作区没有 Bedrock secrets。Bedrock 在此返回 `400`，而不是其他 provider 在缺少 key 时返回的 `424`。
+- **`400` 且返回 `incomplete AWS access-key credentials`**：`AWS_ACCESS_KEY_ID` 和 `AWS_SECRET_ACCESS_KEY` 中缺少一个。
+- **`403` 且返回 `STS denied AssumeRole for the configured Bedrock role`**：该 role 的信任策略不允许 LangSmith，或其 external ID 不是工作区 ID。
 
 ## 配置 Azure Foundry
 
@@ -15,7 +107,7 @@ Azure Foundry 支持 API key 或 Microsoft Entra ID service principal 两种认�
 
 两种方式都需要 `AZURE_FOUNDRY_RESOURCE_NAME`。请把它设置为 Azure 资源名称，而不是 URL 或 deployment 名称。gateway 会向 Azure 公有云中的 `<resource-name>.openai.azure.com` 发送请求。
 
-使用 API key 认证时，请按照 [Admin 设置](/langsmith/llm-gateway-admin-setup#1-add-provider-secrets)中的说明，通过 Azure Foundry provider 表单添加 `AZURE_FOUNDRY_API_KEY` 和 `AZURE_FOUNDRY_RESOURCE_NAME`。
+使用 API key 认证时，请按照[添加 provider key](#添加-provider-key)中的说明，通过 Azure Foundry provider 表单添加 `AZURE_FOUNDRY_API_KEY` 和 `AZURE_FOUNDRY_RESOURCE_NAME`。
 
 ### 使用 Entra ID service principal
 
@@ -25,7 +117,7 @@ Azure Foundry 支持 API key 或 Microsoft Entra ID service principal 两种认�
 1. 在 Microsoft Entra ID 中[注册应用程序](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)，或使用已有的应用注册。记下它的目录（租户）ID 和应用程序（客户端）ID。
 1. 为该应用注册[添加 client secret](https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-credentials)。请记下 secret 的值，而不是它的 ID。
 1. 在 Foundry 资源（而不是其中的项目）上，为该应用的 service principal [分配](https://learn.microsoft.com/en-us/azure/foundry/concepts/rbac-foundry) `Foundry User` 角色（原名 `Azure AI User`）。通用的 `Owner`、`Contributor` 和 `Reader` 角色[无权调用模型](https://learn.microsoft.com/en-us/azure/foundry/concepts/rbac-foundry#permissions-for-each-built-in-role)。
-1. 在 LangSmith 中，选择用于路由 Azure 请求的 workspace。前往 **Settings > Integrations > Provider Secrets**，将以下每一项都添加为自定义 secret：
+1. 在 LangSmith 中，选择用于路由 Azure 请求的 workspace。前往 **Settings > Integrations > Provider secrets**，将以下每一项都添加为自定义 secret：
 
    | Secret name | Value |
    | --- | --- |
@@ -44,7 +136,7 @@ Azure Foundry 支持 API key 或 Microsoft Entra ID service principal 两种认�
 
 ### 验证配置
 
-[为用户配置好 gateway 访问权限](/langsmith/llm-gateway-admin-setup#2-configure-gateway-access-for-users)之后，使用你的 LangSmith API key 通过 gateway 发送一个测试请求：
+[授予 gateway 访问权限](/langsmith/llm-gateway-authentication#grant-permission-to-call-the-gateway)之后，使用你的 LangSmith API key 通过 gateway 发送一个测试请求：
 
 ```bash
 curl https://gateway.smith.langchain.com/azure/v1/chat/completions \
@@ -60,8 +152,44 @@ curl https://gateway.smith.langchain.com/azure/v1/chat/completions \
 
 如果 Azure 返回 `PermissionDenied`，请确认 `Foundry User` 角色分配在 Foundry 资源上，而不是项目上。新的角色分配可能需要[最多 10 分钟](https://learn.microsoft.com/en-us/azure/role-based-access-control/troubleshooting#symptom---role-assignment-changes-are-not-being-detected)才会生效。
 
+## 配置 Gemini Enterprise Agent Platform
+
+Gemini Enterprise Agent Platform 在 provider 表单中显示为 **Google Vertex AI**，它使用 JSON 格式的 Google Cloud service account key 进行认证。gateway 会用该 key 换取短期 access token。它不支持 workload identity federation、Application Default Credentials 或其他外部 account 凭证。`type` 不是 `service_account` 的凭证文件会返回 `400`。
+
+添加 service account key 的步骤：
+
+1. 在 Google Cloud 中，为一个可以调用你所使用模型的 service account [创建 service account key](https://cloud.google.com/iam/docs/keys-create-delete)。
+1. 在 LangSmith 中，选择调用该 provider 的工作区。前往 **Settings > Integrations > Provider secrets** 并点击 **+ Secret**。
+1. 在 **Provider** 下选择 **Google Vertex AI**。把该 key 的 JSON 内容粘贴为值，然后点击 **Save**。
+
+该表单会将 key 保存为 `GOOGLE_VERTEX_AI_WEB_CREDENTIALS`，也就是 [Playground](/langsmith/managing-model-configurations) 使用的同一个 secret。gateway 还会读取 `VERTEX_SERVICE_ACCOUNT_JSON`，当两者都设置时优先使用它。
+
+gateway 会读取两个可选的自定义 secrets：
+
+- **`VERTEX_PROJECT`**：要调用的 Google Cloud project。默认使用 key 中的 `project_id`。
+- **`VERTEX_LOCATION`**：`global` 或某个 Google Cloud 区域，例如 `us-central1`。默认值为 `global`。
+
+在自托管 LangSmith 上，[GKE workload identity](/langsmith/self-host-gke-vertex-ai-workload-identity) 仅覆盖 Playground、Chat 和 Insights，不覆盖 gateway。gateway 仍然需要 service account key。
+
+## 修复 provider 凭证错误
+
+gateway 会把 provider 错误透传给调用方，因此大多数凭证问题会以 provider 自己的状态码和错误体出现。[`X-LangSmith-Gateway-Metadata`](/langsmith/llm-gateway-api-formats#read-response-metadata) 响应 header 可以区分两者：对于 provider 错误，它会包含 `"outcome":"upstream_error"` 和 `"upstream_error_source":"provider_response"`，并在 `upstream_status_code` 中给出 provider 的状态码。
+
+要查看调用方工作区可以访问哪些 provider，请调用 [`GET /v1/models`](/langsmith/llm-gateway-api-formats#list-models)。它只会列出在该工作区中配置了 key 的 provider 的 `<provider>/<model>` ID。
+
+| 状态和响应 | 原因 | 修复 |
+| --- | --- | --- |
+| `424` 且返回 `Required workspace secret "<SECRET_NAME>" is missing.` | 调用方 API key 所属的工作区没有 model ID 中 provider 的 key。 | 向该工作区[添加 provider key](#添加-provider-key)，或使用来自已配置该 key 的工作区的 API key。 |
+| 来自 provider 的 API key 错误，例如 OpenAI 的 `Incorrect API key provided: sk-...`，或 xAI 返回的带有 `Incorrect API key provided.` 的 `400` | LangSmith 中存储的 provider key 无效或已被撤销。 | 替换已存储的 provider key。 |
+| Anthropic 的 `invalid x-api-key`，且 client 的 base URL 设置为 gateway | 存储的 Anthropic key 无效或已被撤销。 | 替换已存储的 `ANTHROPIC_API_KEY`。 |
+
+Amazon Bedrock 和 Gemini Enterprise Agent Platform 会返回 `400` 并指明缺失的凭证，而不是返回 `424`。请参见[验证 Bedrock 配置](#验证-bedrock-配置)。
+
+关于调用方 LangSmith API key 产生的错误（例如 `401` 和 `403`），或绕过 gateway 的 client 返回的 `invalid x-api-key`，请参见 [Fix authentication errors](/langsmith/llm-gateway-authentication#fix-authentication-errors)。
+
 ## See also
 
-- [Admin 设置](/langsmith/llm-gateway-admin-setup)：添加 provider secrets 并授予 gateway 访问权限。
+- [Authenticate to the LLM Gateway](/langsmith/llm-gateway-authentication)：选择并发送调用方使用的 LangSmith API key。
+- [Set up the LLM Gateway](/langsmith/llm-gateway-admin-setup)：为你的组织设置 provider keys、权限和策略。
 - [Direct model access](/langsmith/llm-gateway-direct-model-access)：通过 provider 专属的 gateway path 调用 provider API。
 - [启用 LLM Gateway](/langsmith/llm-gateway-self-hosted)：在自托管 LangSmith 上启用 gateway。

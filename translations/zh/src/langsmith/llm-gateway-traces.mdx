@@ -1,0 +1,64 @@
+---
+title: 查看 LLM Gateway traces
+sidebarTitle: 查看 gateway traces
+description: 查找 LLM Gateway traces，读取其策略和成本 metadata，在 LangSmith Engine 中分类处理策略违规，并控制谁可以查看 gateway traces。
+---
+
+import LLMGatewayBetaNote from '/snippets/langsmith/llm-gateway-beta-note.mdx';
+
+<LLMGatewayBetaNote />
+
+每次经 LLM Gateway 的调用都会追踪到 LangSmith，策略违规会出现在 [LangSmith Engine](/langsmith/engine) 中，供分类处理。
+
+## gateway traces 出现在哪里
+
+每个经 gateway 代理的调用都会追踪到调用方 API key 所关联[工作区](/langsmith/administration-overview#workspaces)中名为 `gateway` 的 project。要控制谁可以查看这些 traces，请参见[限制 trace 的可见性](#限制-trace-的可见性)。
+
+### 打开 Traces 标签页
+
+要查看 gateway 请求，请前往 **LLM Gateway** 并选择 **Traces** 标签页。Simulator 的 **View trace** 按钮会在该标签页中打开其请求，而 **Usage** 详细视图中的 **View traces** 按钮会打开某个用户、API key 或 header 值支出背后的 traces。在 Developer 方案中，请改为打开工作区中的 `gateway` tracing project。
+
+对所有组织而言，trace 内容（请求和响应 body）默认关闭，因此 gateway traces 只记录 metadata，例如 token 数量、策略结果和调用方身份。不含内容的 traces 不计入你的 LangSmith trace 配额。要存储内容，请在 [data policy](/langsmith/llm-gateway-data-policy#data-retention) 中开启 **Trace content**。符合内容记录 data policy 的 traces 会计入你方案的 trace 量。
+
+### Trace 元数据
+
+经 gateway 代理的调用可以通过其落入的 project 以及附加到 span 上的 metadata，与直接调用 LLM 区分开来。gateway 专属的 key 在 trace metadata 中出现在 `gateway.` 下，并记录为 `langsmith.metadata.gateway.*` span attributes：
+
+- **Gateway project**：按 `gateway` project 筛选，或按是否存在 `langsmith.metadata.gateway.*` span attributes 筛选，以找到经 gateway 代理的调用。
+- **调用方身份**：`gateway.workspace_id`、`gateway.api_key_id` 和 `gateway.user_agent`（调用客户端的 `User-Agent` header）。`gateway.user_id` 仅为 personal access tokens 设置，因此使用 service key 的调用没有用户。
+- **凭证来源**：`gateway.credential_source` 指出为 provider 调用付费的凭证：`byok` 表示工作区的 provider key，`credits` 表示 [Gateway Credits](/langsmith/llm-gateway-credits)，`subscription_oauth` 表示 [Claude 订阅](/langsmith/llm-gateway-coding-agents#use-claude-subscription-oauth)，或 `platform_managed`。每个 gateway trace 都带有该 key。
+- **认证模式**：仅当调用方未使用 LangSmith API key 认证时才设置 `gateway.auth_mode`，例如 Claude 订阅的 `claude_max_oauth`。
+- **模型和 provider**：`ls_model_name` 和 `ls_provider`，**Usage** 标签页按它们对支出分组。
+- **请求 headers**：每个 `X-Gateway-*` 请求 header 都记录为 `gateway.<name>`。关于名称的规范化方式，请参见 [Matchable headers](/langsmith/llm-gateway-header-policies#matchable-headers)。
+- **策略评估结果**：每个 gateway span 都会通过 `langsmith.metadata.gateway.policy.matched_ids/_names`、`passed_ids/_names` 和 `violated_ids/_names` 记录评估了哪些策略及其结果，因此通过和阻止都会被捕获。
+- **Guard 规则匹配**：当脱敏策略生效时，guard pipeline 会生成一个 `rule_id → count` 映射，并以 `policy.matched_rules`、`passed_rules` 和 `violated_rules` 标记到 span 上。这些是 rule ID，不是 PII 或 secret 类别标签。
+- **内容标记**：在不存储请求和响应内容的 trace 上，`ls_metadata_only` 为 `true`。当 gateway 因达到每月 trace 上限而丢弃内容时，`content_quota_exceeded` 也为 `true`。
+- **成本数据**：token 数量和成本会即时计算，并计入支出上限策略所依据的同一个支出累加器。
+
+gateway 会自行设置这些 key。客户端无法通过请求 headers 覆盖它们。
+
+## 限制 trace 的可见性
+
+gateway traces 以 runs 的形式写入工作区 project，并遵循 LangSmith 的标准工作区成员模型。在工作区中拥有 `runs:read`（以及查看 project 本身所需的 `projects:read`）的任何人都可以查看该工作区 gateway project 中的 traces。内置的 Workspace Admin、Workspace Editor 和 Workspace Viewer [角色](/langsmith/rbac#workspace-roles)默认都包含这两项权限。
+
+如果需要限制谁可以查看 gateway traces，有两种选择：
+
+- **独立的工作区**（适用于任何[方案](/langsmith/pricing-plans)）：创建一个成员受限的工作区，再为开发者 coding agents 创建一个成员范围更广的工作区。每个工作区都有自己的 provider secrets 和 trace projects。
+- **Project 级访问策略**（需要 [Enterprise 方案](/langsmith/pricing-plans)）：编写一个 [ABAC](/langsmith/abac) 策略，把 gateway project 上的 `projects:read` 和 `runs:read` 限制给特定用户或角色。
+
+## LangSmith Engine 集成
+
+当治理策略触发时（例如达到支出限制、检测到并脱敏 PII，或捕获到 secret），该事件会作为 metadata 记录在 trace 上。这些策略违规会作为问题出现在 LangSmith Engine 中。
+
+在 Engine 问题中，你可以：
+
+1. **查看违规内容：** 哪条策略触发，什么被阻止或脱敏。
+1. **点击进入 trace：** 准确查看策略触发时 agent 正在做什么。
+1. **诊断根本原因：** 是重试循环消耗了预算、用户把凭证粘贴到了 prompt 中，还是合法工作负载超出了上限，等等。
+1. **采取行动：** 更新 agent 的配置、调整策略，或上报处理。
+
+## 下一步
+
+- [监控 LLM Gateway 支出](/langsmith/llm-gateway-monitoring)：按用户、API key、模型和 provider 跟踪支出。
+- [支出策略](/langsmith/llm-gateway-spend-policies)：为 API keys 和用户附加成本上限。
+- [Data policies](/langsmith/llm-gateway-data-policy)：配置 data policies。

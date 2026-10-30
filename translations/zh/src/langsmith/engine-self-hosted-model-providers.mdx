@@ -20,7 +20,7 @@ Engine 会直接从你的集群调用你的 providers。Prompts 和响应只会�
 
 Engine 的 sandbox 用量包含在 Engine 的 LSU 计费中。Engine 用于诊断 issue、生成修复方案和编写 evaluators 的 sandboxes 不会产生额外的 Sandboxes 产品费用。
 
-Engine 支持 Anthropic、OpenAI、Amazon Bedrock、Google Vertex AI 和 Azure AI Foundry。它会使用你选择的 providers 的模型组合，因此为了获得最佳结果，请为你有权限访问的每家 provider 添加凭据。
+Engine 支持 Anthropic、OpenAI、Amazon Bedrock、Google Vertex AI 和 Azure AI Foundry，还可以通过[你自己的 model gateway](#use-a-model-gateway)调用 Claude 和 GPT。它会使用你选择的 providers 的模型组合，因此为了获得最佳结果，请为你有权限访问的每家 provider 添加凭据。
 
 在你的 provider 账户中，为你的 provider 提供的 Anthropic Claude 模型和 OpenAI GPT 模型启用访问。在 Azure 上，请使用 Azure AI Foundry 资源。要确认 Engine 可以访问它使用的模型，请运行 [**Test connection**](#test-a-provider)。
 
@@ -212,6 +212,137 @@ Amazon Bedrock、Google Vertex AI 和 Azure AI Foundry 可以使用 Engine pods 
 
 保存的凭据优先于云身份。在切换 provider 时，请先应用云身份配置，再移除其保存的凭据。然后只在 **Settings > Engine > Model providers** 下移除该 provider 保存的 API key 或 service account JSON。对于 Bedrock，还要移除所有保存的 access key、secret access key 和 session token。保留 Azure AI Foundry 资源名称和任何 Bedrock 区域设置，然后再次[测试该 provider](#test-a-provider)。
 
+## 使用 model gateway
+
+如果你的组织通过自己的 LLM gateway 路由模型流量，Engine 可以通过它发送 Claude 和 GPT 调用，而不是直接调用 providers。该 gateway 会以 **Model gateway** 的形式出现在 **Settings > Engine > Model providers** 下。
+
+<Info>
+Model gateway 支持需要 LangSmith Helm chart `0.17.31` 或更高版本。
+</Info>
+
+Gateway 由安装 LangSmith 的人在 Helm values 中配置，而不是在 UI 中配置。Gateway URL 通常是私有地址，如果做成组织级设置，任何 Organization Admin 都能让 Engine 指向内部服务。Model gateway 目前尚不支持 [BYOC](/langsmith/engine-self-hosted#engine-on-byoc)。
+
+### Gateway 要求
+
+你的 gateway 必须：
+
+- **为 Claude 提供 Anthropic Messages API、为 GPT 提供 OpenAI Responses API，或两者都提供。** Engine 可在任一模型系列上运行。为了获得最佳结果，请两者都提供。
+- **原样转发 `anthropic-beta` header 和请求体。** Engine 的 Claude 请求使用一项 beta 功能，缺少它时 Anthropic 可能会拒绝请求。
+- **在每个响应中返回 token 用量。** 如果响应中没有用量，Engine 会判定该调用失败。
+- **接受 Engine 请求的 provider 模型 ID。** 如果你的 gateway 将它们映射到自己的 deployments，请让响应中的模型保持同一模型系列。
+- **将 base URL 设置为 gateway 的最终地址。** Engine 不跟随重定向，因此会发生重定向的 base URL（例如从 `http` 到 `https`）会让每次调用都失败。
+
+Engine 只发送模型请求。使用 API key 认证时，它不会向 gateway 发送组织、workspace 或 project 标识符。
+
+### 配置 gateway
+
+<Steps>
+  <Step title="声明你的 gateway 提供哪些 API">
+    告诉 LangSmith 该 gateway 提供哪些 API。只有设置此项后，LangSmith 才会显示 **Model gateway**：
+
+    ```yaml
+    commonEnv:
+      - name: ENGINE_GATEWAY_APIS
+        value: '["anthropic","openai"]'
+    ```
+
+    只列出你的 gateway 提供的 API：`anthropic`、`openai` 或两者。
+  </Step>
+  <Step title="让 Engine 指向 gateway">
+    在两个 Engine 工作负载上设置 gateway 的 base URL。Engine 会在每个 URL 后追加 API 路径：
+
+    - `ENGINE_GATEWAY_ANTHROPIC_BASE_URL`：Anthropic SDK 客户端会用作 base URL 的 URL。Engine 调用 `<base URL>/v1/messages`。
+    - `ENGINE_GATEWAY_OPENAI_BASE_URL`：OpenAI SDK 客户端会使用的 URL，通常以 `/v1` 结尾。Engine 调用 `<base URL>/responses`。
+
+    只为你在 `ENGINE_GATEWAY_APIS` 中列出的 API 设置 URL。这些 URL 必须使用 HTTPS。要信任私有证书颁发机构，请参见[为 TLS 挂载内部 CA](/langsmith/self-host-custom-tls-certificates#mount-internal-cas-for-tls)。对于集群内的纯 HTTP 地址，还要将 `ENGINE_GATEWAY_ALLOW_INSECURE_HTTP` 设置为 `"true"`。
+  </Step>
+  <Step title="配置认证">
+    选择 Engine 向 gateway 认证的方式：
+
+    <Tabs>
+      <Tab title="API key">
+        将 gateway key 存储在 Kubernetes secret 中，并挂载到两个 Engine 工作负载。将 `ENGINE_GATEWAY_API_KEY_FILE` 设置为挂载文件的路径。
+
+        ```yaml
+        engineInsightsAgent:
+          apiServer:
+            deployment:
+              extraEnv:
+                - name: ENGINE_GATEWAY_ANTHROPIC_BASE_URL
+                  value: "https://<gateway-host>/anthropic"
+                - name: ENGINE_GATEWAY_OPENAI_BASE_URL
+                  value: "https://<gateway-host>/openai/v1"
+                - name: ENGINE_GATEWAY_API_KEY_FILE
+                  value: "/etc/engine-gateway/api-key"
+              volumes:
+                - name: engine-gateway
+                  secret:
+                    secretName: engine-model-gateway
+              volumeMounts:
+                - name: engine-gateway
+                  mountPath: /etc/engine-gateway
+                  readOnly: true
+          queue:
+            deployment:
+              # The same extraEnv, volumes, and volumeMounts as apiServer.
+        ```
+
+        默认情况下，Engine 以 `Authorization: Bearer <key>` 发送该 key。如果你的 gateway 期望该 key 出现在其他 header 中，请将 `ENGINE_GATEWAY_AUTH_HEADER` 设置为该 header 的名称，例如 `x-api-key`。Engine 随后会把该 key 作为该 header 的值发送。
+
+        要发送额外的 headers，请挂载一个目录，每个 header 对应一个文件，并将 `ENGINE_GATEWAY_HEADERS_DIR` 设置为该目录的路径。每个文件的名称就是 header 名称，文件内容就是其值。Engine 保留 `host`、`content-length`、`content-type`、`transfer-encoding`、`connection`，以及以 `x-langsmith-` 开头的 headers。
+
+        Engine 会在每次运行开始时读取 key 和 header 文件，因此可以在不重启 Engine 的情况下轮换它们。
+      </Tab>
+      <Tab title="LLM auth proxy">
+        如果你的 gateway 位于 [LLM auth proxy](/langsmith/llm-auth-proxy-self-hosted) 之后，Engine 可以使用短期 LangSmith token 而不是静态 key 进行认证。参见[使用 LLM auth proxy](#use-the-llm-auth-proxy)。
+      </Tab>
+    </Tabs>
+
+    应用 Helm values 并重启两个 Engine 工作负载，使它们读取新的环境变量。
+  </Step>
+  <Step title="测试并选择 gateway">
+    在 **Settings > Engine > Model providers** 下，点击 **Model gateway** 旁边的 **Test connection**。Engine 会为你配置的每个 API 通过 gateway 发送一个小请求，并显示每个 API 是否成功。如果 gateway 拒绝请求，结果中会包含 gateway 的错误消息。然后选择 **Model gateway** 并保存。
+  </Step>
+</Steps>
+
+### 使用 LLM auth proxy
+
+使用 LLM auth proxy 时，Engine 从不持有 gateway key。proxy 会校验一个由 LangSmith 签名的 token，而你的 proxy 配置负责添加 gateway 的凭据。
+
+每次运行时，Engine 都会从你的 LangSmith 安装请求一个 token，并在每次模型调用的 `X-LangSmith-LLM-Auth` header 中发送它。token 有效期为五分钟，Engine 会在当前 token 过期前请求新 token。**Test connection** 使用相同的流程。
+
+设置方法：
+
+1. 完成[设置 LLM auth proxy](/langsmith/llm-auth-proxy-self-hosted)的第 1 到第 4 步：配置 JWT 签名和 issuer、为你的组织启用 proxy、设置 JWT audience，并以你的 gateway 作为 upstream 安装 auth proxy chart。
+1. 在两个 Engine 工作负载上，将 `ENGINE_GATEWAY_AUTH` 设置为 `llm_auth_proxy`，并将 base URL 指向 auth proxy 服务而不是 gateway。不要设置 `ENGINE_GATEWAY_API_KEY_FILE`：两者同时设置时，Engine 的运行会失败。
+
+   proxy 会把每个请求的路径追加到 chart 的 `authProxy.upstream` URL 后，因此请保留每个 API 在你的 gateway 上的路径。例如，`authProxy.upstream` 设置为 `https://gateway.example.com`，gateway 在 `https://gateway.example.com/anthropic` 提供 Anthropic API 时，将 `ENGINE_GATEWAY_ANTHROPIC_BASE_URL` 设置为 proxy 的地址加上 `/anthropic`。chart 会将服务命名为 `<release>-auth-proxy`，默认监听端口 `10000`（`authProxy.service.port`）。
+
+   ```yaml
+   engineInsightsAgent:
+     apiServer:
+       deployment:
+         extraEnv:
+           - name: ENGINE_GATEWAY_AUTH
+             value: "llm_auth_proxy"
+           - name: ENGINE_GATEWAY_ANTHROPIC_BASE_URL
+             value: "http://<auth-proxy-service>.<namespace>.svc.cluster.local:10000/anthropic"
+           - name: ENGINE_GATEWAY_OPENAI_BASE_URL
+             value: "http://<auth-proxy-service>.<namespace>.svc.cluster.local:10000/openai/v1"
+           - name: ENGINE_GATEWAY_ALLOW_INSECURE_HTTP
+             value: "true"
+     queue:
+       deployment:
+         # The same extraEnv as apiServer.
+   ```
+
+   仅当 Engine 在集群内通过纯 HTTP 访问 auth proxy 时，才需要 `ENGINE_GATEWAY_ALLOW_INSECURE_HTTP`。
+1. 如果你组织的 **Allowed URLs** 设置为 **Custom**，请将 auth proxy 的主机名添加到列表中。
+
+Engine 按计划运行，而不是以登录用户身份运行。它的 token 标识组织和 workspace，`actor_type` 设置为 `api_key:service`，且不包含 IdP token。如果你的 `ext_authz` 或 `ext_proc` 服务会用用户的 IdP token 换取 gateway 凭据，请单独处理 Engine 的请求，例如将 workspace 映射到 gateway 凭据。
+
+如果 Engine 报告该组织未启用 LLM auth proxy，或该组织没有 JWT audience，请完成[在 LangSmith 中配置组织设置](/langsmith/llm-auth-proxy-self-hosted#3-configure-organization-settings-in-langsmith)。
+
 ## 私有连接
 
 Engine 可以通过公共 egress 工作。要让它的流量保持在私有网络上，请通过 AWS PrivateLink 连接到 LangSmith Intelligence，或通过你所在云的私有 endpoint 连接到你自己的 model providers。
@@ -306,9 +437,9 @@ Engine 会从 `standalone-insights` pods 调用每家 provider 的标准 API 主
 | Amazon Bedrock (Runtime) | `bedrock-runtime.<region>.amazonaws.com` | 针对 `com.amazonaws.<region>.bedrock-runtime` 的 interface VPC endpoint，启用 private DNS |
 | Google Vertex AI | `<region>-aiplatform.googleapis.com`，对于 global 区域为 `aiplatform.googleapis.com` | 用于 Google API 的 Private Service Connect，并为 `googleapis.com` 配置私有 DNS |
 | Azure AI Foundry | `<resource>.openai.azure.com` 和 `<resource>.services.ai.azure.com` | 针对 Foundry 资源的私有 endpoint，及其私有 DNS 区域 |
-| Anthropic、OpenAI | `api.anthropic.com`、`api.openai.com` | 不可用。这些 provider 需要公共 egress。 |
+| Anthropic、OpenAI | `api.anthropic.com`、`api.openai.com` | 不可用。这些 provider 需要公共 egress，除非通过 [model gateway](#use-a-model-gateway) 路由它们。 |
 
-Engine 不接受自定义 endpoint URL，因此私有连接通过 DNS 实现：标准主机名必须能从 Engine pods 解析到你的私有 endpoint。
+Engine 不接受这些 provider 的自定义 endpoint URL，因此私有连接通过 DNS 实现：标准主机名必须能从 Engine pods 解析到你的私有 endpoint。要将模型流量发送到你选择的地址，请使用 [model gateway](#use-a-model-gateway)。
 
 如果 Engine 使用[云身份](#use-cloud-identity-for-your-model-providers)进行认证，pods 还需要访问你所在云的 token 服务，例如在 AWS 上为 AWS STS 的 interface VPC endpoint。
 
