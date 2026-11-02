@@ -469,11 +469,15 @@ These are common nouns, not proper nouns. Write them lowercase in prose, includi
 
 ### Product and feature name capitalization
 
-Capitalize a word when it refers to a **product or brand name**. Use lowercase when it refers to a **common noun**: a thing you build, an instance, or a type.
+Capitalize a word when it refers to a **product or brand name**, or to a **named feature** of a product. Use lowercase when it refers to a **common noun**: a thing you build, an instance, or a type.
 
 **Capitalize** product and brand names:
 
 - LangChain, LangGraph, LangSmith, Deep Agents, Fleet, Engine
+
+**Capitalize** named features of a product:
+
+- Agent Registry (a named feature of LangSmith)
 
 **Lowercase** common nouns (things you create, instances, or types):
 
@@ -483,7 +487,7 @@ Capitalize a word when it refers to a **product or brand name**. Use lowercase w
 - "Build agents across the agent development lifecycle" (the lifecycle is a process, not a product; marketing materials capitalize it, docs do not)
 - "LangChain provides the open agent engineering platform" (the phrase describes what LangChain provides; it is not a product name)
 
-When in doubt, ask: is this word the product's proper name, or is it describing a thing the user creates or works with? If the latter, use lowercase.
+When in doubt, ask: is this word the proper name of a product or a named feature, or is it describing a thing the user creates or works with? If the latter, use lowercase.
 
 Spell out "agent development lifecycle" in prose. Do not use the "ADLC" acronym, which appears in marketing materials but not in the documentation.
 
@@ -596,6 +600,32 @@ Notes:
 - Without `--write`, the script prints the table to stdout for inspection.
 - After regenerating, commit only `src/snippets/langsmith/mda-oauth-catalog.mdx`. Do not edit
   that snippet by hand.
+
+### Update the egress IP inventory
+
+The LangSmith and LangSmith Deployment egress IP tables on `/langsmith/cloud` and
+`/langsmith/cloud-platform-features` are generated from
+`src/langsmith/egress-ip-addresses.json` by `scripts/generate_egress_ip_tables.py`. The JSON is
+also published as-is at `/langsmith/egress-ip-addresses.json` for customers to poll.
+
+Each address has a service (`langsmith` or `langsmith-deployment`), cloud (`gcp` or `aws`),
+customer region (`us`, `eu`, or `apac`), and IPv4 `/32` CIDR. Customers must allowlist every
+matching CIDR, including allocated reserves. Publish new reserves before using them. Attaching
+an already-published address does not require an inventory update. Remove an address only
+after it stops carrying traffic and has been released.
+
+```bash
+uv run python scripts/generate_egress_ip_tables.py           # rewrite the version and both tables
+uv run python scripts/generate_egress_ip_tables.py --check   # fail if anything is stale
+```
+
+Notes:
+
+- Commit the JSON and both generated pages together. Do not edit the generated tables or the
+  `version` field by hand.
+- `make test` runs the same `--check` on the committed files, so CI fails on drift.
+- After deployment, verify the changes at
+  [the public JSON](https://docs.langchain.com/langsmith/egress-ip-addresses.json).
 
 ### Check integration repo links
 
