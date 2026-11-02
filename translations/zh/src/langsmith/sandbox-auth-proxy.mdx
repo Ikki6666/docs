@@ -195,7 +195,8 @@ await client.createSandbox({
 | `name` | 必填。规则的标识符 |
 | `type` | header 注入规则省略；provider 认证规则设为 `aws` 或 `gcp`；设为 `relay` 可让匹配的连接经由 [relay](/langsmith/relays) 发送 |
 | `match_hosts` | header 规则必填；在 `aws` 和 `gcp` 规则上会被拒绝。纯主机名，或在可注册域名前的 `*.` 通配符（`*.github.com`，而不是 `*.com` 或 `*`）。不带 scheme、路径或端口。通配符不匹配顶级域名 |
-| `match_paths` | 要匹配的路径，为空则表示所有路径。仅限 header 规则 |
+| `match_paths` | 要匹配的路径，为空则表示所有路径。仅限 header 规则。模式会与去掉查询字符串的请求路径匹配；参见[按路径或 header 匹配规则](#按路径或-header-匹配规则) |
+| `match_headers` | 必须全部存在的请求 header，每项写作 `"name: value"`，名称小写且值为精确匹配。仅限 header 规则；参见[按路径或 header 匹配规则](#按路径或-header-匹配规则) |
 | `headers` | 要注入的请求头，每个都包含 `name`、`type` 和 `value`。仅限 header 规则 |
 | `aws` / `gcp` | Provider 凭据；参见[对 AWS 请求进行身份验证](#对-aws-请求进行身份验证)和[对 GCP 请求进行身份验证](#对-gcp-请求进行身份验证) |
 | `env_vars` | 在该规则启用期间为 sandbox 设置的环境变量 |
@@ -211,6 +212,73 @@ await client.createSandbox({
 | `workspace_secret` | 使用 `{KEY}` 语法引用一个工作区密钥。在应用 proxy 配置时解析 |
 | `plaintext` | 原样存储并原样返回。适用于非敏感 header |
 | `opaque` | 只写。值会静态加密保存，且永远不会通过 API 返回 |
+
+### 按路径或 header 匹配规则
+
+只使用 `match_hosts` 会让发往某个主机的每个请求都走同一条规则。添加 `match_paths` 或 `match_headers`，可以让发往同一主机的不同请求使用不同的凭据。proxy 按列表顺序检查已启用的 header 规则，并应用第一条主机、路径和 header 全部匹配的规则，因此请把更具体的规则放在前面。
+
+`match_paths` 模式会与请求路径比较，而不是查询字符串：
+
+| Pattern | Matches |
+|---------|---------|
+| `/v1/runs` | 恰好匹配 `/v1/runs` |
+| `/v1/*` 或 `/v1/**` | 任何以 `/v1` 开头的路径。匹配的是 `/*` 之前的文本，因此 `/v1/*` 也会匹配 `/v10` |
+| `*/runs` | 任何以斜杠之后的文本 `runs` 结尾的路径。它也会匹配 `/v1/xruns` |
+| `*` 或 `**` | 所有路径 |
+
+模式不能把通配符放在路径中间，例如 `/v1/*/runs`。
+
+同一个主机可以按路由使用不同的凭据。下面的示例为 `/ingest` 下的请求发送一个 secret，为 `/query` 下的请求发送另一个：
+
+```json
+{
+  "rules": [
+    {
+      "name": "ingest",
+      "match_hosts": ["api.example.com"],
+      "match_paths": ["/ingest/*"],
+      "headers": [
+        {"name": "x-api-key", "type": "workspace_secret", "value": "{INGEST_API_KEY}"}
+      ]
+    },
+    {
+      "name": "query",
+      "match_hosts": ["api.example.com"],
+      "match_paths": ["/query/*"],
+      "headers": [
+        {"name": "x-api-key", "type": "workspace_secret", "value": "{QUERY_API_KEY}"}
+      ]
+    }
+  ]
+}
+```
+
+当多个路由共用同一路径，或凭据取决于代码代表哪个账户时，请改为根据请求 header 匹配。每个 `match_headers` 条目都是 `"name: value"`，名称小写且值为精确匹配，只有当请求携带所有列出的 header 时该规则才会匹配。让 sandbox 发送一个占位值，规则会将其替换为真实凭据：
+
+```json
+{
+  "rules": [
+    {
+      "name": "account-a",
+      "match_hosts": ["api.example.com"],
+      "match_headers": ["authorization: Bearer account-a"],
+      "headers": [
+        {"name": "Authorization", "type": "workspace_secret", "value": "Bearer {ACCOUNT_A_TOKEN}"}
+      ]
+    },
+    {
+      "name": "account-b",
+      "match_hosts": ["api.example.com"],
+      "match_headers": ["authorization: Bearer account-b"],
+      "headers": [
+        {"name": "Authorization", "type": "workspace_secret", "value": "Bearer {ACCOUNT_B_TOKEN}"}
+      ]
+    }
+  ]
+}
+```
+
+`match_paths` 和 `match_headers` 仅在 header 规则上被接受。`aws`、`gcp` 和 `relay` 规则会拒绝这两者。
 
 ### 从规则设置环境变量
 

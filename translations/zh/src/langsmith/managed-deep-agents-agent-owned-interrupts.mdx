@@ -18,7 +18,7 @@ Agent-owned interrupts 要求 `managed-deepagents>=0.8.0`，并且 deployed agen
 
 ## 工作原理
 
-1. Run 从一条 Slack 消息开始。你的 tool 从 `runtime.channel` 读取会话，并使用 deployment 的 bot token 将 Block Kit 消息发送到同一个 Slack thread 中。
+1. Run 从一条 Slack 消息开始。你的 tool 从 `runtime.thread.origin.channel` 读取会话，并使用 deployment 的 bot token 将 Block Kit 消息发送到同一个 Slack thread 中。
 2. Tool 调用 `interrupt()` 并传入携带 correlation ID 的值。Thread 停在 checkpoint 上。
 3. 用户按下按钮或提交 modal。Slack 将交互发送给 Managed Deep Agents，后者将其作为 `user_prompt_response` 事件转发到 deployment。
 4. SDK 将该事件与停放的 interrupt 匹配并恢复 run。`interrupt()` 返回用户的响应，tool 继续执行。
@@ -30,18 +30,18 @@ Agent-owned interrupts 要求 `managed-deepagents>=0.8.0`，并且 deployed agen
 Tool 需要三样东西：要发送到的 Slack 会话、bot token，以及将表单与 interrupt 关联起来的 correlation ID。
 
 :::python
-- **会话**：`runtime.channel.raw_event` 是启动这次 run 的 Slack 事件。它携带 `channel`、`ts`，对于 thread 中的消息还携带 `thread_ts`。发送到该 thread，答案才能路由回同一个 agent thread。
+- **会话**：`runtime.thread.origin.channel.raw_event` 是启动这次 run 的 Slack 事件。它携带 `channel`、`ts`，对于 thread 中的消息还携带 `thread_ts`。发送到该 thread，答案才能路由回同一个 agent thread。
 - **Bot token**：`connections.get("mda/slack-bot-token", {"type": "agent"})` 解析 Managed Deep Agents 为 deployment 预置的 Slack app 的 token。该 slug 是保留的，无法用 `mda connections create` 创建。
 - **Correlation ID**：在每个按钮的 `value`（以 JSON 形式）和传给 `interrupt()` 的值中，把同一个字符串放在 `INTERRUPT_CORRELATION_KEY` 下。
 :::
 
 :::js
-- **会话**：`runtime.channel.rawEvent` 是启动这次 run 的 Slack 事件。它携带 `channel`、`ts`，对于 thread 中的消息还携带 `thread_ts`。发送到该 thread，答案才能路由回同一个 agent thread。
+- **会话**：`runtime.thread.origin.channel.rawEvent` 是启动这次 run 的 Slack 事件。它携带 `channel`、`ts`，对于 thread 中的消息还携带 `thread_ts`。发送到该 thread，答案才能路由回同一个 agent thread。
 - **Bot token**：`connections.get("mda/slack-bot-token", { type: "agent" })` 解析 Managed Deep Agents 为 deployment 预置的 Slack app 的 token。该 slug 是保留的，无法用 `mda connections create` 创建。
 - **Correlation ID**：在每个按钮的 `value`（以 JSON 形式）和传给 `interrupt()` 的值中，把同一个字符串放在 `INTERRUPT_CORRELATION_KEY` 下。
 :::
 
-内置 Slack channel 的 `runtime.channel.post` 只发送文本，因此请直接通过 Slack Web API 发送 Block Kit。
+内置 Slack channel 的 `post` 只发送文本，因此请直接通过 Slack Web API 发送 Block Kit。
 
 :::python
 ```python tools/approval.py expandable
@@ -64,13 +64,14 @@ async def request_approval(amount: str, runtime: ManagedDeepAgentRuntime) -> str
     Args:
         amount: The spend to approve, such as "$1,200".
     """
-    channel = runtime.channel
-    if channel is None or channel.provider != "slack":
+    origin = runtime.thread.origin
+    if origin is None or origin.channel.provider != "slack":
         return "Approval forms are available only in Slack."
+    channel = origin.channel
 
     correlation_id = str(uuid7())
-    # The tool runs again when the interrupt resumes. Post only on the first pass.
-    if channel.event["type"] != "user_prompt_response":
+    # The tool runs again when the interrupt resumes. Post only in the run the Slack message started.
+    if channel.event is not None and channel.event["type"] == "message":
         await post_approval_form(channel.raw_event, amount, correlation_id)
 
     response = interrupt({INTERRUPT_CORRELATION_KEY: correlation_id, "amount": amount})
@@ -138,14 +139,14 @@ type SlackEvent = { channel: string; ts: string; thread_ts?: string };
 
 export const requestApproval = tool(
   async ({ amount }, runtime: ManagedDeepAgentRuntime) => {
-    const channel = runtime.channel;
+    const channel = runtime.thread?.origin?.channel;
     if (!channel || channel.provider !== "slack") {
       return "Approval forms are available only in Slack.";
     }
 
     const correlationId = randomUUID();
-    // The tool runs again when the interrupt resumes. Post only on the first pass.
-    if (channel.event.type !== "user_prompt_response") {
+    // The tool runs again when the interrupt resumes. Post only in the run the Slack message started.
+    if (channel.event?.type === "message") {
       await postApprovalForm(channel.rawEvent as SlackEvent, amount, correlationId);
     }
 
@@ -226,11 +227,11 @@ async function postApprovalForm(
 | `correlation_id` | `string`，可选 | 当按钮的 `value` 是带有 `mda_correlation_id` key 的 JSON 时存在。Modal 提交不会携带它。 |
 
 :::python
-同一个响应也可以在 run context 上通过 `runtime.channel.event` 获取，其中 `type` 为 `user_prompt_response`。Slack 原样的交互 payload 位于 `runtime.channel.raw_event`。对于消息内带有输入的表单，用户的填写内容位于 `raw_event["state"]["values"]`，按 block ID 和 action ID 作为 key。
+同一个响应也可以在 run context 上通过 `runtime.thread.origin.channel.event` 获取，其中 `type` 为 `user_prompt_response`。Slack 原样的交互 payload 位于 `runtime.thread.origin.channel.raw_event`。对于消息内带有输入的表单，用户的填写内容位于 `raw_event["state"]["values"]`，按 block ID 和 action ID 作为 key。
 :::
 
 :::js
-同一个响应也可以在 run context 上通过 `runtime.channel.event` 获取，其中 `type` 为 `user_prompt_response`。Slack 原样的交互 payload 位于 `runtime.channel.rawEvent`。对于消息内带有输入的表单，用户的填写内容位于 `rawEvent.state.values`，按 block ID 和 action ID 作为 key。
+同一个响应也可以在 run context 上通过 `runtime.thread.origin.channel.event` 获取，其中 `type` 为 `user_prompt_response`。Slack 原样的交互 payload 位于 `runtime.thread.origin.channel.rawEvent`。对于消息内带有输入的表单，用户的填写内容位于 `rawEvent.state.values`，按 block ID 和 action ID 作为 key。
 :::
 
 Managed Deep Agents 只读取 Slack 交互 payload 中的第一个 action，因此一次点击必须只代表一个事件。
@@ -245,7 +246,7 @@ Slack 不知道按钮属于哪个 interrupt，因此 SDK 会读取停放在 thre
 | 一个或多个 | 存在且恰好匹配一个 | 恢复匹配的 interrupt。 |
 | 多个 | 缺失 | 什么都不运行。SDK 记录歧义并确认该事件。 |
 | 一个或多个 | 存在但不匹配任何 interrupt，或匹配多个 | 什么都不运行。启动新回合会放弃停放的 checkpoints。 |
-| 没有 | 任意 | 启动一个没有新消息的全新 run。该响应只能在 `runtime.channel.event` 上获取。 |
+| 没有 | 任意 | 启动一个没有新消息的全新 run。该响应只能在 `runtime.thread.origin.channel.event` 上获取。 |
 
 只要 agent 可能在同一个 thread 上停放多个 interrupt，就应携带 correlation ID。没有它，thread 只有在恰好一个 interrupt 待处理时才能被应答。
 
@@ -281,7 +282,7 @@ Modal 提交永远不会携带 `correlation_id`。只有恰好一个 interrupt �
 
 ## 不暂停地发送
 
-Tool 可以发送一个表单并让 run 结束，而不调用 `interrupt()`。此时提交会启动一个没有新消息的全新 run，你的代码从 `runtime.channel.event` 读取答案。平台上没有任何东西追踪某个 prompt 是否有待处理，因此待处理表单的状态、过期时间，以及表单打开期间后续聊天消息的含义都由你的应用负责。
+Tool 可以发送一个表单并让 run 结束，而不调用 `interrupt()`。此时提交会启动一个没有新消息的全新 run，你的代码从 `runtime.thread.origin.channel.event` 读取答案。平台上没有任何东西追踪某个 prompt 是否有待处理，因此待处理表单的状态、过期时间，以及表单打开期间后续聊天消息的含义都由你的应用负责。
 
 当用户的下一个动作预期是回答该 prompt 时，优先使用 `interrupt()`。
 

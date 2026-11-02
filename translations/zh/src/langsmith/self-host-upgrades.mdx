@@ -36,6 +36,7 @@ helm search repo langchain/langsmith --versions
 你应该会看到类似下面的输出：
 
 ```bash
+NAME                             	CHART VERSION	APP VERSION	DESCRIPTION
 langchain/langsmith              	0.17.2       	0.17.30    	Helm chart to deploy the langsmith application ...
 langchain/langsmith              	0.17.1       	0.17.30    	Helm chart to deploy the langsmith application ...
 langchain/langsmith              	0.17.0       	0.17.29    	Helm chart to deploy the langsmith application ...
@@ -106,6 +107,98 @@ langsmith-queue-d58cb64f7-87d68          1/1     Running     0          15h
 1. 在浏览器中访问 `langsmith-frontend` service 的 external IP。LangSmith UI 应该可以正常访问和操作。
 
    ![LangSmith UI](/langsmith/images/langsmith-ui.png)
+
+## 升级独立的 sandbox 集群
+
+当 Sandboxes 运行在[独立集群](/langsmith/self-host-sandbox-separate-cluster)中时，每次升级涉及两个 Helm release：LangSmith 集群中的 `langsmith` 和 sandbox 集群中的 `langsmith-sandbox`。两者必须保持在同一个 LangSmith release 上：
+
+- **顺序**：先升级 `langsmith`，然后在几天内升级 `langsmith-sandbox`。除 runtime 升级滚动发布期间外，不要让 sandbox hosts 运行比 control plane 更新的 release。如果某个版本的 release notes 给出了不同的顺序，请按 release notes 执行。当 runtime 落后超过 72 小时或超前超过 30 分钟时，LangSmith 会[在 UI 中发出警告](/langsmith/self-host-sandbox-separate-cluster#watch-for-a-release-mismatch)。
+- **版本**：使用 appVersion 与你的 `langsmith` chart 的 appVersion 相同的最新 `langsmith-sandbox` chart。这两个 chart 按 appVersion 配对，绝不按 chart version 配对。请参见 [Release policy](/langsmith/release-versions#pair-the-sandbox-runtime-chart)。
+- **固定版本**：将两个 release 都固定到确切的 chart 版本。绝不使用版本范围。
+
+要找到与你的 `langsmith` release 匹配的 runtime chart 版本：
+
+```bash
+helm repo update
+APP=$(helm get metadata langsmith --kube-context <langsmith-context> -n <langsmith-namespace> -o json | jq -r .appVersion)
+helm search repo langchain/langsmith-sandbox --versions --devel -o json \
+  | jq -r --arg a "$APP" '[.[] | select(.name == "langchain/langsmith-sandbox" and .app_version == $a)][0].version // error("no langsmith-sandbox chart for appVersion \($a)")'
+```
+
+每次升级 host 都会逐个重启 hosts，每次重启都会挂起该 host 上运行的 Sandboxes。请参见 [Understand a rolling upgrade](/langsmith/self-host-sandbox-operations#understand-a-rolling-upgrade)。
+
+### 使用 Helm CLI 升级
+
+运行两个命令，每个命令针对自己的集群，先运行 `langsmith`：
+
+```bash
+helm upgrade langsmith langchain/langsmith \
+  --kube-context <langsmith-context> \
+  --namespace <langsmith-namespace> \
+  --version <langsmith-chart-version> \
+  --values langsmith_config.yaml \
+  --wait
+
+helm upgrade langsmith-sandbox langchain/langsmith-sandbox \
+  --kube-context <sandbox-context> \
+  --namespace langsmith-sandbox \
+  --version <matching-sandbox-chart-version> \
+  --values langsmith_sandbox_config.yaml \
+  --wait \
+  --timeout <timeout>
+```
+
+- **runtime 不自动回滚**：不要向 `langsmith-sandbox` 升级传入 `--atomic` 或 `--rollback-on-failure`。Hosts 会逐个 drain，因此缓慢的 rollout 可能超过 `--wait` 超时，但实际上并未失败，而回滚会让每个 host 再次重启。
+- **超时**：将 `--timeout` 设置为大约 hosts 数量乘以 `sandboxHost.deployment.terminationGracePeriodSeconds`（默认 300 秒），再加上 host 启动所需的时间。要跟踪 rollout，请使用类似的超时运行 `kubectl rollout status`。
+- **复用 values**：如果你复用上一个 release 的 values，优先使用 `--reset-then-reuse-values` 而不是 `--reuse-values`。`--reuse-values` 会保留上一个 chart 的默认值，包括其 image tags。
+
+### 使用 Argo CD 或 Flux 升级
+
+- **分两次变更**：在一次 Git 变更中升级 `langsmith`。等到同步成功且应用状态为 Healthy（Flux：HelmRelease 为 `Ready`）后，再在第二次变更中将 `langsmith-sandbox` 升级到完全匹配的版本。
+- **不要合并变更**：一次变更同时升级两个 chart 会让它们同时同步。如果 `langsmith` 升级随后被阻塞，例如 pre-upgrade hook 失败，hosts 会在 control plane 通过之前超前运行。
+- **不要使用浮动版本**：绝不要让 runtime chart 使用浮动版本。不要使用范围、`*` 或 `*-0`，也不要省略 Flux HelmRelease 中的 `version`。
+
+### 使用你自己的基础设施即代码升级
+
+将两个 chart 建模为具有显式依赖关系的两个 Helm release，例如 Terraform 中的 `depends_on`，以确保 `langsmith` 先于 `langsmith-sandbox` 应用。将两者都固定到确切的 chart 版本。
+
+### 检查升级
+
+两次升级完成后：
+
+1. 检查两个 release 报告的 `APP VERSION` 是否相同。Argo CD 不更新 Helm release 记录，因此在 Argo CD 中跳过此步骤；步骤 3 检查的是同一件事：
+
+   ```bash
+   helm list --kube-context <langsmith-context> -n <langsmith-namespace> --filter '^langsmith$'
+   helm list --kube-context <sandbox-context> -n langsmith-sandbox --filter '^langsmith-sandbox$'
+   ```
+
+1. 检查 `platform-backend` 和 `sandbox-host` 的 rollout 是否已完成：
+
+   ```bash
+   kubectl --context <langsmith-context> -n <langsmith-namespace> rollout status deployment/langsmith-platform-backend
+   kubectl --context <sandbox-context> -n langsmith-sandbox rollout status deployment/langsmith-sandbox-sandbox-host --timeout=<timeout>
+   ```
+
+1. 检查每个集群运行的 image tags 是否与该 `APP VERSION` 一致：
+
+   ```bash
+   kubectl --context <langsmith-context> -n <langsmith-namespace> get deployment langsmith-platform-backend \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="platform-backend")].image}{"\n"}'
+   kubectl --context <sandbox-context> -n langsmith-sandbox get deployment langsmith-sandbox-sandbox-host \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="sandbox-host")].image}{"\n"}'
+   ```
+
+这些命令假定 release 名称为 `langsmith` 和 `langsmith-sandbox`。
+
+### 回滚 runtime
+
+只回滚 `langsmith-sandbox` release，可以使用 `helm rollback` 或还原其 Git 变更。不要回滚 `langsmith` release：它的数据库迁移只能向前推进，因此请改为向前修复。回滚 host 会像升级一样重启每个 host。这并不总是安全的：如果较新的 hosts 已经以旧 hosts 无法读取的格式写入 sandbox 数据，请改为前滚。如果不确定，请在回滚 hosts 之前联系支持。
+
+### 更改拓扑或卸载
+
+- **从内嵌 runtime 迁移**：先在 `langsmith` release 上设置 `sandboxes.external.enabled: true`，然后针对相同的 JuiceFS metadata store 和 bucket 安装 `langsmith-sandbox`。请参见 [Move an existing installation to a separate cluster](/langsmith/self-host-sandbox-separate-cluster#move-an-existing-installation-to-a-separate-cluster)。
+- **卸载**：先卸载 `langsmith-sandbox`，然后卸载或重新配置 `langsmith`。请参见 [Uninstall](/langsmith/self-host-sandbox-separate-cluster#uninstall)。
 
 ## 从 v16 升级到 v17
 
