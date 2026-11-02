@@ -25,19 +25,19 @@ host Deployment 使用 `maxSurge: 0` 和 `maxUnavailable: 1`。Kubernetes 先终
 对于 host 持有的 JuiceFS 挂载，启动包括挂载文件系统并在打开 host listener 之前检查存储访问。无法访问存储的替代者会阻塞进度，而不是接受 sandbox 流量。
 
 <Warning>
-滚动升级不是实时迁移，也不是不间断执行。正在 drain 的 host 上的 sandbox 会暂停，其已打开的连接可能断开。应用程序必须处理重连和中断的工作。
+滚动升级不保证不间断执行。正在 drain 的 host 会先尝试将每个运行中的 Sandbox 实时迁移到另一台就绪 host。它无法迁移的 Sandbox（例如没有其他 host 有足够空间时）会被挂起并保持暂停，直到再次启动。无论采用哪种方式，已打开的连接都可能断开。应用程序必须处理重连和中断的工作。
 </Warning>
 
 ## 跟踪 host drain
 
-优雅的 host 关机会在 pod 退出之前尝试挂起持久化 sandbox：
+优雅的 host 关机会在 pod 退出之前尝试移动或挂起持久化 sandbox：
 
 <Steps>
   <Step title="停止新的放置">
     host 进入 drain 状态并通知 platform backend。新的 sandbox 放置使用其他就绪 host。
   </Step>
   <Step title="保存运行中的 sandbox">
-    host 在挂起每个 VM 时停止向对应 sandbox 路由。它尝试将 VM 的内存保存到 JuiceFS，并报告该 sandbox 已停止。
+    host 会先尝试将每个运行中的 sandbox 实时迁移到另一台就绪 host。对于无法迁移的每个 sandbox，它在挂起对应 VM 时停止向该 sandbox 路由，尝试将 VM 的内存保存到 JuiceFS，并报告该 sandbox 已停止。
   </Step>
   <Step title="释放 host">
     host 在停止工作负载的同时持续续约 Lease。VM 全部停止后，它会释放 Lease 并拆除存储挂载。
@@ -71,7 +71,19 @@ host Deployment 使用 `maxSurge: 0` 和 `maxUnavailable: 1`。Kubernetes 先终
 
 ### 诊断停滞的 rollout
 
-比较期望、就绪和已更新的 host 数量。然后检查 pod 事件和节点预配：
+如果部分 host 运行当前 release，而其他 host 在升级 72 小时后仍运行较旧 release，LangSmith 会向组织管理员发出 **Sandbox host rollout is incomplete** 警告；当这些 host 落后两个或更多次版本时，警告会立即发出。该警告链接到本节，供 rollout 没有进展时参考。
+
+比较期望、就绪和已更新的 host 数量，并查看每台 host 运行的 release。然后检查 pod 事件和节点预配：
+
+```bash
+kubectl -n <namespace> get deployment langsmith-sandbox-host
+kubectl -n <namespace> get pods -l app.kubernetes.io/component=langsmith-sandbox-host \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.spec.containers[?(@.name=="sandbox-host")].image}{"\n"}{end}'
+kubectl -n <namespace> describe pod <pending-host-pod>
+kubectl -n <namespace> get events --sort-by=.lastTimestamp
+```
+
+这些名称假设 LangSmith release 名为 `langsmith`；Deployment 为 `<release>-sandbox-host`。如果运行时位于[独立集群](/langsmith/self-host-sandbox-separate-cluster)，请针对该集群的 context 和运行时 release 的 namespace 运行这些命令。在那里，Deployment 及其组件标签为 `<runtime release>-sandbox-host`，例如 `langsmith-sandbox-sandbox-host`，并且本页的设置位于 `langsmith-sandbox` chart 中的 `sandboxHost` 下，而不是 `sandboxes.sandboxHost`。
 
 - **host 停留在 `Pending`**：检查 node pool 限制、基础设施配额、regional 容量、node selector、taint 和资源请求。
 - **host 启动但未就绪**：检查 KVM 可用性、运行时日志，以及对 JuiceFS metadata 和对象存储的访问。

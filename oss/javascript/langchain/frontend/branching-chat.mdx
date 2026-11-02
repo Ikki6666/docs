@@ -167,7 +167,7 @@ function MessageWithForkControls({
 
         stream.submit(
           { messages: [{ type: "human", content: editedText }] },
-          { forkFrom: { checkpointId } }
+          { forkFrom: checkpointId }
         );
       }}
     >
@@ -190,7 +190,7 @@ function MessageWithForkControls({
 要编辑一个用户消息并分叉对话：
 
 1. 从消息元数据中获取 `parentCheckpointId`
-2. 使用 `forkFrom: { checkpointId }` 提交编辑后的消息
+2. 使用 `forkFrom: checkpointId` 提交编辑后的消息
 3. 智能体会从该位置重新运行
 
 ```ts
@@ -206,7 +206,7 @@ function handleEdit(
     {
       messages: [{ type: "human", content: newText }],
     },
-    { forkFrom: { checkpointId: metadata.parentCheckpointId } }
+    { forkFrom: metadata.parentCheckpointId }
   );
 }
 ```
@@ -220,8 +220,8 @@ function handleEdit(
 
 如果你想在不修改输入的情况下重新生成 AI 回复：
 
-1. 从 AI 消息的元数据中获取 `parent_checkpoint`
-2. 传入空输入，并使用 `forkFrom: { checkpointId }`
+1. 从 AI 消息的元数据中获取 `parentCheckpointId`
+2. 传入 `undefined` 输入，并使用 `forkFrom: checkpointId`
 3. 智能体会从该位置生成新的回复
 
 ```ts
@@ -232,12 +232,16 @@ function handleRegenerate(
   if (!metadata?.parentCheckpointId) return;
 
   stream.submit(undefined, {
-    forkFrom: { checkpointId: metadata.parentCheckpointId },
+    forkFrom: metadata.parentCheckpointId,
   });
 }
 ```
 
-每次重新生成都会在该位置为 AI 消息创建一条新的路径。
+SDK 会把 `undefined` 输入转换为 `null`，以便在不提供新输入的情况下从该检查点继续。空对象（`{}`）则会提供新输入。每次重新生成都会在同一线程中创建一条新的路径。
+
+<Warning>
+重新生成可能会重新执行下游的工具和 API 调用。它不会撤销原始运行产生的外部影响。在重新生成之前，请先检查这些影响。
+</Warning>
 
 <Tip>
 重新生成对非确定性智能体很有用。由于 LLM 输出会随 temperature 变化，同一个提示词重新生成后，通常会得到明显不同的结果。
@@ -245,7 +249,7 @@ function handleRegenerate(
 
 ## 底层工作方式
 
-LangGraph 会把每次状态转换都持久化为一个**检查点**。当你使用 `forkFrom` 提交时，后端会从那个位置开启一条新的执行路径，而不是继续追加到当前对话里。结果就是一棵树状结构：
+LangGraph 会在超步（super-step）边界处把状态持久化为**检查点**。在同一个超步中并行运行的节点共享一个检查点边界。当你使用 `forkFrom` 提交时，后端会从那个位置开启一条新的执行路径，而不是继续追加到当前对话里。结果就是一棵树状结构：
 
 ```
 User: "What is React?"
@@ -260,7 +264,8 @@ User: "Tell me about JSX" (edited from branch A)
 ```
 
 每条路径都会保存在检查点存储中。当你想构建单独的时间线视图时，可以使用
-`stream.client.threads.getHistory(threadId)`。
+`stream.client.threads.getHistory(threadId)`。历史记录按最新在前排列，默认返回
+10 条。使用每个状态的 `parent_checkpoint` 来还原祖先关系；仅凭列表位置无法识别分支。
 
 ## 最佳实践
 

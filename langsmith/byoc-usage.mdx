@@ -7,7 +7,7 @@ icon: "plug"
 
 你的 data plane 激活后，其 workspace 的所有 API 流量都会发送到 data plane endpoint，而不是 LangSmith Cloud backend。本页说明如何将请求路由到正确的服务。
 
-LangSmith UI 会自动处理这件事：它会根据你选择的 workspace 路由到正确的 data plane。以下指南适用于你自己的客户端应用和直接 API 调用。
+LangSmith UI 会自动处理这件事：它会根据你选择的 workspace 路由到正确的 data plane。以下指南适用于你自己的客户端代码和直接 API 调用。
 
 ## 组织、data plane 与 workspace
 
@@ -15,7 +15,7 @@ BYOC 部署在标准的 LangSmith [资源层级](/langsmith/administration-overv
 
 - **组织**：最高层级。用户、角色、计费、SSO 配置和 API keys 属于组织，存放在 control plane 中。
 - **Data plane**：属于一个组织，代表数据的物理隔离。一个组织可以有多个 data plane，每个位于自己的 AWS 账户和 region 中。
-- **Workspace**：恰好属于一个 data plane，你在创建 workspace 时选择该 data plane。traces、datasets、experiments 和其他应用数据存放在 workspace 中。
+- **Workspace**：恰好属于一个 data plane，你在创建 workspace 时选择该 data plane。traces、datasets、experiments 和其他 agent 数据存放在 workspace 中。
 
 <img
   src="/langsmith/images/byoc-org-structure.png"
@@ -24,11 +24,11 @@ BYOC 部署在标准的 LangSmith [资源层级](/langsmith/administration-overv
 
 用 data plane 实现数据的物理隔离，用 workspace 实现 data plane 内部的逻辑隔离。划分 data plane 的常见方式有：
 
-- **按 region 划分**，例如 `us-east-1` 和 `us-west-2`，将敏感应用数据保留在特定 region 内。
+- **按 region 划分**，例如 `us-east-1` 和 `us-west-2`，将敏感 agent 数据保留在特定 region 内。
 - **按环境和 region 划分**，例如生产 `us-east-1` 和开发 `us-east-1`，将生产和开发数据保存在不同的 AWS 账户中。
 - **按业务单元划分**，适用于每个业务单元拥有自己 AWS 账户的情况。
 
-在 data plane 之下，workspace 和应用的行为与 Cloud 或自托管时相同。更多信息请参阅 [Administration 概览](/langsmith/administration-overview)和[工作负载隔离](/langsmith/workload-isolation)。
+在 data plane 之下，workspace 隔离的行为与 Cloud 或自托管时相同。更多信息请参阅 [Administration 概览](/langsmith/administration-overview)和[工作负载隔离](/langsmith/workload-isolation)。
 
 ## 查找你的 data plane endpoint
 
@@ -39,6 +39,8 @@ data plane 默认配置为私有 endpoint，因此你需要私有网络连接（
 </Warning>
 
 ## 向 data plane 发送 traces
+
+在基于 agent 的工作区中进行 tracing 时，请在运行示例之前[创建 agent 并配置 agent addressing](/langsmith/create-an-agent#configure-tracing-for-the-agent)。
 
 要将 traces 发送到位于你的 data plane 中的 workspace，请将 LangSmith SDK 指向 data plane endpoint，并使用限定于该 data plane 中某个 workspace 的 API key 进行身份验证：
 
@@ -70,18 +72,20 @@ base URL 会根据路径前缀路由到不同的服务：
 
 ### 双写两个 endpoint
 
-设置 `LANGSMITH_RUNS_ENDPOINTS` 以写入多个 endpoint：
+设置 `LANGSMITH_RUNS_ENDPOINTS` 以写入多个 endpoint。这些 replica 设置会把各 agent 环境的 [`tracer_session_name`](/langsmith/create-an-agent#use-an-environment-project) 用作 `project_name`：
 
 ```bash
 export LANGSMITH_RUNS_ENDPOINTS='[
-  {"api_url": "https://aws.api.smith.langchain.com", "api_key": "ls__key1", "project_name": "project-cloud"},
-  {"api_url": "https://<data_plane_host>", "api_key": "ls__key2", "project_name": "project-byoc"}
+  {"api_url": "https://aws.api.smith.langchain.com", "api_key": "ls__key1", "project_name": "<cloud-environment-tracer-session-name>"},
+  {"api_url": "https://<data_plane_host>", "api_key": "ls__key2", "project_name": "<byoc-environment-tracer-session-name>"}
 ]'
 ```
 
-### 在应用逻辑中选择目的地
+<a id="choose-the-destination-in-application-logic"></a>
 
-要在运行时决定 tracing 的目的地，为每个 endpoint 创建一个 client，并在它们之间进行选择：
+### 在 agent 逻辑中选择目的地
+
+要在运行时决定 tracing 的目的地，为每个 endpoint 创建一个 client，并在它们之间进行选择。把 `LANGSMITH_CLOUD_PROJECT` 和 `LANGSMITH_BYOC_PROJECT` 设置为相应 agent 环境的 `tracer_session_name` 值：
 
 ```python
 import os
@@ -113,10 +117,10 @@ byoc_client = Client(
 
 
 def get_workspace_routing(tenant_id: str):
-    """Determine the tracing destination based on application routing logic."""
+    """Select the tracing destination for this tenant."""
     if tenant_id.startswith("byoc_"):
-        return byoc_client, os.getenv("LANGSMITH_BYOC_PROJECT", "byoc-customer-project")
-    return cloud_client, os.getenv("LANGSMITH_CLOUD_PROJECT", "cloud-customer-project")
+        return byoc_client, require_env("LANGSMITH_BYOC_PROJECT")
+    return cloud_client, require_env("LANGSMITH_CLOUD_PROJECT")
 
 
 @traceable

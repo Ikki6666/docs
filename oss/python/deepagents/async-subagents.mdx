@@ -16,13 +16,17 @@ import AsyncSubagentsTroubleshootingPollingJs from '/snippets/python/code-sample
 import AsyncSubagentsNotificationsPy from '/snippets/python/code-samples/async-subagents-notifications-py.mdx';
 import AsyncSubagentsAnswerWaitingPy from '/snippets/python/code-samples/async-subagents-answer-waiting-py.mdx';
 import AsyncSubagentsParentThreadPy from '/snippets/python/code-samples/async-subagents-parent-thread-py.mdx';
+import AsyncSubagentsNotificationsJs from '/snippets/python/code-samples/async-subagents-notifications-js.mdx';
+import AsyncSubagentsAnswerWaitingJs from '/snippets/python/code-samples/async-subagents-answer-waiting-js.mdx';
+import AsyncSubagentsParentThreadJs from '/snippets/python/code-samples/async-subagents-parent-thread-js.mdx';
+import AsyncSubagentsDeliverResultsPy from '/snippets/python/code-samples/async-subagents-deliver-results-py.mdx';
+import AsyncSubagentsDeliverResultsJs from '/snippets/python/code-samples/async-subagents-deliver-results-js.mdx';
 
 异步子代理允许 supervisor agent 启动会立即返回的后台任务，因此 supervisor 可以在子代理并发工作的同时继续与用户交互。supervisor 可以在任何时点检查进度、发送后续指令，或取消任务。
 
 这建立在 [子代理](/oss/python/deepagents/subagents) 之上；后者是同步运行的，会阻塞 supervisor，直到完成。对于耗时较长、可并行化，或者需要在执行过程中动态调整的任务，请使用异步子代理。
 
 在 Agent Server 上，supervisor 还会在任务完成、失败或需要输入时自动收到通知，因此无需主动检查。
-
 
 ```mermaid
 graph TB
@@ -64,6 +68,9 @@ graph TB
 | `url` | `str` | 可选。省略时使用 ASGI transport（进程内）。设置后使用 HTTP transport 连接远程 Agent Protocol server。 |
 | `headers` | `dict[str, str]` | 可选。发送给远程 server 的附加 header。用于自托管 Agent Protocol server 的自定义认证。 |
 | `mode` | `"isolated" \| "fork"` | 可选。控制子代理启动时收到的对话上下文。默认为 `"isolated"`。参见[选择启动模式](#choose-a-launch-mode)。 |
+| `update_strategy` | `"interrupt" \| "enqueue"` | 可选。run 处于活动状态时 `update_async_task` 如何发送后续指令。默认为 `"interrupt"`。参见[了解生命周期](#understand-the-lifecycle)。 |
+| `webhook` | `str` | 可选。该子代理的任一 run 结束时 Agent Server 调用的 URL。参见[通过你的应用投递结果](#deliver-results-through-your-app)。 |
+| `notify_parent` | `bool` | 可选。子代理在 supervisor 空闲时完成，是否可以唤醒 supervisor。默认为 `True`。 |
 
 
 
@@ -120,29 +127,60 @@ sequenceDiagram
     Supervisor-->>User: "Here are the results"
 ```
 
-- **Launch** 会在 server 上创建新的线程，用任务描述作为输入启动一个 run，并返回线程 ID 作为 task ID。supervisor 会把这个 ID 报告给用户，而不会等待任务完成。
+- **Launch** 会在 server 上创建新的线程，并按[启动模式](#choose-a-launch-mode)确定的输入启动一个 run。isolated 模式只发送任务描述；fork 模式还会发送父代理的有效对话历史。线程 ID 会作为 task ID 返回。supervisor 会把这个 ID 报告给用户，而不会等待任务完成。
 - **Check** 会获取当前 run 状态。如果 run 成功，它会读取线程状态并提取子代理的最终输出。如果仍在运行，它会把这个状态报告给用户。
-- **Update** 会在同一线程上用 interrupt multitask strategy 创建一个新的 run。前一个 run 会被中断，子代理会带着完整对话历史和新的指令重新启动。task ID 保持不变。
+- **Update** 会在同一线程上创建一个新的 run。默认情况下它会中断前一个 run，子代理会带着完整对话历史和新的指令重新启动。task ID 保持不变。
 - **Cancel** 会调用 server 上的 `runs.cancel()`，并把任务标记为 `"cancelled"`。
 - **List** 会遍历所有已跟踪任务。对于非终态任务，它会并行从 server 获取实时状态。终态状态（`success`、`error`、`cancelled`）从缓存返回。
 
-如果子代理因等待输入或审批而暂停，**check** 和 **list** 会把它报告为 `waiting`。更新一个 `waiting` 任务会丢弃其待处理的请求；取消它只会标记为 `"cancelled"`，因为它没有活跃的 run。参见[处理等待输入的子代理](#handle-subagents-waiting-for-input)。
+要让后续指令排队等待，请设置 `update_strategy="enqueue"`。此时 **Update** 会把新的 run 排在当前 run 之后，任务在开始前处于 `pending` 状态。取消该任务也会取消仍然活跃的更早 run。
+如果当前 run 在后续指令开始前因等待输入或审批而暂停，后续指令仍会启动，而该请求会被丢弃。
 
+<Note>
+`update_strategy` 需要 `deepagents>=0.7.30`。它处于 [**beta**](/oss/python/versioning) 阶段；API 和行为可能在版本之间发生变化。
+</Note>
+
+
+
+
+如果子代理因等待输入或审批而暂停，**check** 和 **list** 会把它报告为 `waiting`。更新一个 `waiting` 任务会丢弃其待处理的请求；取消它只会标记为 `"cancelled"`，因为它没有活跃的 run。参见[处理等待输入的子代理](#handle-subagents-waiting-for-input)。
 
 在 [Agent Protocol](https://github.com/langchain-ai/agent-protocol) server 上运行时，子代理会在完成时自动向 supervisor 发送更新。如果 supervisor 和子代理使用[单一部署](#single-deployment)，子代理会在 supervisor 空闲时唤醒它；否则 supervisor 会在下一次 run 开始时收到更新。
 
 <Note>
-    任务通知需要 `deepagents>=0.7.26`。它处于 [**beta**](/oss/python/versioning) 阶段；API 和行为可能在版本之间发生变化。
+任务通知需要 `deepagents>=0.7.26`。它处于 [**beta**](/oss/python/versioning) 阶段；API 和行为可能在版本之间发生变化。
+
+
 </Note>
 
 通知以 `HumanMessage` 的形式返回给 supervisor。它们可以包含图像和其他多模态媒体。消息在 `additional_kwargs["deepagents_notification"]` 中携带 [`TaskEvent`](https://reference.langchain.com/python/deepagents/middleware/async_subagents/TaskEvent)（`task_id`、`agent_name`、`status`、`run_id`），因此你的应用可以用不同于用户消息的方式展示通知：
 
 <AsyncSubagentsNotificationsPy />
 
+
+
+
+### 通过你的应用投递结果
+
+<Note>
+`webhook` 和 `notify_parent` 需要 `deepagents>=0.7.30`。`notify_parent` 处于 [**beta**](/oss/python/versioning) 阶段；API 和行为可能在版本之间发生变化。
+
+
+</Note>
+
+设置 `webhook` 后，每当该子代理的某个 run 结束，Agent Server 都会调用你的应用。该调用包含 run 的 thread ID、run ID、状态和 metadata，其中包括 `parent_thread_id` 和 `subagent_name`。如果希望通过你的应用投递结果而不是唤醒 supervisor，请同时关闭向父代理发送通知。supervisor 在子代理运行期间仍会收到它的更新。
+
+<AsyncSubagentsDeliverResultsPy />
+
+
+
+
 ## 处理等待输入的子代理
 
 <Note>
-    `waiting` 状态需要 `deepagents>=0.7.26`。它处于 [**beta**](/oss/python/versioning) 阶段；API 和行为可能在版本之间发生变化。
+`waiting` 状态需要 `deepagents>=0.7.26`。它处于 [**beta**](/oss/python/versioning) 阶段；API 和行为可能在版本之间发生变化。
+
+
 </Note>
 
 当子代理通过 `interrupt()` 或 [human-in-the-loop](/oss/python/deepagents/human-in-the-loop) 暂停以等待输入或审批时，**check** 和 **list** 工具会把它报告为 `waiting`，并附上待处理的 interrupt。supervisor 不能代替用户回答或批准。这个请求是给用户的。
@@ -151,8 +189,10 @@ sequenceDiagram
 
 <AsyncSubagentsAnswerWaitingPy />
 
-子代理在得到回答后完成时，supervisor 会照常收到通知。如果子代理需要的信息来自 supervisor 而不是用户，可以让它在结果中提出。supervisor 会用 `update_async_task` 回复。
 
+
+
+子代理在得到回答后完成时，supervisor 会照常收到通知。如果子代理需要的信息来自 supervisor 而不是用户，可以让它在结果中提出。supervisor 会用 `update_async_task` 回复。
 
 ## 了解状态管理
 
@@ -183,6 +223,9 @@ sequenceDiagram
 
 ASGI transport 消除了网络延迟，也不需要额外的认证配置。子代理仍然会作为一个拥有自己状态的独立线程运行。这是推荐的默认方式。
 
+
+
+
 ### HTTP transport（远程）
 
 添加 `url` 字段即可切换到 HTTP transport，此时 SDK 调用会通过网络发送到远程 Agent Protocol server：
@@ -210,8 +253,8 @@ ASGI transport 消除了网络延迟，也不需要额外的认证配置。子�
 ### Fork 模式
 
 <Warning>
+Fork 模式是实验性功能，可能会在未来的版本中更改。
 
-`mode="fork"` 仅在 Python 中可用。它是实验性功能，可能会在未来的版本中更改。
 
 </Warning>
 
@@ -230,15 +273,24 @@ async_subagents=[
 
 
 
-启动时，`start_async_task` 会发送父代理的完整对话历史（重放到该时点为止），随后发送任务描述。父代理之后的消息不会转发给子代理。
+
+
+启动时，`start_async_task` 会发送父代理有效对话历史的快照，随后发送任务描述。如果父代理已压缩其历史，快照包含的是压缩后的上下文，而不是每条原始消息。父代理之后的消息不会转发给子代理。
+
+子代理在一个新的 server 线程上启动。fork 模式把对话消息作为 run 输入发送，不会复制父代理的 checkpoint 历史或全部父状态。元数据可以把新线程与其 supervisor 关联起来，但这种关联本身并不会传递对话上下文。
 
 **提示缓存复用。** 要在分叉后的对话前缀上获得缓存命中，请为远程 agent 配置与父代理相同的模型、system prompt、工具和提示处理 middleware。Fork 模式只复制对话历史，不会同步这些设置。配置一致是必要但不充分条件：渲染出的前缀必须一致，且缓存命中取决于 provider。
+
+
 
 ## 选择部署拓扑
 
 ### 单一部署
 
 单一部署意味着所有 agent 都通过 ASGI transport 共置在同一台 server 上。对于基于 LangGraph 的部署，请把所有 graph 注册到一个 `langgraph.json` 中。这是推荐的起点 - 只需要管理一个 server，agent 之间也没有网络延迟。
+
+
+
 
 ### 分离部署
 

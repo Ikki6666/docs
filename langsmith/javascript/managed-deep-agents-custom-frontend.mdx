@@ -1,0 +1,161 @@
+---
+title: 为 Managed Deep Agent 构建自定义 frontend
+sidebarTitle: 自定义 frontend
+description: 从你自己的浏览器或服务器应用调用 Managed Deep Agents deployment，而不是通过 channel 或 LangSmith Studio 访问 agent。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/javascript/langsmith/managed-deep-agents-public-beta-note.mdx';
+
+自定义 frontend 是你编写的、直接调用 deployment 的任何应用，而不是通过 [channel](/langsmith/javascript/managed-deep-agents-channels) 或 [LangSmith Studio](/langsmith/javascript/managed-deep-agents-local-development#start-local-studio) 访问 agent。当 agent 需要嵌入到你控制的产品界面中时，例如支持控制台、内部 dashboard 或面向客户的聊天页面，请使用自定义 frontend。
+
+Managed Deep Agents deployments 运行在 [LangSmith Agent Server](/langsmith/agent-server-overview) 上。Frontend 与每个 Agent Server client 使用的 threads、runs 和 streaming endpoints 通信。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+## 选择 identity provider
+
+发往 deployment 的每个请求都要指名一个调用方，而由 frontend 提供这个名称。哪种 [identity provider](/langsmith/javascript/managed-deep-agents-identity) 合适，取决于 frontend 代码在哪里运行，而不是它用什么语言编写。
+
+| Frontend 从哪里调用 deployment | Identity provider |
+| --- | --- |
+| 用户的浏览器 | 外部 auth provider。浏览器发送 access token，deployment 验证它。参见 [Supabase](/langsmith/javascript/managed-deep-agents-identity#configure-identity-with-supabase)。 |
+| 你自己的服务器，已经对用户完成认证 | [Your own backend](/langsmith/javascript/managed-deep-agents-identity#configure-identity-with-your-own-backend)。你的服务器在共享 ingress secret 的保护下断言用户 ID。 |
+| 你自己的服务器，自身没有最终用户账户 | [LangSmith API key](/langsmith/javascript/managed-deep-agents-identity#configure-identity-with-a-langsmith-api-key) 默认方式。该 key 本身就是调用方。 |
+
+表中任意一个服务器行都适用于任何语言的服务器端渲染应用。Streamlit、Gradio 和 Dash 的代码都运行在服务器上，Next.js route handler 和 Express 代理也是如此。指向 [`mda dev`](/langsmith/javascript/managed-deep-agents-local-development#understand-local-behavior) 的 frontend 在你配置 provider 之前就能工作，因为本地服务器会提供一个测试用户。
+
+<Warning>
+LangSmith API key 可以访问 workspace 中的所有资源，而不仅仅是这个 deployment，因此绝不能将它放进浏览器 JavaScript 中。当浏览器直接调用 deployment 时，请使用外部 auth provider；当你自己的服务器代表用户调用 deployment 时，请使用 backend identity。
+</Warning>
+
+## 连接到 deployment
+
+Frontend 需要两个值。
+
+**Deployment API URL。** `mda deploy` 打印的是 LangSmith deployment dashboard URL，而不是 API URL。打开该 dashboard，然后在 deployment 详情视图中复制 **API URL**。[`mda dev`](/langsmith/javascript/managed-deep-agents-local-development) 启动的本地服务器会在 CLI 打印的 URL 上提供相同的路由。
+
+**Assistant ID。** Client 传入 [agent definition](/langsmith/javascript/managed-deep-agents-agent-definition#parameters) 中 agent 的 `name`。Managed Deep Agents 还将该名称用作 graph ID：
+
+
+
+```ts agent.ts
+import { defineDeepAgent } from "managed-deepagents";
+
+export const agent = defineDeepAgent({
+  name: "research-assistant", // [!code highlight]
+  model: "openai:gpt-5.5",
+});
+```
+
+
+Client 用同一个字符串 `research-assistant` 寻址该 agent。重命名 agent 会改变 client 发送的值，因此请把这个名称当作 deployment 公共接口的一部分。
+
+## 构建 web frontend
+
+[LangChain frontend SDKs](/oss/javascript/langchain/frontend/overview) 将浏览器应用连接到 Agent Server deployment。`useStream` 以响应式值的形式暴露 messages、tool 调用、interrupts 和 thread state：
+
+| Framework | Package | Entry point |
+| --- | --- | --- |
+| React | `@langchain/react` | `useStream` |
+| Vue | `@langchain/vue` | `useStream` |
+| Svelte | `@langchain/svelte` | `useStream` |
+| Angular | `@langchain/angular` | `injectStream` |
+
+Frontend 运行在浏览器中，因此即使 agent 是用 Python 编写的，这些示例也是 TypeScript。
+
+在使用外部 auth provider 的情况下，浏览器发送来自已登录会话的 access token。该 token 会轮换，因此请在会话变化时重新读取它，而不是只在挂载时捕获一次：
+
+```ts useAuthHeaders.ts
+import { useEffect, useState } from "react";
+
+import { supabase } from "./supabase";
+
+export function useAuthHeaders() {
+  const [headers, setHeaders] = useState<Record<string, string>>();
+
+  useEffect(() => {
+    const refresh = async () => {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      setHeaders(token ? { Authorization: `Bearer ${token}` } : undefined);
+    };
+
+    void refresh();
+    const { data } = supabase.auth.onAuthStateChange(() => void refresh()); // [!code highlight]
+    return () => data.subscription.unsubscribe();
+  }, []);
+
+  return headers;
+}
+```
+
+高亮的订阅会在登录、退出和 token 刷新时触发。没有它，该 hook 会一直持有挂载时捕获的 token，一旦该 token 过期，请求就会开始以 401 失败。
+
+将 stream 指向 deployment API URL、agent 名称和这些请求头：
+
+```tsx Chat.tsx
+import { useStream } from "@langchain/react";
+import { useState } from "react";
+
+import { useAuthHeaders } from "./useAuthHeaders";
+
+export function Chat() {
+  const [input, setInput] = useState("");
+  const headers = useAuthHeaders();
+  const stream = useStream({
+    apiUrl: import.meta.env.VITE_DEPLOYMENT_API_URL,
+    assistantId: "research-assistant",
+    defaultHeaders: headers,
+  });
+
+  return (
+    <main>
+      {stream.messages.map((message) => (
+        <p key={message.id}>{message.text}</p>
+      ))}
+
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          stream.submit({ messages: [{ type: "human", content: input }] });
+          setInput("");
+        }}
+      >
+        <input value={input} onChange={(event) => setInput(event.target.value)} />
+        <button type="submit" disabled={stream.isLoading}>
+          Send
+        </button>
+      </form>
+    </main>
+  );
+}
+```
+
+在使用 backend identity 时，浏览器永远不会直接访问 deployment。将 `apiUrl` 指向你自己的服务器，并从那里转发 Agent Server 路由，在每个上游请求上附加 `x-mda-ingress-secret` 以及你的 auth 层解析出的用户 ID。关于请求头和共享 secret，请参见 [Configure identity with your own backend](/langsmith/javascript/managed-deep-agents-identity#configure-identity-with-your-own-backend)。
+
+同样的 frontend 模式也适用于 Managed Deep Agents deployment。参见 [tool-call rendering](/oss/javascript/langchain/frontend/tool-calling)、[generative UI](/oss/javascript/langchain/frontend/generative-ui-overview)、[human-in-the-loop approval](/oss/javascript/langchain/frontend/human-in-the-loop)、[queued submissions](/oss/javascript/langchain/frontend/message-queues) 和 [durable rejoin](/oss/javascript/langchain/frontend/join-rejoin)。
+
+### 处理授权 interrupt
+
+当 agent 需要一个调用方尚未授权的 [user-owned connection](/langsmith/javascript/managed-deep-agents-connections) 时，run 会暂停，`stream.interrupt` 会携带 credential gate payload。浏览器 frontend 渲染 consent 链接，并用 `stream.respond` 恢复。关于 payload 的结构和完整示例，请参见 [Handle the authorization interrupt](/langsmith/javascript/managed-deep-agents-connections#handle-the-authorization-interrupt)。
+
+
+
+## 另请参阅
+
+- [Identity](/langsmith/javascript/managed-deep-agents-identity)：配置调用方如何向 deployment 认证。
+- [Frontend overview](/oss/javascript/langchain/frontend/overview)：消息渲染、tool 调用、interrupts 和 generative UI 模式。
+- [Connections](/langsmith/javascript/managed-deep-agents-connections)：在 UI 中处理凭据授权 interrupt。
+- [MCP endpoint](/langsmith/javascript/managed-deep-agents-mcp-endpoint)：将 agent 暴露给 MCP client，而不是调用 API。
+- [Channels](/langsmith/javascript/managed-deep-agents-channels)：从 Slack 或你自己的 HTTP 服务访问 agent。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/managed-deep-agents-custom-frontend.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

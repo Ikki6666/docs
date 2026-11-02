@@ -161,7 +161,7 @@ with PostgresSaver.from_conn_string(DB_URI) as checkpointer:  # [!code highlight
 
     <Tip>
 **设置**
-    要使用 [MongoDB checkpointer](https://pypi.org/project/langgraph-checkpoint-mongodb/)，您需要一个 MongoDB 集群。如果您还没有集群，请按照 [this guide](https://www.mongodb.com/docs/guides/atlas/cluster/) 创建集群。如果想看面向 agent 的完整 walkthrough，请参见 [使用 MongoDB Atlas 实现短期记忆](/oss/python/integrations/memory/mongodb-short-term-memory)。
+    要使用 [MongoDB checkpointer](https://pypi.org/project/langgraph-checkpoint-mongodb/)，您需要一个 MongoDB 集群。如果您还没有集群，请按照 [this guide](https://www.mongodb.com/docs/atlas/tutorial/deploy-free-tier-cluster/) 创建集群。如果想看面向 agent 的完整 walkthrough，请参见 [使用 MongoDB Atlas 实现短期记忆](/oss/python/integrations/memory/mongodb-short-term-memory)。
     </Tip>
 
     <Tabs>
@@ -769,6 +769,193 @@ with PostgresStore.from_conn_string(DB_URI) as store:  # [!code highlight]
 </Accordion>
 
 <Accordion title="Example: using MongoDB store">
+  ```
+  pip install -U langgraph-store-mongodb langgraph-checkpoint-mongodb
+  ```
+
+    <Tip>
+    `query` 语义搜索需要 MongoDB Vector Search（`$vectorSearch`），它运行于 [MongoDB Atlas](https://www.mongodb.com/docs/atlas/) 或配置了 [Search and Vector Search](https://www.mongodb.com/docs/search/self-managed/current/)（`mongot`）的自管 MongoDB 上。仅有 `mongod` 而没有 `mongot` 是不够的。打开 store 时请传入由 `create_vector_index_config` 生成的 `index_config`。索引创建可能超过默认的 15 秒等待时间，因此首次运行时应将 `auto_index_timeout` 设置得更高。关于 Atlas 集群搭建，请参见 [this guide](https://www.mongodb.com/docs/atlas/tutorial/deploy-free-tier-cluster/)。关于向量索引配置和面向 agent 的完整 walkthrough，请参见 [使用 MongoDB Atlas 实现长期记忆](/oss/python/integrations/memory/mongodb-long-term-memory)。
+    </Tip>
+
+    <Tabs>
+        <Tab title="Async">
+      ```python
+      import os
+      from collections.abc import Sequence
+      from dataclasses import dataclass
+      from uuid import uuid4
+
+      from langchain.chat_models import init_chat_model
+      from langgraph.checkpoint.mongodb import MongoDBSaver  # [!code highlight]
+      from langgraph.graph import StateGraph, MessagesState, START
+      from langgraph.runtime import Runtime  # [!code highlight]
+      from langgraph.store.mongodb import MongoDBStore, create_vector_index_config  # [!code highlight]
+
+      model = init_chat_model(model="claude-haiku-4-5-20251001")
+
+      def embed(texts: Sequence[str]) -> list[list[float]]:
+          # Replace with an embeddings model or LangChain Embeddings instance
+          return [[1.0, 2.0] for _ in texts]
+
+      @dataclass
+      class Context:
+          user_id: str
+
+      async def call_model(  # [!code highlight]
+          state: MessagesState,
+          runtime: Runtime[Context],  # [!code highlight]
+      ):
+          user_id = runtime.context.user_id  # [!code highlight]
+          namespace = ("memories", user_id)
+          memories = await runtime.store.asearch(namespace, query=str(state["messages"][-1].content))  # [!code highlight]
+          info = "\n".join([d.value["data"] for d in memories])
+          system_msg = f"You are a helpful assistant talking to the user. User info: {info}"
+
+          # Store new memories if the user asks the model to remember
+          last_message = state["messages"][-1]
+          if "remember" in last_message.content.lower():
+              memory = "User name is Bob"
+              await runtime.store.aput(namespace, str(uuid4()), {"data": memory})  # [!code highlight]
+
+          response = await model.ainvoke(
+              [{"role": "system", "content": system_msg}] + state["messages"]
+          )
+          return {"messages": response}
+
+      MONGODB_ATLAS_URI = os.environ["MONGODB_ATLAS_URI"]
+      index_config = create_vector_index_config(embed=embed, dims=2, fields=["data"])  # [!code highlight]
+
+      with (
+          MongoDBStore.from_conn_string(  # [!code highlight]
+              MONGODB_ATLAS_URI,
+              index_config=index_config,  # [!code highlight]
+              auto_index_timeout=120,
+          ) as store,
+          MongoDBSaver.from_conn_string(MONGODB_ATLAS_URI) as checkpointer,
+      ):
+          builder = StateGraph(MessagesState, context_schema=Context)  # [!code highlight]
+          builder.add_node(call_model)
+          builder.add_edge(START, "call_model")
+
+          graph = builder.compile(
+              checkpointer=checkpointer,
+              store=store,  # [!code highlight]
+          )
+
+          import asyncio
+
+          async def run():
+              config = {"configurable": {"thread_id": "1"}}
+              stream = await graph.astream_events(
+                  {"messages": [{"role": "user", "content": "Hi! Remember: my name is Bob"}]},
+                  config,
+                  version="v3",
+                  context=Context(user_id="1"),  # [!code highlight]
+              )
+              async for snapshot in stream.values:
+                  snapshot["messages"][-1].pretty_print()
+
+              config = {"configurable": {"thread_id": "2"}}
+              stream = await graph.astream_events(
+                  {"messages": [{"role": "user", "content": "what is my name?"}]},
+                  config,
+                  version="v3",
+                  context=Context(user_id="1"),  # [!code highlight]
+              )
+              async for snapshot in stream.values:
+                  snapshot["messages"][-1].pretty_print()
+
+          asyncio.run(run())
+```
+        </Tab>
+        <Tab title="Sync">
+      ```python
+      import os
+      from collections.abc import Sequence
+      from dataclasses import dataclass
+      from uuid import uuid4
+
+      from langchain.chat_models import init_chat_model
+      from langgraph.checkpoint.mongodb import MongoDBSaver  # [!code highlight]
+      from langgraph.graph import StateGraph, MessagesState, START
+      from langgraph.runtime import Runtime  # [!code highlight]
+      from langgraph.store.mongodb import MongoDBStore, create_vector_index_config  # [!code highlight]
+
+      model = init_chat_model(model="claude-haiku-4-5-20251001")
+
+      def embed(texts: Sequence[str]) -> list[list[float]]:
+          # Replace with an embeddings model or LangChain Embeddings instance
+          return [[1.0, 2.0] for _ in texts]
+
+      @dataclass
+      class Context:
+          user_id: str
+
+      def call_model(  # [!code highlight]
+          state: MessagesState,
+          runtime: Runtime[Context],  # [!code highlight]
+      ):
+          user_id = runtime.context.user_id  # [!code highlight]
+          namespace = ("memories", user_id)
+          memories = runtime.store.search(namespace, query=str(state["messages"][-1].content))  # [!code highlight]
+          info = "\n".join([d.value["data"] for d in memories])
+          system_msg = f"You are a helpful assistant talking to the user. User info: {info}"
+
+          # Store new memories if the user asks the model to remember
+          last_message = state["messages"][-1]
+          if "remember" in last_message.content.lower():
+              memory = "User name is Bob"
+              runtime.store.put(namespace, str(uuid4()), {"data": memory})  # [!code highlight]
+
+          response = model.invoke(
+              [{"role": "system", "content": system_msg}] + state["messages"]
+          )
+          return {"messages": response}
+
+      MONGODB_ATLAS_URI = os.environ["MONGODB_ATLAS_URI"]
+      index_config = create_vector_index_config(embed=embed, dims=2, fields=["data"])  # [!code highlight]
+
+      with (
+          MongoDBStore.from_conn_string(  # [!code highlight]
+              MONGODB_ATLAS_URI,
+              index_config=index_config,  # [!code highlight]
+              auto_index_timeout=120,
+          ) as store,
+          MongoDBSaver.from_conn_string(MONGODB_ATLAS_URI) as checkpointer,
+      ):
+          builder = StateGraph(MessagesState, context_schema=Context)  # [!code highlight]
+          builder.add_node(call_model)
+          builder.add_edge(START, "call_model")
+
+          graph = builder.compile(
+              checkpointer=checkpointer,
+              store=store,  # [!code highlight]
+          )
+
+          config = {"configurable": {"thread_id": "1"}}
+          stream = graph.stream_events(
+              {"messages": [{"role": "user", "content": "Hi! Remember: my name is Bob"}]},
+              config,
+              version="v3",
+              context=Context(user_id="1"),  # [!code highlight]
+          )
+          for snapshot in stream.values:
+              snapshot["messages"][-1].pretty_print()
+
+          config = {"configurable": {"thread_id": "2"}}
+          stream = graph.stream_events(
+              {"messages": [{"role": "user", "content": "what is my name?"}]},
+              config,
+              version="v3",
+              context=Context(user_id="1"),  # [!code highlight]
+          )
+          for snapshot in stream.values:
+              snapshot["messages"][-1].pretty_print()
+```
+        </Tab>
+    </Tabs>
+
+
 
 </Accordion>
 
@@ -1184,9 +1371,13 @@ items = store.search(
     async def chat(state: MessagesState, runtime: Runtime):  # [!code highlight]
         # Search based on user's last message
         items = await runtime.store.asearch(  # [!code highlight]
-            ("user_123", "memories"), query=state["messages"][-1].content, limit=2
+            ("user_123", "memories"), query=state["messages"][-1].content
         )
-        memories = "\n".join(item.value["text"] for item in items)
+        memories = "\n".join(
+            item.value["text"]
+            for item in items
+            if item.score is not None and item.score > 0.2
+        )
         memories = f"## Memories of user\n{memories}" if memories else ""
         response = await model.ainvoke(
             [
@@ -1217,7 +1408,7 @@ items = store.search(
 
 ## 管理短期记忆
 
-启用 [short-term memory](#add-short-term-memory) 后，长时间对话可能会超出 LLM 的上下文窗口。常见的解决方案有：
+启用 [short-term memory](#add-short-term-memory) 后，checkpointer 会在同一 thread 内跨轮次持久化 graph state。调用模型的节点决定把 state 中的哪些数据纳入模型输入。持久化 state 并不会自动把它全部发送给模型。向模型传入过长的消息历史可能超出其上下文窗口。常见的解决方案有：
 
 * [Trim messages](#trim-messages): 删除前 N 条或后 N 条消息（在调用 LLM 之前）
 * [Delete messages](#delete-messages) 来自 LangGraph 状态永久
@@ -1232,6 +1423,8 @@ items = store.search(
 大多数法学硕士都有最大支持的上下文窗口（以令牌计价）。决定何时截断消息的一种方法是计算消息历史记录中的标记，并在接近该限制时进行截断。如果您使用 LangChain，则可以使用修剪消息实用程序并指定要从列表中保留的令牌数量，以及用于处理边界的 `strategy` （例如，保留最后一个 `max_tokens` ）。
 
 
+
+在以下示例中，该节点向模型传入一份修剪后的消息列表，但不会从 state 中删除任何消息。
 
 要修剪消息历史记录，请使用 [`trim_messages`](https://reference.langchain.com/python/langchain-core/messages/utils/trim_messages) 函数：
 
