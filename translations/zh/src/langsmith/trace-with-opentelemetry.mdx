@@ -8,11 +8,41 @@ import AgentTracingPrerequisite from '/snippets/langsmith/agent-tracing-prerequi
 
 import OtlpAgentAddressing from '/snippets/langsmith/otlp-agent-addressing-note.mdx';
 
+
 LangSmith 支持基于 OpenTelemetry 的追踪，因此你可以从任何兼容 OpenTelemetry 的 agent 发送追踪数据。本文既介绍 LangChain agent 的自动埋点，也介绍其他框架的手动埋点方式。
 
 了解如何在 LangSmith 中使用 OpenTelemetry 追踪你的 agent。
 
 <AgentTracingPrerequisite />
+
+## OTel 追踪的工作方式
+
+下图展示了使用 LangSmith 进行 OpenTelemetry 追踪的基本流程，其中包括扇出（fanout）模式：同一份 span 流会被路由到多个可观测性后端。
+
+```mermaid actions={false}
+%%{init: {"theme": "base", "themeVariables": {"lineColor": "#40668D", "primaryColor": "#E5F4FF", "primaryTextColor": "#030710", "primaryBorderColor": "#006DDD"}}}%%
+flowchart TD
+    App["Your agent\n(LangChain, LangGraph,\nor any OTel-compatible code)"]
+    SDK["OpenTelemetry SDK\n(instruments code, creates spans)"]
+    Collector["OpenTelemetry Collector\n(receives, processes, and routes spans)"]
+    LangSmith["LangSmith\n(traces + runs dashboard)"]
+    Other["Other observability backend\n(Datadog, Honeycomb, Grafana, etc.)"]
+
+    App -->|"emits spans"| SDK
+    SDK -->|"exports via OTLP"| Collector
+    Collector -->|"fanout"| LangSmith
+    Collector -->|"fanout"| Other
+
+    classDef process fill:#E5F4FF,stroke:#006DDD,stroke-width:2px,color:#030710
+    classDef output fill:#EBD0F0,stroke:#885270,stroke-width:2px,color:#441E33
+    classDef neutral fill:#F2FAFF,stroke:#40668D,stroke-width:2px,color:#2F4B68
+
+    class App,SDK process
+    class Collector neutral
+    class LangSmith,Other output
+```
+
+OpenTelemetry SDK 会对你的 agent 代码进行埋点并生成 span。span 通过 OTLP 协议发送到 OpenTelemetry Collector，由后者批量处理并同时路由到一个或多个目标（_fanout_）。LangSmith 在其 OTLP endpoint 接收 span，并在 dashboard 中将其显示为 trace。
 
 <Note>
 如果是自托管安装或区域化 SaaS，请在下面的请求中相应更新 LangSmith URL：GCP EU 使用 `eu.api.smith.langchain.com`；GCP APAC 使用 `apac.api.smith.langchain.com`；AWS US 使用 `aws.api.smith.langchain.com`。
@@ -208,10 +238,10 @@ LangSmith 支持基于 OpenTelemetry 的追踪，因此你可以从任何兼容 
 默认情况下，LangSmith OpenTelemetry exporter 会将数据发送到 LangSmith API 的 OTEL endpoint，但你也可以通过设置标准 OTEL 环境变量来进行自定义：
 
 ```bash
-OTEL_EXPORTER_OTLP_ENDPOINT: 覆盖 endpoint URL
-OTEL_EXPORTER_OTLP_HEADERS: 你的 endpoint 所需的请求头，例如其 API key（未设置时，Python SDK 会使用 `langsmith>=0.14.9` 发送你的 LangSmith API key 以及已配置的 agent 和 environment；旧版配置则使用 project 请求头）
-OTEL_SERVICE_NAME: 设置自定义服务名（默认为 "langsmith"）
-OTEL_RESOURCE_ATTRIBUTES: 在进程级别附加自定义元数据字段（见下文）
+OTEL_EXPORTER_OTLP_ENDPOINT: Override the endpoint URL
+OTEL_EXPORTER_OTLP_HEADERS: Headers for your endpoint, like its API key (if unset, the Python SDK sends your LangSmith API key and configured agent and environment with `langsmith>=0.14.9`; legacy configuration uses the project header)
+OTEL_SERVICE_NAME: Set a custom service name (defaults to "langsmith")
+OTEL_RESOURCE_ATTRIBUTES: Attach custom metadata fields at the process level (see below)
 ```
 
 ### 添加进程级 resource attributes
@@ -247,23 +277,23 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-# 为 LangChain 设置环境变量
+# Set environment variables for LangChain
 os.environ["LANGSMITH_OTEL_ENABLED"] = "true"
 os.environ["LANGSMITH_TRACING"] = "true"
 
-# 为你的自定义 endpoint 配置 OTLP exporter
+# Configure the OTLP exporter for your custom endpoint
 provider = TracerProvider()
 otlp_exporter = OTLPSpanExporter(
-    # 改成你的 provider endpoint
+    # Change to your provider's endpoint
     endpoint="https://otel.your-provider.com/v1/traces",
-    # 添加认证所需的请求头
+    # Add any required headers for authentication
     headers={"api-key": "your-api-key"},
 )
 processor = BatchSpanProcessor(otlp_exporter)
 provider.add_span_processor(processor)
 trace.set_tracer_provider(provider)
 
-# 创建并运行一个 LangChain agent
+# Create and run a LangChain agent
 prompt = ChatPromptTemplate.from_template("Tell me a joke about {topic}")
 model = ChatOpenAI()
 chain = prompt | model
@@ -477,7 +507,7 @@ from google.adk.agents import LlmAgent
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
-# 配置 LangSmith OpenTelemetry 导出（不需要 OTEL 环境变量或 headers）
+# Configure LangSmith OpenTelemetry export (no OTEL env vars or headers needed)
 configure()
 
 
@@ -588,7 +618,7 @@ class AttachmentSpanProcessor(SpanProcessor):
 
 load_dotenv()
 
-# Manually set up TracerProvider
+# Set up TracerProvider manually
 provider = TracerProvider()
 trace.set_tracer_provider(provider)
 
