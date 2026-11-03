@@ -13,6 +13,7 @@ sidebarTitle: 启用 blob storage
 - [Amazon S3 (AWS)](#amazon-s3)
 - [Google Cloud Storage (GCP)](#google-cloud-storage)
 - [Azure Blob Storage](#azure-blob-storage)
+- [Neon Object Storage](#neon-object-storage)
 
 完整的云平台专属配置与架构指南，请参见 [AWS](/langsmith/aws-self-hosted)、[GCP](/langsmith/gcp-self-hosted) 或 [Azure](/langsmith/azure-self-hosted)。
 </Tip>
@@ -30,6 +31,7 @@ Azure blob storage 从 Helm chart `0.8.9` 及以上版本可用。[删除 trace 
   * [Amazon S3](https://aws.amazon.com/s3/)
   * [Google Cloud Storage (GCS)](https://cloud.google.com/storage?hl=en)
   * [Azure Blob Storage](https://azure.microsoft.com/en-us/products/storage/blobs)
+  * [Neon Object Storage](https://neon.com/docs/storage/get-started)（兼容 S3）
 
 * 一个用于存储数据的 bucket 或目录。强烈建议为 LangSmith 数据单独创建 bucket 或目录。
   * **如果你启用了 TTL**，则需要设置生命周期策略来删除旧数据。更多信息请参见 [配置 TTL](/langsmith/self-host-ttl)。这些策略应与你在 LangSmith 配置中设置的 TTL 保持一致，否则可能会发生数据丢失。关于如何设置生命周期规则，请参见 [blob storage 的 TTL 配置](#ttl-configuration)。
@@ -42,6 +44,7 @@ Azure blob storage 从 Helm chart `0.8.9` 及以上版本可用。[删除 trace 
   * 这是 LangSmith 访问你的 blob storage 系统时使用的 URL
   * 对于 Amazon S3，它应为 S3 endpoint 的 URL，例如：`https://s3.amazonaws.com`，如果使用区域 endpoint，也可以是 `https://s3.us-west-1.amazonaws.com`
   * 对于 Google Cloud Storage，它应为 GCS endpoint 的 URL，例如：`https://storage.googleapis.com`
+  * 对于 Neon Object Storage，它是你的 Neon branch 的 storage endpoint，例如：`https://br-cool-darkness-a1b2c3d4.storage.c-1.us-east-2.aws.neon.tech`
 
 ## 认证
 
@@ -140,6 +143,44 @@ config:
 </Note>
 
   </Tab>
+  <Tab title="Neon">
+
+### Neon Object Storage
+
+[Neon Object Storage](https://neon.com/docs/storage/get-started) 是挂载到 Neon branch 的兼容 S3 的对象存储。LangSmith 使用 `S3` engine 以及 access key 和 secret key 连接到它。
+
+要为 LangSmith 设置 Neon Object Storage：
+
+1. 在你的 Neon branch 上创建一个私有 bucket，例如 `langsmith`。更多信息请参见 [Neon buckets](https://neon.com/docs/storage/buckets)。
+2. 创建一个同时具有 `storage:read` 和 `storage:write` scope 的凭据。LangSmith 会读取、写入和删除对象，因此需要这两个 scope：
+
+    ```bash
+    neon credentials create --scope storage:read --scope storage:write --name langsmith-blob-storage
+    ```
+
+3. 将该凭据的 `token_id`（以 `nak_live_` 开头）用作 `accessKey`，将其 `s3_secret_access_key`（以 `nsk_live_` 开头）用作 `accessKeySecret`。更多信息请参见 [Neon Object Storage authentication](https://neon.com/docs/storage/authentication)。
+4. 将该 branch 的 storage endpoint 用作 `apiURL`。在 Neon Console 中点击 **Connect** 并打开 **Storage** 选项卡，即可找到它，字段名为 `AWS_ENDPOINT_URL_S3`。
+5. 在你的[配置](#configuration)中设置 `s3UsePathStyle: true`：
+
+    ```yaml
+    config:
+      blobStorage:
+        enabled: true
+        engine: "S3"
+        bucketName: "langsmith"
+        apiURL: "https://br-cool-darkness-a1b2c3d4.storage.c-1.us-east-2.aws.neon.tech"
+        accessKey: "nak_live_..."
+        accessKeySecret: "nsk_live_..."
+        s3UsePathStyle: true
+    ```
+
+<Warning>
+Neon Object Storage 仅通过 path-style URL（`<apiURL>/<bucket>/<key>`）提供 bucket 访问。如果不设置 `s3UsePathStyle: true`，LangSmith 会将请求发送到 `<bucket>.<endpoint>`，由于 Neon 证书不覆盖该主机名，TLS 校验会失败。`s3UsePathStyle` 需要 Helm chart 0.12.4 或更高版本。
+</Warning>
+
+Neon 不会执行 lifecycle rule，因此在启用 [TTL](#ttl-configuration) 之前，请先规划好数据过期方式。更多信息请参见 [Neon Object Storage lifecycle rules](#neon-object-storage-lifecycle-rules)。
+
+  </Tab>
 </Tabs>
 
 ## CH search
@@ -160,6 +201,7 @@ config:
     apiURL: "Your connection url"
     accessKey: "Your access key" # Optional. Only required if using S3 access key and secret key
     accessKeySecret: "Your access key secret" # Optional. Only required if using access key and secret key
+    s3UsePathStyle: false # Optional. Set to true for S3-compatible services that require path-style URLs, such as Neon Object Storage or MinIO
     # The following blob storage configuration values are for Azure and require blobStorage.engine = "Azure". Omit otherwise.
     azureStorageAccountName: "Your storage account name" # Optional. Only required if using storage account and access key.
     azureStorageAccountKey: "Your storage account access key" # Optional. Only required if using storage account and access key.
@@ -326,6 +368,11 @@ rule {
 ```
 
   </Tab>
+  <Tab title="Neon">
+
+Neon Object Storage 不会执行 lifecycle rule。请确保你的[清理任务](#neon-object-storage-lifecycle-rules)会在对象超过对应前缀的 TTL 后，删除 `ttl_90d/`、`ttl_180d/` 等每个自定义前缀下的对象。
+
+  </Tab>
 </Tabs>
 
 如果你自定义了 LangSmith 配置中的 TTL，那么也需要同步调整 blob storage 配置中的 TTL。
@@ -443,5 +490,15 @@ resource "azurerm_storage_management_policy" "example" {
 }
 ```
 
+  </Tab>
+  <Tab title="Neon">
+
+### Neon Object Storage lifecycle rules
+
+<Warning>
+Neon Object Storage 会接受并存储 lifecycle 配置，但不会执行过期规则。`ttl_s/`、`ttl_l/` 和 `ttl_XXd/` 前缀下的对象不会被自动删除，因此 blob 数据的存续时间会超过在 LangSmith 中配置的 TTL。更多信息请参见 [Neon Object Storage troubleshooting](https://neon.com/docs/storage/troubleshooting)。
+</Warning>
+
+要强制执行 TTL，请运行一个定时任务（例如 Kubernetes CronJob），删除超过各前缀 TTL 的对象。
   </Tab>
 </Tabs>
