@@ -8,7 +8,7 @@ import ManagedDeepAgentsPublicBetaNote from '/snippets/javascript/langsmith/mana
 
 通常，managed deep agent 的对话 memory 的作用域是单个 thread 或 session。Durable memory 是可选的知识，agent 可以将其跨 threads、sessions 和 deployments 保留。Managed Deep Agents 默认没有 durable memory。
 
-Durable memory 由 [Context Hub](/langsmith/use-the-context-hub) 提供支持，包含两个相互独立的层。可以只启用其中一个层，也可以两者都启用。
+Durable memory 由 [Context Hub](/langsmith/use-the-context-hub) 提供支持，包含两个相互独立的层。按需启用你需要的层。
 
 <ManagedDeepAgentsPublicBetaNote />
 
@@ -29,7 +29,7 @@ my-agent/
 
 完整的项目布局请参见 [Project structure](/langsmith/javascript/managed-deep-agents-project-structure)。
 
-## 选择 memory 层
+## 选择层
 
 一个层指明 agent 读取和写入的是谁的 memory。每个启用的层都会在 agent 文件系统中挂载自己的读写树。
 
@@ -38,7 +38,25 @@ my-agent/
 | **Agent** | `/memories/agent/` | 该 deployment，由所有调用者共享 | 适合所有人的知识，例如团队约定和可复用的流程 |
 | **User** | `/memories/user/` | 发起该 run 的已验证身份者 | 个人偏好和特定调用者的上下文 |
 
-省略某个层即禁用它。运行时从不在层之间复制内容。
+大多数 agent 只需要一个层。一个挂载点意味着每次模型调用只有一个热文件，每次保存也无需做路由决策。按 agent 要保留谁的知识来选择。
+
+**只用 agent memory**：当每个调用者都能从相同的知识中受益时，例如一个学会升级路径的 support agent、一个学会团队信任哪些来源的 research agent、一个学会某个代码仓库约定的 build agent。
+
+**只用 user memory**：当 agent 服务于许多人并针对每个人做出调整时，例如一个助手学会某个人的办公室、偏好的回答格式或其负责的产品领域。User memory 要求 deployment 将调用者验证为人。
+
+**两者都声明**：当 agent 同时保留这两类知识时，例如一个团队助手既学会共享约定，也学会每个人的偏好。每次保存时，agent 会在运行时引导下选择一个挂载点。要在写入被存储之前审阅该选择，请参见[在写入 memory 之前要求审批](#require-approval-before-a-memory-write)。如果改为每次 run 只挂载一个层，请参见[为每次 run 选择层](#select-layers-for-each-run)。
+
+<Warning>
+**Agent memory 可被每个调用者读取。** 在服务于多个人的 deployment 上，保存到 `/memories/agent/` 的特定调用者细节会暴露给所有人。
+
+运行时会告知 agent 不要在那里保存私密或特定调用者的信息。该指示只是引导，没有任何机制强制执行。
+
+同时声明 user memory，可以为 agent 提供一个正确存放此类细节的位置。只使用 agent memory 则无处可放。只有仅挂载 user memory 的 deployment 才能彻底避免这种暴露。在必须挂载 agent memory 的场景下，请[在写入 memory 之前要求审批](#require-approval-before-a-memory-write)。
+</Warning>
+
+省略某个层即禁用它。移除 memory 声明会为整个 agent 关闭 durable memory。
+
+关闭 memory 不会删除任何内容。每个层背后的 Context Hub 仓库会保留其内容，只是 agent 无法再读写它们。再次声明该层会挂载相同的仓库，之前存储的所有内容仍然存在。运行时从不在层之间复制内容。
 
 当 agent 需要在运行过程中学习并稍后复用知识时，请使用 durable memory。对于始终生效的行为，请改用 [instructions](/langsmith/javascript/managed-deep-agents-instructions)。对于特定任务的流程，请改用 [skills](/langsmith/javascript/managed-deep-agents-skills)。
 
@@ -55,21 +73,29 @@ Agent memory 没有 identity 要求。如果只启用 agent 层，可以跳过�
 <Steps>
   <Step title="添加 memory 声明" id="add-the-memory-declaration">
 
-导出一个名为 `memory` 的声明，启用你想要的层：
+导出一个名为 `memory` 的声明，启用你想要的层。以下示例启用 agent memory，它无需 identity 配置即可工作：
 
 
 
 ```ts memory.ts
 import { defineMemory, memoryLayer } from "managed-deepagents";
 
-export const memory = defineMemory({
-  agent: memoryLayer(),
-  user: memoryLayer(),
-});
+export const memory = defineMemory({ agent: memoryLayer() });
 ```
 
 
-除非你提供自己的配置，否则每个层都会使用其[默认访问策略](#control-access-to-a-layer)。
+如果改为让每个人拥有自己的 memory，请声明 user 层，并确认你的 deployment 将调用者验证为人：
+
+
+
+```ts memory.ts
+import { defineMemory, memoryLayer } from "managed-deepagents";
+
+export const memory = defineMemory({ user: memoryLayer() });
+```
+
+
+除非 factory 为 run 选择了层，否则每个层都会使用其[默认访问](#control-access-to-a-layer)。
 
   </Step>
   <Step title="指导记住什么（可选）" id="guide-what-to-remember">
@@ -105,38 +131,59 @@ authorization. When you decide to persist something, use `edit_file` or
 声明一个层会让它可用。agent 在某次 run 中是否真的能访问它，则是另一个决定，在每次 run 开始时做出一次：
 
 1. 运行时解析调用者。如果调用者不是已验证身份的人，user memory 到此为止。
-2. 该层的 `allow(context)` 策略会运行；如果声明时没有提供策略，则应用默认策略。
+2. agent factory 为该次 run 选择层；如果没有 factory 进行选择，则应用项目的声明。
 3. 通过的层会挂载到各自的路径，并加载其热 memory。
 
-如果没有提供 `allow`，Managed Deep Agents 会应用以下默认值：
+当没有任何 selection 为某次 run 选择层时，Managed Deep Agents 会应用以下默认值：
 
 | Run 来源 | Agent memory | User memory |
 | --- | --- | --- |
 | Slack 一对一 DM | Allowed | Allowed |
 | Slack channel 或群组 DM | Allowed | Denied |
 | Direct API run | Allowed | Denied |
-| Studio，已验证用户 | Allowed | Allowed，不调用策略 |
+| Studio，已验证用户 | Allowed | Allowed |
 
-Agent memory 由 deployment 共享，因此默认可用。User memory 是个人的，因此默认只在对话已经对某个人私密的场景下挂载。Slack channel、群组 DM 和 direct API run 都不属于这种场景，而运行时无法从外部判断这类 run 是否私密。默认拒绝意味着个人 memory 永远不会到达共享对话，除非你用自己的策略主动启用。
+Agent memory 由 deployment 共享，因此默认可用。User memory 是个人的，因此默认只在对话已经对某个人私密的场景下挂载。Slack channel、群组 DM 和 direct API run 都不属于这种场景。运行时无法从外部确定这类 run 是否私密，因此会在这些场景拒绝 user memory。除非 deployment 主动启用，否则个人 memory 永远不会到达共享对话。
 
-运行时在挂载存储之前，每次 run 只评估一次策略。返回 `false` 只会在该次 run 中移除该层的挂载及其自动 memory 内容。已存储的 memory 不会被删除。
+### 为每次 run 选择层
 
-### 读取 run context
+要按 run 决定，请导出 agent factory，并把 `memory` 传给它返回的定义。factory 会收到运行时，因此可以读取调用者发送的应用上下文，或 run 到达时所处的 [channel](/langsmith/javascript/managed-deep-agents-runtime#channel)。factory 本身的说明请参见[为每次 run 选择配置](/langsmith/javascript/managed-deep-agents-agent-definition#select-configuration-per-run)。
 
-`allow` 接收 run context。只有当你想让 user memory 出现在默认策略拒绝的场景（例如你自己的应用调用 API）时，才需要读取它。
+Direct API run 默认会被拒绝 user memory，因为运行时无法确定该 run 是否私密。你的应用掌握这一信息：它知道自己代表哪个最终用户，以及该用户是否要求 agent 记住自己。请把该决定放在 run 的 `context` 字段中发送，然后在 factory 中读取它。
 
-托管 channel run 会在 `context.channel` 中携带当前的投递，原始 provider event 也一并携带。默认的 user memory 策略会读取 Slack channel 类型，其中 `"im"` 表示一对一 DM：
+以下示例在调用者将 `remember` 设为 `true` 时挂载 user memory，否则挂载 agent memory：
 
 
 
-```ts
-allow: (context) => context.channel?.rawEvent?.channel_type === "im";
+```ts agent.ts
+import {
+  defineDeepAgent,
+  defineMemory,
+  memoryLayer,
+  type ManagedServerRuntime,
+} from "managed-deepagents";
+import { z } from "zod";
+
+const contextSchema = z.object({ remember: z.boolean().optional() });
+
+export function agent(
+  runtime: ManagedServerRuntime<z.infer<typeof contextSchema>>
+) {
+  const remember = runtime.executionRuntime?.context?.remember === true;
+
+  return defineDeepAgent({
+    name: "office-helpdesk",
+    model: "openai:gpt-5.5",
+    memory: remember
+      ? defineMemory({ user: memoryLayer() })
+      : defineMemory({ agent: memoryLayer() }),
+    contextSchema,
+  });
+}
 ```
 
 
-默认策略下，不携带 provider event 的投递不会收到 user memory。
-
-Direct API 调用者在创建 run 时可以提供自己的 context：
+调用者在创建 run 时提供该上下文，因此产品中的“记住我”设置会变成 run 上的一个字段：
 
 
 
@@ -152,31 +199,75 @@ await client.runs.create(threadId, assistantId, {
 ```
 
 
-### 替换默认策略
+factory 的 selection 会在该次 run 中覆盖项目的 memory 声明。上表仅适用于没有 factory 选择层的 run。
 
-提供 `allow` 即可替换某个层的默认策略。策略可以是同步或异步的。以下配置让 agent memory 对所有人可用，并在调用者传入 `remember: true` 时启用 user memory：
+有一条规则不受覆盖影响：user memory 只为已验证身份的人挂载。为 service principal 选择的 user 层不会挂载。在任何 run 访问 user memory 之前，请先配置 [Supabase](/langsmith/javascript/managed-deep-agents-identity#configure-identity-with-supabase) 或你自己的后端。
 
 
 
-```ts memory.ts
-import { defineMemory, memoryLayer } from "managed-deepagents";
+传入 `memory: null` 可让某次 run 没有 durable memory。省略 `memory` 则保留项目声明的内容。
 
-type Context = {
-  remember?: boolean;
-};
 
-export const memory = defineMemory<Context>({
-  agent: memoryLayer(),
-  user: memoryLayer({
-    allow: (context) => context.remember === true,
-  }),
-});
+Agent Server 在运行 graph 之外，还会调用 factory 来检查 graph，因此请让 selection 成为其收到的运行时的纯函数。请参见[保持 factory 可重复](/langsmith/javascript/managed-deep-agents-agent-definition#keep-the-factory-repeatable)。
+
+### 从 allow 策略迁移
+
+层以前可以携带返回布尔值的 `allow(context)` 策略。该回调自 `managed-deepagents` 0.9.0 起已弃用。在 `memory.py` 或 `memory.ts` 中声明的策略仍会运行，因此现有项目可以继续工作。在 factory 中选择层即可替代它。
+
+在 factory 中选择的 memory 会拒绝该回调：
+
+
+
+```text
+Dynamically selected memory cannot use `allow`. Select memory layers or return null from the dynamic agent resolver instead.
 ```
 
 
 <Warning>
-策略只能在运行时已验证身份的调用者范围内放宽访问。它无法为 service principal 启用 user memory，也无法选择另一个人的 memory。运行时会在调用 `allow` 之前检查已验证的 principal，因此上面的例子只向已验证为人的 direct API 调用者授予 user memory。
+抛出异常的策略会让 run 失败，而不是拒绝挂载。对于仍在运行的策略，请在内部捕获异常并返回 `false`，这样当数据存储不可用时，user memory 会被拒绝，而 run 可以继续。
 </Warning>
+
+factory selection 和 `allow` 策略都不会把访问范围放宽到运行时所验证的调用者之外。两者都不会为 service principal 挂载 memory，也都无法访问另一个人的 memory。
+
+### 测试 memory 访问
+
+当 user 层已挂载时，已验证的 Studio 用户会收到它：运行时会为该用户跳过该层的策略。本地 `mda dev` 的 principal 也以相同方式解析。因此 Studio 不是测试 user 层策略的地方。省略 user 层的 factory，或从未声明该层的项目，会让 Studio 没有 user memory。
+
+Agent 层没有这种豁免。它的策略会为每个调用者运行，包括已验证的 Studio 用户。
+
+Agent Server 还会调用 factory 来检查 graph，这些调用不携带 run context。读取 context 的 selection 在这些调用中会走 fallback 分支。Native Node 还要求 Agent Server 将 run context 传给 graph factory。
+
+请通过真实调用者针对 deployment 来测试 selection 或策略：一条 Slack 消息，或你自己的应用发送它自己的 context。
+
+## 在写入 memory 之前要求审批
+
+策略决定某个层是否挂载，但不决定 agent 会向已挂载的层写入什么。当某个人应在更改被保存之前看到它时，请暂停 tool 调用。
+
+在有许多调用者的 deployment 上，只要挂载了 agent memory，这一点就很重要。运行时会告知 agent 不要在那里保存特定调用者的信息，但没有任何机制强制执行。审批卡片会指明目标路径。审阅者可以看到写入将前往哪个挂载点，并在任何内容被存储之前更正或拒绝它。
+
+
+
+TypeScript 尚不支持 interrupt 模式。`FilesystemPermission` 支持 `"allow"` 和 `"deny"`，因此规则可以阻止对某个挂载点的写入，但无法暂停以等待审批：
+
+```ts agent.ts
+import { defineDeepAgent } from "managed-deepagents";
+
+import { searchPolicies } from "./tools/policies";
+
+export const agent = defineDeepAgent({
+  name: "office-helpdesk",
+  model: "openai:gpt-5.5",
+  tools: [searchPolicies],
+  permissions: [
+    {
+      operations: ["write"],
+      paths: ["/memories/**"],
+      mode: "deny",
+    },
+  ],
+});
+```
+
 
 ## 识别 user memory 背后的人
 
@@ -198,9 +289,11 @@ User memory 以该 run 的已验证 principal 为 key，而不是以调用者传
 | 路径 | 用途 |
 | --- | --- |
 | 挂载点根目录下的 `AGENTS.md` | **热 memory**，存放紧凑、经常相关的知识。其内容会加载到每一次模型调用中。 |
-| 挂载点下的其他文件 | **冷 memory**，存放详细知识，agent 只在相关时才读取。 |
+| 挂载点下的其他文件 | **冷 memory**，存放详细知识，只在 agent 打开文件时读取。 |
 
-热 memory 会消耗每次 run 的 context，因此要保持紧凑。把详细内容（例如流程、决策记录和研究笔记）放入冷文件，并在有用时从热 memory 链接到它们。
+热 memory 会消耗每次 run 的 context，因此要保持紧凑。
+
+运行时不会对 memory 分层。编写好的 instructions 和 skills 决定记住什么、写入哪个文件。缺少这些指导时，模型可能会不断追加到 `AGENTS.md`，而后面的每次调用都要为此付出代价。要让详细内容不进入每次模型调用，请指明要写入的冷文件（例如流程、决策记录和研究笔记），并告诉 agent 从 `AGENTS.md` 链接到它们。
 
 agent 使用内置的 [`read_file`](/oss/javascript/deepagents/tools#built-in-harness-tools)、[`edit_file`](/oss/javascript/deepagents/tools#built-in-harness-tools) 和 [`write_file`](/oss/javascript/deepagents/tools#built-in-harness-tools) tools 读取和更新 memory。尚不存在的热文件在被首次写入之前保持为空。
 
@@ -214,7 +307,7 @@ Agent memory 由该 deployment 的所有调用者共享，并且每个调用者�
 
 ## 测试 memory
 
-在没有 Slack workspace 的情况下，Studio 是测试 user memory 的方式。已验证的 Studio 用户会收到所有声明的 memory 层，并且运行时不会为该用户调用 user 层的 `allow` 策略。在 Studio 中看起来毫无作用的声明层，通常根本没有被声明，因此请先检查 `memory.py` 或 `memory.ts`。
+在没有 Slack workspace 的情况下，Studio 是测试 memory 的方式。已验证的 Studio 用户会收到所有已声明的层，因此在 Studio 中看起来毫无作用的层，通常根本没有被声明。请先检查 `memory.py` 或 `memory.ts`。
 
 Studio 写入的位置取决于你在运行什么：
 
@@ -223,13 +316,9 @@ Studio 写入的位置取决于你在运行什么：
 
 本地 memory 和已部署的 memory 是独立的存储，因此在 `mda dev` 下教给 agent 的内容，在部署之后不会出现。
 
-运行时只在 run 执行期间评估策略。检查 graph 不会调用它。Native Node 还要求 Agent Server 将 run context 传给 graph factory。
+访问决策是例外。请参见[测试 memory 访问](#test-memory-access)。
 
 更多信息请参见 [Local development](/langsmith/javascript/managed-deep-agents-local-development)。
-
-## 禁用 memory
-
-省略某个层即禁用它。移除 memory 声明即可完全关闭 durable memory。禁用一个层会让 agent 无法再访问它，但不会删除已存储的 memory。
 
 ## Deployment
 
