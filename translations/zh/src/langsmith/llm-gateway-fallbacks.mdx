@@ -13,31 +13,57 @@ LLM Gateway 中的模型 fallback 会在主模型返回已配置的错误（例�
 
 ## 工作原理
 
-一条 fallback 链包含：
+### 链的组成部分
+
+一条模型 fallback 链包含：
 
 - **一个主模型**：当请求失败时触发该链的 provider 和模型。
 - **一到五个 fallback**：provider 模型或已保存的[模型配置](/langsmith/model-configurations)的有序列表。provider 模型会使用工作区中该 provider 的 secret，或对符合条件的托管模型使用 Gateway Credits。
-- **触发条件（triggers）**：把请求移到下一个模型的 HTTP 状态码。默认值涵盖常见的超时、速率限制和服务器错误，例如 `408`、`429`、`500` 和 `503`。默认值不包含 `424`，当某个模型在工作区中没有 provider key 时，gateway 会返回该状态码。添加 `424` 可以让链跳过没有 key 的 fallback。没有 key 的主模型会返回 `424`，而不会尝试该链。
-- **首次输出超时**：每次尝试在 gateway 移到下一个模型之前可以等待多久。该超时默认开启，时长为 120 秒，每次尝试都会获得新的计时器。[统一 API 格式](/langsmith/llm-gateway-api-formats)中的流式请求会等待首次输出。非流式请求和 [direct model access](/langsmith/llm-gateway-direct-model-access) 请求会等待响应 header。
+- **Fallback 触发条件**：把请求移到下一个模型的 HTTP 状态码。默认值涵盖速率限制、过载、服务器和请求超时错误，例如 `408`、`429`、`500` 和 `503`。
+- **首次输出时间**：每次尝试在 gateway 移到下一个模型之前可以等待多久。该超时默认开启，时长为 120 秒，每次尝试都会获得新的计时器。[统一 API 格式](/langsmith/llm-gateway-api-formats)中的流式请求会等待首次输出。非流式请求和 [direct model access](/langsmith/llm-gateway-direct-model-access) 请求会等待响应 header。
+- **模型冷却**（可选）：多少次失败会让 gateway 跳过某个模型，以及跳过多久。默认关闭。详情请参见[模型冷却](#模型冷却)。
 
 <Tip>
-[Rate limit policy](/langsmith/llm-gateway-rate-limit-policies) 会在 gateway 调用主模型之前拦截请求，因此它产生的 `429` 不会触发该链。只有来自 provider 的 `429` 才会触发。
+有两种状态码在 fallback 中的行为比较特殊：
+
+- **来自 rate limit policy 的 `429`**：[rate limit policy](/langsmith/llm-gateway-rate-limit-policies) 会在 gateway 调用主模型之前拦截请求，因此它产生的 `429` 不会触发该链。只有来自 provider 的 `429` 才会触发。
+- **`424` 表示缺少 provider key**：默认触发条件不包含 `424`。添加它可以让链跳过工作区中没有 [provider key](/langsmith/llm-gateway-provider-authentication#fix-provider-credential-errors) 的 fallback。没有 key 的主模型会返回 `424`，而不会尝试该链。
 </Tip>
+
+### 模型冷却
+
+冷却是指 gateway 在一段时间内跳过 fallback 链中的某个模型而不调用它。跳过很可能失败的模型，可以为每个请求省下一次失败尝试的延迟。模型会通过两种方式进入冷却：
+
+- **Provider 速率限制**：当 provider 返回 `429` 时，gateway 会在 provider 响应给出的重试延迟内跳过该模型。如果响应未设置延迟，冷却持续 5 秒。任何冷却都不会超过 300 秒。工作区中所有触发条件包含 `429` 的链都会跳过该模型。
+- **模型冷却**：为某条链开启 **Model cooldown** 后，如果在冷却周期内某个模型命中该链的触发条件达到设定次数，该链会在冷却周期内跳过它。触发状态码、超时和 provider 传输错误都计为失败。其他状态码和被取消的请求不计入，成功也不会重置计数。失败按每条链中的每个模型分别计数，因此其他链仍会调用该模型。开启后，默认在 3 次失败后跳过该模型 60 秒。周期结束后，gateway 会再次调用该模型，其失败计数重新开始。
+
+链中的最后一个模型始终会被调用，即使它正处于冷却中。
+
+### 请求流程
 
 对于每个请求：
 
-1. gateway 会调用由请求的带 provider 前缀 model ID 选定的主模型。
-1. 如果请求以已配置的触发状态码失败、超时或遇到传输错误，gateway 会加载匹配的 fallback 链。
-1. 按顺序调用每个 fallback，直到某个调用成功、返回不会触发另一个 fallback 的状态码，或链条耗尽。
-1. 以 client 使用的 API 格式返回最终响应。
+1. gateway 会把请求的带 provider 前缀 model ID 匹配到一条 fallback 链，并调用主模型。
+1. 如果这次尝试以触发状态码失败、超时或遇到传输错误，gateway 会按顺序调用下一个 fallback。
+1. gateway 重复上一步，直到出现以下任一情况：
+   - 某个模型成功。
+   - 某个模型返回的状态码不是触发条件。
+   - 没有剩余的 fallback。
+1. gateway 以 client 使用的 API 格式返回最后一个响应。
+
+gateway 会跳过任何正在[冷却](#模型冷却)的模型（最后一个除外），不调用它。被跳过的模型不会出现在响应体中。要查看被跳过的模型，请[调查该链的尝试](#排查-fallback-尝试)。
 
 一旦流式响应开始发送输出，gateway 就会锁定该模型，不再回退，即使该流之后失败也是如此。
 
-fallback 可以使用与主模型不同的 provider 和 API 格式。gateway 会在[受支持的 API 格式](/langsmith/llm-gateway-api-formats)之间转换请求和响应，因此 Anthropic 主模型可以回退到 OpenAI 模型，而 client 无需任何改动。
+<Tip>
+每次尝试都会被追踪，并单独计入 [spend policies](/langsmith/llm-gateway-spend-policies)。一个使用了两个 fallback 的请求会记录三次模型调用：一次主模型尝试和两次 fallback 尝试。被跳过的模型不产生模型调用。
+</Tip>
+
+### 支持的格式与 endpoint
+
+fallback 可以使用与主模型不同的 provider 和 API 格式。gateway 会在[受支持的 API 格式](/langsmith/llm-gateway-api-formats)之间转换请求和响应。例如，Anthropic 主模型可以回退到 OpenAI 模型，而 client 无需任何改动。
 
 fallback 链适用于 Chat Completions、Responses 和 Messages 请求，包括统一 endpoint 和 direct model access 路径。其他 endpoint（例如 embeddings）会直接调用请求的模型，不使用 fallback。
-
-每次尝试都会被追踪，并单独计入 [spend policies](/langsmith/llm-gateway-spend-policies)。一个使用了两个 fallback 的请求会记录三次模型调用：一次主模型尝试和两次 fallback 尝试。
 
 ## 创建 fallback 链
 
@@ -52,17 +78,18 @@ fallback 链适用于 Chat Completions、Responses 和 Messages 请求，包括�
 1. 选择该链适用的 **Workspace**。
 1. 选择主 provider 和模型。发往这个带 provider 前缀 model ID 的请求，会在主模型尝试失败时使用该链。
 1. 在 **Fallbacks** 下，按 gateway 应尝试的顺序添加一到五个备用模型。可以直接选择 provider 和模型、选择已有的模型配置，或创建自定义模型配置。
-1. 在 **Configure fallback triggers (advanced)** 下，检查触发下一个 fallback 的 HTTP 状态码。要添加状态码，请在字段中输入它，然后从列表中选择。
-1. （可选）在同一部分中调整 **First output timeout per model (seconds)**，或关闭 **Time to first output** 以移除超时。
+1. 在 **Fallback triggers** 下，检查把请求发送到下一个模型的状态码。按需调整。
+1. （可选）调整[**首次输出时间**](#链的组成部分)，单位为秒。将字段留空可移除超时。
+1. （可选）开启[**模型冷却**](#模型冷却)，并设置跳过模型的时长以及多少次失败会开始冷却。
 1. 点击 **Create chain**。
 
 <Tip>
-一个 provider 和模型在每个工作区中只能有一条 fallback 链。要更改其行为，请编辑已有的链。
+一个 provider 和模型在每个工作区中最多只能有一条 fallback 链。要更改其行为，请编辑已有的链。
 </Tip>
 
-## 在 Simulator 中测试链
+## 测试 fallback 链
 
-Simulator 会通过 fallback 链发送请求，同时模拟链中每个模型的行为，因此你可以在生产环境中的 provider 发生故障之前检查链的路由和新增延迟。
+Simulator 会通过 fallback 链发送请求，并为每个模型使用你选择的行为，例如速率限制或宕机。这样你可以在生产环境中的 provider 发生故障之前检查链的路由和新增延迟。
 
 测试链的步骤：
 
@@ -78,6 +105,7 @@ Simulator 会通过 fallback 链发送请求，同时模拟链中每个模型的
 - **模拟失败不会发送推理请求。** 为了近似网络延迟，gateway 会调用一个不生成 token 的 provider endpoint。模拟失败不会产生 trace。
 - **模拟失败只会在触发状态码上回退。** 只有当 `429` 和 `503` 位于链的触发条件中时，Rate limit 和 Outage 才会移到下一个模型。两者都包含在默认值中。
 - **Simulator 只发送非流式请求。** 要检查链的流式行为，请从你的代码中发送流式请求。
+- **Simulator 会忽略冷却。** 即使某个模型正在冷却，它也会调用每个模型，并且它的失败不计入 **Model cooldown**，因此测试运行不会为生产流量冷却某个模型。要检查冷却行为，请从你的代码中通过该链发送请求。
 - **模拟之外的错误仍会出现。** 如果某个 fallback 在工作区中没有 provider key，它的尝试会返回 `424`，与生产环境相同。如果主模型没有 key，Simulator 会在运行链之前提示你添加一个。
 
 ## 发起调用
@@ -97,8 +125,8 @@ gateway 会应用为该 API key 所属工作区中的 `<PRIMARY_MODEL_ID>` 配�
 
 当链运行时，响应会记录 gateway 尝试了哪些模型、每次尝试的状态码，以及处理请求的模型：
 
-- **在你的 traces 中**：如果你的应用通过 Python 中的 LangChain chat model（`langchain-openai>=1.6.7` 或 `langchain-anthropic>=1.7.5`）调用 gateway，并开启了 [tracing](/langsmith/observability)，则该模型的 run 会有一个 **Gateway** 部分，列出每次尝试。
-- **在响应中**：其他 client 可以读取 `X-LangSmith-Gateway-Metadata` [响应 header](/langsmith/llm-gateway-api-formats#read-response-metadata)。其 `attempt_details` 字段列出每次尝试的模型和状态码，`selected_model` 指定处理请求的模型。
+- **在你的 traces 中**：如果你的应用通过 Python 中的 LangChain chat model（`langchain-openai>=1.6.7` 或 `langchain-anthropic>=1.7.5`）调用 gateway，并开启了 [tracing](/langsmith/observability)，则该模型的 run 会有一个 **Gateway** 部分，列出每次尝试。chat model 会从下一项所述的响应 header 中读取这些信息。
+- **在响应中**：其他 client 可以读取 `X-LangSmith-Gateway-Metadata` [响应 header](/langsmith/llm-gateway-api-formats#read-response-metadata)。其 `attempt_details` 字段列出每次尝试的模型和状态码，`selected_model` 指定处理请求的模型。因[冷却](#模型冷却)而被跳过的模型，其 `fallback_trigger` 为 `cooldown`，且没有状态码。
 
 ## 为 prompt 设置 fallback
 

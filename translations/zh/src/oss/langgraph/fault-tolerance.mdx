@@ -1,7 +1,12 @@
 ---
 title: 容错能力
-description: 在 LangGraph 中配置每个节点的超时、重试和错误处理程序。
+description: 在 LangGraph 中配置每个节点的超时、重试、错误处理程序和恢复策略。
 ---
+
+import LanggraphFaultToleranceLlmRecoverableJs from '/snippets/code-samples/langgraph-fault-tolerance-llm-recoverable-js.mdx';
+import LanggraphFaultToleranceLlmRecoverablePy from '/snippets/code-samples/langgraph-fault-tolerance-llm-recoverable-py.mdx';
+import LanggraphFaultToleranceUnexpectedJs from '/snippets/code-samples/langgraph-fault-tolerance-unexpected-js.mdx';
+import LanggraphFaultToleranceUnexpectedPy from '/snippets/code-samples/langgraph-fault-tolerance-unexpected-py.mdx';
 
 当节点因缓慢的外部 API、瞬态网络错误或未处理的异常而发生故障时，LangGraph 为您提供三种可组合的响应机制：
 
@@ -268,6 +273,108 @@ const graph = new StateGraph(State)
 
 即使没有重试策略，`executionInfo` 也可用 — `nodeAttempt` 默认为 `1`。
 :::
+
+## 重试边界与幂等性
+
+[重试](#retries)会从头重新运行整个节点函数。这为节点执行带来**至少一次**语义：当策略匹配时，LangGraph 会再次调用该节点。它并不能让外部副作用恰好执行一次。
+
+```text
+attempt 1:  node starts -> call payment API -> payment succeeds -> process crashes
+attempt 2:  node starts -> call payment API -> payment succeeds again
+```
+
+[检查点](/oss/langgraph/checkpointers)在[超级步骤](/oss/langgraph/graph-api#super-steps)边界写入，而不是在函数执行中途写入。来自失败尝试的图写入会被丢弃。节点执行期间的副作用（付款、发送邮件、外部写入）位于该边界之外。应用代码必须让这些副作用具备幂等性。
+
+这一重新执行模型同样适用于[中断](/oss/langgraph/interrupts)之后或崩溃恢复之后。请参阅[重新执行与幂等性](/oss/langgraph/graph-api#re-execution-and-idempotency)。若要在节点内部对工作设置检查点，以便恢复时跳过已完成的单元，请将每个单元包装为[任务](/oss/langgraph/graph-api#using-tasks-in-nodes)。
+
+### 使用幂等键保护副作用
+
+在执行副作用时一并发送一个稳定的幂等键，以便提供商对重试进行去重。该键必须在副作用运行**之前**就已经持久化。不要在同一个节点内生成它并依赖返回值：
+
+```text
+attempt 1:  node starts -> generate key K1 -> charge succeeds -> process dies before returning
+attempt 2:  node starts -> state has no key -> generate key K2 -> charge runs again
+```
+
+`K1` 从未被写入检查点。请从已经持久化的状态中派生该键：
+
+:::python
+```python
+def charge_customer(state: State) -> dict:
+    # Same order always produces the same key across retries and resumes.
+    idempotency_key = f"charge:{state['order_id']}"
+
+    provider.charge(
+        customer_id=state["customer_id"],
+        amount=state["amount"],
+        idempotency_key=idempotency_key,
+    )
+
+    # Observability only. A retry must not depend on this return value.
+    return {"last_payment_key": idempotency_key, "charged": True}
+```
+:::
+
+:::js
+```typescript
+async function chargeCustomer(state: typeof State.State) {
+  // Same order always produces the same key across retries and resumes.
+  const idempotencyKey = `charge:${state.orderId}`;
+
+  await provider.charge({
+    customerId: state.customerId,
+    amount: state.amount,
+    idempotencyKey,
+  });
+
+  // Observability only. A retry must not depend on this return value.
+  return { lastPaymentKey: idempotencyKey, charged: true };
+}
+```
+:::
+
+如果没有可持久化的业务标识，请在执行副作用之前，在单独的节点中持久化一个生成的键。若发生进程崩溃，只有当中间那次检查点已经持久化时，这种做法才有效。此模式请使用[同步耐久性](/oss/langgraph/checkpointers#durability-modes)。
+
+:::python
+```python
+import uuid
+
+def reserve_key(state: State) -> dict:
+    # Own node so the key is checkpointed before anything external runs.
+    return {"payment_key": state.get("payment_key") or str(uuid.uuid4())}
+
+def charge_customer(state: State) -> dict:
+    provider.charge(..., idempotency_key=state["payment_key"])
+    return {"charged": True}
+```
+:::
+
+:::js
+```typescript
+import { randomUUID } from "node:crypto";
+
+function reserveKey(state: typeof State.State) {
+  // Own node so the key is checkpointed before anything external runs.
+  return { paymentKey: state.paymentKey ?? randomUUID() };
+}
+
+async function chargeCustomer(state: typeof State.State) {
+  await provider.charge({ ..., idempotencyKey: state.paymentKey });
+  return { charged: true };
+}
+```
+:::
+
+两项要求：
+
+1. **该键可由持久化状态重现。** 重试或在全新进程中恢复时，能够重建出相同的键。
+2. **外部服务接受该键。** 在依赖它之前，请查阅提供商的文档。
+
+### 将缺失的确认视为未知
+
+如果提供商已经提交但确认丢失，图在本地没有任何记录，即使副作用可能已经发生。当提供商支持去重时，之后使用相同键的尝试可以避免盲目重复，但结果仍然未知。请将本地状态缺失视为未知，而不是当成副作用未发生的证据。在补偿或继续之前，向提供商查询该操作的状态。
+
+对于无法在 API 层面实现幂等的副作用，请将其移出可重试的节点。例如，在重试次数用尽后从[错误处理程序](#error-handling)中运行它们，或交由按任务 ID 去重的单独工作进程执行。
 
 ## 超时
 
@@ -858,6 +965,44 @@ const graph = new StateGraph(State)
 ### 子图失败
 
 如果节点包装子图并且子图引发未处理的异常，则该异常会显示到父节点。如果父节点有错误处理程序，则该处理程序会在 `error.error` 中触发子图的异常。
+
+## 恢复策略
+
+重试和错误处理程序涵盖自动重试以及重试耗尽后的补偿。另外两种常见模式位于您的节点逻辑中：
+
+| 策略 | 由谁修复 | 机制 |
+|----------|--------------|-----------|
+| 暂时性错误 | 系统 | 节点上的[重试策略](#retries) |
+| 重试后可恢复的失败 | 开发者 | [`error_handler` / `errorHandler`](#error-handling)（Saga / 补偿） |
+| LLM 可恢复的错误 | LLM | 将错误写入状态，并使用 @[`Command`] 路由回去 |
+| 用户可修复的错误 | 人工 | 使用 [`interrupt()`](/oss/langgraph/interrupts) 暂停 |
+| 意外错误 | 开发者 | 让异常向上冒泡，使运行失败 |
+
+### LLM 可恢复的错误
+
+当工具调用或解析以模型可以纠正的方式失败时，在节点中捕获该错误，将其写入状态，并路由回智能体，以便 LLM 进行调整：
+
+:::python
+<LanggraphFaultToleranceLlmRecoverablePy />
+:::
+
+:::js
+<LanggraphFaultToleranceLlmRecoverableJs />
+:::
+
+这是应用层的控制流，而不是 `error_handler`。节点处理一种已知的失败模式并让运行继续。
+
+### 意外错误
+
+不要捕获无法处理的失败。如果没有匹配的重试策略或错误处理程序，异常会向上冒泡，导致运行失败，以便您修复缺陷：
+
+:::python
+<LanggraphFaultToleranceUnexpectedPy />
+:::
+
+:::js
+<LanggraphFaultToleranceUnexpectedJs />
+:::
 
 :::python
 
