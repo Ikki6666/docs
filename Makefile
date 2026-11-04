@@ -102,7 +102,7 @@ PYTHON_FILES=.
 
 lint:
 	uv run ruff format $(PYTHON_FILES) --diff
-	uv run ruff check $(PYTHON_FILES) --diff
+	uv run ruff check $(PYTHON_FILES)
 	uv run ty check
 	uv run codespell src
 
