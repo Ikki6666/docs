@@ -9,7 +9,7 @@ sidebarTitle: 基于属性的访问控制
 ABAC（Attribute-Based Access Control）是一个 Enterprise 功能，用于实现细粒度访问控制。如果你对该功能感兴趣，请[联系销售团队](https://www.langchain.com/contact-sales)。其他方案默认所有用户都使用 Admin 角色。
 </Note>
 
-ABAC 通过给访问决策增加基于标签的条件，来补充[基于角色的访问控制（RBAC）](/langsmith/rbac)。RBAC 根据用户角色授予一揽子权限，例如“可以读取所有项目”；而 ABAC 允许你根据资源标签进一步限制或授予访问，例如“只能读取带有 `Environment=Development` 标签的项目”。
+ABAC 通过给访问决策增加基于标签的条件，来补充[基于角色的访问控制（RBAC）](/langsmith/rbac)。RBAC 根据用户角色授予一揽子权限，例如“可以读取所有项目”；而 ABAC 允许你根据资源标签进一步限制或授予访问，例如“只能读取带有 `Environment=Development` 标签的项目”。在单个 project 内，ABAC 还可以根据 root run metadata 限制用户可读取的 traces。详见[使用 root run metadata 控制 trace 访问](#control-trace-access-with-root-run-metadata)。
 
 <Note>
 角色、资源标签和 ABAC 策略都可以通过 UI 或 [API](https://api.smith.langchain.com/docs#/access_policies) 管理。配置完成后，策略会在 API 和 UI 中自动生效。
@@ -18,7 +18,7 @@ ABAC 通过给访问决策增加基于标签的条件，来补充[基于角色�
 ## 开始前准备
 
 * 先在工作区中[设置资源标签](/langsmith/set-up-resource-tags)。
-* 当前 ABAC 在策略中仅支持把 `resource_tag_key` 作为 `attribute_name`，也就是只支持基于资源标签来评估。暂不支持其他属性。
+* ABAC 在策略中支持两种 `attribute_name` 取值：`resource_tag_key` 用于评估资源标签，`root_run_metadata` 用于评估 project 中每条 trace 的 root run metadata。
 
 ## 为自托管部署启用 ABAC
 
@@ -106,6 +106,7 @@ Deny 策略始终优先。如果 allow 和 deny 策略同时匹配，最终结�
 | `prompt` | `prompts:read`, `prompts:update`, `prompts:delete`, `prompts:share`, `prompts:tag` |
 | `dataset` | `datasets:read`, `datasets:update`, `datasets:delete`, `datasets:share`, `datasets:download`, `datasets:clone` |
 | `deployment` | `deployments:read`, `deployments:update`, `deployments:delete` |
+| `queues` | `annotation-queues:create`, `annotation-queues:delete`, `annotation-queues:read`, `annotation-queues:update` |
 | `mcp_server` | `mcp-servers:read`, `mcp-servers:invoke`, `mcp-servers:update`, `mcp-servers:delete`。详见 [Fleet 工具访问控制](/langsmith/fleet/access-and-oversight#tool-access-control)。 |
 | `fleet_integration` | `mcp-servers:read`, `mcp-servers:invoke`。详见 [Fleet 工具访问控制](/langsmith/fleet/access-and-oversight#tool-access-control)。 |
 
@@ -120,10 +121,12 @@ Runs 本身没有独立标签。Run 权限（`runs:read`、`runs:read-inputs`、
 #### Conditions
 
 `conditions` 数组中的每个条件都指定：
-- **`attribute_name`** - 当前仅支持 `resource_tag_key`
-- **`attribute_key`** - 要匹配的标签 key，例如 `Environment`、`Application`
+- **`attribute_name`** - `resource_tag_key` 用于匹配资源标签，`root_run_metadata` 用于匹配 root run metadata
+- **`attribute_key`** - 要匹配的标签 key 或 metadata key，例如 `Environment`、`Application`
 - **`operator`** - 比较运算符
 - **`attribute_value`** - 要比较的值
+
+下面的运算符适用于 `resource_tag_key` 条件。`root_run_metadata` 条件仅支持 `equals`。相关规则请参阅[使用 root run metadata 控制 trace 访问](#control-trace-access-with-root-run-metadata)。
 
 #### 运算符
 
@@ -172,6 +175,8 @@ Teams 不创建策略，只附加已有策略：
 
 ## ABAC 与 RBAC 如何协同工作
 
+<a id="how-abac-works-with-rbac"></a>
+
 在决定是否允许访问资源时，系统会同时考虑 [RBAC](/langsmith/rbac) 权限和 ABAC 策略：
 
 - ABAC **deny** 策略会覆盖 RBAC 权限
@@ -207,6 +212,44 @@ Teams 不创建策略，只附加已有策略：
 <a id="control-access-to-run-inputs-and-outputs"></a>
 
 `runs:read` 控制用户能否看到某个 run。`runs:read-inputs` 和 `runs:read-outputs` 控制用户能否看到该 run 的输入与输出。这些权限的访问策略使用 `resource_type: "project"`，并基于每个 run 的父 project 进行评估，因此你可以在部分 project 中隐藏输入、输出或两者，同时保持工作区中其他 project 不受影响。这些权限的 RBAC 与 ABAC 组合方式与其他任何权限相同。详见 [ABAC 与 RBAC 如何协同工作](#how-abac-works-with-rbac)。
+
+## 使用 root run metadata 控制 trace 访问
+
+<a id="control-trace-access-with-root-run-metadata"></a>
+
+`root_run_metadata` 条件根据每条 trace 的 root run metadata 中的某个 key，限制用户在 project 中可以读取哪些 traces。借助它，你可以在不把 traces 拆分到不同 project 的前提下，隐藏 project 中的部分 traces，或只向用户显示标记给他们的 traces。
+
+`root_run_metadata` 条件只能用在 `permission: "runs:read"` 且 `resource_type: "project"` 的条件组中。它接受以下字段：
+
+- **`attribute_key`**：root run metadata 中的顶层 key。不支持嵌套 key，因此该 key 不能包含 `.`。
+- **`operator`**：仅支持 `equals`。匹配区分大小写。
+- **`attribute_value`**：要匹配的值，或占位符 `${user.ls_user_id}`。该占位符会匹配发起请求用户的 `ls_user_id`。可从 [`GET /auth/public`](/langsmith/smith-api/auth/get-public-auth-info) 获取该值。请使用响应中的 `ls_user_id` 字段，它不同于 `user_id` 或用户对象的 `id`。
+
+`attribute_key` 和 `attribute_value` 都不能包含双引号或反斜杠，并且各自限制为 255 字节。以 `${` 开头的值必须正好是 `${user.ls_user_id}`。
+
+条件组可以把 `root_run_metadata` 条件与 `resource_tag_key` 条件组合使用。标签条件用于选择该组适用的 projects，metadata 条件用于选择这些 project 中的 traces。组内所有条件都必须匹配。
+
+条件只评估 root run，因此一条 trace 中的所有 runs 要么全部可见，要么全部隐藏。请在摄取之前为 root run 设置好 metadata key 和 value。root run metadata 在摄取后不可变，因此你无法事后再添加或修改它来让某条 trace 匹配策略。关于如何添加 metadata，请参阅[为 traces 添加 metadata 与标签](/langsmith/add-metadata-tags)。
+
+### metadata 条件如何与 RBAC 结合
+
+metadata 条件遵循与其他策略相同的优先级：先应用 deny 策略，再应用 RBAC，最后应用 allow 策略。
+
+- **Deny 策略**：带 metadata 条件的 deny 策略会隐藏匹配的 traces，而不会封锁整个 project。用户仍可访问该 project 中的其他 traces。当多条 deny 策略生效时，只要某条 trace 匹配其中任意一条，就会被隐藏。
+- **Allow 策略**：带 metadata 条件的 allow 策略只对匹配的 traces 授予 `runs:read`。当多条 allow 策略生效时，用户只要匹配其中任意一条，就能读取对应的 trace。
+- **RBAC**：如果用户角色授予了 `runs:read`，那么除 deny 策略隐藏的 traces 之外，用户可以读取所有 traces，此时 allow 策略不起作用。若要把某个角色限制为 allow 策略匹配的 traces，请从该角色中移除 `runs:read`。
+
+使用 service key 认证的请求没有关联的 `ls_user_id`，因此使用 `${user.ls_user_id}` 的条件不会匹配。使用 Personal Access Token（PAT）或已登录浏览器会话认证的请求会带有用户的 `ls_user_id`。关于 PAT 与 service key 的详情，请参阅 [API keys](/langsmith/create-account-api-key#api-keys)。
+
+### metadata 条件下的响应
+
+<a id="responses-under-metadata-conditions"></a>
+
+当 metadata 条件对某个 project 中的用户生效时，LangSmith 会将该用户在该 project 中的读取范围过滤为其可见的 traces：
+
+- run 列表、trace 列表和 run 分析会省略隐藏的 traces。
+- 按 ID 请求隐藏的 trace 或其任意 run 会返回 `404 Not Found`，包括下载该 trace 以及打开其 messages 或 trajectory。
+- project 列表会省略该 project 的 run 与 feedback 统计信息。
 
 ## 示例场景
 
@@ -356,6 +399,77 @@ Teams 不创建策略，只附加已有策略：
 }
 ```
 
+### 7. 按 root run metadata 隐藏 traces
+
+在任意 project 中，隐藏 root run 的 `source` 为 `customer` 的 traces。角色授予 `runs:read` 的用户仍可看到其他所有 traces：
+
+```json
+{
+  "name": "Hide Customer Traces",
+  "effect": "deny",
+  "condition_groups": [{
+    "permission": "runs:read",
+    "resource_type": "project",
+    "conditions": [{
+      "attribute_name": "root_run_metadata",
+      "attribute_key": "source",
+      "operator": "equals",
+      "attribute_value": "customer"
+    }]
+  }]
+}
+```
+
+### 8. 只向用户显示标记给他们的 traces
+
+只向每个用户显示 root run 的 `allowed_ls_user_id` 等于该用户 LangSmith 用户 ID 的 traces。请把这条策略附加到不授予 `runs:read` 的角色上，因为 RBAC 权限优先于 allow 策略：
+
+```json
+{
+  "name": "Traces Labeled for the Caller",
+  "effect": "allow",
+  "condition_groups": [{
+    "permission": "runs:read",
+    "resource_type": "project",
+    "conditions": [{
+      "attribute_name": "root_run_metadata",
+      "attribute_key": "allowed_ls_user_id",
+      "operator": "equals",
+      "attribute_value": "${user.ls_user_id}"
+    }]
+  }]
+}
+```
+
+### 9. 生产 project 中的团队 traces
+
+授予对 root run 的 `team` 为 `payments` 的 traces 的访问权限，但仅限于标记了 `Environment=prod` 的 projects。标签条件用于选择 projects，metadata 条件用于选择其中的 traces：
+
+```json
+{
+  "name": "Payments Traces in Prod",
+  "effect": "allow",
+  "condition_groups": [{
+    "permission": "runs:read",
+    "resource_type": "project",
+    "conditions": [
+      {
+        "attribute_name": "resource_tag_key",
+        "attribute_key": "Environment",
+        "operator": "equals",
+        "attribute_value": "prod"
+      },
+      {
+        "attribute_name": "root_run_metadata",
+        "attribute_key": "team",
+        "operator": "equals",
+        "attribute_value": "payments"
+      }
+    ]
+  }]
+}
+```
+
 ## 创建时标记资源
 
 启用 ABAC 策略后，资源会按其标签受到访问控制。为确保资源在创建后立即受到保护，你可以在创建请求中通过 `tag_value_ids` 参数直接提供标签。
@@ -387,6 +501,14 @@ project、dataset 和 prompt 的创建端点都支持这一做法，包括 fork 
 - 检查用户角色是否授予了 `runs:read-inputs` 和 `runs:read-outputs`，或者是否有 allow 策略为该 run 所属的 project 授予了这两个权限
 - 检查是否存在匹配该 project 标签的 `runs:read-inputs` 或 `runs:read-outputs` deny 策略
 - 只有同时授予这两个权限，消息与轨迹视图才能正常显示，否则会返回 `403 Forbidden`
+
+**找不到 traces 或返回 `404 Not Found`？**
+- 检查是否存在带 `root_run_metadata` 条件、且匹配该 trace root run metadata 的 deny 策略
+- 如果用户的访问权限来自带 `root_run_metadata` 条件的 allow 策略，请检查 root run 是否带有该 metadata key，且值完全一致（包括大小写）
+- 条件只匹配 root run 上的顶层 key，不会匹配子 run 上的 metadata
+
+**Threads、共享或实验对比返回 `403 Forbidden`？**
+- 在 `root_run_metadata` 条件对用户生效的任何 project 中，这些界面都不可用。完整列表请参阅 [metadata 条件下的响应](#responses-under-metadata-conditions)
 
 **策略没有生效？**
 - 确认策略附加到了正确的角色上

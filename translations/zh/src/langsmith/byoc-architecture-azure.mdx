@@ -1,0 +1,174 @@
+---
+title: Azure 上的 BYOC 架构
+sidebarTitle: 架构
+description: LangSmith BYOC 在你的 Azure 订阅中部署的内容、data plane 如何连接到 LangChain control plane、LangSmith 获得的访问权限，以及你的数据如何得到保护。
+icon: "sitemap"
+---
+
+Azure 上的 BYOC 在你的 Azure 订阅中的资源组内运行 LangSmith data plane，而 LangChain 在 `centralus` 的自己的 Azure 环境中运行 control plane。你的 trace 数据保留在你的订阅中。本页介绍 LangSmith 部署的内容、流量如何流转、LangSmith 获得的访问权限，以及你的数据如何得到保护。AWS 上的 BYOC 请参阅 [BYOC 架构](/langsmith/byoc-architecture-aws)。
+
+<Note>
+Azure 上的 BYOC 处于 [beta](/langsmith/release-stages) 阶段。资源和权限可能在不同版本之间变化。本页中的值是当前默认值。
+</Note>
+
+要设置 data plane，请遵循 [Azure 上的 BYOC 入门](/langsmith/byoc-onboarding-azure)。
+
+## Control plane 与 data plane
+
+| Plane | 运行位置 | 持有的内容 |
+|-------|---------------|---------------|
+| **Control plane** | LangChain 的 Azure 环境，`centralus`，位于 [azure.smith.langchain.com](https://azure.smith.langchain.com) | 身份验证、组织和 workspace 配置、计费和使用量元数据、LangSmith API keys，以及静态前端资源 |
+| **Data plane** | 你的 Azure 订阅中的一个资源组，位于你选择的 region | Traces、prompts、datasets、evaluators、experiments、annotation queues、agent 部署、workspace secrets 以及其他应用数据 |
+
+<img
+  className="block dark:hidden"
+  src="/langsmith/images/byoc-architecture-azure.png"
+  alt="BYOC architecture diagram for Azure. The LangSmith UI and the client apps in your application VNet reach the data plane over VNet peering or a VPN gateway, which terminates at an internal load balancer. The load balancer feeds an Istio ingress in an AKS cluster in your Azure subscription, which routes to the LangSmith services that run the backend and SmithDB, and those services read and write Blob Storage, Azure PostgreSQL, and Azure Managed Redis. The LangChain cloud control plane in centralus holds Crossplane, on-call engineers, alerting, and the LangSmith control plane services. Crossplane reaches the AKS API with Entra ID for scaling and upgrades, the data plane sends auth and telemetry back over Private Link, and the control plane uses Entra ID workload identity to provision resources in your subscription."
+/>
+
+<img
+  className="hidden dark:block"
+  src="/langsmith/images/byoc-architecture-azure-dark.png"
+  alt="BYOC architecture diagram for Azure. The LangSmith UI and the client apps in your application VNet reach the data plane over VNet peering or a VPN gateway, which terminates at an internal load balancer. The load balancer feeds an Istio ingress in an AKS cluster in your Azure subscription, which routes to the LangSmith services that run the backend and SmithDB, and those services read and write Blob Storage, Azure PostgreSQL, and Azure Managed Redis. The LangChain cloud control plane in centralus holds Crossplane, on-call engineers, alerting, and the LangSmith control plane services. Crossplane reaches the AKS API with Entra ID for scaling and upgrades, the data plane sends auth and telemetry back over Private Link, and the control plane uses Entra ID workload identity to provision resources in your subscription."
+/>
+
+data plane 的生命周期如下：
+
+1. 你应用 LangSmith Terraform module，它会创建一个资源组和一个 Key Vault，并在该资源组上为 LangSmith BYOC 应用授予两个角色。
+1. 你通过 LangSmith API 创建 data plane。Control plane 检查其访问权限，并将 data plane 的 bootstrap secret 写入你的 Key Vault。
+1. Control plane 在资源组中创建网络、AKS 集群、数据库和存储，然后在集群上安装 LangSmith。
+1. Data plane 向 control plane 上报，其状态变为 `active`。
+1. 在你删除 data plane 之前，LangChain 会对其进行升级、扩缩容和修复。
+
+## 部署的内容
+
+LangSmith 会在你的资源组中创建所有 data plane 资源。AKS 还会创建一个节点资源组 `<name>-smith-aks-nodes` 并管理它。
+
+### 网络
+
+LangSmith 会根据创建请求中的 `vpc_cidr` 范围创建 VNet，并将其划分为子网。对于 `/16` 的 VNet：
+
+| 子网 | 大小 | 用途 |
+|--------|------|-----|
+| AKS | `/20` | AKS 节点和 pod。出站流量通过具有一个静态公共 IP 地址的 NAT 网关。 |
+| 私有 endpoints | `/24` | 用于 PostgreSQL、Redis、Blob storage、Key Vault 和 LangSmith control plane 的共享私有 endpoints。 |
+
+私有 endpoint 子网上的一个网络安全组使用三个应用程序安全组，仅允许来自 AKS 子网的流量：到 PostgreSQL endpoints 的 TCP 5432，到 Redis endpoints 的 TCP 10000 和 8500 到 8599，以及到 Blob storage、Key Vault 和 control plane endpoints 的 TCP 443。
+
+AKS 子网占 VNet 的十六分之一，私有 endpoint 子网占 1/256。`/18` 的 VNet 会得到 `/22` 的 AKS 子网和 `/26` 的私有 endpoint 子网。Kubernetes 服务范围来自 VNet 之外：`10.240.0.0/16`，如果你的 VNet 与 `10.240.0.0/16` 重叠，则为 `192.168.0.0/16`。
+
+链接到 VNet 的私有 DNS 区域会将 PostgreSQL、Redis、Key Vault 和 Blob storage 解析到它们的私有 endpoints。
+
+### 计算
+
+- **AKS**：Standard 层的 Kubernetes 1.35。私有集群，没有公共 API endpoint。本地账户和 run command 已禁用。身份验证使用 Microsoft Entra ID，并通过 Azure RBAC 进行 Kubernetes 授权。OIDC 颁发者和 workload identity 已启用。
+- **网络插件**：使用 Azure CNI 与 Cilium 处理数据路径和网络策略。
+- **系统 node pool**：三个运行 Azure Linux 的 `Standard_D2s_v6` 节点，分布在该 region 的可用区中，专用于关键附加组件。
+- **应用节点**：[节点自动预配](https://learn.microsoft.com/azure/aks/node-autoprovision)会随 pod 的需求增加和移除节点。它使用版本 5 或更高的按需 D、E 和 F 系列 VM。每个 node pool 都有 CPU 和内存限制。通用池限制为 100 vCPU 和 400 GiB 内存。SmithDB 在其自己的池上运行，其中包含一个使用本地 NVMe 磁盘作为缓存的 VM 池。
+- **升级**：AKS 会在 data plane 的[维护窗口](/langsmith/byoc-onboarding-azure#change-data-plane-settings)内自动应用 Kubernetes 补丁版本和节点镜像更新。
+
+### 数据存储
+
+| 存储 | 配置 |
+|-------|---------------|
+| **PostgreSQL**（LangSmith） | Azure Database for PostgreSQL 灵活服务器，PostgreSQL 16，`GP_Standard_D2ds_v4`，32 GiB 存储并支持自动增长。在支持的区域中启用区域冗余高可用性。备份保留 7 天，不启用异地冗余备份。仅使用 Microsoft Entra 身份验证，不使用密码身份验证，不允许公共访问。 |
+| **PostgreSQL**（SmithDB metastore） | 第二个灵活服务器，PostgreSQL 18，`GP_Standard_D2ds_v4`，128 GiB 存储。可用性、备份和访问设置相同。 |
+| **Azure Managed Redis** | `Balanced_B3`，启用高可用性、OSS 集群策略，无持久化。仅使用 TLS，禁用访问密钥，不允许公共访问。 |
+| **Blob storage** | 用于 trace payload 和附件，以及 SmithDB 数据的存储账户。StorageV2、Standard，在具有可用区的区域中使用 ZRS，其他区域使用 LRS。仅支持使用 TLS 1.2 或更高版本的 HTTPS。禁用共享密钥访问和公共网络访问。 |
+| **Key Vault** | 你创建的 vault。Data plane 通过私有 endpoint 读取其 bootstrap secret，并每小时刷新一次。 |
+
+Data planes 在 [SmithDB](/langsmith/self-host-smithdb) 中存储和查询 traces，其数据位于 Blob storage，元数据位于 SmithDB PostgreSQL 服务器。它们不运行 ClickHouse。
+
+### DNS 与 ingress
+
+- **主机名**：`<data_plane_id>.azure.langchain-byoc.com`。LangSmith 会在你的资源组中为该主机名创建一个公共 DNS 区域，并从 LangChain 拥有的父区域中委派它。
+- **Load balancer**：Azure Standard load balancer，可为公共或内部，由创建请求中的 `public_load_balancer` 设置。
+- **私有 DNS**：对于内部 load balancer，主机名通过链接到 data plane VNet 的私有 DNS 区域解析。公共区域保存证书验证记录，而不是内部 endpoint 地址。你的用户和应用需要通过私有区域进行 DNS 解析。
+- **Ingress**：Istio ingress gateway。HTTP 会重定向到 HTTPS，网关会拒绝 `TRACE`、`TRACK` 和 `CONNECT` 方法。
+- **TLS**：cert-manager 通过 DNS-01 质询为该主机名获取 Let's Encrypt 证书。
+
+### 标识
+
+Data plane 工作负载通过 AKS OIDC 颁发者的 workload identity 联合，使用你资源组中的用户分配托管标识。其中不存在存储密钥、数据库密码或客户端密码。每个标识只拥有其工作负载所需的角色，例如某个 Blob 容器上的数据角色、PostgreSQL 数据库角色，或 vault 上的 `Key Vault Secrets User`。
+
+## 连接性
+
+| 路径 | 网络 | 身份验证 |
+|------|---------|----------------|
+| Control plane 到 Azure Resource Manager | 通过 HTTPS 访问公共 Azure Resource Manager endpoint | 你的租户中 LangSmith BYOC 应用的 Microsoft Entra 令牌 |
+| Control plane 到 AKS API | Private Link。LangChain control plane 网络中的私有 endpoint 连接到你的集群的 API server。AKS API 没有公共 endpoint。 | Microsoft Entra 令牌和 Azure RBAC |
+| Data plane 到 control plane | Private Link。data plane 的共享私有 endpoint 子网中的私有 endpoint 连接到 LangSmith control plane。你资源组中的私有 DNS 区域会将 LangSmith API 和遥测主机名解析到该 endpoint。 | data plane 令牌 |
+| 你的用户和应用到 data plane | 公共或内部 load balancer | LangSmith API keys 以及通过 control plane 登录 |
+
+Data plane 通过 NAT 网关从 LangChain 的容器注册表拉取 LangSmith 容器镜像。
+
+Data plane 向 control plane 发送运维数据，例如身份验证请求、健康指标和使用量。与在 AWS 上一样，LangSmith UI 从 control plane 加载静态资源，并将每个针对应用数据的请求发送到你的 data plane。参见[数据流量](/langsmith/byoc-architecture-aws#data-traffic)。
+
+## 访问与权限
+
+LangChain 通过一个多租户 Microsoft Entra 应用 **LangSmith BYOC** 管理你的 data plane。你将其服务主体添加到你的租户，并在每个 data plane 资源组上为它授予角色。该应用不请求任何 Microsoft Graph 权限。
+
+Control plane 不保存你租户的任何凭据。它运行在 AKS 上，workload identity 联合会将 pod 令牌交换为你租户中 LangSmith BYOC 应用的令牌。只有预置和管理 data planes 的 control plane 服务才能获取该令牌。
+
+### 角色分配
+
+| 角色 | 范围 | LangSmith 需要它的原因 |
+|------|-------|------------------------|
+| `langsmith-byoc-<key>-<suffix>`（自定义） | Data plane 资源组 | 创建、更新和删除 data plane 资源，将 bootstrap secret 写入 Key Vault，以及批准到 AKS API 和数据存储的私有 endpoints。该角色会逐一列出它允许的每个操作。 |
+| 同一自定义角色，设置 `reduced_access = true` | Data plane 资源组 | Data plane 处于活动状态后，就地缩减该角色的操作。它可以升级、扩缩容和修复 data plane，但无法删除 data plane、其数据存储或其网络，也无法写入 Key Vault secrets。 |
+| `User Access Administrator` | Data plane 资源组 | 为 data plane 的托管标识授予角色，并创建自定义的 Blob 数据角色 |
+| `Azure Kubernetes Service RBAC Cluster Admin` | Data plane 的 AKS 集群 | 在集群上安装和升级 LangSmith。LangSmith 会自行创建此角色分配。 |
+
+[Terraform module](https://github.com/langchain-ai/terraform/blob/main/modules/byoc/azure/langsmith-byoc-access/main.tf) 会为每个 data plane 创建一个自定义角色，其唯一可分配范围就是该资源组。两个角色分配都以你组织的 external ID 作为描述。当它们不匹配时，LangSmith 会拒绝创建 data plane，从而将资源组绑定到你的 LangSmith 组织。
+
+### LangChain 可以访问和不能访问的内容
+
+| 项目 | LangChain 的访问权限 |
+|------|------------------|
+| Data plane 资源组中的资源 | 创建、更改和删除 |
+| Data plane 资源组中的角色分配 | 创建和删除 |
+| Data plane 的 AKS 集群 | 集群管理员 |
+| 你订阅中的其他资源组和资源 | 无 |
+| AKS 节点资源组 | 无。由 AKS 管理。 |
+| 你的 Microsoft Entra 目录和 Microsoft Graph | 无 |
+| Blob storage、PostgreSQL 和 Redis 中的数据 | 无数据角色。这些角色是管理角色。 |
+| Key Vault secret 值 | 通过 Azure Resource Manager 写入。没有读取 secrets 的角色。 |
+
+要移除 LangSmith 的访问权限，请参阅[移除 LangSmith 访问权限](/langsmith/byoc-onboarding-azure#remove-langsmith-access)。
+
+## 数据保护
+
+### 加密
+
+| 存储 | 静态 | 传输中 |
+|-------|---------|------------|
+| Blob storage | Microsoft 托管密钥 | 仅限使用 TLS 1.2 或更高版本的 HTTPS |
+| PostgreSQL | Microsoft 托管密钥 | TLS，配合 Microsoft Entra 身份验证 |
+| Redis | Microsoft 托管密钥 | 仅 TLS |
+| Key Vault | Microsoft 托管密钥 | TLS，通过私有 endpoint |
+| AKS 磁盘 | Microsoft 托管密钥 | 流量保留在集群内 |
+
+### 保留
+
+- **Trace payloads**：当每个对象的保留层级结束时，Blob 生命周期规则会删除该对象。默认值为短期 traces 14 天、长期 traces 400 天。你可以通过 `ttl` 设置更改两者。参见[更改 data plane 设置](/langsmith/byoc-onboarding-azure#change-data-plane-settings)。
+- **Blob 版本**：已启用版本控制，以前的版本会在创建 7 天后删除。已删除的容器可以在 7 天内恢复。Blob 软删除已禁用，因此过期的 traces 不会超过其保留层级。
+- **PostgreSQL**：自动备份在同一 region 中保留 7 天。
+- **Redis**：无持久化，也无备份。Redis 只保存短期数据。
+
+### 删除
+
+当你删除 data plane 时，LangSmith 会删除 AKS 集群、PostgreSQL、Redis 和网络资源。它保留你的资源组、你的 Key Vault，以及存放 trace 和 SmithDB 数据的 Blob storage 账户。有关详细信息，请参阅[删除 data plane](/langsmith/byoc-onboarding-azure#delete-a-data-plane)。
+
+## 扩缩容与运维
+
+预置完成后，LangChain 会运维你的 Azure data plane。有关自动扩缩容、默认实例大小、升级和维护窗口，请参阅 [Azure 上的 BYOC 运维](/langsmith/byoc-operations-azure)。有关预估的基础设施成本，请参阅 [Azure data plane 成本估算](/langsmith/byoc-data-plane-cost-azure)。
+
+### 日志
+
+你的 Azure 活动日志会记录 LangSmith 对 Azure Resource Manager 的调用。要收集资源和网络日志，请在你的订阅中配置诊断设置和 VNet 流日志。有关可用日志和你的责任，请参阅[审计](/langsmith/byoc-operations-azure#auditing)。
+
+## 下一步
+
+- [BYOC 概览](/langsmith/byoc)
+- [Azure 上的 BYOC 入门](/langsmith/byoc-onboarding-azure)
+- [BYOC 共享责任模型](/langsmith/byoc-shared-responsibility)

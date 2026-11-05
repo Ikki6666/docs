@@ -56,6 +56,38 @@ keywords: ["checkpoint", "checkpoints", "checkpointer", "InMemorySaver", "Postgr
 
 检查点使用 `thread_id` 作为存储和检索检查点的主键。如果没有它，检查指针将无法在 [interrupt](/oss/langgraph/interrupts) 之后保存状态或恢复执行，因为检查指针使用 `thread_id` 来加载保存的状态。
 
+<a id="choose-how-to-continue-a-thread"></a>
+
+#### 选择如何继续线程
+
+`thread_id` 标识已保存的状态。输入和 `checkpoint_id` 共同决定一次调用是开始新的工作、恢复未完成的工作，还是重播历史。仅复用线程 ID 并不意味着执行会恢复。
+
+:::python
+在已有检查点和已有线程的情况下，按目标选择调用方式：
+
+| 目标 | 调用方式 | 执行行为 |
+| --- | --- | --- |
+| 提交新输入 | `graph.invoke(input, config)` | 把输入应用到已保存的状态，并从入口点开始执行。 |
+| 出错后继续 | `graph.invoke(None, config)` | 加载最新的检查点并重试未完成的工作。省略 `checkpoint_id`。 |
+| 响应 `interrupt()` | `graph.invoke(Command(resume=answer), config)` | 提供 interrupt 的返回值。被中断的节点会从函数开头重新运行。 |
+| 重播历史 | `graph.invoke(None, snapshot.config)` | 使用 `get_state_history()` 返回的快照，并重新执行该检查点之后的节点。 |
+:::
+
+:::js
+在已有检查点和已有线程的情况下，按目标选择调用方式：
+
+| 目标 | 调用方式 | 执行行为 |
+| --- | --- | --- |
+| 提交新输入 | `await graph.invoke(input, config)` | 把输入应用到已保存的状态，并从入口点开始执行。 |
+| 出错后继续 | `await graph.invoke(null, config)` | 加载最新的检查点并重试未完成的工作。省略 `checkpoint_id`。 |
+| 响应 `interrupt()` | `await graph.invoke(new Command({ resume: answer }), config)` | 提供 interrupt 的返回值。被中断的节点会从函数开头重新运行。 |
+| 重播历史 | `await graph.invoke(null, snapshot.config)` | 使用 `getStateHistory()` 返回的快照，并重新执行该检查点之后的节点。 |
+:::
+
+新输入不会清空线程。LangGraph 会使用状态的 [reducer](/oss/langgraph/graph-api#reducers) 应用这些输入。如果要从空状态开始，请使用新的 `thread_id`。
+
+当最新检查点没有未完成的工作时，恢复会直接返回已保存的结果，而不运行任何节点。可运行的示例请参阅 [Functional API 错误恢复](/oss/langgraph/functional-api-tasks#resume-after-an-error)、[恢复 interrupt](/oss/langgraph/interrupts#resuming-interrupts) 和[重播历史](/oss/langgraph/use-time-travel#replay)。
+
 ### 检查点
 
 线程在特定时间点的状态称为检查点。检查点是保存在每个 [super-step](#super-steps) 处的图形状态的快照，并由 `StateSnapshot` 对象表示（有关完整字段引用，请参阅 [StateSnapshot fields](#statesnapshot-fields) ）。
@@ -791,7 +823,7 @@ checkpointer.setup()
 
 本节介绍从头开始为自定义存储后端实现 `BaseCheckpointSaver` 。如果您已经有一个有效的检查点并且只需要添加增量通道支持，请跳转到 [Delta channel support](#delta-channel-support)。
 
-＃＃＃ 概述
+### 概述
 
 LangGraph 的持久层构建在两个存储抽象之上：
 
@@ -992,7 +1024,7 @@ async def aget_tuple(self, config):
 
 删除线程的所有检查点和写入。检查点行和写入行都必须删除。
 
-###行键/索引设计
+### 行键/索引设计
 
 如何存储和索引检查点直接影响正确性和性能。
 

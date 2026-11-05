@@ -1,0 +1,92 @@
+---
+title: Azure 上的 BYOC 运维
+sidebarTitle: 运维
+description: LangChain 如何扩缩容、升级和维护 Azure 上的 LangSmith BYOC data plane，包括实例规格、维护窗口和审计。
+icon: "tool"
+---
+
+预置完成后，LangChain 会运维你的 Azure data plane，包括升级、扩缩容、监控和安全修补。你无需为每个服务设置容量或调优。AWS 上的 BYOC 请参阅 [BYOC 运维](/langsmith/byoc-operations-aws)。
+
+## 自动扩缩容
+
+LangChain 会随负载变化对你的 data plane 进行扩缩：
+
+- **无状态 LangSmith 服务**：KEDA 在每个服务的最小和最大副本数之间进行扩缩。大多数服务以所请求资源的 70% CPU 和 80% 内存为目标。
+- **集群节点**：AKS [节点自动预置](https://learn.microsoft.com/azure/aks/node-autoprovision)为无法调度的 pods 增加容量，并移除未使用的容量。每个节点池都有 CPU 和内存限制。general 节点池限制为 100 vCPU 和 400 GiB 内存。system 节点池固定为 3 个节点。
+- **存储**：已启用 PostgreSQL 存储自动增长。Blob storage 随使用量增长，生命周期规则会按其保留层级使 trace payload 过期。
+- **数据库**：LangChain 监控使用量，并可调整 PostgreSQL 和 Redis 的规格、服务副本数以及节点池限制。
+
+SmithDB 为计算和本地 NVMe 缓存存储使用专用节点池。存储配置和保留策略请参阅[数据存储](/langsmith/byoc-architecture-azure#data-stores)和[数据保护](/langsmith/byoc-architecture-azure#data-protection)。
+
+## 高可用性
+
+在支持的区域，data plane 使用区域冗余的 PostgreSQL standby 服务器。Azure Managed Redis 有一个副本用于高可用性。Blob storage 在具有可用区的区域使用区域冗余存储（ZRS），在其他区域使用本地冗余存储（LRS）。
+
+## 实例规格
+
+data plane 的数据库和 system node 默认使用以下规格。如需不同规格，请联系 LangChain 团队。
+
+| 资源 | 默认规格 |
+| --- | --- |
+| PostgreSQL（LangSmith） | PostgreSQL 16，`GP_Standard_D2ds_v4`，32 GiB 存储，启用自动增长 |
+| PostgreSQL（SmithDB metastore） | PostgreSQL 18，`GP_Standard_D2ds_v4`，128 GiB 存储，启用自动增长 |
+| Azure Managed Redis | `Balanced_B3`，启用高可用性，禁用持久化 |
+| AKS system node pool | 3 个 `Standard_D2s_v6` 节点，固定规格 |
+| Application 和 SmithDB 节点 | 节点自动预置，在各节点池的限制范围内 |
+
+LangSmith 服务启动时使用以下资源请求和自动扩缩边界：
+
+| 服务 | 最小副本数 | 最大副本数 | CPU 请求 | 内存请求 |
+| --- | --- | --- | --- | --- |
+| Backend | 2 | 20 | 1 | 4 GiB |
+| Platform backend | 2 | 20 | 500m | 1 GiB |
+| Ingest queue | 2 | 20 | 2 | 4 GiB |
+| Queue | 1 | 10 | 1 | 4 GiB |
+| Listener | 1 | 10 | 1 | 1500 MiB |
+| Host backend | 1 | 10 | 500m | 1000 MiB |
+| ACE backend | 1 | 10 | 1 | 2 GiB |
+| Presidio | 1 | 10 | 250m | 2 GiB |
+
+## LangSmith 升级
+
+LangChain 负责管理 LangSmith 版本升级。服务使用 horizontal pod autoscaling 和 pod disruption budgets 来限制替换 pods 的影响。更新期间的可用性取决于服务的副本数和可用的集群容量。
+
+## 支持服务的升级
+
+LangChain 会与 LangSmith 工作负载一起管理 Istio 和 KEDA 等支持服务。Azure data plane 将 traces 存储在 SmithDB 中，不运行 ClickHouse。
+
+## Kubernetes 集群升级
+
+AKS 会在 data plane 的维护窗口内自动应用 Kubernetes 补丁版本和节点镜像更新。system 节点池在升级期间使用一个 surge 节点，以便 pods 迁移到新容量上。
+
+## 维护窗口
+
+Azure data plane 有一个每周 4 小时的 UTC 维护窗口。默认是周日 07:00–11:00 UTC（`sun:07:00-sun:11:00`）。AKS 升级和 PostgreSQL 维护使用该窗口。
+
+要更改该窗口，请使用[更改 data plane 设置](/langsmith/byoc-onboarding-azure#change-data-plane-settings)中描述的 API。LangSmith UI 中的维护窗口设置表单仅支持 AWS。
+
+## 可观测性
+
+data plane 从 Azure Monitor 读取 PostgreSQL 和 Redis 指标，并向 LangChain 报告健康指标。你可以像自托管部署那样配置 LangSmith 服务的日志、指标和 traces。参见[将 LangSmith 遥测数据导出到你的可观测性 backend](/langsmith/export-backend)。
+
+你可以部署自己的可观测性和安全监控 agents，前提是它们不会干扰 LangSmith 工作负载。
+
+## 故障排查
+
+LangChain 通过委托的 Microsoft Entra 角色管理你 data plane 中的资源。这些管理角色不会授予 Blob storage、PostgreSQL 或 Redis 上的数据角色。完整的权限模型请参阅[访问与权限](/langsmith/byoc-architecture-azure#access-and-permissions)。
+
+当故障排查需要数据时，你可以自己运行查询，然后在与 LangChain 共享之前验证和清理输出。如果工程师需要临时访问权限，LangChain 团队会与你协调该访问。
+
+## 审计
+
+- **LangSmith 审计日志**：data plane 操作记录在 data plane 中，control plane 操作记录在 control plane 中。请参阅[审计日志](/langsmith/audit-logs)。
+- **Azure 活动日志**：记录 LangSmith 在你的订阅中对 Azure Resource Manager 的调用。
+- **资源和网络日志**：LangSmith 不会配置 Azure 诊断设置或 VNet flow logs。AKS control plane 和审计日志、Key Vault 审计日志、PostgreSQL 日志以及网络 flow logs 默认不会被收集。请配置诊断设置和 flow logs 来收集它们。
+
+你负责查看这些日志并配置告警。
+
+## 另请参阅
+
+- [Azure 上的 BYOC 架构](/langsmith/byoc-architecture-azure)
+- [Azure data plane 成本估算](/langsmith/byoc-data-plane-cost-azure)
+- [BYOC 使用](/langsmith/byoc-usage)

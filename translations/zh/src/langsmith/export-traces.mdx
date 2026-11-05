@@ -4,17 +4,21 @@ sidebarTitle: 查询 traces
 tag: "SDK"
 ---
 
-推荐使用 [SDK](https://reference.langchain.com/python/langsmith/) 中的 `list_runs` 方法，或 [API](/langsmith/smith-api-ref) 中的 `/runs/query` 端点，来查询 [runs](/langsmith/observability-concepts#runs)（也就是 LangSmith traces 中的 span 数据）。LangSmith 以一种简单格式存储 traces，该格式定义见 [Run（span）数据格式](/langsmith/run-data-format)。
+推荐使用 [SDK](https://reference.langchain.com/python/langsmith/) 中的 `runs.query` 方法，或 [API](/langsmith/smith-api-ref) 中的 `POST /api/v2/runs/query` 端点，来查询 [runs](/langsmith/observability-concepts#runs)（也就是 LangSmith traces 中的 span 数据）。LangSmith 以一种简单格式存储 traces，该格式定义见 [Run（span）数据格式](/langsmith/run-data-format)。
 
 本页涵盖以下内容：
 
 - [使用 filter 参数](#use-filter-arguments)：通过 SDK 参数进行基于关键字的筛选。
 - [使用过滤查询语言](#use-filter-query-language)：使用 LangSmith 过滤语法编写复杂查询。
-- [使用子 run 谓词查询 trace trees](#query-trace-trees-with-child-run-predicates)：结合服务端收窄范围与本地子 run 遍历。
-- [速率限制](#rate-limits)：每个租户的限制以及避免触发限制的最佳实践。
+- [使用子 run 谓词查询 trace trees](#query-trace-trees-with-child-run-predicates)：结合服务端收窄范围与每条 trace 的 runs。
+- [速率限制](#rate-limits)：限制与最佳实践。
 
 <Note>
 如果你想导出大量 traces，建议使用 [Bulk Data Export](/langsmith/data-export)。它对大数据量处理更稳健，并支持自动重试与分区并行。
+</Note>
+
+<Note>
+`runs.query` 取代了已弃用的 `list_runs` / `listRuns` 和 `read_run` / `readRun`。LangSmith Cloud 将于 2027 年 1 月 31 日移除这些方法，自托管 LangSmith 将在 v0.19 中移除这些方法。新方法要求 `langsmith>=0.10.15`（Python）或 `langsmith>=0.8.9`（TypeScript），在自托管 LangSmith 上还要求 v0.16 或更高版本。完整的变更列表请参阅[迁移指南](/langsmith/smithdb-sdk-migration-query-runs)。
 </Note>
 
 <Note>
@@ -23,33 +27,50 @@ tag: "SDK"
 
 ## 使用 filter 参数
 
-对于简单查询，你不必依赖查询语法。可以直接使用[filter 参数参考](/langsmith/trace-query-syntax#filter-arguments)中列出的参数。
+对于简单查询，你不必依赖查询语法，可以直接使用 [filter 参数参考](/langsmith/trace-query-syntax#filter-arguments)中列出的 filter 参数。
 
 <Warning>
 **前置条件**
 
-运行下面的代码片段之前，请先初始化 client。
+运行下面的代码片段之前，请先初始化 client、查找 project ID，并设置时间窗口：
+
+- `runs.query` 接收 project ID，而不是 project 名称。
+- 除非传入 `min_start_time`，否则它只回溯 **1 天**。下面的代码片段使用 7 天窗口。单次查询最多可跨越 401 天。
+- 除非传入 `selects`（大写字段名，例如 `NAME`、`INPUTS`、`OUTPUTS`），否则它只返回 run 的 `ID`。
+- 在 Python 中，`client.runs` 是异步的：请在 `async` 函数内运行代码片段，例如配合 `asyncio.run()`。每次查询都会返回一个异步迭代器，自动为你分页获取结果。
 </Warning>
 
 <CodeGroup>
 
 ```python Python
+from datetime import datetime, timedelta, timezone
+
 from langsmith import Client
 
 client = Client()
+project_id = str(client.read_project(project_name="<your_project>").id)
+since = datetime.now(timezone.utc) - timedelta(days=7)
 ```
 
 ```typescript TypeScript
-import { Client, Run } from "langsmith";
+import { Client } from "langsmith";
 
 const client = new Client();
+const projectId = (await client.readProject({ projectName: "<your_project>" })).id;
+const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 ```
 
 ```java Java
 import com.langchain.smith.client.LangsmithClient;
 import com.langchain.smith.client.okhttp.LangsmithOkHttpClient;
+import com.langchain.smith.models.runs.RunQueryV2Params;
+import java.time.OffsetDateTime;
 
 LangsmithClient client = LangsmithOkHttpClient.fromEnv();
+String projectId = "<your_project_id>";
+OffsetDateTime since = OffsetDateTime.now().minusDays(7);
+
+// Run any of the queries below with: client.runs().queryV2(params)
 ```
 
 </CodeGroup>
@@ -61,24 +82,35 @@ LangsmithClient client = LangsmithOkHttpClient.fromEnv();
 <CodeGroup>
 
 ```python Python
-project_runs = client.list_runs(project_name="<your_project>")
+project_runs = [
+    run
+    async for run in client.runs.query(
+        project_ids=[project_id],
+        min_start_time=since,
+        selects=["ID", "NAME", "RUN_TYPE", "START_TIME"],
+    )
+]
 ```
 
 ```typescript TypeScript
-// Download runs in a project
-const projectRuns: Run[] = [];
-for await (const run of client.listRuns({
-  projectName: "<your_project>",
+const projectRuns = [];
+for await (const run of client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  selects: ["ID", "NAME", "RUN_TYPE", "START_TIME"],
 })) {
   projectRuns.push(run);
-};
+}
 ```
 
 ```java Java
-import com.langchain.smith.models.runs.RunQueryParams;
+import com.langchain.smith.models.runs.RunSelectField;
 
-RunQueryParams projectRuns = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params projectRuns = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
+    .addSelect(RunSelectField.ID)
+    .addSelect(RunSelectField.NAME)
     .build();
 ```
 
@@ -89,33 +121,34 @@ RunQueryParams projectRuns = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-todays_llm_runs = client.list_runs(
-    project_name="<your_project>",
-    start_time=datetime.now() - timedelta(days=1),
-    run_type="llm",
-)
+todays_llm_runs = [
+    run
+    async for run in client.runs.query(
+        project_ids=[project_id],
+        min_start_time=datetime.now(timezone.utc) - timedelta(days=1),
+        run_type="LLM",
+    )
+]
 ```
 
 ```typescript TypeScript
-const todaysLlmRuns: Run[] = [];
-for await (const run of client.listRuns({
-  projectName: "<your_project>",
-  startTime: new Date(Date.now() - 1000 * 60 * 60 * 24),
-  runType: "llm",
+const todaysLlmRuns = [];
+for await (const run of client.runs.query({
+  project_ids: [projectId],
+  min_start_time: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+  run_type: "LLM",
 })) {
   todaysLlmRuns.push(run);
-};
+}
 ```
 
 ```java Java
-OffsetDateTime now = OffsetDateTime.now();
-OffsetDateTime twentyFourHoursAgo = now.minus(24, ChronoUnit.HOURS);
+import com.langchain.smith.models.runs.RunType;
 
-RunQueryParams todaysLlmRuns = RunQueryParams.builder()
-    .runType(RunQueryParams.RunType.LLM)
-    .startTime(twentyFourHoursAgo)
-    .addSession("<your_project>")
-    .limit(50L)
+RunQueryV2Params todaysLlmRuns = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(OffsetDateTime.now().minusDays(1))
+    .runType(RunType.LLM)
     .build();
 ```
 
@@ -128,27 +161,25 @@ Root runs 是没有父级的 runs。它们的 `is_root` 值为 `True`，你可�
 <CodeGroup>
 
 ```python Python
-root_runs = client.list_runs(
-    project_name="<your_project>",
-    is_root=True
+root_runs = client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    is_root=True,
 )
 ```
 
 ```typescript TypeScript
-const rootRuns: Run[] = [];
-for await (const run of client.listRuns({
-  projectName: "<your_project>",
-  isRoot: 1,
-})) {
-  rootRuns.push(run);
-};
+const rootRuns = client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  is_root: true,
+});
 ```
 
 ```java Java
-import com.langchain.smith.models.runs.RunQueryParams;
-
-RunQueryParams rootRuns = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params rootRuns = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .isRoot(true)
     .build();
 ```
@@ -160,25 +191,26 @@ RunQueryParams rootRuns = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-correct_runs = client.list_runs(project_name="<your_project>", error=False)
+correct_runs = client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    has_error=False,
+)
 ```
 
 ```typescript TypeScript
-const correctRuns: Run[] = [];
-for await (const run of client.listRuns({
-  projectName: "<your_project>",
-  error: false,
-})) {
-  correctRuns.push(run);
-};
+const correctRuns = client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  has_error: false,
+});
 ```
 
 ```java Java
-import com.langchain.smith.models.runs.RunQueryParams;
-
-RunQueryParams noErrorRuns = RunQueryParams.builder()
-    .addSession("<your_project>")
-    .error(false)
+RunQueryV2Params noErrorRuns = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
+    .hasError(false)
     .build();
 ```
 
@@ -186,19 +218,17 @@ RunQueryParams noErrorRuns = RunQueryParams.builder()
 
 ### 按 run ID 列出 runs
 
-<Warning>
-**会忽略其他参数**
-
-如果你按上述方式提供一个 run ID 列表，系统会忽略 `project_name`、`run_type` 等其他筛选参数，而是直接返回与这些 ID 匹配的 runs。
-</Warning>
-
-如果你已经有一组 run IDs，可以直接列出它们：
+如果已经有一组 run ID，可以直接列出它们。同时也要传入 project ID；`ids` 可以与其他过滤器组合使用。
 
 <CodeGroup>
 
 ```python Python
-run_ids = ['a36092d2-4ad5-4fb4-9c0d-0dba9a2ed836','9398e6be-964f-4aa4-8ae9-ad78cd4b7074']
-selected_runs = client.list_runs(id=run_ids)
+run_ids = ["a36092d2-4ad5-4fb4-9c0d-0dba9a2ed836", "9398e6be-964f-4aa4-8ae9-ad78cd4b7074"]
+selected_runs = client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    ids=run_ids,
+)
 ```
 
 ```typescript TypeScript
@@ -206,20 +236,18 @@ const runIds = [
   "a36092d2-4ad5-4fb4-9c0d-0dba9a2ed836",
   "9398e6be-964f-4aa4-8ae9-ad78cd4b7074",
 ];
-const selectedRuns: Run[] = [];
-for await (const run of client.listRuns({
-  id: runIds,
-})) {
-  selectedRuns.push(run);
-};
+const selectedRuns = client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  ids: runIds,
+});
 ```
 
 ```java Java
-import com.langchain.smith.models.runs.RunQueryParams;
-
-RunQueryParams runIdsRuns = RunQueryParams.builder()
-    .addSession("<your_project>")
-    .id(runIds)
+RunQueryV2Params runIdsRuns = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
+    .ids(runIds)
     .build();
 ```
 
@@ -227,13 +255,17 @@ RunQueryParams runIdsRuns = RunQueryParams.builder()
 
 ### 按 ID 获取单个 run
 
-如果你想按 ID 获取单个 run（trace），请使用 `read_run` 方法。这在你已经有一个明确的 trace ID 时特别有用，例如从 LangSmith 共享链接 `https://smith.langchain.com/public/<trace-id>/r` 中获取到该 ID，并想读取其完整数据。
+要按 ID 获取单个 run，请使用 `runs.retrieve` 方法。它需要该 run 所属 project 的 ID。如果要获取公开分享链接中的 run，请改用[公开 runs 方法](/langsmith/smithdb-sdk-migration-feedback)。
 
 <CodeGroup>
 
 ```python Python
 run_id = "a36092d2-4ad5-4fb4-9c0d-0dba9a2ed836"
-run = client.read_run(run_id)
+run = await client.runs.retrieve(
+    run_id,
+    project_id=project_id,
+    selects=["NAME", "INPUTS", "OUTPUTS"],
+)
 
 # Access run data
 print(run.inputs)
@@ -243,7 +275,10 @@ print(run.name)
 
 ```typescript TypeScript
 const runId = "a36092d2-4ad5-4fb4-9c0d-0dba9a2ed836";
-const run = await client.readRun(runId);
+const run = await client.runs.retrieve(runId, {
+  project_id: projectId,
+  selects: ["NAME", "INPUTS", "OUTPUTS"],
+});
 
 // Access run data
 console.log(run.inputs);
@@ -252,12 +287,13 @@ console.log(run.name);
 ```
 
 ```java Java
-import com.langchain.smith.models.runs.RunQueryParams;
+import com.langchain.smith.models.runs.Run;
+import com.langchain.smith.models.runs.RunRetrieveV2Params;
 
-RunQueryParams runIdRun = RunQueryParams.builder()
-    .addSession("<your_project>")
-    .addId(runId)
-    .build();
+Run run = client.runs().retrieveV2(
+    runId,
+    RunRetrieveV2Params.builder().projectId(projectId).build()
+);
 ```
 
 </CodeGroup>
@@ -274,7 +310,7 @@ RunQueryParams runIdRun = RunQueryParams.builder()
 
 ### 列出会话 thread 中的所有 root runs
 
-这是获取某个会话 thread 中 runs 的方式。关于如何设置 threads，请参阅[设置 threads 的操作指南](/langsmith/threads)。
+这是获取某个会话 thread 中 runs 的方式。关于如何设置 threads，请参阅[设置 threads 的操作指南](/langsmith/threads)。如需直接列出 threads 及其 traces，请参阅[查询 threads](/langsmith/query-threads)。
 Threads 是通过共享 thread ID 进行分组的。LangSmith UI 允许使用以下任一 metadata key：`session_id` 或 `thread_id`。其中 session ID 也叫 tracing project ID。下面的查询会匹配这两者中的任意一种。
 
 <CodeGroup>
@@ -282,29 +318,26 @@ Threads 是通过共享 thread ID 进行分组的。LangSmith UI 允许使用以
 ```python Python
 group_key = "<your_thread_id>"
 filter_string = f'and(in(metadata_key, ["session_id","thread_id"]), eq(metadata_value, "{group_key}"))'
-thread_runs = client.list_runs(
-    project_name="<your_project>",
+thread_runs = client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
     filter=filter_string,
-    is_root=True
+    is_root=True,
 )
 ```
 
 ```typescript TypeScript
 const groupKey = "<your_thread_id>";
 const filterString = `and(in(metadata_key, ["session_id","thread_id"]), eq(metadata_value, "${groupKey}"))`;
-const threadRuns: Run[] = [];
-for await (const run of client.listRuns({
-  projectName: "<your_project>",
+const threadRuns = client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
   filter: filterString,
-  isRoot: true
-})) {
-  threadRuns.push(run);
-};
+  is_root: true,
+});
 ```
 
 ```java Java
-import com.langchain.smith.models.runs.RunQueryParams;
-
 String groupKey = "<your_thread_id>";
 
 String filterString = String.format(
@@ -312,9 +345,11 @@ String filterString = String.format(
     groupKey
 );
 
-RunQueryParams threadRuns = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params threadRuns = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter(filterString)
+    .isRoot(true)
     .build();
 ```
 
@@ -325,24 +360,27 @@ RunQueryParams threadRuns = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-client.list_runs(
-    project_name="<your_project>",
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
     filter='eq(name, "extractor")',
-    trace_filter='and(eq(feedback_key, "user_score"), eq(feedback_score, 1))'
+    trace_filter='and(eq(feedback_key, "user_score"), eq(feedback_score, 1))',
 )
 ```
 
 ```typescript TypeScript
-client.listRuns({
-  projectName: "<your_project>",
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
   filter: 'eq(name, "extractor")',
-  traceFilter: 'and(eq(feedback_key, "user_score"), eq(feedback_score, 1))'
-})
+  trace_filter: 'and(eq(feedback_key, "user_score"), eq(feedback_score, 1))',
+});
 ```
 
 ```java Java
-RunQueryParams extractorRuns = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params extractorRuns = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("eq(name, \"extractor\")")
     .traceFilter("and(eq(feedback_key, \"user_score\"), eq(feedback_score, 1))")
     .build();
@@ -350,27 +388,30 @@ RunQueryParams extractorRuns = RunQueryParams.builder()
 
 </CodeGroup>
 
-### 列出 `star_rating` 大于 4 的 runs
+### 列出 `star_rating` 键对应分数大于 4 的 runs
 
 <CodeGroup>
 
 ```python Python
-client.list_runs(
-    project_name="<your_project>",
-    filter='and(eq(feedback_key, "star_rating"), gt(feedback_score, 4))'
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter='and(eq(feedback_key, "star_rating"), gt(feedback_score, 4))',
 )
 ```
 
 ```typescript TypeScript
-client.listRuns({
-  projectName: "<your_project>",
-  filter: 'and(eq(feedback_key, "star_rating"), gt(feedback_score, 4))'
-})
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: 'and(eq(feedback_key, "star_rating"), gt(feedback_score, 4))',
+});
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("and(eq(feedback_key, \"star_rating\"), gt(feedback_score, 4))")
     .build();
 ```
@@ -379,20 +420,23 @@ RunQueryParams runs = RunQueryParams.builder()
 
 ### 列出完成耗时超过 5 秒的 runs
 
+延迟以秒为单位、按数值传入。
+
 <CodeGroup>
 
 ```python Python
-client.list_runs(project_name="<your_project>", filter='gt(latency, "5s")')
+client.runs.query(project_ids=[project_id], min_start_time=since, filter="gt(latency, 5)")
 ```
 
 ```typescript TypeScript
-client.listRuns({projectName: "<your_project>", filter: 'gt(latency, "5s")'})
+client.runs.query({ project_ids: [projectId], min_start_time: since, filter: "gt(latency, 5)" });
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
-    .filter("gt(latency, \"5s\")")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
+    .filter("gt(latency, 5)")
     .build();
 ```
 
@@ -403,16 +447,17 @@ RunQueryParams runs = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-client.list_runs(project_name="<your_project>", filter='neq(status, "error")')
+client.runs.query(project_ids=[project_id], min_start_time=since, filter='neq(status, "error")')
 ```
 
 ```typescript TypeScript
-client.listRuns({projectName: "<your_project>", filter: 'neq(status, "error")'})
+client.runs.query({ project_ids: [projectId], min_start_time: since, filter: 'neq(status, "error")' });
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("neq(status, \"error\")")
     .build();
 ```
@@ -421,19 +466,30 @@ RunQueryParams runs = RunQueryParams.builder()
 
 ### 列出 `start_time` 晚于某个时间戳的所有 runs
 
+如需限定时间窗口本身，请优先使用 `min_start_time` 和 `max_start_time` 参数；`start_time` 过滤器只会在该窗口内进一步收窄结果。
+
 <CodeGroup>
 
 ```python Python
-client.list_runs(project_name="<your_project>", filter='gt(start_time, "2023-07-15T12:34:56Z")')
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter='gt(start_time, "2023-07-15T12:34:56Z")',
+)
 ```
 
 ```typescript TypeScript
-client.listRuns({projectName: "<your_project>", filter: 'gt(start_time, "2023-07-15T12:34:56Z")'})
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: 'gt(start_time, "2023-07-15T12:34:56Z")',
+});
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("gt(start_time, \"2023-07-15T12:34:56Z\")")
     .build();
 ```
@@ -445,16 +501,17 @@ RunQueryParams runs = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-client.list_runs(project_name="<your_project>", filter='search("substring")')
+client.runs.query(project_ids=[project_id], min_start_time=since, filter='search("substring")')
 ```
 
 ```typescript TypeScript
-client.listRuns({projectName: "<your_project>", filter: 'search("substring")'})
+client.runs.query({ project_ids: [projectId], min_start_time: since, filter: 'search("substring")' });
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("search(\"substring\")")
     .build();
 ```
@@ -466,16 +523,17 @@ RunQueryParams runs = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-client.list_runs(project_name="<your_project>", filter='has(tags, "2aa1cf4")')
+client.runs.query(project_ids=[project_id], min_start_time=since, filter='has(tags, "2aa1cf4")')
 ```
 
 ```typescript TypeScript
-client.listRuns({projectName: "<your_project>", filter: 'has(tags, "2aa1cf4")'})
+client.runs.query({ project_ids: [projectId], min_start_time: since, filter: 'has(tags, "2aa1cf4")' });
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("has(tags, \"2aa1cf4\")")
     .build();
 ```
@@ -484,26 +542,31 @@ RunQueryParams runs = RunQueryParams.builder()
 
 ### 列出所有满足以下条件的 runs：在指定时间戳之后启动，且状态不是 error，或 feedback "Correctness" 分数等于 0
 
+把时间戳作为 `min_start_time` 传入，并将 `or` 条件保留在 `filter` 中。
+
 <CodeGroup>
 
 ```python Python
-client.list_runs(
-  project_name="<your_project>",
-  filter='and(gt(start_time, "2023-07-15T12:34:56Z"), or(neq(status, "error"), and(eq(feedback_key, "Correctness"), eq(feedback_score, 0.0))))'
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=datetime(2026, 7, 15, 12, 34, 56, tzinfo=timezone.utc),
+    filter='or(neq(status, "error"), and(eq(feedback_key, "Correctness"), eq(feedback_score, 0.0)))',
 )
 ```
 
 ```typescript TypeScript
-client.listRuns({
-  projectName: "<your_project>",
-  filter: 'and(gt(start_time, "2023-07-15T12:34:56Z"), or(neq(status, "error"), and(eq(feedback_key, "Correctness"), eq(feedback_score, 0.0))))'
-})
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: "2026-07-15T12:34:56Z",
+  filter: 'or(neq(status, "error"), and(eq(feedback_key, "Correctness"), eq(feedback_score, 0.0)))',
+});
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
-    .filter("and(gt(start_time, \"2023-07-15T12:34:56Z\"), or(neq(status, \"error\"), and(eq(feedback_key, \"Correctness\"), eq(feedback_score, 0.0))))")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(OffsetDateTime.parse("2026-07-15T12:34:56Z"))
+    .filter("or(neq(status, \"error\"), and(eq(feedback_key, \"Correctness\"), eq(feedback_score, 0.0)))")
     .build();
 ```
 
@@ -514,22 +577,25 @@ RunQueryParams runs = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-client.list_runs(
-  project_name="<your_project>",
-  filter='and(or(has(tags, "experimental"), has(tags, "beta")), gt(latency, 2))'
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter='and(or(has(tags, "experimental"), has(tags, "beta")), gt(latency, 2))',
 )
 ```
 
 ```typescript TypeScript
-client.listRuns({
-  projectName: "<your_project>",
-  filter: 'and(or(has(tags, "experimental"), has(tags, "beta")), gt(latency, 2))'
-})
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: 'and(or(has(tags, "experimental"), has(tags, "beta")), gt(latency, 2))',
+});
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("and(or(has(tags, 'experimental'), has(tags, 'beta')), gt(latency, 2))")
     .build();
 ```
@@ -543,22 +609,25 @@ RunQueryParams runs = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-client.list_runs(
-  project_name="<your_project>",
-  filter='search("image classification")'
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter='search("image classification")',
 )
 ```
 
 ```typescript TypeScript
-client.listRuns({
-  projectName: "<your_project>",
-  filter: 'search("image classification")'
-})
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: 'search("image classification")',
+});
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("search(\"image classification\")")
     .build();
 ```
@@ -572,43 +641,45 @@ RunQueryParams runs = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-to_search = {
-    "user_id": ""
-}
-
 # Check for any run with the "user_id" metadata key
-client.list_runs(
-  project_name="default",
-  filter="eq(metadata_key, 'user_id')"
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter="eq(metadata_key, 'user_id')",
 )
 # Check for runs with user_id=4070f233-f61e-44eb-bff1-da3c163895a3
-client.list_runs(
-  project_name="default",
-  filter="and(eq(metadata_key, 'user_id'), eq(metadata_value, '4070f233-f61e-44eb-bff1-da3c163895a3'))"
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter="and(eq(metadata_key, 'user_id'), eq(metadata_value, '4070f233-f61e-44eb-bff1-da3c163895a3'))",
 )
 ```
 
 ```typescript TypeScript
 // Check for any run with the "user_id" metadata key
-client.listRuns({
-  projectName: 'default',
-  filter: `eq(metadata_key, 'user_id')`
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: `eq(metadata_key, 'user_id')`,
 });
 // Check for runs with user_id=4070f233-f61e-44eb-bff1-da3c163895a3
-client.listRuns({
-  projectName: 'default',
-  filter: `and(eq(metadata_key, 'user_id'), eq(metadata_value, '4070f233-f61e-44eb-bff1-da3c163895a3'))`
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: `and(eq(metadata_key, 'user_id'), eq(metadata_value, '4070f233-f61e-44eb-bff1-da3c163895a3'))`,
 });
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runsWithUserId = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("eq(metadata_key, 'user_id')")
     .build();
 
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runsForUser = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("and(eq(metadata_key, 'user_id'), eq(metadata_value, '4070f233-f61e-44eb-bff1-da3c163895a3'))")
     .build();
 ```
@@ -622,22 +693,25 @@ RunQueryParams runs = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-client.list_runs(
-  project_name="default",
-  filter="and(eq(metadata_key, 'environment'), eq(metadata_value, 'production'))"
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter="and(eq(metadata_key, 'environment'), eq(metadata_value, 'production'))",
 )
 ```
 
 ```typescript TypeScript
-client.listRuns({
-  projectName: 'default',
-  filter: `and(eq(metadata_key, 'environment'), eq(metadata_value, 'production'))`
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: `and(eq(metadata_key, 'environment'), eq(metadata_value, 'production'))`,
 });
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("and(eq(metadata_key, 'environment'), eq(metadata_value, 'production'))")
     .build();
 ```
@@ -651,22 +725,25 @@ RunQueryParams runs = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-client.list_runs(
-  project_name="default",
-  filter="and(eq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))"
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter="and(eq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))",
 )
 ```
 
 ```typescript TypeScript
-client.listRuns({
-  projectName: 'default',
-  filter: `and(eq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))`
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: `and(eq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))`,
 });
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("and(eq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))")
     .build();
 ```
@@ -681,78 +758,90 @@ RunQueryParams runs = RunQueryParams.builder()
 
 ```python Python
 # Find all runs where the metadata does not contain a "thread_id" key
-client.list_runs(
-  project_name="default",
-  filter="and(neq(metadata_key, 'thread_id'))"
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter="and(neq(metadata_key, 'thread_id'))",
 )
 
 # Find all runs where the thread_id in metadata is not "a1b2c3d4-e5f6-7890"
-client.list_runs(
-  project_name="default",
-  filter="and(eq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))"
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter="and(eq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))",
 )
 
 # Find all runs where there is no "thread_id" metadata key and the "a1b2c3d4-e5f6-7890" value is not present
-client.list_runs(
-  project_name="default",
-  filter="and(neq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))"
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter="and(neq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))",
 )
 
 # Find all runs where the thread_id metadata key is not present but the "a1b2c3d4-e5f6-7890" value is present
-client.list_runs(
-  project_name="default",
-  filter="and(neq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))"
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter="and(neq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))",
 )
 ```
 
 ```typescript TypeScript
 // Find all runs where the metadata does not contain a "thread_id" key
-client.listRuns({
-  projectName: 'default',
-  filter: `and(neq(metadata_key, 'thread_id'))`
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: `and(neq(metadata_key, 'thread_id'))`,
 });
 
 // Find all runs where the thread_id in metadata is not "a1b2c3d4-e5f6-7890"
-client.listRuns({
-  projectName: 'default',
-  filter: `and(eq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))`
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: `and(eq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))`,
 });
 
 // Find all runs where there is no "thread_id" metadata key and the "a1b2c3d4-e5f6-7890" value is not present
-client.listRuns({
-  projectName: 'default',
-  filter: `and(neq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))`
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: `and(neq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))`,
 });
 
 // Find all runs where the thread_id metadata key is not present but the "a1b2c3d4-e5f6-7890" value is present
-client.listRuns({
-  projectName: 'default',
-  filter: `and(neq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))`
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: `and(neq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))`,
 });
 ```
 
 ```java Java
 // Find all runs where the metadata does not contain a "thread_id" key
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("default")
+RunQueryV2Params runsWithoutThreadId = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("and(neq(metadata_key, 'thread_id'))")
     .build();
 
 // Find all runs where the thread_id in metadata is not "a1b2c3d4-e5f6-7890"
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("default")
+RunQueryV2Params runsWithOtherThreadId = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("and(eq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))")
     .build();
 
 // Find all runs where there is no "thread_id" metadata key and the "a1b2c3d4-e5f6-7890" value is not present
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("default")
+RunQueryV2Params runsWithoutThreadIdOrValue = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("and(neq(metadata_key, 'thread_id'), neq(metadata_value, 'a1b2c3d4-e5f6-7890'))")
     .build();
 
 // Find all runs where the thread_id metadata key is not present but the "a1b2c3d4-e5f6-7890" value is present
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("default")
+RunQueryV2Params runsWithValueNotThreadId = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("and(neq(metadata_key, 'thread_id'), eq(metadata_value, 'a1b2c3d4-e5f6-7890'))")
     .build();
 ```
@@ -766,22 +855,25 @@ RunQueryParams runs = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-client.list_runs(
-  project_name="default",
-  filter="and(eq(name, 'ChatOpenAI'), eq(metadata_key, 'thread_id'), eq(metadata_value, '69b12c91-b1e2-46ce-91de-794c077e8151'))"
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
+    filter="and(eq(name, 'ChatOpenAI'), eq(metadata_key, 'thread_id'), eq(metadata_value, '69b12c91-b1e2-46ce-91de-794c077e8151'))",
 )
 ```
 
 ```typescript TypeScript
-client.listRuns({
-  projectName: 'default',
-  filter: `and(eq(name, 'ChatOpenAI'), eq(metadata_key, 'thread_id'), eq(metadata_value, '69b12c91-b1e2-46ce-91de-794c077e8151'))`
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
+  filter: `and(eq(name, 'ChatOpenAI'), eq(metadata_key, 'thread_id'), eq(metadata_value, '69b12c91-b1e2-46ce-91de-794c077e8151'))`,
 });
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("and(eq(name, 'ChatOpenAI'), eq(metadata_key, 'thread_id'), eq(metadata_value, '69b12c91-b1e2-46ce-91de-794c077e8151'))")
     .build();
 ```
@@ -797,26 +889,29 @@ RunQueryParams runs = RunQueryParams.builder()
 <CodeGroup>
 
 ```python Python
-client.list_runs(
-    project_name="<your_project>",
+client.runs.query(
+    project_ids=[project_id],
+    min_start_time=since,
     filter='eq(name, "RetrieveDocs")',
     trace_filter='and(eq(feedback_key, "user_score"), eq(feedback_score, 1))',
-    tree_filter='eq(name, "ExpandQuery")'
+    tree_filter='eq(name, "ExpandQuery")',
 )
 ```
 
 ```typescript TypeScript
-client.listRuns({
-  projectName: "<your_project>",
+client.runs.query({
+  project_ids: [projectId],
+  min_start_time: since,
   filter: 'eq(name, "RetrieveDocs")',
-  traceFilter: 'and(eq(feedback_key, "user_score"), eq(feedback_score, 1))',
-  treeFilter: 'eq(name, "ExpandQuery")'
-})
+  trace_filter: 'and(eq(feedback_key, "user_score"), eq(feedback_score, 1))',
+  tree_filter: 'eq(name, "ExpandQuery")',
+});
 ```
 
 ```java Java
-RunQueryParams runs = RunQueryParams.builder()
-    .addSession("<your_project>")
+RunQueryV2Params runs = RunQueryV2Params.builder()
+    .addProjectId(projectId)
+    .minStartTime(since)
     .filter("eq(name, \"RetrieveDocs\")")
     .traceFilter("and(eq(feedback_key, 'user_score'), eq(feedback_score, 1))")
     .treeFilter("eq(name, 'ExpandQuery')")
@@ -827,89 +922,78 @@ RunQueryParams runs = RunQueryParams.builder()
 
 ## 使用子 run 谓词查询 trace trees
 
-使用 `trace_filter` 可以匹配 root run 上的字段，使用 `tree_filter` 可以匹配 trace tree 中任意 run 上受支持的可搜索字段。如果你需要对任意返回的子 run 字段进行断言，例如嵌套的 `inputs`、`outputs` 或 `extra` 载荷，请按以下步骤进行：
+使用 `trace_filter` 可以匹配 root run 上的字段，使用 `tree_filter` 可以匹配 trace tree 中任意 run 上受支持的可搜索字段。如果你需要针对任意返回的子 run 字段应用谓词，例如嵌套的 `inputs`、`outputs` 或 `extra` 载荷，请按以下步骤进行：
 
-1. 先在服务端使用 `filter`、`trace_filter`、`tree_filter`、`run_type`、metadata 过滤器、`parent_run_id` 以及 `ls_run_depth` [system metadata key](/langsmith/ls-metadata-parameters#ls_run_depth) 来收窄候选 root traces。
-2. 在 Python 中调用 `read_run(..., load_child_runs=True)`，或在 TypeScript 中调用 `readRun(..., { loadChildRuns: true })`，把每个候选 root trace 连同子 runs 一起 hydrate 出来。
-3. 在本地遍历已经 hydrate 的 `child_runs` tree，并对那些无法作为服务端过滤字段使用的内容应用你的断言。
+1. 先在服务端使用 `filter`、`trace_filter`、`tree_filter`、`run_type`、metadata 过滤器以及 `ls_run_depth` [system metadata key](/langsmith/ls-metadata-parameters#ls_run_depth) 来收窄候选 root traces。
+2. 使用 `traces.list_runs` / `traces.listRuns` 获取每个候选 trace 的 runs。
+3. 在本地对那些无法作为服务端过滤字段使用的内容应用你的谓词。
 
-下面这个示例（Python 0.8 与 JS 0.7）会返回包含某个工具 run，且该工具 run 输出中包含特定值的 root traces。服务端的 `tree_filter` 先把候选范围收窄到包含该工具 run 的 traces，然后本地断言再检查 hydrate 后的 `outputs` 载荷。
+下面这个示例会返回这样的 root traces：其中包含某个工具 run，且该工具 run 的 output 含有特定值。服务端的 `tree_filter` 先把候选范围收窄到包含该工具 run 的 traces，然后本地谓词再检查 `outputs` 载荷。
 
 <CodeGroup>
 
 ```python Python
-from datetime import datetime, timedelta
+import asyncio
+from datetime import datetime, timedelta, timezone
 
 from langsmith import Client
 
-client = Client()
-project_name = "<your_project>"
+
+async def main():
+    client = Client()
+    project_id = str(client.read_project(project_name="<your_project>").id)
+
+    matching_trace_ids = []
+    async for candidate in client.runs.query(
+        project_ids=[project_id],
+        min_start_time=datetime.now(timezone.utc) - timedelta(days=7),
+        is_root=True,
+        tree_filter='and(eq(run_type, "tool"), eq(name, "<tool_name>"))',
+        selects=["TRACE_ID"],
+    ):
+        response = await client.traces.list_runs(
+            str(candidate.trace_id),
+            project_id=project_id,
+            selects=["NAME", "RUN_TYPE", "OUTPUTS"],
+        )
+        if any(
+            run.run_type == "tool"
+            and run.name == "<tool_name>"
+            and "<expected_value>" in str(run.outputs or {})
+            for run in response.items
+        ):
+            matching_trace_ids.append(candidate.trace_id)
 
 
-def iter_runs(run):
-    yield run
-    for child in run.child_runs or []:
-        yield from iter_runs(child)
-
-
-candidate_roots = client.list_runs(
-    project_name=project_name,
-    is_root=True,
-    start_time=datetime.now() - timedelta(days=7),
-    tree_filter='and(eq(run_type, "tool"), eq(name, "<tool_name>"))',
-    select=["id"],
-)
-
-matching_roots = []
-for candidate in candidate_roots:
-    root = client.read_run(candidate.id, load_child_runs=True)
-    has_matching_child = any(
-        child.id != root.id
-        and child.run_type == "tool"
-        and child.name == "<tool_name>"
-        and "<expected_value>" in str(child.outputs or {})
-        for child in iter_runs(root)
-    )
-    if has_matching_child:
-        matching_roots.append(root)
+asyncio.run(main())
 ```
 
 ```typescript TypeScript
-import { Client, Run } from "langsmith";
+import { Client } from "langsmith";
 
 const client = new Client();
-const projectName = "<your_project>";
+const projectId = (await client.readProject({ projectName: "<your_project>" })).id;
 
-function* iterRuns(run: Run): Generator<Run> {
-  yield run;
-  for (const child of run.child_runs ?? []) {
-    yield* iterRuns(child);
-  }
-}
-
-const candidateRoots: Run[] = [];
-for await (const run of client.listRuns({
-  projectName,
-  isRoot: true,
-  startTime: new Date(Date.now() - 1000 * 60 * 60 * 24 * 7),
-  treeFilter: 'and(eq(run_type, "tool"), eq(name, "<tool_name>"))',
-  select: ["id"],
+const matchingTraceIds: string[] = [];
+for await (const candidate of client.runs.query({
+  project_ids: [projectId],
+  min_start_time: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
+  is_root: true,
+  tree_filter: 'and(eq(run_type, "tool"), eq(name, "<tool_name>"))',
+  selects: ["TRACE_ID"],
 })) {
-  candidateRoots.push(run);
-}
-
-const matchingRoots: Run[] = [];
-for (const candidate of candidateRoots) {
-  const root = await client.readRun(candidate.id, { loadChildRuns: true });
-  const hasMatchingChild = [...iterRuns(root)].some(
-    (child) =>
-      child.id !== root.id &&
-      child.run_type === "tool" &&
-      child.name === "<tool_name>" &&
-      JSON.stringify(child.outputs ?? {}).includes("<expected_value>"),
+  const response = await client.traces.listRuns(candidate.trace_id!, {
+    project_id: projectId,
+    selects: ["NAME", "RUN_TYPE", "OUTPUTS"],
+  });
+  const hasMatchingChild = (response.items ?? []).some(
+    (run) =>
+      run.run_type === "tool" &&
+      run.name === "<tool_name>" &&
+      JSON.stringify(run.outputs ?? {}).includes("<expected_value>"),
   );
   if (hasMatchingChild) {
-    matchingRoots.push(root);
+    matchingTraceIds.push(candidate.trace_id!);
   }
 }
 ```
@@ -921,88 +1005,65 @@ for (const candidate of candidateRoots) {
 下面的 Python 示例展示了如何导出 traces 的扁平化视图，并包含每条 trace 内 agent 使用过的工具信息（来自嵌套 runs）。
 这适合用来分析 agents 在多条 traces 中的行为。
 
-这个示例会查询指定天数范围内的所有工具 runs，并按其父级（root）run ID 分组。然后它会为每个 root run 拉取相关信息，例如 run name、inputs、outputs，并把这些信息与子 run 信息组合在一起。
+这个示例会查询指定天数范围内的所有工具 runs，并按其 trace ID 分组。然后它为每个 root run 拉取相关信息，例如 run 名称、inputs、outputs，并把这些信息与子 run 信息组合在一起。
 
 为了优化查询，该示例：
 
 1. 查询工具 runs 时只选择必要字段，从而减少查询耗时。
-2. 批量拉取 root runs，同时并发处理工具 runs。
+2. 按 ID 分批拉取 root runs。root run 的 ID 就是它的 trace ID。
 
 <CodeGroup>
 
 ```python Python
+import asyncio
 from collections import defaultdict
-from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from langsmith import Client
-from tqdm.auto import tqdm
 
-client = Client()
-project_name = "my-project"
-num_days = 30
 
-# List all tool runs
-tool_runs = client.list_runs(
-    project_name=project_name,
-    start_time=datetime.now() - timedelta(days=num_days),
-    run_type="tool",
-    # We don't need to fetch inputs, outputs, and other values that # may increase the query time
-    select=["trace_id", "name", "run_type"],
-)
+async def main():
+    client = Client()
+    project_id = str(client.read_project(project_name="my-project").id)
+    num_days = 30
+    since = datetime.now(timezone.utc) - timedelta(days=num_days)
 
-data = []
-futures: list[Future] = []
-trace_cursor = 0
-trace_batch_size = 50
+    # Collect all tools invoked within each trace
+    tools_by_trace = defaultdict(set)
+    async for run in client.runs.query(
+        project_ids=[project_id],
+        min_start_time=since,
+        run_type="TOOL",
+        # We don't need inputs, outputs, and other values that may increase the query time
+        selects=["TRACE_ID", "NAME"],
+    ):
+        tools_by_trace[str(run.trace_id)].add(run.name)
 
-tool_runs_by_parent = defaultdict(lambda: defaultdict(set))
-# Do not exceed rate limit
-with ThreadPoolExecutor(max_workers=2) as executor:
-    # Group tool runs by parent run ID
-    for run in tqdm(tool_runs):
-        # Collect all tools invoked within a given trace
-        tool_runs_by_parent[run.trace_id]["tools_involved"].add(run.name)
-        # maybe send a batch of parent run IDs to the server
-        # this lets us query for the root runs in batches
-        # while still processing the tool runs
-        if len(tool_runs_by_parent) % trace_batch_size == 0:
-            if this_batch := list(tool_runs_by_parent.keys())[
-                trace_cursor : trace_cursor + trace_batch_size
-            ]:
-                trace_cursor += trace_batch_size
-                futures.append(
-                    executor.submit(
-                        client.list_runs,
-                        project_name=project_name,
-                        run_ids=this_batch,
-                        select=["name", "inputs", "outputs", "run_type"],
-                    )
-                )
-    if this_batch := list(tool_runs_by_parent.keys())[trace_cursor:]:
-        futures.append(
-            executor.submit(
-                client.list_runs,
-                project_name=project_name,
-                run_ids=this_batch,
-                select=["name", "inputs", "outputs", "run_type"],
+    # Fetch the root runs in batches
+    data = []
+    trace_ids = list(tools_by_trace)
+    trace_batch_size = 50
+    for i in range(0, len(trace_ids), trace_batch_size):
+        async for root_run in client.runs.query(
+            project_ids=[project_id],
+            min_start_time=since,
+            ids=trace_ids[i : i + trace_batch_size],
+            selects=["ID", "NAME", "RUN_TYPE", "INPUTS", "OUTPUTS"],
+        ):
+            data.append(
+                {
+                    "run_id": root_run.id,
+                    "run_name": root_run.name,
+                    "run_type": root_run.run_type,
+                    "inputs": root_run.inputs,
+                    "outputs": root_run.outputs,
+                    "tools_involved": list(tools_by_trace[str(root_run.id)]),
+                }
             )
-        )
+    return data
 
-for future in tqdm(futures):
-    root_runs = future.result()
-    for root_run in root_runs:
-        root_data = tool_runs_by_parent[root_run.id]
-        data.append(
-            {
-                "run_id": root_run.id,
-                "run_name": root_run.name,
-                "run_type": root_run.run_type,
-                "inputs": root_run.inputs,
-                "outputs": root_run.outputs,
-                "tools_involved": list(root_data["tools_involved"]),
-            }
-        )
+
+data = asyncio.run(main())
 
 # (Optional): Convert to a pandas DataFrame
 import pandas as pd
@@ -1021,100 +1082,70 @@ df.head()
 <CodeGroup>
 
 ```python Python
+import asyncio
 from collections import defaultdict
-from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-import pandas as pd
 from langsmith import Client
-from tqdm.auto import tqdm
 
-client = Client()
-project_name = "your-project-name"
-num_days = 1
 
-# List all tool runs
-retriever_runs = client.list_runs(
-    project_name=project_name,
-    start_time=datetime.now() - timedelta(days=num_days),
-    run_type="retriever",
-    # This time we do want to fetch the inputs and outputs, since they
-    # may be adjusted by query expansion steps.
-    select=["trace_id", "name", "run_type", "inputs", "outputs"],
-    trace_filter='eq(feedback_key, "user_score")',
-)
+async def main():
+    client = Client()
+    project_id = str(client.read_project(project_name="your-project-name").id)
+    num_days = 1
+    since = datetime.now(timezone.utc) - timedelta(days=num_days)
 
-data = []
-futures: list[Future] = []
-trace_cursor = 0
-trace_batch_size = 50
-
-retriever_runs_by_parent = defaultdict(lambda: defaultdict(list))
-# Do not exceed rate limit
-with ThreadPoolExecutor(max_workers=2) as executor:
-    # Group retriever runs by parent run ID
-    for run in tqdm(retriever_runs):
-        # Collect all retriever calls invoked within a given trace
-        for k, v in run.inputs.items():
-            retriever_runs_by_parent[run.trace_id][f"retriever.inputs.{k}"].append(v)
+    # List all retriever runs in traces with "user_score" feedback
+    retriever_data = defaultdict(lambda: defaultdict(list))
+    async for run in client.runs.query(
+        project_ids=[project_id],
+        min_start_time=since,
+        run_type="RETRIEVER",
+        # This time we do want to fetch the inputs and outputs, since they
+        # may be adjusted by query expansion steps.
+        selects=["TRACE_ID", "INPUTS", "OUTPUTS"],
+        trace_filter='eq(feedback_key, "user_score")',
+    ):
+        for k, v in (run.inputs or {}).items():
+            retriever_data[str(run.trace_id)][f"retriever.inputs.{k}"].append(v)
         for k, v in (run.outputs or {}).items():
-            # Extend the docs
-            retriever_runs_by_parent[run.trace_id][f"retriever.outputs.{k}"].extend(v)
-        # maybe send a batch of parent run IDs to the server
-        # this lets us query for the root runs in batches
-        # while still processing the retriever runs
-        if len(retriever_runs_by_parent) % trace_batch_size == 0:
-            if this_batch := list(retriever_runs_by_parent.keys())[
-                trace_cursor : trace_cursor + trace_batch_size
-            ]:
-                trace_cursor += trace_batch_size
-                futures.append(
-                    executor.submit(
-                        client.list_runs,
-                        project_name=project_name,
-                        run_ids=this_batch,
-                        select=[
-                            "name",
-                            "inputs",
-                            "outputs",
-                            "run_type",
-                            "feedback_stats",
-                        ],
-                    )
-                )
-    if this_batch := list(retriever_runs_by_parent.keys())[trace_cursor:]:
-        futures.append(
-            executor.submit(
-                client.list_runs,
-                project_name=project_name,
-                run_ids=this_batch,
-                select=["name", "inputs", "outputs", "run_type"],
-            )
-        )
+            retriever_data[str(run.trace_id)][f"retriever.outputs.{k}"].extend(v)
 
-for future in tqdm(futures):
-    root_runs = future.result()
-    for root_run in root_runs:
-        root_data = retriever_runs_by_parent[root_run.id]
-        feedback = {
-            f"feedback.{k}": v.get("avg")
-            for k, v in (root_run.feedback_stats or {}).items()
-        }
-        inputs = {f"inputs.{k}": v for k, v in root_run.inputs.items()}
-        outputs = {f"outputs.{k}": v for k, v in (root_run.outputs or {}).items()}
-        data.append(
-            {
-                "run_id": root_run.id,
-                "run_name": root_run.name,
-                **inputs,
-                **outputs,
-                **feedback,
-                **root_data,
+    # Fetch the root runs, with their feedback, in batches
+    data = []
+    trace_ids = list(retriever_data)
+    trace_batch_size = 50
+    for i in range(0, len(trace_ids), trace_batch_size):
+        async for root_run in client.runs.query(
+            project_ids=[project_id],
+            min_start_time=since,
+            ids=trace_ids[i : i + trace_batch_size],
+            selects=["ID", "NAME", "INPUTS", "OUTPUTS", "FEEDBACK_STATS"],
+        ):
+            feedback = {
+                f"feedback.{k}": v.avg
+                for k, v in (root_run.feedback_stats or {}).items()
             }
-        )
+            inputs = {f"inputs.{k}": v for k, v in (root_run.inputs or {}).items()}
+            outputs = {f"outputs.{k}": v for k, v in (root_run.outputs or {}).items()}
+            data.append(
+                {
+                    "run_id": root_run.id,
+                    "run_name": root_run.name,
+                    **inputs,
+                    **outputs,
+                    **feedback,
+                    **retriever_data[str(root_run.id)],
+                }
+            )
+    return data
+
+
+data = asyncio.run(main())
 
 # (Optional): Convert to a pandas DataFrame
 import pandas as pd
+
 df = pd.DataFrame(data)
 df.head()
 ```
@@ -1123,4 +1154,4 @@ df.head()
 
 ## 速率限制
 
-[`POST /runs/query`](/langsmith/smith-api/run/query-runs) 端点会根据查询参数按租户施加速率限制。完整的表格和最佳实践请参阅 [Run query 端点速率限制](/langsmith/usage-and-billing#run-query-endpoint)。
+`runs.query`（`POST /api/v2/runs/query`）有独立的速率限制，且高于已弃用的 `POST /runs/query` 端点：在 LangSmith Cloud 中，每个 API key 每 10 秒 300 次请求。超过限制的请求会返回 `429 Too Many Requests`。它不受已弃用端点按租户限制的约束。通用最佳实践请参阅 [Run query 端点速率限制](/langsmith/usage-and-billing#run-query-endpoint)。
