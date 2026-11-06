@@ -76,9 +76,11 @@ Profile 还带有一个 **Network scope**，用于控制 agent 计算机的出�
 **Stopped computer cleanup** 只适用于 **Computer per thread** 模式。Shared computers 不会被自动删除。
 </Note>
 
-## Base snapshot
+## 选择基础 snapshot
 
-Snapshot 是用来启动计算机的磁盘镜像。默认情况下，所有 Fleet agents 都会使用工作区默认 snapshot。要构建、捕获或配置自定义 snapshots，请参阅[Sandbox snapshots](/langsmith/sandbox-snapshots)。你可以在 settings popover 中为 agent[修改 snapshot](#configure-lifecycle-and-snapshot)。
+Snapshot 是用来启动计算机的磁盘镜像。未选择 snapshot 时，Fleet 会使用平台默认值 `system/default:latest`。当前默认值基于 `ubuntu:26.04`，包含 Python 3、Node.js 24、Go、Git、Docker、一个浏览器以及文档处理库。完整工具列表和其他系统 snapshot 请参阅[了解系统 snapshot](/langsmith/sandbox-snapshots#understand-system-snapshots)。
+
+要为已有 agent 更改 snapshot，请在 settings popover 中设置 **Snapshot**，具体步骤见[配置 lifecycle 和 snapshot](#configure-lifecycle-and-snapshot)。要构建或捕获自己的 snapshot，请参阅 [Sandbox snapshots](/langsmith/sandbox-snapshots)，并包含[为 Fleet 准备自定义镜像](#prepare-a-custom-image-for-fleet)中列出的组件。
 
 <Note>
 Snapshot 变更只会影响该 agent 后续创建的新计算机。在 **Shared computer** 模式下，唯一那台共享计算机会在整个生命周期中保持其原始 snapshot 不变。
@@ -99,3 +101,36 @@ Agent 的 snapshot、idle timeout 和 stopped computer cleanup 都在 settings p
     点击 **Save changes**。
   </Step>
 </Steps>
+
+## 为 Fleet 准备自定义镜像
+
+自定义 snapshot 会替换默认文件系统，不会继承默认工具。即使从最小化的 Linux 镜像开始，也要包含 agent 所用 Fleet 能力对应的依赖。
+
+| 能力 | 组件 |
+| --- | --- |
+| 命令执行 | 位于 `/bin/bash` 的 Bash。Fleet 用它运行每条命令，缺少它命令就会失败。 |
+| 运行 setup 和文件工具 | 命令必须以 `root` 或能够在 `/` 下创建目录的用户身份运行。需要 Python 3、`tar`、`grep`，以及 `mkdir`、`rm`、`ln` 等核心工具。 |
+| [Access profiles](#access-profiles) | 位于 `/etc/ssl/certs/ca-certificates.crt` 的系统 CA bundle。启动时，sandbox 会把代理的 CA 追加到该文件，并把常见的 CA-bundle 环境变量指向它。Debian、Ubuntu、Alpine 和 Wolfi 使用该路径。RHEL 系列镜像把 bundle 放在别处，因此需要在此路径提供一个，否则 sandbox 发出的 HTTPS 请求可能无法通过证书校验。 |
+| PowerPoint 文件（`fleet-pptx`） | Python 3 和 `python-pptx`。 |
+| Word 文件（`fleet-docx`） | Python 3 和 `python-docx`。 |
+| Excel 文件（`fleet-xlsx`） | Python 3、`openpyxl`、`defusedxml` 和 `lxml`。该 skill 要求打开文件前 `openpyxl.xml.DEFUSEDXML` 为 `True`。 |
+| 旧版文档转换（`fleet-document-converter`） | Node.js 20 或更高版本，以及来自 `@firecrawl/anydoc` 的 `anydoc` 可执行文件，包括其特定平台的 native 包。 |
+
+如果缺少 `python-pptx` 或 `python-docx`，该 skill 会把固定版本安装到 `/tmp` 下的虚拟环境中，这需要 Python 的 `venv` 模块以及 PyPI 访问权限。如果缺少 `anydoc`，转换器会用 `npx` 运行它，这需要 npm 以及 npm registry 访问权限。Excel skill 没有安装回退方案。对于无法访问包 registry 的镜像，请预装每个组件。
+
+要查看你所用 release 中默认镜像包含的版本，请从 `system/default:latest` 启动一个 sandbox 并运行：
+
+```bash
+python3 -m pip list 2>/dev/null | grep -iE '^(python-docx|python-pptx|openpyxl|defusedxml|lxml|pillow|xlsxwriter) '
+anydoc --version
+```
+
+在基于自定义 snapshot 启动的 sandbox 中运行同样的命令，确认它已可供 Fleet 使用。还要检查文档库能否导入，以及加固后的 XML 解析器是否启用：
+
+```bash
+python3 -c "import docx, pptx, openpyxl.xml; assert openpyxl.xml.DEFUSEDXML"
+```
+
+你的镜像不需要使用 Ubuntu，也不需要包含默认镜像中的每个开发工具。如果使用其他发行版，请提供兼容的包及其 native 依赖。
+
+`system/default:latest` 是 snapshot 引用，不是 Dockerfile `FROM` 指令可用的 container image URI。请先构建自己的 container image，再[从中创建 snapshot](/langsmith/sandbox-snapshots#build-a-snapshot-from-a-container-image)。要审计默认 snapshot 或某个具名系统 snapshot，请使用已部署的 `sandbox-host` 镜像，按[在自托管部署中检查默认 snapshot 文件系统](/langsmith/sandbox-snapshots#inspect-the-default-snapshot-filesystem-in-self-hosted-deployments)操作。

@@ -6,21 +6,58 @@ description: 构建并捕获可复用的 sandbox 文件系统镜像。
 
 **snapshot** 是一个可复用的 sandbox 文件系统。当你希望从自定义文件系统镜像启动 sandboxes 时，可以基于某个 container image 构建自定义 snapshot。
 
-你也可以从一个正在运行的 sandbox 中捕获 snapshot，例如安装 packages、写入数据文件，或配置状态，然后把结果 snapshot 下来，作为新的起始镜像重复使用。
+你也可以从正在运行的 sandbox 中捕获 snapshot。安装 packages、写入数据文件或配置状态，然后对结果制作 snapshot，并将其作为新的起点重复使用。
 
 ![Sandboxes snapshots page](/images/langsmith/sandboxes/sb-snapshots.png)
 
-## 了解默认 snapshot
+## 了解系统 snapshot
 
-当你创建 sandbox 时未选择 snapshot，LangSmith 会使用内置的默认 snapshot。该默认 snapshot 提供 Ubuntu 24.04 文件系统，并附带常用开发工具。LangSmith 可能会随时间更新默认 snapshot 中包含的 packages 和工具。
+当你创建 sandbox 时未选择 snapshot，LangSmith 会使用内置的 `system/default:latest` snapshot。当前默认值以 `ubuntu:26.04` container image 为起点，并包含下文列出的工具。较旧的自托管版本可能包含不同的 Ubuntu 版本和 package 集合。
+
+### 检查默认工具
+
+默认文件系统包含以下工具。此列表概括了已安装的能力，而不是完整的软件物料清单（SBOM）。
+
+| 类别 | 包含的工具 |
+| --- | --- |
+| 语言和 package 管理器 | Python 3（含 pip 和 venv）、uv 和 uvx、Node.js 24（含 npm）、pnpm、Yarn、Go 和 Ruby。 |
+| 源代码管理 | Git、GitHub CLI（`gh`）以及 `gh stack` 扩展。 |
+| 构建和 container 工具 | `build-essential`、CMake、pkg-config、Docker、Docker Buildx、Docker Compose 和 BuildKit。 |
+| Shell 和文件工具 | Bash、Zsh、tmux、ttyd、ripgrep、fd、jq、bat、tree、zip、unzip、rsync 以及常用 Linux 工具。 |
+| 网络和数据工具 | curl、wget、OpenSSH client 和 server、DNS 和网络诊断工具、SQLite 以及 PostgreSQL client。 |
+| 浏览器自动化 | Chrome for Testing 和 `agent-browser`。 |
+| 文档处理 | `python-docx`、`python-pptx`、带 `defusedxml` 的 `openpyxl` 以及 `anydoc`。请参阅 [Fleet 文档依赖](/langsmith/fleet/computer-use#prepare-a-custom-image-for-fleet)。 |
+| LangSmith 工具 | LangSmith CLI 和 Custom Apps 开发服务器。 |
+
+Package 版本可能因 LangSmith 版本而异。若要审计确切安装的 packages 及其传递依赖，请按[在自托管部署中检查默认 snapshot 文件系统](#在自托管部署中检查默认-snapshot-文件系统)所述，检查已部署镜像中的文件系统。
+
+### 选择系统 snapshot
+
+系统 snapshot 是由 LangSmith 维护的只读起始文件系统，在各工作区之间共享。常规工作负载请使用 `system/default:latest`，也可以基于自己的 container image [构建自定义 snapshot](#从-container-image-构建-snapshot)。其他系统 snapshot 支撑特定的 LangSmith 功能，由这些功能自动选用。此处列出它们，是为了便于你审计其内容。
+
+引用采用 `system/<name>:<tag>` 的形式。省略 tag 即选择 `latest`。`system/` 命名空间是保留的：你不能在其中构建、捕获、重新打 tag 或删除 snapshot。从使用系统 snapshot 的 sandbox 捕获的 snapshot 归属于你的工作区。
+
+| Snapshot 引用 | 使用者 | 基础内容和附加内容 |
+| --- | --- | --- |
+| `system/default:latest` | 常规开发以及 [Fleet 计算机](/langsmith/fleet/computer-use) | Ubuntu 26.04，包含[默认工具](#检查默认工具)。 |
+| `system/custom-apps:latest` | [Custom apps](/langsmith/custom-apps) | 默认文件系统，外加预置的应用起始模板，以及 `/workspace/app` 中已安装的依赖。 |
+| `system/code-evaluators:latest` | Python 和 JavaScript [code evaluators](/langsmith/code-evaluator-ui) | 默认文件系统，外加 NumPy、pandas、jsonschema、SciPy、scikit-learn，以及 LangSmith Python 和 JavaScript SDK。 |
+| `system/prebuilt-voice-evaluator:latest` | 托管的[语音指标评估](/langsmith/evaluators#voice-evaluation) | 默认文件系统，外加 `/opt/venv` 中的 NumPy、`ffmpeg`、`ffprobe`，以及 `/opt/langsmith_eval` 中的语音评估模块。 |
+| `system/taskset-runner:latest` | Taskset 执行 | 默认文件系统，外加位于 `/opt/smith-harbor/.venv` 的 Python 3.12 环境中的 Harbor 和 `smith-harbor`，并缓存 `langgraph-cli` 以供离线使用。 |
+
+可用目录取决于你的 LangSmith 版本。在自托管部署中，它来自你的 LangSmith 发行版中的 `sandbox-host` 镜像；请参阅[自托管更新日志](/langsmith/self-hosted-changelog)。
+
+LangSmith 可以更新 `latest` 背后的内容；已有 sandbox 会保留其原始 snapshot ID。当你需要复用某个特定版本时，请使用 snapshot ID 而不是可变 tag。
 
 ### 在自托管部署中检查默认 snapshot 文件系统
 
 在自托管部署中，LangSmith 会基于 sandbox 运行时 container image（`sandbox-host`）中内嵌的文件系统来创建默认 snapshot：
 
-1. 在构建 `sandbox-host` 镜像时，LangSmith 以 Ubuntu 24.04 为起点并安装默认开发工具。
+1. 在构建 `sandbox-host` 镜像时，LangSmith 以 `ubuntu:26.04` 为起点并安装默认工具。
 2. LangSmith 将该文件系统打包为一个 16 GiB 的压缩 ext4 文件，位于 `/opt/sandbox-host/bin/builder-base.ext4.gz`。
-3. 当 `sandbox-host` 启动时，LangSmith 使用该内嵌文件系统创建默认 snapshot。
+3. 当 `sandbox-host` 启动时，LangSmith 把这些内嵌文件系统注册为系统 snapshot。
+
+当前的 host 镜像还包含 `/opt/sandbox-host/bin/system-snapshots.json`。该 manifest 记录了每个 snapshot 的名称、tag、payload 路径、文件系统校验和、容量、架构以及运行配置。命名变体的压缩文件位于 `/opt/sandbox-host/bin/system-snapshots/` 下。要审计某个变体，请复制 manifest 中 `payload_path` 指向的文件，而不是默认 payload。将副本在本地保存为 `builder-base.ext4.gz`，即可复用下文的解压和提取命令。
 
 默认 snapshot 文件系统的来源是这个压缩的 ext4 文件，而不是单独拉取的 container image。
 
@@ -479,7 +516,7 @@ const sb = await client.createSandbox({ snapshotName: "ml-ready" });
 
 </CodeGroup>
 
-`snapshot_id` / `snapshot_name`，或 TypeScript 中的 `snapshotId` / `snapshotName`，两者最多传一个。如果都不传，则会使用默认 runtime。
+`snapshot_id` / `snapshot_name`，或 TypeScript 中的 `snapshotId` / `snapshotName`，两者最多传一个。如果都不传，则会使用 `system/default:latest`。
 </Tip>
 
 ### 调整捕获等待时间

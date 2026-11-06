@@ -23,6 +23,7 @@ LangChain 提供了一组适用于常见场景的预构建 middleware。每个 m
 | [Tool retry](#tool-retry) | 使用指数退避自动重试失败的 tool call。 |
 | [Model retry](#model-retry) | 使用指数退避自动重试失败的模型调用。 |
 | [Model fallback](#model-fallback) | 主模型失败时自动切换到备用模型。 |
+| [Model refusal](#model-refusal) | 模型拒绝时抛出错误，而不是把拒绝当作最终答案。 |
 | [Summarization](#summarization) | 在接近 token 上限时自动总结对话历史。 |
 | [Human-in-the-loop](#human-in-the-loop) | 在执行 tool call 前暂停，等待人工批准。 |
 | [Model call limit](#model-call-limit) | 通过限制模型调用次数来防止成本过高。 |
@@ -840,6 +841,133 @@ const agent = createAgent({
 :::
 
 </Accordion>
+
+:::python
+### Model refusal
+
+<Note>
+    `ModelRefusalMiddleware` 需要 `langchain>=1.4.9`。
+</Note>
+
+当模型拒绝时抛出 @[`ModelRefusalError`]，而不是把拒绝作为 agent 的最终答案返回。提供商把拒绝（例如安全策略拒绝）作为成功响应上报，因此没有这个 middleware 时，agent 运行会像成功一样结束。Model refusal 适用于以下情况：
+
+- 在模型拒绝时让运行明确失败。
+- 借助 [Model fallback](#model-fallback) 在另一个模型上重试被拒绝的请求。
+
+这个 middleware 会检查每个模型响应中是否存在 [`refusal` 内容块](/oss/langchain/messages#content-block-reference)，OpenAI、Anthropic 和 Gemini 模型会生成该内容块。它还会捕获在结构化 `response_format` 下解析失败的拒绝。它不会检测模型以普通文本形式写出的拒绝。
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import ModelFallbackMiddleware, ModelRefusalMiddleware
+
+agent = create_agent(
+    model="claude-sonnet-5-5",
+    tools=[],
+    middleware=[
+        ModelFallbackMiddleware("gpt-6.1-sol"),
+        ModelRefusalMiddleware(),
+    ],
+)
+```
+
+把 @[`ModelRefusalMiddleware`] 列在 @[`ModelFallbackMiddleware`] 之后，这样 fallback 会捕获该错误并在下一个模型上重试。`ModelRetryMiddleware` 不会重试拒绝。流式输出时，模型在拒绝前发送的文本可能在 middleware 抛出之前就到达客户端。
+
+#### Handle a refusal
+
+选择应用在模型拒绝时的响应方式：
+
+<AccordionGroup>
+
+<Accordion title="Catch the error and continue">
+
+在调用 agent 的位置捕获 @[`ModelRefusalError`]。被拒绝的回复不会保存到 thread，因此下一条消息会在同一模型或另一个模型上正常继续对话：
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import ModelRefusalMiddleware
+from langchain_core.exceptions import ModelRefusalError
+from langgraph.checkpoint.memory import InMemorySaver
+
+agent = create_agent(
+    model="claude-sonnet-5-5",
+    tools=[],
+    middleware=[ModelRefusalMiddleware()],
+    checkpointer=InMemorySaver(),
+)
+config = {"configurable": {"thread_id": "1"}}
+
+try:
+    agent.invoke({"messages": [{"role": "user", "content": "..."}]}, config)
+except ModelRefusalError as error:
+    print(error)  # Tell the user the request was refused
+
+# The thread is still usable
+agent.invoke({"messages": [{"role": "user", "content": "Try something else"}]}, config)
+```
+
+</Accordion>
+
+<Accordion title="Fall back to another model">
+
+把 @[`ModelFallbackMiddleware`] 列在 `ModelRefusalMiddleware` 之前，如上面的示例所示。模型拒绝时，请求会在下一个模型上重试，该模型可以来自同一提供商，也可以来自其他提供商。fallback 模型仍可能拒绝同一请求，因此请结合其他选项之一，处理所有模型都拒绝的情况。
+
+</Accordion>
+
+<Accordion title="Reply to the user after fallback">
+
+当所有模型都拒绝时，如果想回复用户而不是让运行失败，请在 `ModelFallbackMiddleware` 之前添加一个捕获该错误的 middleware：
+
+```python
+from typing import Callable
+
+from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    ModelFallbackMiddleware,
+    ModelRefusalMiddleware,
+    ModelRequest,
+    ModelResponse,
+    wrap_model_call,
+)
+from langchain.messages import AIMessage
+from langchain_core.exceptions import ModelRefusalError
+
+
+@wrap_model_call
+def reply_on_refusal(
+    request: ModelRequest,
+    handler: Callable[[ModelRequest], ModelResponse],
+) -> ModelResponse:
+    try:
+        return handler(request)
+    except ModelRefusalError:
+        # Every model refused: reply to the user instead of failing the run
+        return ModelResponse(result=[AIMessage("I cannot help with that request.")])
+
+
+agent = create_agent(
+    model="claude-sonnet-5-5",
+    tools=[],
+    middleware=[
+        reply_on_refusal,
+        ModelFallbackMiddleware("gpt-6.1-sol"),
+        ModelRefusalMiddleware(),
+    ],
+)
+```
+
+当 `claude-sonnet-5-5` 拒绝时，请求会回退到 `gpt-6.1-sol`。如果该模型也拒绝，`reply_on_refusal` 会返回这条消息。
+
+</Accordion>
+
+<Accordion title="Write custom handling">
+
+对于其他处理方式，例如在 state 中记录拒绝，或调用 `interrupt()` 询问人工如何继续，请跳过 `ModelRefusalMiddleware`，并在自己的 middleware 中检查每个响应是否包含 [`refusal` 内容块](/oss/langchain/messages#content-block-reference)。参见 [Custom middleware](/oss/langchain/middleware/custom)。
+
+</Accordion>
+
+</AccordionGroup>
+
+:::
 
 ### Summarization
 
