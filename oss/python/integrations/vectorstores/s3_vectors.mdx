@@ -1,0 +1,211 @@
+---
+title: "Amazon S3 Vectors 集成"
+description: "使用 LangChain Python 集成 S3Vectors 向量存储。"
+integration:
+  name: AmazonS3Vectors
+  pypi: langchain-aws
+  delete_by_id: true
+  filtering: true
+  search_by_vector: true
+  search_with_score: true
+  async_api: false
+  passes_standard_tests: false
+  multi_tenancy: false
+  ids_in_add_documents: true
+---
+
+>[Amazon S3 Vectors](https://aws.amazon.com/s3/features/vectors/) 是一种云对象存储，原生支持存储和查询向量。它面向不需要内存型向量数据库那种高吞吐、低延迟特性的大型向量数据集，并且无需预置任何基础设施。
+
+本页介绍如何使用 `langchain-aws` 包中的 `AmazonS3Vectors` 向量存储。
+
+## 设置
+
+### 安装
+
+<CodeGroup>
+    ```bash pip
+    pip install -U langchain-aws
+    ```
+    ```bash uv
+    uv add langchain-aws
+    ```
+</CodeGroup>
+
+<Note>
+`AmazonS3Vectors` 需要 `langchain-aws>=0.2.31`。
+</Note>
+
+### 创建 vector bucket
+
+使用此向量存储前，必须先创建一个 S3 vector bucket。除非传入 `create_index_if_not_exist=False`，否则首次写入时会自动创建向量索引。
+
+```bash
+aws s3vectors create-vector-bucket --vector-bucket-name my-vector-bucket
+```
+
+这需要 `s3vectors:CreateVectorBucket` 权限。更多信息请参阅 [S3 Vectors 入门](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-getting-started.html)。
+
+### 凭证
+
+该向量存储使用标准的 AWS 凭证链。你也可以传入 `region_name`、`credentials_profile_name`，或一个已有的 boto3 `client`。
+
+## 初始化
+
+```python
+from langchain_aws import BedrockEmbeddings
+from langchain_aws.vectorstores import AmazonS3Vectors
+
+embeddings = BedrockEmbeddings(model_id="amazon.titan-embed-text-v2:0")
+
+vector_store = AmazonS3Vectors(
+    vector_bucket_name="my-vector-bucket",
+    index_name="my-index",
+    embedding=embeddings,
+)
+```
+
+索引名称长度必须为 3 到 63 个字符，以字母或数字开头和结尾，并且只能包含小写字母、数字、连字符和点。
+
+## 管理向量存储
+
+### 向向量存储添加条目
+
+```python
+from langchain_core.documents import Document
+
+vector_store.add_documents(
+    [
+        Document("Star Wars", id="key1", metadata={"genre": "scifi"}),
+        Document("Jurassic Park", id="key2", metadata={"genre": "scifi"}),
+        Document("Finding Nemo", id="key3", metadata={"genre": "family"}),
+    ]
+)
+```
+
+你也可以在一次调用中构建向量存储并添加文本：
+
+```python
+vector_store = AmazonS3Vectors.from_texts(
+    ["hello", "developer", "wife"],
+    vector_bucket_name="my-vector-bucket",
+    index_name="my-index",
+    embedding=embeddings,
+)
+```
+
+### 从向量存储删除条目
+
+```python
+vector_store.delete(ids=["key1", "key2"])
+```
+
+<Warning>
+不传 `ids` 调用 `delete()` 会删除整个向量索引及其中的所有内容。除非你确实想删除索引，否则始终要传入 `ids`。
+</Warning>
+
+### 按 ID 获取条目
+
+```python
+docs = vector_store.get_by_ids(["key1", "key3"])
+```
+
+<Note>
+只要请求的 ID 中有任何一个不存在，`get_by_ids` 就会抛出 `ValueError` 并且不返回任何内容，而不会返回它找到的那部分子集。
+</Note>
+
+## 查询向量存储
+
+### 相似度搜索
+
+```python
+results = vector_store.similarity_search("adventures in space", k=2)
+
+for doc in results:
+    print(doc.page_content)
+```
+
+### 带分数的相似度搜索
+
+返回的分数是距离，因此数值越小表示匹配越接近。
+
+```python
+results = vector_store.similarity_search_with_score("adventures in space", k=2)
+
+for doc, score in results:
+    print(score, doc.page_content)
+```
+
+### Metadata 过滤
+
+过滤器使用 S3 Vectors 的过滤语法：
+
+```python
+vector_store.similarity_search_with_score(
+    "adventures in space",
+    filter={"genre": {"$eq": "family"}},
+)
+```
+
+受支持的操作符请参阅 [Metadata filtering](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-metadata-filtering.html)。
+
+### 按向量搜索
+
+```python
+results = vector_store.similarity_search_by_vector(embeddings.embed_query("space"), k=2)
+```
+
+## 配置
+
+### 距离度量
+
+`distance_metric` 可接受 `cosine`（默认值）或 `euclidean`。该参数在创建索引时确定，因此之后再修改对已有索引没有影响。
+
+```python
+vector_store = AmazonS3Vectors(
+    vector_bucket_name="my-vector-bucket",
+    index_name="my-index",
+    embedding=embeddings,
+    distance_metric="euclidean",
+)
+```
+
+### 不可过滤的 metadata
+
+在 `non_filterable_metadata_keys` 中列出的 metadata 键会随文档一起存储和返回，但不能用于过滤器。对其中一个键进行过滤会抛出 `ValidationException`。该设置在创建索引时确定。
+
+```python
+vector_store = AmazonS3Vectors(
+    vector_bucket_name="my-vector-bucket",
+    index_name="my-index",
+    embedding=embeddings,
+    non_filterable_metadata_keys=["raw_source"],
+)
+```
+
+### Page content 存储
+
+默认情况下，文档文本以 `_page_content` 为键存放在 metadata 中。设置 `page_content_metadata_key` 可以更改该键，或将其设为 `None`，以便只对文本做 embedding 而不存储它；此时检索到的文档 `page_content` 为空。
+
+Metadata 须遵守 S3 Vectors 的[限制与约束](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html)，其中每个向量的 metadata 总量上限为 40 KB。
+
+## 作为 retriever 使用
+
+```python
+retriever = vector_store.as_retriever(search_kwargs={"k": 2})
+retriever.invoke("adventures in space")
+```
+
+## API reference
+
+有关所有功能与配置选项的详细文档，请参阅 [`AmazonS3Vectors` API reference](https://reference.langchain.com/python/langchain-aws/vectorstores/s3_vectors/base/AmazonS3Vectors)。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/python/integrations/vectorstores/s3_vectors.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

@@ -47,6 +47,28 @@ keywords: ["checkpoint", "checkpoints", "checkpointer", "InMemorySaver", "Postgr
 
 检查点使用 `thread_id` 作为存储和检索检查点的主键。如果没有它，检查指针将无法在 [interrupt](/oss/python/langgraph/interrupts) 之后保存状态或恢复执行，因为检查指针使用 `thread_id` 来加载保存的状态。
 
+<a id="choose-how-to-continue-a-thread"></a>
+
+#### 选择如何继续线程
+
+`thread_id` 标识已保存的状态。输入和 `checkpoint_id` 共同决定一次调用是开始新的工作、恢复未完成的工作，还是重播历史。仅复用线程 ID 并不意味着执行会恢复。
+
+在已有检查点和已有线程的情况下，按目标选择调用方式：
+
+| 目标 | 调用方式 | 执行行为 |
+| --- | --- | --- |
+| 提交新输入 | `graph.invoke(input, config)` | 把输入应用到已保存的状态，并从入口点开始执行。 |
+| 出错后继续 | `graph.invoke(None, config)` | 加载最新的检查点并重试未完成的工作。省略 `checkpoint_id`。 |
+| 响应 `interrupt()` | `graph.invoke(Command(resume=answer), config)` | 提供 interrupt 的返回值。被中断的节点会从函数开头重新运行。 |
+| 重播历史 | `graph.invoke(None, snapshot.config)` | 使用 `get_state_history()` 返回的快照，并重新执行该检查点之后的节点。 |
+
+
+
+
+新输入不会清空线程。LangGraph 会使用状态的 [reducer](/oss/python/langgraph/graph-api#reducers) 应用这些输入。如果要从空状态开始，请使用新的 `thread_id`。
+
+当最新检查点没有未完成的工作时，恢复会直接返回已保存的结果，而不运行任何节点。可运行的示例请参阅 [恢复 interrupt](/oss/python/langgraph/interrupts#resuming-interrupts) 和[重播历史](/oss/python/langgraph/use-time-travel#replay)。封装其他框架时入口点（entrypoint）的恢复规则，参见 [Functional API 概览](/oss/python/langgraph/functional-api#run-and-resume)。
+
 ### 检查点
 
 线程在特定时间点的状态称为检查点。检查点是保存在每个 [super-step](#super-steps) 处的图形状态的快照，并由 `StateSnapshot` 对象表示（有关完整字段引用，请参阅 [StateSnapshot fields](#statesnapshot-fields) ）。
@@ -271,6 +293,23 @@ interrupted = next(
 
 
 
+#### 列出所有线程
+
+要查看检查点保存器持有状态的每一个线程，例如构建管理视图或调试视图，请在列出检查点时省略 `thread_id`：
+
+`graph.get_state_history(config)` 要求 `config` 中包含 `thread_id`，并且只返回单个线程的历史记录。请在传给 `compile` 的同一个检查点保存器上调用 `.list`，并传入 `config=None`：
+
+```python
+# config=None returns checkpoints across every thread
+for checkpoint_tuple in checkpointer.list(None):
+    print(checkpoint_tuple.config["configurable"]["thread_id"])
+```
+
+传入 `None`，而不是 `{}`。[`SqliteSaver`](https://reference.langchain.com/python/langgraph/checkpoints/#langgraph.checkpoint.sqlite.SqliteSaver) 会将任何非 `None` 的配置视为线程过滤器，并在缺少 `thread_id` 时抛出错误。对于异步图，请改用 `.alist(None)`。此用法适用于 [`InMemorySaver`](https://reference.langchain.com/python/langgraph/checkpoints/#langgraph.checkpoint.memory.InMemorySaver)、[`SqliteSaver`](https://reference.langchain.com/python/langgraph/checkpoints/#langgraph.checkpoint.sqlite.SqliteSaver) 和 [`PostgresSaver`](https://reference.langchain.com/python/langgraph/checkpoints/#langgraph.checkpoint.postgres.PostgresSaver)。`.list` 仍然每个检查点返回一行，而不是每个线程返回一行，因此需要按 `thread_id` 自行分组来构建线程列表。
+
+
+
+
 ### 重播
 
 重播从先前的检查点重新执行步骤。使用先前的 `checkpoint_id` 调用图表以在该检查点之后重新运行节点。检查点之前的节点将被跳过（它们的结果已保存）。检查点之后的节点重新执行，包括任何 LLM 调用、API 请求或 [interrupts](/oss/python/langgraph/interrupts) — 这些在重放期间始终重新触发。
@@ -368,7 +407,7 @@ graph.stream(
 * `.put` - 存储检查点及其配置和元数据。
 * `.put_writes` - 存储链接到检查点的中间写入（即 [pending writes](#pending-writes)）。
 * `.get_tuple` - 获取用于给定配置的检查点元组（`thread_id` 和 `checkpoint_id`）。这用于填充 `graph.get_state()` 中的 `StateSnapshot`。
-* `.list` - 列出与给定配置和过滤条件匹配的检查点。这用于填充 `graph.get_state_history()` 中的状态历史记录
+* `.list` - 列出与给定配置和过滤条件匹配的检查点。这用于填充 `graph.get_state_history()` 中的状态历史记录。传入 `config=None` 可跨所有线程列出检查点。参见 [列出所有线程](#list-every-thread)。
 
 如果检查指针与异步图形执行一起使用（即通过 `.ainvoke`、`.astream`、`.abatch` 执行图形），则将使用上述方法的异步版本（`.aput`、`.aput_writes`、`.aget_tuple`、`.alist`）。
 
@@ -437,7 +476,7 @@ checkpointer.setup()
 
 本节介绍从头开始为自定义存储后端实现 `BaseCheckpointSaver` 。如果您已经有一个有效的检查点并且只需要添加增量通道支持，请跳转到 [Delta channel support](#delta-channel-support)。
 
-＃＃＃ 概述
+### 概述
 
 LangGraph 的持久层构建在两个存储抽象之上：
 
@@ -638,7 +677,7 @@ async def aget_tuple(self, config):
 
 删除线程的所有检查点和写入。检查点行和写入行都必须删除。
 
-###行键/索引设计
+### 行键/索引设计
 
 如何存储和索引检查点直接影响正确性和性能。
 

@@ -6,7 +6,7 @@ tag: "Beta"
 ---
 
 <Note>
-Red Teaming 处于私有的 [beta](/langsmith/release-stages#beta) 阶段。它仅在 LangSmith Cloud 上、对已启用该功能的组织可用。它仅支持运行在 [LangSmith Cloud deployments](/langsmith/deploy-to-cloud) 上的 agent；不支持外部托管的 agent。如需申请访问权限，请[加入等待名单](https://www.langchain.com/langsmith-engine-v2-new-feature-access)。
+Red Teaming 处于私有的 [beta](/langsmith/release-stages#beta) 阶段。它仅在 LangSmith Cloud 上、对已启用该功能的组织可用。它支持运行在 [LangSmith Cloud deployments](/langsmith/deploy-to-cloud) 和[外部 deployment](#set-up-an-external-deployment) 上的 agent。如需申请访问权限，请[加入等待名单](https://www.langchain.com/langsmith-engine-v2-new-feature-access)。
 </Note>
 
 Red Teaming 通过向已部署的 agent 发送新的合成请求并评判其响应来测试它。[Engine 从你的 traces 中检测到的 issue](/langsmith/engine-issues) 来自生产环境中已经发生的失败。Red Teaming 寻找尚未发生的失败，例如一次成功的 prompt injection、在没有你的 agent 所要求的确认的情况下执行了有后果的 tool call，或隐藏上下文泄漏到答案中。
@@ -15,12 +15,12 @@ Red Teaming 通过向已部署的 agent 发送新的合成请求并评判其响�
 
 ## Red Teaming 的工作方式
 
-Red Teaming 会探测被设置为 tracing project 的 [baseline deployment](/langsmith/engine-fix-validation#set-the-baseline-deployment) 的 deployment。每次 run：
+默认情况下，Red Teaming 会探测 tracing project 的 [baseline deployment](/langsmith/engine-fix-validation#set-the-baseline-deployment)。如果你配置了外部 target，Engine 会改为探测该 endpoint。每次 run：
 
-1. **映射应用。** Engine 审查 tracing project 中最多 25 条最近的 traces，以及（如果已连接）你的代码仓库。它会从中学习 agent 的 prompts、tools、guardrails 和请求格式。如果 Engine 已经扫描过该 project，run 会从该 project 的 agent overview 开始，并运行一次较短的确认扫描。
+1. **映射应用。** 对于 baseline deployment，Engine 审查最多 25 条最近的 traces，以及（如果已连接）你的代码仓库。它会从中学习 agent 的 prompts、tools、guardrails 和请求格式。如果 Engine 已经扫描过该 project，它会从该 project 的 agent overview 开始，并运行一次较短的确认扫描。外部 run 不会读取 traces 或 agent overview。它们使用 endpoint 响应、HTTP API 的上传 spec，以及（如果可用）来自已连接仓库的经筛查的行为摘要。
 2. **形成假设。** 每个假设描述 agent 可能失败的一种具体方式。Engine 为它分配一个 [issue class](#red-teaming-issue-classes) 和一个场景类型，后者记录该失败是普通用户可以触发的，还是需要蓄意攻击。
-3. **探测 deployment。** Engine 向 deployment 发送每个假设最多两个合成请求。探针会复用真实 trace 的请求格式，但将其内容替换为新的合成输入。
-4. **评判结果。** Engine 审查每个探针的响应和 trace，然后为该假设分配一个状态和一个严重性。对于模棱两可的结果，Engine 可以发送一个后续探针。
+3. **探测 deployment。** Engine 向 deployment 发送每个假设最多两个合成请求。baseline 探针复用真实 trace 的请求格式，但将其内容替换为新的合成输入。外部探针使用 A2A 协议或一个允许的 OpenAPI operation。
+4. **评判结果。** Engine 审查每个探针的响应，对于 baseline deployment 还审查其 trace。然后它为假设分配一个状态和一个严重性。对于模棱两可的结果，Engine 可以发送一个后续探针。
 
 过去的 trace 只帮助 Engine 理解应用。每个被确认的发现都来自 run 期间发送的探针，而不是早期 trace 中的错误。
 
@@ -31,13 +31,52 @@ Red Teaming 会探测被设置为 tracing project 的 [baseline deployment](/lan
 运行 Red Teaming 需要：
 
 - **tracing project 上的 Engine**：为接收你的 agent traces 的 project [设置 Engine](/langsmith/engine-setup)。
-- **一个 baseline deployment**：同一 workspace 中一个就绪的、非 preview 的 [LangSmith Cloud deployment](/langsmith/deploy-to-cloud)，并被设置为该 project 的基线。请参阅 [Set the baseline deployment](/langsmith/engine-fix-validation#set-the-baseline-deployment)。
-- **权限**：在 tracing project 上拥有 `runs:read` 权限以查看红队报告。要启动 run，你还需要项目上的 `runs:create` 权限和 baseline deployment 上的 `deployments:update` 权限。
-- **已连接的仓库（推荐）**：通过[已连接的 GitHub 仓库](/langsmith/engine-repositories)，Engine 会从源代码中读取你的 agent 的 prompts、tools 和 guardrails。没有仓库时，发现只能依赖 traces，报告会显示 **Repository context was not available**。
+- **一个 target deployment**：同一 workspace 中一个就绪的、非 preview 的 LangSmith Cloud deployment，并被设置为该 project 的基线，或者一个外部 endpoint。请参阅 [Set the baseline deployment](/langsmith/engine-fix-validation#set-the-baseline-deployment) 或 [Set up an external deployment](#set-up-an-external-deployment)。
+- **权限**：在 tracing project 上拥有 `runs:read` 权限以查看红队报告，以及 `runs:create` 权限以启动 run。配置外部 target 需要在 project 上拥有 `issues:update` 权限。使用 baseline deployment 还需要在该 deployment 上拥有 `deployments:update` 权限。
+- **已连接的仓库（推荐）**：通过[已连接的 GitHub 仓库](/langsmith/engine-repositories)，Engine 可以使用你的 agent 的 prompts、tools 和 guardrails 来指导测试。外部 run 收到的是一份经筛查的行为摘要，而不是原始源代码。没有仓库时，baseline run 依赖 traces。外部 run 依赖 endpoint 响应，对于 HTTP API 还依赖上传的 spec。
 
 <Warning>
-探针是真实的请求。每个探针都会在 baseline deployment 上创建一个 thread 和一个 run，而你的 agent 在响应时可以调用其工具。请选择一个可以接受合成测试流量和工具副作用的 deployment，例如 staging deployment。
+探针是真实的请求，你的 agent 在响应时可以调用其工具。baseline 探针会创建 threads 和 runs；外部探针会调用配置的 endpoint。请选择一个可以接受合成测试流量和工具副作用的 deployment，例如 staging deployment。请使用测试凭据和非生产数据存储。
 </Warning>
+
+## 设置外部 deployment
+
+外部 target 让 Engine 测试托管在 LangSmith Cloud 之外的 agent。你可以连接一个 A2A agent，或一个由 OpenAPI spec 描述的 HTTP API。外部 run 不需要 baseline deployment。
+
+外部 target 必须为你的 project 启用。如果 **Configure Engine** 中没有 **Red team target**，请通过[等待名单](https://www.langchain.com/langsmith-engine-v2-new-feature-access)申请访问权限。
+
+要连接一个外部 deployment：
+
+1. 在 **Engine** 页面上，选择 tracing project，然后点击 **Configure Engine**。
+2. 找到 **Red team target** 部分并选择一个 **Endpoint type**：
+   - **A2A agent**：在 **Endpoint URL** 中输入该 agent 的 A2A endpoint。Engine 会向该 URL 发送 A2A 消息。
+   - **HTTP API with an OpenAPI spec**：在 **Endpoint URL** 中输入该 API 的 base URL，然后点击 **Upload spec**。上传一份 JSON 或 YAML 格式的 OpenAPI 3 文档，并选择 1 到 10 个 Engine 可以调用的 operations。
+3. 在 **Endpoint authentication** 下，点击 **Add header** 并输入你的 endpoint 所需的 headers。至少需要一个身份验证 header。请使用仅具备测试所需最小权限的凭据。
+4. 点击 **Save**，返回 **Red Teaming**，然后点击 **Run red team**。
+
+### 选择可访问的 endpoint
+
+该 endpoint 必须使用 HTTPS，并解析到一个公网地址。Engine 会阻止私有地址、loopback 地址和云元数据地址，并且不跟随重定向。请输入带路径、且不包含内嵌凭据、查询参数或片段的 URL。
+
+对于 A2A agent，请使用消息 endpoint，而不是 agent card URL。Engine 会检查 endpoint 所在源上的 `/.well-known/agent-card.json` 以选择协议版本。当该 card 在配置的 URL 上声明了 v1.0 JSON-RPC 接口时，Engine 使用 A2A v1.0，否则使用 v0.3。
+
+对于 HTTP API，Engine 会把每个允许的 operation 的路径追加到配置的 base URL 之后。它不会使用 spec 中的 `servers` URL。支持的方法为 `GET`、`POST`、`PUT` 和 `PATCH`。不允许 `DELETE`。带请求体的 operations 必须接受 JSON。spec 中的引用必须是本地 `$ref` 指针。将 spec 转换为转义非 ASCII 字符的紧凑 JSON 后，其大小限制为 256 KB。
+
+<Warning>
+请将允许的 operations 限制在你可以安全测试的 endpoint 上。排除 `DELETE` 并不能阻止其他 operations 更改数据或触发外部操作。
+</Warning>
+
+### 管理 endpoint 身份验证
+
+Engine 只会把保存的 headers 发送到配置的 target，而不是你的 baseline deployment。它不会把你的 LangSmith 平台凭据发送到外部 endpoint。Header 值会加密且只可写入。设置中只显示它们的名称。
+
+更改 endpoint URL 需要重新输入每个 header 值。对于 HTTP API，更改 URL 还需要重新上传 spec 并重新选择 operations。要更改同一 endpoint 允许的 operations，请点击 **Replace spec**，上传文档，选择 operations，然后保存。
+
+### 了解外部 run 的限制
+
+外部 run 使用 endpoint 响应而不是 LangSmith traces 来评判发现。它们不会检查内部 tool calls，也不提供 **View proof trace** 链接。已连接的仓库可以提供经筛查的行为摘要。读取 target 响应的 model 绝不会读取原始源代码。外部探针是单轮的，因此无法确认需要两轮对话的 **Session Integrity** 发现。
+
+当两个 target 都已配置时，外部 target 在 Red Teaming 中优先。[Fix validation](/langsmith/engine-fix-validation) 会继续使用 baseline deployment。要让 Red Teaming 回到 baseline deployment，请在 **Red team target** 中点击 **Remove**。没有 baseline 时，移除外部 target 后就没有可测试的 target。
 
 ## 启动 Red Teaming run
 
@@ -95,9 +134,9 @@ Red Teaming 会探测被设置为 tracing project 的 [baseline deployment](/lan
 展开探针卡片可以看到：
 
 - **合成 prompt**：Engine 发送给 deployment 的确切 prompt。
-- **Observed**：从你的 agent 响应中引用的摘录，以及探针 trace 的摘要，例如其 tool calls、tool errors 和 token 数。
+- **Observed**：从你的 agent 响应中引用的摘录。baseline 探针还会包含 trace 摘要，例如 tool calls、tool errors 和 token 数。
 - **Expected**：正确的应用本应返回的内容。
-- **View proof trace**：在侧边面板中打开探针的 trace。
+- **View proof trace**：在侧边面板中打开探针的 trace。仅对 baseline 探针可用，不适用于外部探针。
 
 在探针下方，**Why the Judge Decided This** 解释 Engine 如何得出该状态和严重性，**What to Do Next** 推荐修复方案。被标记为 **Unexpected** 的假设是 Engine 在测试另一个假设时发现的发现。
 
@@ -125,7 +164,7 @@ Red Teaming 会探测被设置为 tracing project 的 [baseline deployment](/lan
 
 ## 再次运行 Red Teaming
 
-Red Teaming 会在同一 deployment revision 的 run 之间延续结论。新的 run 会从最多五个更早的、针对同一 baseline deployment 和活动 revision 的成功 run 中获得结论。Engine 会跳过更早的 run 已经确认或发现安全的假设（除非新的 run 显示行为发生了变化），并优先处理需要审查的假设。
+对于 baseline deployment，Red Teaming 会在同一 deployment revision 的 run 之间延续结论。新的 run 会从最多五个更早的、针对同一 baseline deployment 和活动 revision 的成功 run 中获得结论。Engine 会跳过更早的 run 已经确认或发现安全的假设（除非新的 run 显示行为发生了变化），并优先处理需要审查的假设。
 
 在你向 baseline deployment 部署新 revision 后，下一次 run 会在没有先前结论的情况下开始。使用 **Findings Over Runs** 对比各 run 之间的被确认发现。
 
@@ -135,16 +174,17 @@ Red Teaming 会在同一 deployment revision 的 run 之间延续结论。新的
 
 | Limit | 每次 run 的值 |
 |---|---|
-| 审查的 traces | 25，从最多 100 条最近的 trace 摘要中选出 |
+| 审查的 traces | baseline：25，从最多 100 条最近的 trace 摘要中选出。外部：0。 |
 | 假设 | 50 |
 | 每个假设的探针 | 2 |
-| 发往 baseline deployment 的请求 | 100 |
+| 发往 target 的请求 | 60 |
 | 建议 | 20 |
 
 ## Red Teaming 如何处理你的数据
 
-- **合成探针**：探针内容是合成的。Engine 不会把客户 trace 内容或仓库文本复制进探针；trace 只提供请求格式。
-- **只读访问**：Red Teaming 使用只读的 LangSmith 凭据读取你的 traces，并使用只读的 GitHub token 克隆你的仓库。
+- **合成探针**：探针内容是合成的。Engine 不会把客户 trace 内容或原始仓库源代码复制进探针。对于 baseline deployment，trace 只提供请求格式。
+- **只读访问**：Red Teaming 使用只读的 LangSmith 凭据读取 baseline traces，并使用只读的 GitHub token 克隆你的仓库。外部 run 不会读取 traces。
+- **经筛查的仓库上下文**：对于外部 target，由单独的分析器读取仓库并生成行为摘要。Engine 在使用该摘要指导探针之前，会筛查其中的源代码、文件路径、URL 和 secrets。
 - **筛查报告**：Engine 在存储模型撰写的报告文本之前会筛查其中的 secrets，并限制响应摘录的长度。
 
 关于 Engine 如何更广泛地处理你的数据，请参阅 [Engine security](/langsmith/engine-security)。

@@ -1,0 +1,71 @@
+---
+title: Azure data plane 成本估算
+sidebarTitle: 成本估算
+description: Azure 上 LangSmith BYOC data plane（运行 SmithDB）的粗略基础设施成本，包括示例节点数量和附加费用，不含 sandboxes。
+icon: brand-azure
+---
+
+<Warning>
+这些是估算值，不是报价。Azure 会不另行通知地调整价格。你的账单取决于 region、使用量和折扣。下方小计不包含节点磁盘、网络、对象存储和其他使用费用，它不是一个完整的月度账单。
+</Warning>
+
+这是 [Azure 上的 LangSmith BYOC data plane](/langsmith/byoc-architecture-azure) 的粗略月度基础设施成本。Azure data plane 运行 SmithDB，而不是 ClickHouse。
+
+此估算使用 `eastus` 的 USD 按量付费价格、Linux VM，以及每月 730 小时。数据库和 system node 的规格与[默认配置](/langsmith/byoc-operations-azure#instance-sizes)一致。Application 和 SmithDB 节点数量是假设值，不是固定的部署规模。AKS 节点自动预置会在每个节点池的限制范围内选择 VM 规格和数量。
+
+## 粗略月度估算
+
+此示例预算假设 2 到 6 个 application 节点、1 个 SmithDB 缓存节点和 1 个 SmithDB 计算节点。每一行计算资源对应一组独立的 VM。SmithDB 计算未包含在 application 节点估算中。
+
+<Note>
+Sandboxes 不计入基线，包括其宿主机计算、存储和 private endpoint。此估算不表示 sandboxes 默认被禁用，也不表示提供自助关闭选项。
+</Note>
+
+| 项目 | 粗略月度估算 | 备注 |
+| --- | --- | --- |
+| AKS control plane | ~\$73 | Standard tier，按每小时 \$0.10 计费。 |
+| System node pool | ~\$221 | 3 个 `Standard_D2s_v6` 节点，每个按每小时 \$0.101 计费。节点磁盘另计。 |
+| Application worker 节点 | \$589–\$1,765 | 假设 2 到 6 个 `Standard_D8s_v6` 节点，每个按每小时 \$0.403 计费，用于 LangSmith pods。 |
+| SmithDB 缓存节点 | ~\$1,455 | 假设 1 个 `Standard_D32ds_v6`，按每小时 \$1.993 计费，用于查询、摄取和 compaction workers。本地 NVMe 已包含在 VM 价格中。 |
+| SmithDB 计算节点 | ~\$294 | 假设 1 个 `Standard_D8s_v6`，按每小时 \$0.403 计费，用于 compaction 调度和集群管理器。 |
+| PostgreSQL，LangSmith | ~\$267 | PostgreSQL 18，`GP_Standard_D2ds_v4`，32 GiB 存储，在支持的区域使用区域冗余 standby。包含主库和 standby 的计算与存储。 |
+| PostgreSQL，SmithDB metastore | ~\$289 | PostgreSQL 18，`GP_Standard_D2ds_v4`，128 GiB 存储，在支持的区域使用区域冗余 standby。包含主库和 standby 的计算与存储。 |
+| Azure Managed Redis | ~\$95 | `Balanced_B3`，启用高可用性。2 个节点，每个按每小时 \$0.065 计费。 |
+| 节点磁盘 | 另计，未包含 | 节点不使用临时 OS 磁盘时的托管 OS 磁盘。SmithDB 缓存使用本地 NVMe，而不是单独计费的托管缓存磁盘。 |
+| 网络 | 另计，未包含 | NAT gateway、load balancer、private endpoints、公共 IP 地址、数据处理和数据传输。 |
+| Blob storage、Key Vault、DNS 和监控 | 另计，未包含 | 存储容量、操作、保留策略，以及你启用的任何诊断日志。 |
+
+已定价项目的月度小计（不含 sandboxes）：**\$3,283–\$4,460**。再加上上述附加费用、税费和 LangSmith 费用，才能估算完整账单。
+
+将 system node 从 3 个 `Standard_D4s_v6` 降为 3 个 `Standard_D2s_v6`，每月可节省约 \$221 的 VM 计算费用。较早的、仅基于 D8s_v5 的 SmithDB 估算并不代表专用 NVMe 节点池。仅缩小 system node 本身并不能降低总账单。
+
+PostgreSQL 估算使用每 vCore 小时 \$0.089 和每 GiB 月 \$0.115 的预置存储价格。每个服务器有 2 个 vCore 和匹配的 standby。超出包含额度的存储增长和备份存储需要额外付费。
+
+SmithDB 缓存示例有 32 vCPU 和 128 GiB 内存。Azure 特有的 pod 请求为：查询 4 vCPU 和 8 GiB，摄取 4 vCPU 和 8 GiB，每个 compaction worker 8 vCPU 和 16 GiB。它们的缓存请求分别为 200 GiB、100 GiB 和每个 worker 100 GiB。这些 pod 运行在专用的本地 NVMe 节点池上，与 compaction 调度器和集群管理器分开。副本数量、调度开销、升级和负载可能需要更多节点。此示例不保证吞吐量水平，也不保证高可用的 SmithDB 节点布局。
+
+在网络方面，仅 NAT gateway 每月就约需 \$33，这还不含数据处理。在不包含 sandboxes 且启用 control plane 私有访问的情况下，7 个显式的客户侧 private endpoints 每月约需 \$51：2 个 PostgreSQL、2 个 Blob storage、Redis、Key Vault 和 control plane 访问。AKS 管理 private endpoint 运行在 LangChain 的订阅中，不计入你的账单。Standard load balancer 的前 5 条规则每月约需 \$18.25。这些费用未包含在小计中。请在 Azure 定价计算器中加入你部署所需的资源和流量。
+
+## Sandbox 附加项
+
+如果你的部署包含 sandboxes，请单独为其专用宿主机节点、Blob storage 和 private endpoint 预留预算。一台示例 `Standard_D16ds_v6` 宿主机按每小时 \$0.997 计算，每月约需 **\$728**。其 private endpoint 每月增加 \$7.30，另加 sandbox 存储和流量费用。增加宿主机将提高计算成本。
+
+## 另请参阅
+
+- [Azure retail prices API](https://prices.azure.com/api/retail/prices)
+- [Azure pricing calculator](https://azure.microsoft.com/en-us/pricing/calculator/)
+- [Azure NAT Gateway pricing](https://azure.microsoft.com/en-us/pricing/details/azure-nat-gateway/)
+- [Azure Managed Redis pricing](https://azure.microsoft.com/en-us/pricing/details/managed-redis/)
+- [Azure Database for PostgreSQL pricing](https://azure.microsoft.com/en-us/pricing/details/postgresql/flexible-server/)
+- [Azure 上的 BYOC 运维](/langsmith/byoc-operations-azure)
+- [Configure SmithDB for scale](/langsmith/self-host-smithdb-scale)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/byoc-data-plane-cost-azure.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

@@ -6,10 +6,10 @@ description: 设置一个使用 decision model 作为 judge 的 LangSmith evalua
 
 Decision model evaluator 使用 [decision model](/langsmith/online-evaluations-decision-models#decision-models) 作为 judge。你定义的每个问题都会返回一个带类型的答案，LangSmith 会将它记录在自己的 feedback key 下。
 
-本指南介绍如何在 [LangSmith UI](https://smith.langchain.com?utm_source=docs&utm_medium=cta&utm_campaign=langsmith-signup&utm_content=langsmith-decision-model-evaluator) 中定义 decision model evaluator。你可以在 dataset 上使用它以[在 experiments 上自动运行 evaluations](/langsmith/bind-evaluator-to-dataset)，也可以在 tracing project 上将其用作 [online evaluator](/langsmith/online-evaluations-decision-models)。要改为使用 LLM 作为 judge，请参阅 [How to define an LLM-as-a-judge evaluator](/langsmith/llm-as-judge)。
+本指南介绍如何在 [LangSmith UI](https://smith.langchain.com?utm_source=docs&utm_medium=cta&utm_campaign=langsmith-signup&utm_content=langsmith-decision-model-evaluator) 中或[通过 API](#create-the-evaluator-with-the-api) 定义 decision model evaluator。你可以在 dataset 上使用它以[在 experiments 上自动运行 evaluations](/langsmith/bind-evaluator-to-dataset)，也可以在 tracing project 上将其用作 [online evaluator](/langsmith/online-evaluations-decision-models)。要改为使用 LLM 作为 judge，请参阅 [How to define an LLM-as-a-judge evaluator](/langsmith/llm-as-judge)。
 
 <Note>
-你只能在 LangSmith UI 中创建 decision model evaluators。LangSmith SDKs 暂不支持创建它们。
+你可以在 LangSmith UI 中或使用 [LangSmith REST API](#create-the-evaluator-with-the-api) 创建 decision model evaluators。LangSmith SDKs 暂不支持创建它们。
 </Note>
 
 <Note>
@@ -81,6 +81,67 @@ Questions 是你的 decision model evaluator 使用的评分标准。每个 ques
 要保存 evaluator，请点击 **Create** 或 **Save**。
 
 在 dataset 上，evaluator 会在每个新 experiment 上运行。在 tracing project 上，它会评估匹配其过滤条件的传入 runs 或 threads。关于过滤条件、采样率和回填，请参阅 [Set up decision model online evaluators](/langsmith/online-evaluations-decision-models)。
+
+## 通过 API 创建 evaluator
+
+要在单个请求中创建 decision model evaluator 并将其挂载到 dataset 或 tracing project，请向 `/api/v1/runs/rules/decision-models` 端点发送 `POST` 请求。该端点支持 Jev、SemIf 和 OpenAI decision models。每个 question 的 key 都会成为一个 feedback key。
+
+发送请求之前，请按 [Step 1](#step-1-create-the-evaluator) 所述，将 provider 的 API key 添加为 workspace secret。
+
+以下请求在 dataset 上创建一个 Jev evaluator。将 `LANGSMITH_API_KEY` 设为你的 LangSmith API key，将 `LANGSMITH_WORKSPACE_ID` 设为包含该 dataset 的 workspace ID，并将 `<your-dataset-id>` 替换为要评估的 dataset ID：
+
+```bash
+curl -X POST 'https://api.smith.langchain.com/api/v1/runs/rules/decision-models' \
+  -H 'Content-Type: application/json' \
+  -H "X-API-Key: $LANGSMITH_API_KEY" \
+  -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+  -d '{
+    "display_name": "answer-quality",
+    "dataset_id": "<your-dataset-id>",
+    "prompt": [["human", "Question: {{input}}\nAnswer: {{output}}"]],
+    "variable_mapping": {"input": "input", "output": "output"},
+    "provider": "typesafe",
+    "model": "jev-latest",
+    "questions": {
+      "helpful": {
+        "type": "noul",
+        "instructions": "Does the answer address the question?",
+        "yes": "It answers the question",
+        "no": "It does not"
+      },
+      "tone": {
+        "type": "choice",
+        "instructions": "What is the tone of the answer?",
+        "options": ["formal", "casual"]
+      },
+      "quality": {
+        "type": "score",
+        "instructions": "Rate the overall quality of the answer.",
+        "levels": ["poor", "ok", "great"]
+      }
+    }
+  }'
+```
+
+请求体接受以下字段：
+
+- **`display_name`**：evaluator 名称。必填。
+- **`dataset_id`** 或 **`session_id`**：要评估其 experiments 的 dataset，或要评估其 runs 的 tracing project。
+- **`prompt`**：decision model 读取的 [state](#state)，以 `[role, template]` 对组成的列表表示。必填。
+- **`template_format`**：`mustache`（默认）或 `f-string`。
+- **`variable_mapping`**：将每个 prompt 变量映射到 run 或 example 字段，例如 `input` 或 `output`。请映射 prompt 中的每个变量。API 接受不带映射的请求，但在映射所有变量之前，LangSmith UI 无法测试或保存该 evaluator。
+- **`questions`**：以 feedback key 为键、按提问顺序排列的 [questions](#questions)。必填。每个 question 都有 `type` 和 `instructions`：
+  - **`noul`**：评分从 0 到 1 的是或否问题。可选择同时设置 `yes` 和 `no`，说明每个答案的含义。
+  - **`choice`**：2 到 255 个 `options` 之一，以名称列表或名称到说明的映射给出。
+  - **`score`**：2 到 10 个 `levels` 之一，从最低开始列出，按位置评分。
+- **`provider`**：Jev 和 SemIf 使用 `typesafe`（默认），TypeSafe-compatible endpoint 使用 `typesafe_compatible`，或使用 `openai_decisions`。
+- **`model`**：`typesafe` 默认为 `jev-latest`，`openai_decisions` 默认为 `gpt-6-luna`。SemIf 请使用 `semif-qwen3.5-4b`。
+- **`base_url`**：直接调用的 model endpoint，而不是通过 LangSmith gateway 调用，使用 workspace 的 `TYPESAFE_API_KEY` 或 `OPENAI_API_KEY` secret。`typesafe_compatible` 必填。
+- **`model_headers`**：每次 model 调用时发送的 headers，例如 `TypeSafe-Danger-Zone-Long-Context`。LangSmith 会按原样将它们保存在 evaluator 的 prompt 中，因此不要在其中放置 API key。
+- **`timeout_seconds`**：每次 model 调用等待的秒数。仅适用于 `openai_decisions`。
+- **`max_retries`**：失败的 model 调用重试次数。仅适用于 `openai_decisions`。
+
+完整 schema（包括采样率、过滤条件和保存的 model configurations），请参阅 API 参考中的 [Create decision model rule](/langsmith/smith-api/run/create-decision-model-rule)。
 
 ## 继续阅读
 

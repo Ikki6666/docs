@@ -4,9 +4,14 @@ sidebarTitle: Caching
 description: 在 agent deployment 中使用 stale-while-revalidate 和 key-value cache API 在服务端缓存值。
 ---
 
-[Agent Server](/langsmith/agent-server) 内置了一个 cache，你可以在已部署的 graph 中使用。调用 `swr` 并传入 key 和 loader function 后，server 会缓存结果、在后台重新验证 stale entry，并在每次读取时返回最新数据。
+部署在 [Agent Server](/langsmith/agent-server) 上的 agent 经常调用外部服务，例如 config store、auth provider 和 feature-flag 系统。这些服务返回的数据很少需要在每次调用时重新获取。内置 cache 可以把这些结果存储在服务端，让后续运行从内存读取，而不是发起冗余的网络调用。
 
-所有 cache API 都是 **仅限服务端** 的，并且要求使用 LangGraph Agent Server runtime。缓存值必须可被 JSON 序列化。
+Cache 提供两层 API：
+
+- **`swr`**：stale-while-revalidate。传入 key 和异步 loader 后，server 会缓存结果，在后续读取时直接返回，并在 entry 变为 stale 时于后台重新验证。大多数缓存需求都使用这一层。
+- **`cache_get` / `cache_set`**：底层 key-value API，适用于需要手动控制读写的场景。
+
+所有 cache API 都是仅限服务端的，并且要求使用 Agent Server runtime。缓存值必须可被 JSON 序列化。
 
 <Note>
 `swr` 要求 Agent Server runtime **v0.7.79** 或更高版本，目前处于 **[beta](/langsmith/release-stages)**。
@@ -20,13 +25,17 @@ description: 在 agent deployment 中使用 stale-while-revalidate 和 key-value
 ```python
 from langgraph_sdk.cache import swr
 
-result = await swr("config:global", load_config)
-config_data = result.value
+async def fetch_config() -> dict:
+    """Call your config service, database, or external API."""
+    ...
+
+result = await swr("config:global", fetch_config)
+config = result.value
 ```
 
-第一次调用时，`swr` 会等待 `load_config()` 完成并缓存结果。后续调用会立即返回缓存值，并在后台重新验证。
+第一次调用时，`swr` 会等待 `fetch_config()` 完成并缓存结果。后续调用会立即返回缓存值，并在后台重新验证。
 
-## Configure freshness
+## Control freshness and expiry
 
 控制缓存值保持 fresh 的时间，以及其何时过期：
 
@@ -36,7 +45,7 @@ from langgraph_sdk.cache import swr
 
 result = await swr(
     "config:global",
-    load_config,
+    fetch_config,  # async loader defined above
     fresh_for=timedelta(minutes=5),
     max_age=timedelta(hours=1),
 )
@@ -56,6 +65,65 @@ result = await swr(
 | **Stale** | `fresh_for <= age < max_age` | 立即返回缓存值，并触发后台刷新。 |
 | **Expired** | `age >= max_age` | 等待 `loader()`，存储结果并返回。 |
 
+## Inspect and update cached values
+
+`swr` 返回一个 `SWRResult` 对象，包含 value 和 cache status：
+
+```python
+result = await swr("config:global", fetch_config)
+
+result.value   # the cached or freshly loaded value
+result.status  # "miss" | "fresh" | "stale" | "expired"
+
+# Update the cached value directly
+await result.mutate({"model": "gpt-5.4-mini", "temperature": 0.5})
+
+# Or force revalidation by calling the loader again
+await result.mutate()
+```
+
+`.status` 表示该值来自缓存还是刚刚加载。调用 `.mutate(new_value)` 可替换缓存 entry，或调用不带参数的 `.mutate()` 强制再次运行 loader。
+
+## Cache auth credentials
+
+在 [custom auth handler](/langsmith/custom-auth) 中缓存 credential validation，避免每个请求都访问 identity provider：
+
+```python
+from datetime import timedelta
+
+import httpx
+from langgraph_sdk import Auth
+from langgraph_sdk.cache import swr
+
+auth = Auth()
+http_client = httpx.AsyncClient()
+
+async def validate_token(token: str) -> dict:
+    """Validate a bearer token against your identity provider."""
+    resp = await http_client.get(
+        "https://idp.example.com/userinfo",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+@auth.authenticate
+async def authenticate(headers: dict) -> Auth.types.MinimalUserDict:
+    token = (headers.get(b"authorization") or b"").decode()
+    if not token:
+        raise Auth.exceptions.HTTPException(status_code=401, detail="Missing token")
+
+    result = await swr(
+        f"auth:token:{token}",
+        lambda: validate_token(token),
+        fresh_for=timedelta(minutes=5),
+        max_age=timedelta(hours=1),
+    )
+    return result.value
+```
+
+在这个设置下，server 会在 5 分钟内直接返回缓存的 user，而不会联系 identity provider。之后，它会在最长 1 小时内进行后台 revalidation。1 小时后，下一个请求会阻塞，直到 `validate_token` 完成。
+
 ## Use with Pydantic models
 
 传入 `model` 参数后，可以自动序列化和反序列化 Pydantic model：
@@ -69,61 +137,20 @@ class UserProfile(BaseModel):
     email: str
     role: str
 
+async def fetch_profile(user_id: str) -> dict:
+    """Fetch a user profile from your user service."""
+    ...
+
+user_id = "user-123"
 result = await swr(
     f"profile:{user_id}",
     lambda: fetch_profile(user_id),
     model=UserProfile,
 )
-profile: UserProfile = result.value  # deserialized automatically
+profile: UserProfile = result.value  # deserialized as UserProfile
 ```
 
 `swr` 会在存储前调用 `model_dump(mode="json")`，并在读取时调用 `model.model_validate()`。
-
-## Cache auth credentials
-
-你可以在 [custom auth handler](/langsmith/custom-auth) 中缓存 credential validation，避免每个请求都访问 identity provider：
-
-```python
-from datetime import timedelta
-from langgraph_sdk import Auth
-from langgraph_sdk.cache import swr
-
-auth = Auth()
-
-@auth.authenticate
-async def authenticate(headers: dict) -> Auth.types.MinimalUserDict:
-    token = (headers.get(b"authorization") or b"").decode()
-    if not token:
-        raise Auth.exceptions.HTTPException(status_code=401, detail="Missing token")
-
-    result = await swr(
-        f"auth:token:{token}",
-        lambda: validate_and_fetch_user(token),
-        fresh_for=timedelta(minutes=5),
-        max_age=timedelta(hours=1),
-    )
-    return result.value
-```
-
-在这个设置下，server 会在 5 分钟内直接返回缓存的 user 而不做 revalidation，然后在最长 1 小时内进行后台 revalidation。1 小时后，下一个请求会阻塞，直到 `validate_and_fetch_user` 完成。
-
-## Inspect cache status
-
-`swr` 返回一个 `SWRResult` 对象，包含 value 和 cache status：
-
-```python
-result = await swr("my-key", my_loader)
-
-result.value   # the cached or freshly loaded value
-result.status  # "miss" | "fresh" | "stale" | "expired"
-```
-
-调用 `.mutate()` 可以更新缓存值，或强制 revalidation：
-
-```python
-await result.mutate(new_value)  # update the cache with a new value
-await result.mutate()           # force revalidation by calling the loader
-```
 
 ## Low-level cache API
 
@@ -133,11 +160,16 @@ await result.mutate()           # force revalidation by calling the loader
 from datetime import timedelta
 from langgraph_sdk.cache import cache_get, cache_set
 
-value = await cache_get("my-key")
+async def compute_embeddings(text: str) -> list[float]:
+    """Call an embeddings API or run an expensive computation."""
+    ...
+
+key = "embeddings:doc-42"
+value = await cache_get(key)
 
 if value is None:
-    value = await expensive_computation()
-    await cache_set("my-key", value, ttl=timedelta(hours=1))
+    value = await compute_embeddings("hello world")
+    await cache_set(key, value, ttl=timedelta(hours=1))
 ```
 
 ### `cache_get`
@@ -164,7 +196,7 @@ async def cache_set(key: str, value: Any, *, ttl: timedelta | None = None) -> No
 
 - [Add custom authentication](/langsmith/custom-auth) 到你的 deployment。
 - [Add custom lifespan events](/langsmith/custom-lifespan) 以在 server 启动时初始化资源。
-- 了解 [agent server architecture](/langsmith/agent-server)。
+- 了解 [Agent Server 架构](/langsmith/agent-server)。
 
 ---
 
