@@ -103,7 +103,7 @@ const SYSTEM_PROMPT = openuiLibrary.prompt({ ... });
 
 export function App() {
   const stream = useStream({
-    apiUrl: import.meta.env.VITE_LANGGRAPH_API_URL ?? "/api/langgraph",
+    apiUrl: import.meta.env.VITE_LANGGRAPH_API_URL ?? "http://localhost:2024",
     assistantId: "openui",
   });
 
@@ -497,6 +497,189 @@ followUpCard  = Card([CardHeader("Explore Further"), followUpBtns], "sunk")
 root = Stack([..., followUpCard])
 ```
 
+## 使用 Deep Agents 构建并行仪表盘
+
+上面的流程把一份 OpenUI 程序渲染到一个界面上。对于更丰富的应用，可以让 [Deep Agents](/oss/deepagents/overview) coordinator 把任务分派给多个专业 agent，每个 agent 都通过同一条 @[`useStream`] 连接并发地流式输出自己的 OpenUI panel。[OpenUI 并行仪表盘示例](https://github.com/langchain-ai/streaming-cookbook/tree/main/typescript/openui) 可以把一份仪表盘 brief 变成独立流式输出的 Stripe、PostHog、GitHub 和 Calendar panels，无需编写自定义 graph 或 stream 解复用代码。
+
+```mermaid
+%%{
+  init: {
+    "fontFamily": "monospace",
+    "flowchart": {
+      "curve": "curve"
+    }
+  }
+}%%
+graph LR
+  BRIEF["User brief"]
+  COORD["Deep Agents coordinator"]
+  PANELS["Stripe / PostHog / GitHub / Calendar panel agents"]
+  SUBAGENTS["stream.subagents"]
+  RENDERER["Renderer per panel"]
+
+  BRIEF --> COORD
+  COORD --"parallel task() calls"--> PANELS
+  PANELS --"namespaced events"--> SUBAGENTS
+  SUBAGENTS --"useMessages(stream, snapshot)"--> RENDERER
+```
+
+### 共用一个 OpenUI library
+
+在服务端（用于生成 panel prompt）和客户端（作为 `Renderer` prop）使用同一个 library 对象，这样模型被告知的组件始终与 renderer 能绘制的组件一致：
+
+```ts library.ts
+import { openuiChatLibrary, openuiChatPromptOptions } from "@openuidev/react-ui";
+
+export const library = openuiChatLibrary;
+export const promptOptions = openuiChatPromptOptions;
+```
+
+### 定义 coordinator 与 panel agents
+
+@[`createDeepAgent`] 会构建一个只负责路由的 coordinator：它挑选一份 brief 所需的专业 agent，并在一条消息中发出它们全部的 `task()` 调用，让各个 panel 并发运行。每个 panel subagent 共用同一份预生成的 OpenUI system prompt，并且只拿到自己数据领域所需的 tools。
+
+```ts expandable agent.ts
+import { createDeepAgent, type SubAgent } from "deepagents";
+
+import { library, promptOptions } from "./library.js";
+import { calendarTools, githubTools, posthogTools, stripeTools } from "./tools.js";
+
+// The coordinator only routes, so a fast model handles it; panels generate
+// strict openui-lang and stay on the frontier model.
+const COORDINATOR_MODEL = "openai:gpt-5.4-mini";
+const PANEL_MODEL = "openai:gpt-6.1-sol";
+
+// Generate the shared panel prompt once at module load so the model prefix
+// stays stable for provider prompt caching.
+const PANEL_SYSTEM_PROMPT = library.prompt({
+  ...promptOptions,
+  preamble:
+    "Build one panel of a live executive dashboard. Follow the coordinator's " +
+    "task exactly and stay within the data available from your tools.",
+  additionalRules: [
+    ...(promptOptions.additionalRules ?? []),
+    "Use your available data tools before writing the panel.",
+    "Return the complete openui-lang program and nothing else.",
+    "Emit the `root` statement on the first line so rendering can start immediately.",
+  ],
+});
+
+const subagents: SubAgent[] = [
+  {
+    name: "stripe-panel",
+    model: PANEL_MODEL,
+    description: "Builds the revenue and payments panel from Stripe data.",
+    systemPrompt: PANEL_SYSTEM_PROMPT,
+    tools: stripeTools,
+  },
+  // posthog-panel, github-panel, and calendar-panel follow the same shape.
+];
+
+const COORDINATOR_PROMPT = `You orchestrate a live executive dashboard.
+
+1. Delegate immediately. Never write openui-lang yourself.
+2. Launch all selected specialists in a SINGLE message, one task call per
+   panel, so they run concurrently.
+3. Give each task a distinct, self-contained description.
+4. After the tasks complete, reply with one short plain-text summary.`;
+
+export const dashboard = createDeepAgent({
+  model: COORDINATOR_MODEL,
+  systemPrompt: COORDINATOR_PROMPT,
+  subagents,
+});
+```
+
+coordinator 从不编写 openui-lang。每个 panel agent 先调用自己的 tools，然后返回一份以 `root` 开头的完整程序，这样它的 renderer 可以在模型写完剩余语句之前就开始绘制。
+
+### 注册 graph
+
+让 `langgraph.json` 指向导出的 coordinator：
+
+```json langgraph.json
+{
+  "node_version": "22",
+  "graphs": {
+    "dashboard": "./src/agent.ts:dashboard"
+  },
+  "env": "../../.env"
+}
+```
+
+### 在前端发现并渲染 panels
+
+一条 `useStream` 连接同时承载 coordinator 和每个 panel。panels 并不是硬编码的：每个并行的 `task()` 调用都会以 `stream.subagents` snapshot 的形式出现。对每个 snapshot，用一个 `useMessages(stream, snapshot)` projection 限定范围，使某个 panel 只收到它自己 subagent 的消息，然后把它对应的 OpenUI 程序交给独立的 `Renderer`：
+
+```tsx expandable App.tsx
+import { memo } from "react";
+
+import type { SubagentDiscoverySnapshot } from "@langchain/langgraph-sdk/stream";
+import { useMessages, useStream } from "@langchain/react";
+import { Renderer, type ActionEvent } from "@openuidev/react-lang";
+
+import { library } from "./library";
+
+// One panel, scoped to one subagent. Memoized so the app shell's re-renders
+// never reach this Renderer; the panel's own tokens arrive through useMessages.
+const Panel = memo(function Panel({
+  stream,
+  snapshot,
+  isStreaming,
+  onAction,
+}: {
+  stream: ReturnType<typeof useStream>;
+  snapshot: SubagentDiscoverySnapshot;
+  isStreaming: boolean;
+  onAction: (event: ActionEvent) => void;
+}) {
+  const messages = useMessages(stream, snapshot);
+  // The program is the last AI message whose text starts with `root =`.
+  const program = programFromMessages(messages);
+
+  if (program === "") return <PanelSkeleton name={snapshot.name} />;
+
+  return (
+    <Renderer
+      response={program}
+      library={library}
+      isStreaming={isStreaming}
+      onAction={onAction}
+    />
+  );
+});
+
+export function Dashboard() {
+  const stream = useStream({
+    assistantId: "dashboard",
+    apiUrl: import.meta.env.VITE_LANGGRAPH_API_URL ?? "http://localhost:2024",
+  });
+
+  // Discover top-level panels from the stream; the layout adapts to whichever
+  // specialists the coordinator delegated.
+  const panels = [...stream.subagents.values()].filter(
+    (snapshot) => snapshot.parentId === null,
+  );
+
+  return (
+    <main>
+      {panels.map((snapshot) => (
+        <Panel
+          key={snapshot.id}
+          stream={stream}
+          snapshot={snapshot}
+          isStreaming={snapshot.status === "running" && stream.isLoading}
+          onAction={(event) => {
+            // Handle continue_conversation and open_url actions.
+          }}
+        />
+      ))}
+    </main>
+  );
+}
+```
+
+由于 SDK 把 subagent token 事件隔离在 root store 之外，而且每个 `Panel` 都基于 snapshot 身份做了 memo 化，因此一个 panel 的 tokens 永远不会触发另一个 panel 重渲染。
+
 ## 最佳实践
 
 - **在模块加载时生成 system prompt**：不要在 React component 内部生成；prompt 有好几千字节，应当只计算一次
@@ -505,3 +688,5 @@ root = Stack([..., followUpCard])
 - **只在完整语句时更新**：不要让 Renderer 随每个 token 重渲染；只在完整语句（`name = ComponentCall(...)`）到达时更新
 - **渲染前验证 chart 数据**：chart 组件需要 `Series` 和 label 数组先定义好，才能加入稳定快照
 - **保持 camelCase 变量名**：openui-lang 解析器只接受 camelCase 标识符；请在 system prompt 的 `additionalRules` 中强化这一点
+- **在一条消息中分派 panels**：向 Deep Agents 专业 agent 扇出时，在 coordinator 的一条消息中发出全部 `task()` 调用，让 panels 并发流式输出，而不是逐个进行
+- **让每个 panel 只作用于自己的 subagent**：从 `stream.subagents` 发现 panels，并把每个 snapshot 传给 `useMessages(stream, snapshot)`，这样每个 panel 只渲染自己 subagent 的输出
