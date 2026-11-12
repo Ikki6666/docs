@@ -31,7 +31,7 @@ LangSmith 会在你的 GCP 项目中创建以下内容：
 
 - **网络**：一个带有 GKE 子网的 VPC、具有静态出口 IP 地址的 Cloud NAT，以及私有服务访问。
 - **GKE**：区域级私有 GKE Standard 集群，启用 Workload Identity 和屏蔽节点。
-- **Cloud SQL for PostgreSQL**：仅使用私有 IP、高可用性、TLS 和 IAM 数据库登录，因此不存在数据库密码。
+- **Cloud SQL for PostgreSQL**：一个 instance 用于 LangSmith，另一个用于 SmithDB metastore。仅使用私有 IP、高可用性、TLS 和 IAM 数据库登录，因此不存在数据库密码。
 - **Memorystore for Redis Cluster**：TLS 和 IAM 身份验证，通过 Private Service Connect 访问。
 - **Cloud Storage**：一个强制执行公共访问防护的存储桶。
 - **DNS 与 ingress**：用于 data plane 主机名的 Cloud DNS 区域、使用 Let's Encrypt 的 cert-manager、基于 Secret Manager 的 External Secrets，以及 Istio ingress gateway。
@@ -46,17 +46,17 @@ GCP data planes 在 [SmithDB](/langsmith/self-host-smithdb) 中存储和查询 t
 1. **用户到 data plane**：用户通过 `https://<first 8 characters of the data plane ID>.gcp.langchain-byoc.com` 访问。该主机名指向公共或内部 load balancer 上的 Istio ingress gateway，load balancer 类型在创建 data plane 时由你选择。
 1. **Data plane 到 control plane**：data plane 通过其 VPC 中的 Private Service Connect endpoint 访问位于 `us-central1.p.api.smith.langchain.com` 的 LangSmith API。此路径承载心跳、登录和身份验证调用，以及遥测。它不使用互联网。
 1. **Control plane 到 GCP APIs**：control plane 以单一 LangChain 标识 `byoc-crossplane@langchain-prod.iam.gserviceaccount.com` 运行。它会模拟你的 provisioner 服务账号，因此你项目中的每个 GCP API 调用都以该 provisioner 的身份发起。LangSmith API 将 data plane secrets 写入 Secret Manager，Crossplane 创建、更新和删除其他资源。
-1. **Control plane 到 GKE**：Crossplane 通过集群基于 DNS 的 control plane endpoint 安装和更新集群内资源。每个请求都需要一个具有该集群访问权限的标识的 Google 令牌。Crossplane 的 Helm 和 Kubernetes provider 无法模拟 provisioner，因此 control plane 服务账号本身在你的项目上持有 `roles/container.admin`。
+1. **Control plane 到 GKE**：Crossplane 通过集群基于 DNS 的 control plane endpoint 安装和更新集群内资源。每个请求都需要一个具有该集群访问权限的标识的 Google 令牌。Crossplane 的 Helm 和 Kubernetes provider 无法模拟 provisioner，因此 control plane 服务账号本身持有 `roles/container.admin`。你的 Terraform module 仅对带有 `managed_by: langsmith` 标签的 GKE cluster 授予该角色，而 LangSmith 会在创建每个 data plane 集群时为其打上标签。
 1. **DNS 委派**：control plane 在 LangChain 的父区域 `gcp.langchain-byoc.com` 中写入 data plane 主机名的 NS 委派。该记录位于 LangChain 的项目中，而不是你的项目。
 
 ## 创建与删除生命周期
 
-1. 你的 Terraform 创建 provisioner 服务账号及其角色，并允许 control plane 服务账号模拟它。
+1. 你的 Terraform 创建 provisioner 服务账号及其角色，创建 `managed_by: langsmith` 标签，并允许 control plane 服务账号模拟该 provisioner。
 1. 你通过 API 创建 data plane。
 1. Control plane 检查其访问权限，将 data plane secrets 写入 Secret Manager，并将 data plane 交给 Crossplane。
-1. Crossplane 构建网络、GKE、Cloud SQL、Memorystore、Cloud Storage 和 DNS，然后安装 LangSmith。
+1. Crossplane 构建网络、GKE、Cloud SQL、Memorystore、Cloud Storage 和 DNS，并将 GKE cluster 和 Cloud SQL instance 标记为 `managed_by: langsmith`，然后安装 LangSmith。
 1. Data plane 发送心跳，LangSmith 将其显示为 `active`。
-1. 当你删除 data plane 时，control plane 解除删除保护，Crossplane 删除资源，control plane 删除 secrets。
+1. 当你删除 data plane 时，control plane 解除删除保护，Crossplane 删除资源，control plane 删除 secrets。Cloud Storage 存储桶和 Cloud SQL 备份会保留。更多信息，请参阅[拆除会保留的内容](/langsmith/byoc-onboarding-gcp#what-teardown-keeps)。
 
 ## 网络
 
@@ -77,9 +77,9 @@ GCP data planes 在 [SmithDB](/langsmith/self-host-smithdb) 中存储和查询 t
 
 | 存储 | 配置 |
 |-------|---------------|
-| Cloud SQL for PostgreSQL | Enterprise 版，区域级并在另一个可用区中有一个备用实例，支持存储自动增长。仅使用私有 IP。需要 TLS。使用 IAM 数据库登录，因此不存在应用密码。自动备份（保留 7 个）和时间点恢复（7 天）。已启用删除保护。存放 LangSmith 和 SmithDB metastore 数据库。 |
+| Cloud SQL for PostgreSQL | Enterprise 版，区域级并在另一个可用区中有一个备用实例，支持存储自动增长。仅使用私有 IP。需要 TLS。使用 IAM 数据库登录，因此不存在应用密码。自动备份（保留 7 个）和时间点恢复（7 天）。已启用删除保护。拆除时，Cloud SQL 会创建一份保留 365 天的最终备份，并保留自动备份。共两个 instance：一个存放 LangSmith 数据库，另一个存放 SmithDB metastore。 |
 | Memorystore for Redis Cluster | 一个分片和一个副本。IAM 身份验证和 TLS。通过 Private Service Connect endpoint 访问。已启用删除保护。 |
-| Cloud Storage | 一个区域级存储桶，用于 LangSmith blobs 和 SmithDB 数据。统一存储桶级访问权限，并强制执行公共访问防护。生命周期规则会删除 TTL 前缀下的对象。 |
+| Cloud Storage | 一个区域级存储桶，用于 LangSmith blobs 和 SmithDB 数据。统一存储桶级访问权限，并强制执行公共访问防护。生命周期规则会删除 TTL 前缀下的对象。拆除时会保留存储桶及其对象。 |
 | Secret Manager | 用于 data plane 配置和 Postgres 的区域级 secrets，以及在启用沙箱时用于沙箱的一个 secret。使用 data plane ID 标记。Control plane 在创建时写入它们，在拆除时删除它们。 |
 
 ## GKE 与计算
@@ -100,12 +100,12 @@ GCP data planes 在 [SmithDB](/langsmith/self-host-smithdb) 中存储和查询 t
 
 ## 集群内资源
 
-- **LangSmith**：LangSmith Helm chart，包含 SmithDB。每个 LangSmith pod 都通过 Workload Identity 以 workload 服务账号运行。SmithDB 通过 Cloud SQL Auth Proxy sidecar 访问 Cloud SQL。
+- **LangSmith**：LangSmith Helm chart，包含 SmithDB。每个 LangSmith pod 都通过 Workload Identity 以 workload 服务账号运行。SmithDB 通过 Cloud SQL Auth Proxy sidecar 访问其 metastore instance。
 - **KEDA**：对 LangSmith 服务进行自动扩缩容。
 - **External Secrets Operator**：基于 Secret Manager 的 ClusterSecretStore，只能从 LangSmith 命名空间使用。它每小时同步一次 data plane secrets。
 - **cert-manager 和 trust-manager**：cert-manager 使用 Let's Encrypt issuer，仅在 data plane 区域中进行 DNS-01 质询。trust-manager 构建一个 CA bundle，包含公共 CA 以及 Cloud SQL 和 Memorystore 的 CA。
 - **Istio**：base、istiod 和 ingress gateway。
-- **Postgres 设置任务**：创建 IAM 数据库用户并授予其数据库所有者角色。它不保存密码。
+- **Postgres 设置任务**：创建数据库和 IAM 数据库用户，并授予其数据库所有者角色。它不保存密码。
 
 ## DNS 与 ingress
 
@@ -119,7 +119,7 @@ GCP data planes 在 [SmithDB](/langsmith/self-host-smithdb) 中存储和查询 t
 
 ## Private Service Connect
 
-- LangChain 在 `us-central1` 中发布一个 service attachment。它只接受其接受列表上的项目，因此在创建 data plane 之前，你需要将项目编号发送给 LangChain。
+- LangChain 在 `us-central1` 中发布一个 service attachment。LangSmith 会在 data plane 预置过程中自动将你的项目添加到其接受列表。无需手动将项目加入允许列表。
 - Data plane 创建该 endpoint：control plane endpoint 子网中的一个内部地址，以及指向 service attachment 的转发规则。其他 region 中的 data planes 通过全局访问到达该 endpoint。
 - 一个用于 `us-central1.p.api.smith.langchain.com` 的私有 DNS 区域，仅在 data plane VPC 内可见，指向该 endpoint。
 - Private Service Connect 仅承载从 data plane 到 control plane 的流量。Control plane 通过 GKE 基于 DNS 的 endpoint 到达集群。
@@ -134,12 +134,16 @@ GCP data planes 在 [SmithDB](/langsmith/self-host-smithdb) 中存储和查询 t
 |----------|--------------|
 | `langsmith-byoc-provisioner` 服务账号 | LangSmith 用于预置的服务账号。其描述是你的 external ID。 |
 | provisioner 上的 Token Creator | 允许 `byoc-crossplane@langchain-prod.iam.gserviceaccount.com` 模拟该 provisioner。不信任任何其他 LangChain 标识。 |
-| `langsmithByocProvisioner` 自定义角色 | 在项目上绑定的权限，用于创建、更新和删除 data plane 资源。 |
-| `langsmithByocProjectIamGranter` 自定义角色 | `resourcemanager.projects.getIamPolicy` 和 `setIamPolicy`。IAM 条件允许 provisioner 仅添加或移除以下项目角色：`artifactregistry.reader`、`cloudsql.admin`、`cloudsql.client`、`cloudsql.instanceUser`、`container.admin`、`container.defaultNodeServiceAccount`、`redis.dbConnectionUser` 和 `secretmanager.secretAccessor`。 |
+| `langsmithByocProvisioner` 自定义角色 | 在项目上绑定的权限，用于创建、更新和删除名称条件无法限制的 data plane 资源。 |
+| `langsmithByocNamed<Kind>` 自定义角色 | 每种资源类型一个角色：Cloud SQL instances、GKE clusters、networks、subnets、Cloud Routers、addresses、forwarding rules、Memorystore for Redis clusters、service connection policies、Cloud Storage 和 Secret Manager。每个角色都按资源名称绑定 IAM 条件，因此 provisioner 只能创建、更改和删除名称以 `langsmith-` 开头的资源，以及 ID 以 `ls-` 开头的 secrets。 |
+| `managed_by: langsmith` 标签 | 一个项目标签。provisioner 只能将其绑定到名称以 `langsmith-` 开头的 GKE cluster 和 Cloud SQL instance。 |
+| control plane 的 `roles/container.admin` | 授予 `byoc-crossplane@langchain-prod.iam.gserviceaccount.com`，条件是集群带有 `managed_by: langsmith` 标签。它覆盖 GKE API 和 Kubernetes API。 |
+| `langsmithByocClusterConnect` 自定义角色 | 为 control plane 服务账号提供 `container.clusters.connect`，仅限名称以 `langsmith-` 开头的集群。基于 DNS 的 endpoint 会在不检查集群标签的情况下校验该权限。连接本身不会获得集群内的任何访问权限。 |
+| `langsmithByocProjectIamGranter` 自定义角色 | `resourcemanager.projects.getIamPolicy` 和 `setIamPolicy`。IAM 条件允许 provisioner 仅添加或移除以下项目角色：`artifactregistry.reader`、`cloudsql.admin`、`cloudsql.client`、`cloudsql.instanceUser`、`container.defaultNodeServiceAccount`、`redis.dbConnectionUser` 和 `secretmanager.secretAccessor`。该条件限制的是角色，而不是授予对象。 |
 | `langsmithByocServiceAccountUser` 自定义角色 | `iam.serviceAccounts.actAs`，使 GKE 节点和工作负载能以 data plane 服务账号运行。IAM 不会对 `actAs` 评估条件，因此该绑定没有条件。 |
 | 项目 API | 使用 `enable_apis`（默认 `true`）时：Compute Engine、GKE、Cloud DNS、IAM、IAM Service Account Credentials、Network Connectivity、Memorystore for Redis、Secret Manager、Service Directory、Service Networking 和 Cloud SQL Admin。 |
 
-自定义角色 ID 前缀默认为 `langsmithByoc`。设置 `custom_role_id_prefix` 可以更改它。有关每个角色的完整权限列表，请参阅该 module 的 [README](https://github.com/langchain-ai/terraform/tree/main/modules/byoc/gcp/langsmith-byoc-service-account) 和源代码。
+自定义角色 ID 前缀默认为 `langsmithByoc`。如果项目中已存在使用这些 ID 的角色，请设置 `custom_role_id_prefix`。每个项目只应用一份该 module，因为它会创建项目的 `managed_by` 标签键。有关每个角色的完整权限列表，请参阅该 module 的 [README](https://github.com/langchain-ai/terraform/tree/main/modules/byoc/gcp/langsmith-byoc-service-account) 和源代码。
 
 ### 创建时的检查
 
@@ -159,17 +163,17 @@ Crossplane 会为每个 data plane 的每一类工作负载创建一个 Google �
 | `lsa-<hash>` / `langsmith-workload` | LangSmith 应用和 SmithDB | 项目：`redis.dbConnectionUser`、`cloudsql.client`、`cloudsql.instanceUser`。存储桶：`storage.objectAdmin`。自身上的 Token Creator，用于为 Cloud Storage URL 签名。 |
 | `lse-<hash>` / `langsmith-external-secrets` | External Secrets Operator | `secretmanager.secretAccessor`，并为 data plane 的每个 secret ID 设置条件。使用 `byo_iam` 时：ID 以 `ls-` 开头的 secrets。 |
 | `lsc-<hash>` / `langsmith-cert-manager` | cert-manager | 仅在 data plane 的 DNS 区域上具有 `dns.admin`，绝不在项目上。 |
-| `lsp-<hash>` / `langsmith-postgres-setup` | Postgres 设置任务 | 项目：`cloudsql.admin`。 |
+| `lsp-<hash>` / `langsmith-postgres-setup` | Postgres 设置任务 | 项目：`cloudsql.admin`，仅适用于带有 `managed_by: langsmith` 标签的 Cloud SQL instance。使用 `byo_iam` 时：在带标签的 instance 上具有 `cloudsql.users.create`、`list` 和 `update`（自定义角色 `langsmithByocPostgresSetup`），在名称以 `langsmith-` 开头的 instance 上具有 `cloudsql.viewer`。 |
 | `lsn-<hash>` / `langsmith-node` | GKE 节点 | 项目：`container.defaultNodeServiceAccount`、`artifactregistry.reader`。 |
 | `lsh-<hash>` / `langsmith-sandbox-host` | 沙箱节点（启用沙箱时） | 项目：`container.defaultNodeServiceAccount`、`artifactregistry.reader`、`redis.dbConnectionUser`。存储桶：仅在 `smithbox/` 托管文件夹上具有 `storage.objectAdmin`。 |
 
-Crossplane 还会在项目上向 `byoc-crossplane@langchain-prod.iam.gserviceaccount.com` 授予 `roles/container.admin`。使用 `byo_iam` 时，由你的 Terraform 进行此授权。
+你的 Terraform module 会向 `byoc-crossplane@langchain-prod.iam.gserviceaccount.com` 授予 `roles/container.admin`，仅限带标签的集群，无论是否使用 `byo_iam`。Crossplane 不会向它做任何授权。
 
 使用 `byo_iam` 时，不要给项目中自己的 secrets 分配以 `ls-` 开头的 ID，否则 External Secrets 可以读取它们。
 
 ### 自带 IAM
 
-在项目中创建 data planes 之前，先在 module 中设置 `byo_iam = true`，并在创建 data plane 时将 `byoiam_enabled` 设为 `true`。存在 data planes 时不要更改 `byo_iam`。使用 `byo_iam` 时：
+在项目中创建 data planes 之前，先在 module 中设置 `byo_iam = true`，并在创建 data plane 时将 `byoiam_enabled` 设为 `true`。如果项目中还存放不属于 LangSmith 的资源，请使用它。存在 data planes 时不要更改 `byo_iam`。使用 `byo_iam` 时：
 
 - 你的 Terraform 创建六个服务账号及其项目角色。
 - provisioner 角色失去 `iam.serviceAccounts.create`、`delete`、`update` 和 `setIamPolicy`。它保留 `get`、`list` 和 `getIamPolicy`。
@@ -179,13 +183,18 @@ Crossplane 还会在项目上向 `byoc-crossplane@langchain-prod.iam.gserviceacc
 
 ### LangChain 可以访问和不能访问的内容
 
-- **可以**：通过 provisioner 创建、更改和删除 data plane 资源。读取项目的 IAM 策略和服务账号。通过 `container.admin` 在项目中的 GKE 集群上充当集群管理员。LangSmith 就是这样安装和升级应用的。
-- **不能（受角色限制）**：provisioner 没有 `storage.objects.get`，因此无法读取存储桶中的对象。它可以列出和删除对象以便拆除。它没有 `secretmanager.versions.access`，因此无法读取 secrets。它没有 Cloud SQL 用户或数据库登录权限，也没有项目之外的任何权限。
+- **可以**：通过 provisioner 创建、更改和删除 data plane 资源，对大多数类型而言，这意味着名称以 `langsmith-` 开头的资源。读取项目的 IAM 策略和服务账号。通过 `container.admin` 在带有 `managed_by: langsmith` 标签的 GKE cluster 上充当集群管理员。LangSmith 就是这样安装和升级应用的。
+- **不能（受角色限制）**：provisioner 没有 `storage.objects.get`，因此无法读取存储桶中的对象。它可以列出和删除对象。它没有 `secretmanager.versions.access`，因此无法读取 secrets。它没有 Cloud SQL 数据库或用户的权限，没有数据库登录权限，也没有项目之外的任何权限。Postgres 设置账号的 Cloud SQL 权限仅适用于 data plane 的 instance（LangSmith 会将其标记为 `managed_by: langsmith`），因此它无法管理你其他 Cloud SQL instance 上的用户或设置。
 
-这些是 provisioner 角色的限制，而不是拒绝策略。provisioner 仍然可以在存储桶和 DNS 区域上设置 IAM 策略，在没有 `byo_iam` 时还可以在服务账号上设置。
+这些是 provisioner 角色的限制，而不是拒绝策略。provisioner 仍然可以在 `langsmith-` 存储桶上、项目中的每个 DNS 区域和 Artifact Registry repository 上设置 IAM 策略，在没有 `byo_iam` 时还可以在服务账号上设置。
 
 <Warning>
-请使用一个只存放 LangSmith 资源的项目。IAM 条件无法按账号名称限制服务账号权限。在没有 `byo_iam` 时，provisioner 的 `setIamPolicy` 和 `actAs` 会作用于项目中的每个服务账号，因此它可以冒充其中任何一个。授予 control plane 服务账号的 `container.admin` 以及授予 Postgres 设置账号的 `cloudsql.admin` 项目级权限，也会覆盖项目中的每个 GKE 集群和 Cloud SQL 实例。
+请使用一个只存放 LangSmith 资源的项目。名称条件能将 provisioner 限制到大多数类型的 `langsmith-` 资源，但并非处处如此。如果项目中还存放其他资源，`byo_iam` 会移除下文中服务账号和项目角色授予的访问权限，但不会移除其余权限：
+
+- **服务账号**：IAM 通过服务账号的数字唯一 ID 来检查服务账号，因此条件无法按账号名称限制服务账号权限。在没有 `byo_iam` 时，provisioner 的 `setIamPolicy` 和 `actAs` 会作用于项目中的每个服务账号，因此它可以冒充其中任何一个。
+- **项目角色授予**：在没有 `byo_iam` 时，provisioner 可以将上面列出的项目角色授予任何 principal，包括它自己。借助 `cloudsql.admin` 或 `secretmanager.secretAccessor`，它可以访问项目中的每个 Cloud SQL instance 或 secret。
+- **DNS 区域和 Artifact Registry repository**：provisioner 可以更改、删除项目中的任何 DNS 区域及其记录，以及任何 Artifact Registry repository，并设置其 IAM 策略。
+- **你自己的 `langsmith-` 资源**：如果你的资源名称也以 `langsmith-` 开头，名称条件无法将你的资源与 LangSmith 的资源区分开。
 </Warning>
 
 ### 移除访问权限
@@ -193,7 +202,7 @@ Crossplane 还会在项目上向 `byoc-crossplane@langchain-prod.iam.gserviceacc
 要移除 LangChain 对你项目的访问权限：
 
 - **推荐**：在 LangSmith 中删除 data plane。等待它消失，如果没有其他 data planes 使用该项目，再运行 `terraform destroy`。
-- **立即**：移除两项 LangChain 授权：provisioner 上的 Token Creator 绑定（或 provisioner 本身），以及项目上授予 `byoc-crossplane@langchain-prod.iam.gserviceaccount.com` 的 `roles/container.admin`。此后 LangSmith 无法更改或删除 data plane。资源会保留，你必须自行删除它们。
+- **立即**：移除 LangChain 授权：provisioner 上的 Token Creator 绑定（或 provisioner 本身），以及授予 `byoc-crossplane@langchain-prod.iam.gserviceaccount.com` 的带标签条件的 `roles/container.admin` 和 `langsmithByocClusterConnect`。此后 LangSmith 无法更改或删除 data plane。资源会保留，你必须自行删除它们。
 
 ## 下一步
 

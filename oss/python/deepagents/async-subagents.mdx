@@ -22,35 +22,37 @@ import AsyncSubagentsParentThreadJs from '/snippets/python/code-samples/async-su
 import AsyncSubagentsDeliverResultsPy from '/snippets/python/code-samples/async-subagents-deliver-results-py.mdx';
 import AsyncSubagentsDeliverResultsJs from '/snippets/python/code-samples/async-subagents-deliver-results-js.mdx';
 
-异步子代理允许 supervisor agent 启动会立即返回的后台任务，因此 supervisor 可以在子代理并发工作的同时继续与用户交互。supervisor 可以在任何时点检查进度、发送后续指令，或取消任务。
+异步子代理允许 supervisor agent 启动会立即返回的后台任务。supervisor 可以在子代理并发工作的同时继续与用户交互。supervisor 可以在任何时点检查任务状态、发送后续指令，或取消任务。在 Agent Server 上，子代理还会在完成、失败或需要输入时回报。supervisor 无需主动检查。
 
 这建立在 [子代理](/oss/python/deepagents/subagents) 之上；后者是同步运行的，会阻塞 supervisor，直到完成。对于耗时较长、可并行化，或者需要在执行过程中动态调整的任务，请使用异步子代理。
 
-在 Agent Server 上，supervisor 还会在任务完成、失败或需要输入时自动收到通知，因此无需主动检查。
+要在托管 agent 中运行异步子代理，请用 `async: true` 启用它们。参见 [Managed Deep Agents 中的异步子代理](/langsmith/python/managed-deep-agents-subagents#async-subagents)。
 
 ```mermaid
 graph TB
-    User([用户]) --> Supervisor[Supervisor Agent]
+    User([User]) <--> Supervisor[Supervisor Agent]
 
     Supervisor --> |launch| Researcher[Researcher]
     Supervisor --> |launch| Coder[Coder]
 
-    Researcher --> |check| Supervisor
-    Coder --> |check| Supervisor
+    Researcher -.-> |notify| Supervisor
+    Coder -.-> |notify| Supervisor
 ```
 
 <Note>
-异步子代理可以与任何实现 [Agent Protocol](https://github.com/langchain-ai/agent-protocol) 的 server 通信。你可以使用 [LangSmith Deployment](/langsmith/deployment)，也可以自托管任何兼容 Agent Protocol 的 server。每个子代理都独立于 supervisor 运行，supervisor 通过 SDK 来启动、检查、更新和取消它们。
+异步子代理可在任何实现 [Agent Protocol](https://github.com/langchain-ai/agent-protocol) 的 server 上运行，例如 [LangSmith Deployment](/langsmith/deployment) 或自托管的 Agent Protocol server。每个子代理都独立于 supervisor 运行。supervisor 通过 SDK 启动、检查、更新和取消它。通知和 webhook 需要 [Agent Server](/langsmith/agent-server)。
 </Note>
 
-## 何时使用异步子代理
+## 比较同步和异步子代理
 
 | 维度 | 同步子代理 | 异步子代理 |
 |------|-----------|-----------|
-| **执行模型** | supervisor 会阻塞，直到子代理完成 | 立即返回 job ID；supervisor 继续执行 |
+| **执行模型** | supervisor 会阻塞，直到子代理完成 | 立即返回 task ID；supervisor 继续执行 |
+| **运行位置** | 在 supervisor 的 run 内部 | 在 server 上自己的线程中（Agent Server 或其他 Agent Protocol server） |
 | **并发性** | 并行但阻塞 | 并行且非阻塞 |
+| **结果** | 作为工具结果返回 | 在 Agent Server 上，子代理会通知 supervisor；否则由 supervisor 调用 `check_async_task` |
 | **任务中更新** | 不支持 | 可通过 `update_async_task` 发送后续指令 |
-| **取消** | 不支持 | 可通过 `cancel_async_task` 取消运行中的任务 |
+| **取消** | 不支持（除非停止 supervisor） | 可通过 `cancel_async_task` 取消任务 |
 | **状态性** | 无状态 - 多次调用之间没有持久状态 | 有状态 - 在自己的线程上跨交互保持状态 |
 | **适用场景** | 需要先等结果再继续的任务 | 在聊天中交互式管理的长耗时复杂任务 |
 
@@ -70,7 +72,7 @@ graph TB
 | `mode` | `"isolated" \| "fork"` | 可选。控制子代理启动时收到的对话上下文。默认为 `"isolated"`。参见[选择启动模式](#choose-a-launch-mode)。 |
 | `update_strategy` | `"interrupt" \| "enqueue"` | 可选。run 处于活动状态时 `update_async_task` 如何发送后续指令。默认为 `"interrupt"`。参见[了解生命周期](#understand-the-lifecycle)。 |
 | `webhook` | `str` | 可选。该子代理的任一 run 结束时 Agent Server 调用的 URL。参见[通过你的应用投递结果](#deliver-results-through-your-app)。 |
-| `notify_parent` | `bool` | 可选。子代理在 supervisor 空闲时完成，是否可以唤醒 supervisor。默认为 `True`。 |
+| `notify_parent` | `bool` | 可选。子代理在 supervisor 空闲时完成或失败，是否可以唤醒 supervisor。默认为 `True`。 |
 
 
 
@@ -94,10 +96,10 @@ graph TB
 | 工具 | 作用 | 返回值 |
 |------|------|------|
 | `start_async_task` | 启动新的后台任务 | Task ID（立即返回） |
-| `check_async_task` | 获取任务当前状态和结果 | 状态 + 结果（如果已完成） |
-| `update_async_task` | 向运行中的任务发送新指令 | 确认信息 + 更新后的状态 |
-| `cancel_async_task` | 停止运行中的任务 | 确认信息 |
-| `list_async_tasks` | 列出所有已跟踪任务及其实时状态 | 任务摘要 |
+| `check_async_task` | 获取任务的当前状态，以及其结果、错误或它正在向用户询问的内容 | 状态，以及结果、错误或待处理的请求 |
+| `update_async_task` | 向任务发送新指令 | 后续指令已启动或已排队的确认 |
+| `cancel_async_task` | 停止任务 | 确认 |
+| `list_async_tasks` | 列出已跟踪的任务及其实时状态，可选按状态筛选 | 每个任务的状态（不含结果） |
 
 supervisor 的 LLM 会像调用其他工具一样调用这些工具。middleware 会自动处理线程创建、run 管理和状态持久化。
 
@@ -105,33 +107,34 @@ supervisor 的 LLM 会像调用其他工具一样调用这些工具。middleware
 
 典型交互如下：
 
+<Note>
+在 Agent Server 上，supervisor 无需检查任务：子代理完成时，任务会通知 supervisor。
+</Note>
+
 ```mermaid
 sequenceDiagram
     participant User
     participant Supervisor
-    participant Platform as Agent Protocol Server
+    participant Researcher
 
     User->>Supervisor: "Research topic X"
-    Supervisor->>Platform: launch(researcher, "topic X")
-    Platform-->>Supervisor: task_id: abc123
+    Supervisor->>Researcher: start_async_task("topic X")
+    Researcher-->>Supervisor: task_id (immediately)
+    Supervisor-->>User: "I have started the research. You can keep chatting while it runs."
 
-    Note over Platform: Researcher working...
+    Note over User,Supervisor: User keeps chatting with the supervisor
+    Note over Researcher: Researcher working...
 
-    Supervisor-->>User: "Started task abc123"
-
-    Note over User,Platform: User continues conversation
-
-    User->>Supervisor: "How's the research going?"
-    Supervisor->>Platform: check(abc123)
-    Platform-->>Supervisor: status: success, result: "findings..."
-    Supervisor-->>User: "Here are the results"
+    Researcher-->>Supervisor: notification: success + result
+    Note over Supervisor: Woken by the notification
+    Supervisor-->>User: "The research is done. Here is what it found..."
 ```
 
-- **Launch** 会在 server 上创建新的线程，并按[启动模式](#choose-a-launch-mode)确定的输入启动一个 run。isolated 模式只发送任务描述；fork 模式还会发送父代理的有效对话历史。线程 ID 会作为 task ID 返回。supervisor 会把这个 ID 报告给用户，而不会等待任务完成。
-- **Check** 会获取当前 run 状态。如果 run 成功，它会读取线程状态并提取子代理的最终输出。如果仍在运行，它会把这个状态报告给用户。
+- **Launch** 会在 server 上创建新的线程，并按[启动模式](#choose-a-launch-mode)确定的输入启动一个 run。isolated 模式只发送任务描述；fork 模式还会发送父代理的有效对话历史。`start_async_task` 会把线程 ID 作为 task ID 返回。
+- **Check** 会获取任务的当前状态，以及其结果、错误或它正在向用户询问的内容。
 - **Update** 会在同一线程上创建一个新的 run。默认情况下它会中断前一个 run，子代理会带着完整对话历史和新的指令重新启动。task ID 保持不变。
 - **Cancel** 会调用 server 上的 `runs.cancel()`，并把任务标记为 `"cancelled"`。
-- **List** 会遍历所有已跟踪任务。对于非终态任务，它会并行从 server 获取实时状态。终态状态（`success`、`error`、`cancelled`）从缓存返回。
+- **List** 会遍历所有已跟踪任务。对于非终态任务，它会并行从 server 获取实时状态。对于终态状态（`success`、`error`、`timeout`、`cancelled`、`interrupted`），它使用缓存的状态。
 
 要让后续指令排队等待，请设置 `update_strategy="enqueue"`。此时 **Update** 会把新的 run 排在当前 run 之后，任务在开始前处于 `pending` 状态。取消该任务也会取消仍然活跃的更早 run。
 如果当前 run 在后续指令开始前因等待输入或审批而暂停，后续指令仍会启动，而该请求会被丢弃。
@@ -145,20 +148,30 @@ sequenceDiagram
 
 如果子代理因等待输入或审批而暂停，**check** 和 **list** 会把它报告为 `waiting`。更新一个 `waiting` 任务会丢弃其待处理的请求；取消它只会标记为 `"cancelled"`，因为它没有活跃的 run。参见[处理等待输入的子代理](#handle-subagents-waiting-for-input)。
 
-在 [Agent Protocol](https://github.com/langchain-ai/agent-protocol) server 上运行时，子代理会在完成时自动向 supervisor 发送更新。如果 supervisor 和子代理使用[单一部署](#single-deployment)，子代理会在 supervisor 空闲时唤醒它；否则 supervisor 会在下一次 run 开始时收到更新。
+在 [Agent Server](/langsmith/agent-server) 上，子代理会在完成、失败或需要输入时通知 supervisor。当 supervisor 忙碌时，它会在下一次模型调用前收到这些通知。如果子代理和 supervisor 位于[同一部署](#single-deployment)，那么完成或失败的子代理会通过一次新的 run 唤醒空闲的 supervisor。只有作为 deep agent 的子代理才会唤醒空闲的 supervisor。等待输入的子代理不会唤醒 supervisor。supervisor 会在下一次 run 时收到该通知。
+
 
 <Note>
-任务通知需要 `deepagents>=0.7.26`。它处于 [**beta**](/oss/python/versioning) 阶段；API 和行为可能在版本之间发生变化。
+任务通知需要 `deepagents>=0.7.26`，通知 metadata 需要 `deepagents>=0.7.33`。它们处于 [**beta**](/oss/python/versioning) 阶段；API 和行为可能在版本之间发生变化。
 
 
 </Note>
 
-通知以 `HumanMessage` 的形式返回给 supervisor。它们可以包含图像和其他多模态媒体。消息在 `additional_kwargs["deepagents_notification"]` 中携带 [`TaskEvent`](https://reference.langchain.com/python/deepagents/middleware/async_subagents/TaskEvent)（`task_id`、`agent_name`、`status`、`run_id`），因此你的应用可以用不同于用户消息的方式展示通知：
+supervisor 会以 `HumanMessage` 的形式接收每条通知。通知可以包含图像和其他多模态媒体。每条通知都携带 metadata：其 `source` 为 `"async_subagent"`，其 `data` 为一个 [`TaskEvent`](https://reference.langchain.com/python/deepagents/middleware/async_subagents/TaskEvent)（`task_id`、`agent_name`、`status`、`run_id`）。用 `get_notification_metadata` 读取它，以便用不同于用户消息的方式展示通知：
 
 <AsyncSubagentsNotificationsPy />
 
 
 
+
+<Note>
+异步子代理的拒绝结果需要 `deepagents>=0.7.33`。
+</Note>
+
+
+
+
+如果子代理的 run 以模型拒绝结束，supervisor 会收到一条说明该情况的简短结果，而不是拒绝内容本身。参见[模型拒绝](/oss/python/deepagents/subagents#model-refusals)。
 
 ### 通过你的应用投递结果
 
@@ -168,7 +181,7 @@ sequenceDiagram
 
 </Note>
 
-设置 `webhook` 后，每当该子代理的某个 run 结束，Agent Server 都会调用你的应用。该调用包含 run 的 thread ID、run ID、状态和 metadata，其中包括 `parent_thread_id` 和 `subagent_name`。如果希望通过你的应用投递结果而不是唤醒 supervisor，请同时关闭向父代理发送通知。supervisor 在子代理运行期间仍会收到它的更新。
+设置 `webhook` 后，每当该子代理的某个 run 结束，Agent Server 都会调用你的应用。该调用包含 run 的 thread ID、run ID、状态和 metadata，其中包括 `parent_thread_id` 和 `subagent_name`。如果希望通过你的应用投递结果而不是唤醒 supervisor，请同时关闭向父代理发送通知。supervisor 在子代理运行期间仍会收到通知。
 
 <AsyncSubagentsDeliverResultsPy />
 
@@ -183,7 +196,7 @@ sequenceDiagram
 
 </Note>
 
-当子代理通过 `interrupt()` 或 [human-in-the-loop](/oss/python/deepagents/human-in-the-loop) 暂停以等待输入或审批时，**check** 和 **list** 工具会把它报告为 `waiting`，并附上待处理的 interrupt。supervisor 不能代替用户回答或批准。这个请求是给用户的。
+当子代理通过 `interrupt()` 或 [human-in-the-loop](/oss/python/deepagents/human-in-the-loop) 暂停以等待输入或审批时，`check_async_task` 和 `list_async_tasks` 会把它报告为 `waiting`。只有 `check_async_task` 还会返回其待处理的 interrupt。supervisor 不能代替用户回答或批准。这个请求是给用户的。
 
 你的应用在子代理自己的线程上作答。task ID 就是子代理的 thread ID：
 
@@ -248,7 +261,7 @@ ASGI transport 消除了网络延迟，也不需要额外的认证配置。子�
 | `"isolated"`（默认） | 只发送被委派的任务描述。子代理全新启动，对父代理的对话历史一无所知。 |
 | `"fork"` | 启动时先发送父代理对话的快照，然后发送任务描述。子代理可以在后台工作期间使用这些上下文。 |
 
-对于大多数任务，`"isolated"` 是正确的选择。当子代理需要已有的上下文时，请使用 `"fork"`，例如后台起草 agent 应当按照对话中已经确定的风格和语气来写作。
+对于大多数任务，`"isolated"` 是正确的选择。当子代理需要已有的上下文时，请使用 `"fork"`。例如，对于应当按照对话中已经确定的风格和语气来写作的后台起草 agent，请使用 `"fork"`。
 
 ### Fork 模式
 
@@ -327,17 +340,19 @@ supervisor 会根据描述决定启动哪个子代理。描述要具体、动作
 
 
 
-### 用 thread ID 做 tracing
+### 跟踪子代理运行
 
-在基于 LangGraph 的部署中，每一次异步子代理运行都是一次标准的 LangGraph run，会完整显示在 LangSmith 中。supervisor 的 trace 会展示 `launch`、`check`、`update`、`cancel` 和 `list` 的工具调用。每个子代理 run 都会作为单独的 trace 出现，并通过 thread ID 关联。使用 thread ID（task ID）可以把 supervisor 的编排 trace 和子代理执行 trace 关联起来。
+在基于 LangGraph 的部署中，每一次异步子代理运行都是一次标准的 LangGraph run，会完整显示在 LangSmith 中。supervisor 的 trace 会展示它的 `start_async_task`、`check_async_task`、`update_async_task`、`cancel_async_task` 和 `list_async_tasks` 调用。默认情况下，每个子代理 run 都会作为单独的 trace 出现。使用 thread ID（task ID）可以把子代理的 trace 与 supervisor 的 trace 匹配起来。
+
+同一部署上的子代理还会收到 supervisor 的 trace header。要把子代理的 run 显示为嵌套在 supervisor 的 trace 下，请让子代理的 graph 采用这些 trace header。参见 [Agent Server 上的分布式 tracing](/langsmith/agent-server-distributed-tracing)。
 
 ## 故障排查
 
 ### supervisor 在 launch 后立即轮询
 
-**问题**：supervisor 在启动后立刻循环调用 `check`，把异步执行变成了阻塞执行。
+**问题**：supervisor 在启动后立刻循环调用 `check_async_task`，把异步执行变成了阻塞执行。
 
-**解决方案**：middleware 会注入 system prompt 规则来避免这种情况。如果仍然轮询，请在 supervisor 的 system prompt 中强化该行为：
+**解决方案**：supervisor 无需检查。在 Agent Server 上，子代理会在任务完成、失败或需要输入时通知 supervisor。`start_async_task` 的工具描述已经告诉模型不要在启动后立即检查状态。如果仍然轮询，请在 supervisor 的 system prompt 中强化这一点：
 
 <AsyncSubagentsTroubleshootingPollingPy />
 
@@ -346,15 +361,15 @@ supervisor 会根据描述决定启动哪个子代理。描述要具体、动作
 
 ### supervisor 报告了过期状态
 
-**问题**：supervisor 参考的是对话历史中更早的任务状态，而不是重新调用 `check`。
+**问题**：supervisor 报告的是对话中更早的任务状态，而不是再次检查任务。
 
-**解决方案**：middleware prompt 会指示模型“对话历史中的任务状态总是过期的”。如果仍然出现这种情况，请增加明确指令，要求在报告状态前始终调用 `check` 或 `list`。
+**解决方案**：`check_async_task` 和 `list_async_tasks` 的工具描述会告诉模型对话历史中的状态是过期的。如果仍然出现这种情况，请增加指令，要求在报告任务状态前调用 `check_async_task` 或 `list_async_tasks`。开启通知后，supervisor 无需检查就能了解每次状态变化。
 
 ### task ID 查找失败
 
-**问题**：supervisor 截断或重新格式化了 task ID，导致 `check` 或 `cancel` 失败。
+**问题**：supervisor 截断或重新格式化了 task ID，导致 `check_async_task` 或 `cancel_async_task` 失败。
 
-**解决方案**：middleware prompt 会指示模型始终使用完整的 task ID。如果仍然截断，这通常是模型特定问题 - 请尝试不同的模型，或者在 system prompt 中加入“always show the full task_id, never truncate or abbreviate it”。
+**解决方案**：每个工具的 task ID 参数会告诉模型传入完整的 task ID。如果仍然截断，原因通常是模型特定的。请尝试不同的模型，或者在 system prompt 中加入“always show the full task_id, never truncate or abbreviate it”。
 
 ### 子代理启动后排队而不是运行
 

@@ -272,6 +272,8 @@ with CockroachDBSaver.from_conn_string(DB_URI) as checkpointer:
     # checkpointer.disable_ttl()
 ```
 
+从 v0.6.0 起，活跃的 thread 会保留它仍在使用的值，即使这些值比 interval 更旧；而 thread 一旦空闲达到该 interval，就会整体过期。当设置发生变化时，`enable_ttl()` 会暂停 TTL，等待约 15 秒，并在恢复 TTL 之前将现有 thread 更新到最新状态，因此请在升级后从单个进程运行一次。之后使用相同设置的调用会立即返回。
+
 异步版本：`await checkpointer.aenable_ttl(ttl_interval="7 days", cron="@hourly")`
 
 <Note>
@@ -361,6 +363,86 @@ deleted = store.delete_namespace(("user", "alice"))
 
 在 `AsyncCockroachDBStore` 上，请使用 `await store.adelete_namespace(...)`。
 
+#### 让记忆保持真实（v0.6.0+）
+
+语义搜索按与查询的相似度对记忆排序，而不是按它们是否仍然真实。`reconcile` 在一个可串行化事务中写入一条记忆，并按你选择的策略处理可能与它冲突的记忆。store 不会发起任何 LLM 调用。
+
+<Tip>
+在从 v0.5 升级而来的 store 上，使用本节中的方法前请先运行一次 `setup()`。它会应用 migration 2，添加这些方法所需的列；在它运行之前，这些方法会抛出 `ValueError`。在开启 history 之前，请等待所有写入方都运行 v0.6.0。
+</Tip>
+
+一个 slot 命名一条记忆所陈述的事实。使用 `slot="topic"` 时，候选包括同一 key 下的记忆，以及该 namespace 中 `topic` 字段具有相同值的每条存活记忆。`first_of(skip_duplicates(), supersede_same_slot())` 会跳过重复项并确认它所重复的那条记忆，否则允许同一 slot 中较新的事实取代旧事实。`reconcile` 没有默认策略。
+
+沿用上面的 `DB_URI`，以下工具会将事实保存到由模型命名的 topic 下，并列出用户过去对该 topic 的说法：
+
+```python
+from dataclasses import dataclass
+
+from langchain.agents import create_agent
+from langchain.tools import ToolRuntime, tool
+from langchain_cockroachdb import CockroachDBStore
+from langchain_cockroachdb.store import first_of, skip_duplicates, supersede_same_slot
+
+POLICY = first_of(skip_duplicates(), supersede_same_slot())
+
+
+@dataclass
+class Context:
+    user_id: str
+
+
+@tool
+def remember(text: str, topic: str, runtime: ToolRuntime[Context, dict]) -> str:
+    """Save a fact about the user. topic names what it is about, such as "seat"."""
+    assert isinstance(runtime.store, CockroachDBStore)
+    namespace = ("user", runtime.context.user_id, "memories")
+    result = runtime.store.reconcile(
+        namespace,
+        None,  # the store generates the key
+        {"topic": topic, "text": text},
+        slot="topic",
+        policy=POLICY,
+        provenance={"source": "chat"},
+    )
+    if result.new != "written":
+        return f"Already known: {text}"
+    replaced = f", replacing {len(result.superseded)}" if result.superseded else ""
+    return f"Saved: {text}{replaced}"
+
+
+@tool
+def past_memories(topic: str, runtime: ToolRuntime[Context, dict]) -> str:
+    """List what the user used to say about a topic, newest first."""
+    assert isinstance(runtime.store, CockroachDBStore)
+    namespace = ("user", runtime.context.user_id, "memories")
+    lines = [
+        f"{version.ended_at:%Y-%m-%d}: {version.value['text']} ({version.reason})"
+        for version in runtime.store.history(namespace, limit=100)
+        if version.value.get("topic") == topic
+    ]
+    return "\n".join(lines) or f"No earlier memories about {topic}."
+
+
+with CockroachDBStore.from_conn_string(DB_URI, history=True) as store:
+    store.setup()
+    agent = create_agent(
+        "claude-sonnet-4-6",
+        tools=[remember, past_memories],
+        context_schema=Context,
+        store=store,
+    )
+```
+
+设置 `history=True` 后，每次覆盖、取代或删除记忆的写入都会保留它所终结的版本，包括它的 provenance、该事实为真的时间以及它结束的原因。普通的 `put` 和 `delete` 也会保留 history。`history(namespace, key)` 按从新到旧列出一条记忆的旧版本，而 `history(namespace)` 会列出该 namespace 中每条记忆的旧版本，因此即使记忆保存在生成的 key 下，也能给出时间线。
+
+`confirm(namespace, key)` 会将一条记忆标记为已确认：它会记录这次确认，并续订该记忆的过期时间。当 store 的 `ttl` 中 `refresh_on_read` 设为 `False` 时，过期时间跟随确认而非读取来续订。
+
+`record(namespace, key)` 会读取一条记忆及其版本和 provenance。`put_if(namespace, key, value, expected=record)` 和 `delete_if(namespace, key, expected=record)` 仅当该记忆仍是 `record` 返回的那一条时才会生效，因此两个写入方不会丢失更新。冲突会以结果的形式返回，而不是抛出异常：`applied` 为 `False`，`current` 保存当前存活的记忆，供你合并。
+
+在启用了 history 的 store 上，`delete` 是软删除：它所终结的版本仍留在 history 中。`purge(namespace, key)` 会彻底遗忘一个 key：该记忆、它的 vector，以及它的 history。被 `reconcile` 取代的记忆会在 history 中保留自己的 key，因此也要 purge 那个 key，或者使用 `delete_namespace` 遗忘某个 namespace 下的所有内容，包括 history。
+
+在 `AsyncCockroachDBStore` 上，这些方法都有一个带 `a` 前缀的异步形式，例如 `await store.areconcile(...)`。
+
 ### Multi-tenancy
 
 通过可选的 namespace 列按租户隔离向量数据。启用后，所有 CRUD 和搜索操作都会限定在指定 namespace 范围内。
@@ -369,6 +451,7 @@ CockroachDB 的 C-SPANN 索引支持前缀列，因此 namespace 过滤可以直
 
 ```python
 from langchain_cockroachdb import AsyncCockroachDBVectorStore, CockroachDBEngine
+from langchain_cockroachdb.indexes import CSPANNIndex
 from langchain_openai import OpenAIEmbeddings
 
 engine = CockroachDBEngine.from_connection_string(CONNECTION_STRING)
@@ -388,10 +471,20 @@ vectorstore = AsyncCockroachDBVectorStore(
     namespace="tenant_a",
 )
 
+# Index the vectors with the namespace as the prefix column, before writes start
+await vectorstore.aapply_vector_index(CSPANNIndex(), prefix_columns=["namespace"])
+
 # All operations are scoped to tenant_a
-ids = await vectorstore.aadd_texts(["Tenant A document"])
+ids = await vectorstore.aadd_texts(
+    ["Tenant A document"], metadatas=[{"category": "news"}]
+)
 results = await vectorstore.asimilarity_search("query", k=5)
+results = await vectorstore.asimilarity_search(
+    "query", k=5, filter={"category": "news"}
+)
 ```
+
+从 v0.6.0 起，带 metadata `filter` 的搜索也会使用 C-SPANN 索引：store 会对来自索引的最近行应用该 filter，只有当通过的行太少时才执行精确搜索。namespace 必须是该索引唯一的前缀列，如示例所示；来自索引的结果与任何索引搜索一样是近似结果。
 
 Document id 必须跨 namespace 唯一。库生成的 id 始终是唯一的；如果添加的文档 id 已属于另一个 namespace，则会引发 `ValueError`，且不会写入任何内容。
 

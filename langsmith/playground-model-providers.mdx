@@ -106,17 +106,34 @@ Amazon Bedrock 支持三种鉴权方式。**IAM trusted entity 是推荐方案**
 #### IAM trusted entity（推荐）
 
 <Note>
-**不适用于 [self-hosted LangSmith](/langsmith/self-hosted) 或 [BYOC](/langsmith/byoc)。** 这类场景请改用 access keys 或 Bedrock API key。
+**不适用于 [self-hosted LangSmith](/langsmith/self-hosted)，也不适用于 GCP 或 Azure 上的 [BYOC](/langsmith/byoc)。** 这类场景请改用 access keys 或 Bedrock API key。在 BYOC AWS data planes 上，请改为遵循 [BYOC 上的 IAM trusted entity](#iam-trusted-entity-on-byoc)，而不是下面的步骤。
 </Note>
 
 使用 IAM trusted entity 鉴权时，你需要在自己的 AWS 账号中创建一个 IAM role，并允许 LangSmith 去 assume 这个 role。LangSmith 不会存储任何 access keys，而是会在每次请求时通过 [AWS STS](https://docs.aws.amazon.com/STS/latest/APIReference/welcome.html) 来 assume 该 role。
 
-此处设置的 `AWS_IAM_ROLE_ARN` secret 也会被 [LLM Gateway](/langsmith/llm-gateway-provider-authentication#use-an-iam-role) 读取。一个 role 即可覆盖 Playground、LLM-as-a-judge evaluators 和 gateway 请求。
+此处设置的 `AWS_IAM_ROLE_ARN` secret 也会被 [LLM Gateway](/langsmith/llm-gateway-provider-authentication#use-an-iam-role) 读取。一个 role 即可覆盖 Playground、LLM-as-a-judge evaluators 和 gateway 请求。如果你还要将该 role 用于 gateway，请为该 role 添加 [gateway 的权限](/langsmith/llm-gateway-provider-authentication#use-an-iam-role)。
 
 配置步骤如下：
 
-1. 在你的 AWS 账号中创建一个 IAM role，并赋予它调用 Bedrock 模型的权限，例如 `bedrock:InvokeModel`。
-2. 添加一条 trust policy，允许 LangSmith 的 AWS 账号（`808407022534`）通过你的 LangSmith workspace ID 作为 external ID 来 assume 这个 role：
+1. 在你的 AWS 账号中创建一个 IAM role，并赋予它调用 Bedrock 模型的权限：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+2. 添加一条 trust policy，允许 LangSmith 的 AWS 账号（`808407022534`）通过你的 LangSmith workspace ID 作为 external ID 来 assume 这个 role。你可以从 Bedrock provider 的 secrets 配置中复制这条 policy，并填入你的 workspace ID：
 
 ```json
 {
@@ -147,6 +164,47 @@ Amazon Bedrock 支持三种鉴权方式。**IAM trusted entity 是推荐方案**
     ![Bedrock secrets and API keys configuration with the IAM Trusted Entity section](/images/langsmith/bedrock-secrets-config.png)
 
 关于 trust policy 的更多细节，请参见 [AWS 文档](https://aws.amazon.com/blogs/security/how-to-use-trust-policies-with-iam-roles/)。
+
+#### IAM trusted entity on BYOC
+
+在 [BYOC](/langsmith/byoc) AWS data planes 上，由你 data plane 的 AWS 账号中的两个 role 来 assume 你的 role，而不是由 LangSmith 的 AWS 账号来 assume。Playground role 为 Playground 和 LLM-as-a-judge evaluators 提供服务。Data plane 的 workload role 为 [LLM Gateway](/langsmith/llm-gateway-provider-authentication#use-an-iam-role) 提供服务。两者都只能 assume 带有 `LangSmithBedrock=true` 标签的 role，并且只能使用 external ID。
+
+如果你的 data plane 使用 [bring your own IAM](/langsmith/byoc-byoiam-aws)，请使用 [`byoiam` Terraform module](https://github.com/langchain-ai/terraform/tree/main/modules/byoc/aws/byoiam) 的 `v0.17.67` 或更高版本创建它。如果你的 data plane 是用更早的版本创建的，请将该 module 升级到 `v0.17.67` 或更高版本并重新 apply。然后联系 [LangSmith support](https://support.langchain.com) 为该 data plane 开启 IAM trusted entity 鉴权。
+
+配置步骤如下：
+
+1. 使用 [IAM trusted entity（推荐）](#iam-trusted-entity-recommended) 中的权限 policy 创建一个 IAM role。如果 LLM Gateway 也要使用该 role，请同时添加 [gateway 的权限](/langsmith/llm-gateway-provider-authentication#use-an-iam-role)。
+2. 为该 role 添加标签 `LangSmithBedrock`，值为 `true`。
+3. 添加一条 trust policy，允许这两个 role 来 assume 你的 role，并使用你的 LangSmith workspace ID 作为 external ID。由于这些 role 会为其会话打上标签，该 policy 还必须在单独的一条 statement 中允许 `sts:TagSession`，且该 statement 不带 `sts:ExternalId` 条件。如果没有这条 statement，AWS 会拒绝 assume 该 role。你可以从 Bedrock provider 的 secrets 配置中复制这条 policy，并填入两个 role ARN 和你的 workspace ID：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": ["<playground-role-arn>", "<gateway-role-arn>"]
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "<your-langsmith-workspace-id>"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": ["<playground-role-arn>", "<gateway-role-arn>"]
+      },
+      "Action": "sts:TagSession"
+    }
+  ]
+}
+```
+
+4. 在 Playground 中，将 role ARN 填入 Bedrock provider 的 **IAM Trusted Entity** 区域，具体操作参见 [IAM trusted entity（推荐）](#iam-trusted-entity-recommended) 的第 3 步。
 
 #### Access keys
 
