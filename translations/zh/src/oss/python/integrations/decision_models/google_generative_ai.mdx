@@ -1,0 +1,258 @@
+---
+title: "Google Gemini Decisions 集成"
+sidebarTitle: "Google Gemini Decisions"
+description: "使用 LangChain Python 集成 GoogleGenAIClassifier 决策模型。"
+---
+
+[Gemini Decisions API](https://aistudio.google.com/docs/decisions-api) 会读取文本、结构化 JSON 和媒体内容，并返回带类型的答案和概率，而不是生成的文本。
+
+`GoogleGenAIClassifier` 将这些 decision 暴露为 LangChain `Runnable`，因此你可以 invoke、batch，或与其他 runnable 组合使用。它接受字符串、JSON 对象和数组、[LangChain message 对象](/oss/langchain/messages) 以及标准媒体块，并在 LangSmith 中记录 traces 和 token 用量。你还可以将它和 [agent middleware](#agent-middleware) 一起使用，以路由模型并对工具调用进行拦截。它适用于聚焦的 decision，例如路由请求、标记内容以供审核，或评定严重程度，由应用代码根据概率或置信度采取行动。
+
+<Note>
+`GoogleGenAIClassifier` 处于 beta 阶段，要求 `langchain-google-genai>=4.5.0` 和 `google-genai>=3.2.0`。其 API 可能会在不另行通知的情况下变更。
+</Note>
+
+## 设置
+
+<CodeGroup>
+```bash uv
+uv add langchain "langchain-google-genai>=4.5.0"
+```
+
+```bash pip
+pip install langchain "langchain-google-genai>=4.5.0"
+```
+</CodeGroup>
+
+在 [Google AI Studio](https://aistudio.google.com/apikey) 中创建 API key 并导出：
+
+```bash
+export GOOGLE_API_KEY=...
+```
+
+`GoogleGenAIClassifier` 会读取 `GOOGLE_API_KEY`，然后读取 `GEMINI_API_KEY`。请求始终使用 Gemini Developer API，而不是 Gemini Enterprise Agent Platform。
+
+## 快速开始
+
+创建一个带 decisions model 的 `GoogleGenAIClassifier`，然后在每次调用时一起传入 state 和命名的问题。共享同一 state 的问题会在一个请求中得到回答：
+
+```python
+from langchain_core.decisions import Choice, Noul, Score
+from langchain_google_genai import GoogleGenAIClassifier
+
+classifier = GoogleGenAIClassifier(model="gemini-decision-1")
+
+response = classifier.invoke(
+    {
+        "state": "The blue mug I ordered arrived cracked. Fix this today!",
+        "questions": {
+            "damaged": Noul(
+                instructions="Did the item arrive damaged?",
+                criteria={"true": "The item is broken, cracked, or dented."},
+            ),
+            "department": Choice(
+                instructions="Which team should handle this request?",
+                criteria={
+                    "billing": "Payment or refund questions.",
+                    "shipping": "Delivery problems or damaged items.",
+                    "other": None,
+                },
+            ),
+            "frustration": Score(
+                instructions="How frustrated does the customer appear?",
+                criteria=["Calm.", "Concerned but civil.", "Very angry."],
+            ),
+        },
+    }
+)
+
+print(response.nouls["damaged"].noul)
+print(response.choices["department"].choice, response.choices["department"].confidence)
+print(response.scores["frustration"].score)
+```
+
+答案以你提供的问题名称为键，并按类型分别归组到 `nouls`、`choices` 和 `scores` 中。所有答案也可通过 `answers` 获取。响应中还会包含作出回答的 `model` 以及 token `usage`。
+
+问题和响应类型（例如 `Noul` 和 `ClassifierResponse`）来自 `langchain_core.decisions`。
+
+每个问题都需要 `instructions`。即使问题名称看起来不言自明，也请在其中写出完整的问题。
+
+## 问题类型
+
+每个问题都属于以下三种类型之一：
+
+| 类型 | 询问 | 返回 | 适用场景 |
+|---|---|---|---|
+| `Noul` | 这是否为真？ | `noul`，即回答“是”的概率 | 你的代码依赖 `if` 分支 |
+| `Choice` | 这些选项中该选哪一个？ | `choice`，以及 `probabilities` 和 `confidence` | 各选项对应不同的代码路径 |
+| `Score` | 哪一个等级？ | `score`，以及 `legend`、`probabilities` 和 `confidence` | 答案是一个需要与阈值比较的连续区间 |
+
+- **`Noul`**：返回 `0.01` 到 `0.99` 之间的概率，因此高于 `0.99` 的阈值永远不会匹配。接近 `0.5` 的值表示不确定，而不是“中等”，所以对于连续区间请使用 `Score`。当仅凭 instructions 仍留有解释空间时，请传入带有 `true` 和 `false` 描述的 `criteria`。`Noul` 答案没有 `confidence`，因为概率本身就是答案。
+- **`Choice`**：将每个标签映射到一个描述；当标签不需要描述时映射到 `None`。如果你的选项可能无法覆盖所有输入，请包含一个 `other` 标签。`confidence` 是所选标签的概率。
+- **`Score`**：接受两个或更多等级，从低到高排列，并从 `0` 开始索引。返回的 `score` 是各等级索引的概率加权平均值，因此可能落在等级之间，而 `legend` 会将每个索引映射到其描述。`confidence` 是所选等级的概率。
+
+描述和 instructions 可以是文本或结构化 JSON。JSON 内容会作为 JSON 文本发送。Decisions API 在问题中只接受文本，因此 instructions 或 criteria 中出现媒体块会引发 `ValueError`。
+
+`langchain_core.decisions` 还定义了一个 `Box` 问题类型，用于定位图像中的对象。Gemini Decisions API 不支持它，对于包含 `Box` 问题的请求，`GoogleGenAIClassifier` 会引发 `ValueError`。
+
+## State
+
+`state` 可以是字符串、JSON 对象或数组，也可以是对象或数组内任意深度的 LangChain messages：
+
+- **字符串**：按原样发送。
+- **JSON 对象和数组**：作为 JSON 文本发送。
+- **LangChain messages**：转换为 role 和 content 对象，然后作为 JSON 文本发送。
+- **媒体块**：带有 `base64` 或 `url` 数据的标准 `image`、`audio`、`video` 和 `file` 块会作为原生媒体发送，并放在它们在 JSON 文本中出现的位置。使用其他数据源的块会引发 `ValueError`。
+
+要对一段对话进行分类，请将 messages 放在 state 中传入：
+
+```python
+from langchain.messages import AIMessage, HumanMessage
+
+response = classifier.invoke(
+    {
+        "state": {
+            "conversation": [
+                HumanMessage("Where is my order?"),
+                AIMessage("It was delivered yesterday."),
+                HumanMessage("It arrived smashed to pieces."),
+            ]
+        },
+        "questions": {
+            "damaged": Noul(instructions="Did the item arrive damaged?"),
+        },
+    }
+)
+```
+
+要对图像进行分类，请在 state 中的任意位置包含一个标准媒体块：
+
+```python
+import base64
+from pathlib import Path
+
+image_data = base64.b64encode(Path("delivery.jpg").read_bytes()).decode()
+
+response = classifier.invoke(
+    {
+        "state": {
+            "caption": "Photo of the delivered item.",
+            "photo": {
+                "type": "image",
+                "base64": image_data,
+                "mime_type": "image/jpeg",
+            },
+        },
+        "questions": {
+            "damaged": Noul(instructions="Did the item arrive damaged?"),
+        },
+    }
+)
+```
+
+## 配置
+
+| 参数 | 描述 |
+|---|---|
+| `model` | Decisions 模型名称，例如 `gemini-decision-1`。必填。 |
+| `api_key` | Google API key。默认使用 `GOOGLE_API_KEY`，然后使用 `GEMINI_API_KEY`。 |
+| `base_url` | API 请求的 base URL。默认为 `google-genai` SDK 的默认值。 |
+| `timeout` | 请求超时时间，单位为秒。 |
+| `max_retries` | 最大请求尝试次数（包括第一次尝试）。设为 `1` 可禁用重试。 |
+| `client` | 用于请求的 `google.genai.Client`。设置后，`api_key`、`base_url`、`timeout` 和 `max_retries` 将被忽略。 |
+
+## 错误
+
+- **`ValueError`**：在以下情况下引发：没有可用的 API key 且未提供 `client`，请求包含 `Box` 问题，或问题的 instructions 或 criteria 包含媒体块。
+- **`ModelRefusalError`**：当 API 阻止输入时引发。消息中包含阻止原因。可从 `langchain_core.exceptions` 导入。
+
+## Agent middleware
+
+LangChain 包含两个 beta middleware，它们会在 agent 的 decision 点使用 decision model。将 `GoogleGenAIClassifier` 作为它们的 `classifier` 传入。两者都要求 `langchain>=1.5.0`：
+
+<CodeGroup>
+```bash uv
+uv add "langchain>=1.5.0" "langchain-google-genai>=4.5.0"
+```
+
+```bash pip
+pip install "langchain>=1.5.0" "langchain-google-genai>=4.5.0"
+```
+</CodeGroup>
+
+### 模型路由
+
+[`ModelRouterMiddleware`](/oss/langchain/middleware/built-in#model-router) 会根据最新的人类消息，为每次 agent 运行从你命名的模型中选择一个：
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import ModelChoice, ModelRouterMiddleware
+from langchain_google_genai import GoogleGenAIClassifier
+
+router = ModelRouterMiddleware(
+    choices={
+        "fast": ModelChoice(
+            model="google_genai:gemini-3.8-flash",
+            criteria="Simple, well-scoped tasks.",
+        ),
+        "powerful": ModelChoice(
+            model="google_genai:gemini-4-carbon",
+            criteria="Complex tasks that need deeper reasoning.",
+        ),
+    },
+    instructions="Choose the least costly model that can complete the task.",
+    classifier=GoogleGenAIClassifier(model="gemini-decision-1"),
+)
+
+agent = create_agent("google_genai:gemini-3.8-flash", middleware=[router])
+
+result = agent.invoke({"messages": [{"role": "user", "content": "What is 2 + 2?"}]})
+print(result["model_route"].choice)
+```
+
+### 工具调用拦截
+
+[`AutoModeMiddleware`](/oss/langchain/middleware/built-in#auto-mode) 会检查对你列出的每个工具的调用，并阻止 classifier 判定为有风险的调用：
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import AutoModeMiddleware
+from langchain.tools import tool
+from langchain_google_genai import GoogleGenAIClassifier
+
+
+@tool
+def delete_file(path: str) -> str:
+    """Delete a file."""
+    return f"Deleted {path}."
+
+
+agent = create_agent(
+    "google_genai:gemini-3.8-flash",
+    tools=[delete_file],
+    middleware=[
+        AutoModeMiddleware(
+            tools=[delete_file],
+            classifier=GoogleGenAIClassifier(model="gemini-decision-1"),
+        )
+    ],
+)
+
+result = agent.invoke({"messages": [{"role": "user", "content": "Delete notes.txt."}]})
+print(result["messages"][-1].text)
+```
+
+默认 instructions 会将破坏性操作视为有风险，即使用户主动要求也是如此。当 agent 调用 `delete_file` 时，middleware 会返回一条错误 `ToolMessage`，而不是运行该工具，agent 会报告该调用已被阻止。
+
+## Tracing
+
+`GoogleGenAIClassifier` 的运行会在 [LangSmith](/langsmith/observability) 中以 `google_genai` provider 和模型名称进行 trace，因此你可以将 decisions 和 token 用量与应用的其他部分一起查看。
+
+## 另请参阅
+
+- [Gemini Decisions API 指南](https://aistudio.google.com/docs/decisions-api)
+- [Google provider 概览](/oss/integrations/providers/google)
+- [ChatGoogleGenerativeAI](/oss/integrations/chat/google_generative_ai)
+- [预构建 middleware](/oss/langchain/middleware/built-in)
+- [OpenAI Decisions 集成](/oss/integrations/decision_models/openai)
+- [LangChain Google GenAI API reference](https://reference.langchain.com/python/langchain-google-genai)

@@ -1,59 +1,54 @@
 ---
 title: 基于属性的访问控制
 sidebarTitle: 基于属性的访问控制
+description: 基于资源标签和 root run metadata 授予或限制对 LangSmith 资源的访问，使用构建在基于角色的访问控制之上的访问策略。
 ---
 
-本参考文档介绍 LangSmith 的基于属性的访问控制（ABAC）系统。它通过资源属性实现细粒度访问控制，可与 [RBAC](/langsmith/rbac) 互补使用。若要自动把用户 provision 到角色中，请参见 [SCIM](/langsmith/user-management#set-up-scim-for-your-organization)。
+基于属性的访问控制（ABAC）允许组织管理员根据资源的属性授予或限制对 LangSmith 资源的访问。
+
+它构建在[基于角色的访问控制（RBAC）](/langsmith/rbac)之上。角色会在整个工作区范围内授予某项权限，例如读取所有 project。访问策略则会将这项权限收窄或扩展到属性匹配的资源，例如带有 `Environment=Development` 标签的 projects。
+
+访问策略可以匹配两类属性：
+
+- **资源标签**（`resource_tag_key`）：projects、datasets、prompts 以及其他工作区资源上的[资源标签](/langsmith/set-up-resource-tags)。
+- **Root run metadata**（`root_run_metadata`）：每条 trace 的 root run 上的 metadata。用它来控制用户在某个 project 内可以读取哪些 traces。详见[使用 root run metadata 控制 trace 访问](#control-trace-access-with-root-run-metadata)。
 
 <Note>
-ABAC（Attribute-Based Access Control）是一个 Enterprise 功能，用于实现细粒度访问控制。如果你对该功能感兴趣，请[联系销售团队](https://www.langchain.com/contact-sales)。其他方案默认所有用户都使用 Admin 角色。
-</Note>
-
-ABAC 通过给访问决策增加基于标签的条件，来补充[基于角色的访问控制（RBAC）](/langsmith/rbac)。RBAC 根据用户角色授予一揽子权限，例如“可以读取所有项目”；而 ABAC 允许你根据资源标签进一步限制或授予访问，例如“只能读取带有 `Environment=Development` 标签的项目”。在单个 project 内，ABAC 还可以根据 root run metadata 限制用户可读取的 traces。详见[使用 root run metadata 控制 trace 访问](#control-trace-access-with-root-run-metadata)。
-
-<Note>
-角色、资源标签和 ABAC 策略都可以通过 UI 或 [API](https://api.smith.langchain.com/docs#/access_policies) 管理。配置完成后，策略会在 API 和 UI 中自动生效。
+ABAC 在 Enterprise 计划中提供。如果你对该功能感兴趣，请[联系销售团队](https://www.langchain.com/contact-sales)。其他计划默认所有用户都使用 Admin 角色。
 </Note>
 
 ## 开始前准备
 
-* 先在工作区中[设置资源标签](/langsmith/set-up-resource-tags)。
-* ABAC 在策略中支持两种 `attribute_name` 取值：`resource_tag_key` 用于评估资源标签，`root_run_metadata` 用于评估 project 中每条 trace 的 root run metadata。
+你需要具备：
+
+- **为你的组织启用 ABAC**：在 LangSmith Cloud 上，ABAC 是 Enterprise 计划的一部分。在自托管部署上，请先[启用 ABAC](#enable-abac-on-a-self-hosted-deployment)。
+- **管理策略的权限**：创建、编辑或删除策略需要 `organization:access-control:manage` 权限，[Organization Admins](/langsmith/rbac#organization-admin) 和 [Organization Operators](/langsmith/rbac#organization-operator) 拥有该权限。
+- **资源标签**：对于基于标签的条件，请在工作区中[设置资源标签](/langsmith/set-up-resource-tags)。仅使用 root run metadata 的策略不需要资源标签。
+- **API 凭证**：若要通过 API 管理策略，请使用拥有 `organization:access-control:manage` 权限的用户的 personal access token（PAT），或拥有 Organization Admin 权限的组织范围 service key。请将请求发送到你的 API URL。对于 LangSmith Cloud，请在 [Regional storage](/langsmith/cloud#regional-storage) 中查找你所在区域的 API URL。对于自托管部署，请使用 `https://<your-langsmith-domain>/api`。
 
 ## 为自托管部署启用 ABAC
 
-1. ABAC 需要运行 Helm chart 0.11.28 或更高版本（应用版本 0.12.1）的[self-hosted](/langsmith/self-hosted) LangSmith 部署。升级后，可使用以下任一方式启用 ABAC：
+在[自托管](/langsmith/self-hosted)部署上使用 ABAC 需要 Helm chart 0.11.28 或更高版本（应用版本 0.12.1）。升级后，可使用以下任一方式启用 ABAC：
 
-    - **为单个组织启用：** 对你的 LangSmith PostgreSQL 数据库执行如下语句，并把 `<organization_id>` 替换成从 UI 中组织设置页面复制的 ID：
+- **为单个组织启用**：对你的 LangSmith PostgreSQL 数据库执行如下语句，并把 `<organization_id>` 替换成从 UI 中组织设置页面复制的 ID：
 
-        ```sql
-        UPDATE organizations SET config = config || '{"can_use_abac": true}' WHERE id = '<organization_id>' AND NOT is_personal;
-        ```
-
-    - **为所有组织启用：** 在 `values.yaml` 的 `commonEnv` 中加入如下环境变量：
-
-        ```yaml
-        DEFAULT_ORG_FEATURE_CAN_USE_ABAC: "true"
-        ```
-
-        <Note>
-        该环境变量对 personal organizations 不生效，因为 personal organizations 不启用 [RBAC](/langsmith/rbac)。
-        </Note>
-
-1. 配置认证。若要通过 API 管理访问策略，你需要一个 Personal Access Token（PAT），其所属用户需拥有 `organization:access-control:manage` 权限（例如 [Organization Admin](/langsmith/rbac#organization-admin) 或 [Organization Operator](/langsmith/rbac#organization-operator)），或一个拥有 Organization Admin 权限的组织范围 service key。在运行任何脚本之前，请设置以下环境变量：
-
-    ```bash
-    export LANGSMITH_API_KEY="your_admin_api_key"
-    # Required for self-hosted or regional SaaS deployments:
-    # export LANGCHAIN_ENDPOINT="https://eu.api.smith.langchain.com"
-    # export LANGCHAIN_ENDPOINT="https://aws.api.smith.langchain.com"
-    # export LANGCHAIN_ENDPOINT="https://apac.api.smith.langchain.com"
-    # export LANGCHAIN_ENDPOINT="https://langsmith.yourdomain.com/api"
+    ```sql
+    UPDATE organizations SET config = config || '{"can_use_abac": true}' WHERE id = '<organization_id>' AND NOT is_personal;
     ```
+
+- **为所有组织启用**：在 `values.yaml` 的 `commonEnv` 中加入如下环境变量：
+
+    ```yaml
+    DEFAULT_ORG_FEATURE_CAN_USE_ABAC: "true"
+    ```
+
+    <Note>
+    该环境变量对 personal organizations 不生效，因为 personal organizations 不启用 [RBAC](/langsmith/rbac)。
+    </Note>
 
 ## 访问策略结构
 
-访问策略定义了在什么条件下允许或拒绝访问。结构如下：
+访问策略是一个 JSON 对象，用于设置 effect、一个或多个条件组，以及该策略适用的角色：
 
 ```json
 {
@@ -82,8 +77,8 @@ ABAC 通过给访问决策增加基于标签的条件，来补充[基于角色�
 
 `effect` 决定在条件匹配时会发生什么：
 
-- **`allow`** - 条件匹配时授予访问
-- **`deny`** - 条件匹配时拒绝访问
+- **`allow`**：条件匹配时授予访问。
+- **`deny`**：条件匹配时拒绝访问。
 
 <Note>
 Deny 策略始终优先。如果 allow 和 deny 策略同时匹配，最终结果一定是拒绝访问。
@@ -91,12 +86,13 @@ Deny 策略始终优先。如果 allow 和 deny 策略同时匹配，最终结�
 
 ### Condition groups
 
-`condition_groups` 数组中包含一个或多个条件组。多个条件组之间使用 **OR 逻辑** 评估，也就是说，只要任意一个组匹配，策略就会生效。
+`condition_groups` 数组中包含一个或多个条件组。LangSmith 使用 **OR 逻辑** 评估多个条件组。只要任意一个组匹配，策略就会生效。
 
-每个条件组都指定：
-- **`permission`** - 该组适用的权限
-- **`resource_type`** - 要匹配的资源类型
-- **`conditions`** - 条件数组（组内采用 **AND 逻辑** 评估）
+每个条件组包含以下字段：
+
+- **`permission`**：该组适用的权限。
+- **`resource_type`**：要匹配的资源类型。
+- **`conditions`**：条件数组，组内采用 **AND 逻辑** 评估。
 
 #### 资源类型与权限
 
@@ -110,21 +106,20 @@ Deny 策略始终优先。如果 allow 和 deny 策略同时匹配，最终结�
 | `mcp_server` | `mcp-servers:read`, `mcp-servers:invoke`, `mcp-servers:update`, `mcp-servers:delete`。详见 [Fleet 工具访问控制](/langsmith/fleet/access-and-oversight#tool-access-control)。 |
 | `fleet_integration` | `mcp-servers:read`, `mcp-servers:invoke`。详见 [Fleet 工具访问控制](/langsmith/fleet/access-and-oversight#tool-access-control)。 |
 
-<Note>
-Runs 本身没有独立标签。Run 权限（`runs:read`、`runs:read-inputs`、`runs:read-outputs`、`runs:create`、`runs:share`、`runs:delete`）是基于其父 project 的标签来评估的。关于输入与输出权限如何影响响应，请参阅[控制对 run 输入与输出的访问](#control-access-to-run-inputs-and-outputs)。
-</Note>
+某些资源类型的评估方式有所不同：
 
-<Note>
-克隆（clone）会将示例从源数据集复制到目标数据集。系统会针对两个数据集分别校验 `datasets:clone` 权限：一次基于源数据集的标签，一次基于目标数据集的标签。要成功完成克隆，策略必须授予对这两个数据集的 `datasets:clone` 访问权限。
-</Note>
+- **Runs**：Runs 本身没有独立标签。Run 权限（`runs:read`、`runs:read-inputs`、`runs:read-outputs`、`runs:create`、`runs:share`、`runs:delete`）是基于其父 project 的标签来评估的。关于输入与输出权限如何影响响应，请参阅[控制对 run 输入与输出的访问](#control-access-to-run-inputs-and-outputs)。
+- **Agent environments**：在[基于 agent 的工作区](/langsmith/agent-registry)中，一个 tracing project 是某个 agent 的一个 [environment](/langsmith/agent-environments)。`project` 条件组会分别应用于每个 environment，而不是应用于整个 agent。
+- **Dataset clones**：克隆（clone）会将示例从源数据集复制到目标数据集。LangSmith 会校验两次 `datasets:clone`，每次针对一个数据集的标签。策略必须对这两个数据集都授予 `datasets:clone`。
 
 #### Conditions
 
-`conditions` 数组中的每个条件都指定：
-- **`attribute_name`** - `resource_tag_key` 用于匹配资源标签，`root_run_metadata` 用于匹配 root run metadata
-- **`attribute_key`** - 要匹配的标签 key 或 metadata key，例如 `Environment`、`Application`
-- **`operator`** - 比较运算符
-- **`attribute_value`** - 要比较的值
+`conditions` 数组中的每个条件包含以下字段：
+
+- **`attribute_name`**：`resource_tag_key` 用于匹配资源标签，`root_run_metadata` 用于匹配 root run metadata。
+- **`attribute_key`**：要匹配的标签 key 或 metadata key，例如 `Environment` 或 `Application`。
+- **`operator`**：比较运算符。
+- **`attribute_value`**：要比较的值。
 
 下面的运算符适用于 `resource_tag_key` 条件。`root_run_metadata` 条件仅支持 `equals`。相关规则请参阅[使用 root run metadata 控制 trace 访问](#control-trace-access-with-root-run-metadata)。
 
@@ -164,11 +159,45 @@ Runs 本身没有独立标签。Run 权限（`runs:read`、`runs:read-inputs`、
 
 策略还可以绑定到 [teams](/langsmith/teams#access-policies)。Team 的策略会应用于其成员在 team 可访问的工作区中。
 
+如需从你的身份提供商自动将用户 provision 到角色中，请参阅 [SCIM](/langsmith/user-management#set-up-scim-for-your-organization)。
+
 ## 管理访问策略
 
-可在组织设置中或通过 LangSmith API 管理访问策略。创建、编辑或删除策略需要 `organization:access-control:manage` 权限，[Organization Admins](/langsmith/rbac#organization-admin) 和 [Organization Operators](/langsmith/rbac#organization-operator) 拥有该权限。在创建策略之前，请先在工作区中[设置资源标签](/langsmith/set-up-resource-tags)。
+你可以在组织设置中使用可视化编辑器，或通过 [LangSmith API](https://api.smith.langchain.com/docs#/access_policies) 管理访问策略。两者都需要 `organization:access-control:manage` 权限。
 
-Teams 不创建策略，只附加已有策略：
+### 在 UI 中创建访问策略
+
+在可视化编辑器中，每个 **rule** 对应一个[条件组](#condition-groups)。
+
+要创建访问策略：
+
+1. 进入 **Settings**，选择 **Organization**。然后进入 **Permissions** > **Access Policies**。在某些版本的设置页面中，该页面列在 **Access and Security** 下的 **ABAC** 中。
+2. 在 **ABAC** 下，选择 **Policies** 标签页，然后点击 **Create Policy**。
+3. 输入 **Name**，并可选填写 **Description**。
+4. 将 **Effect** 设为 **Allow** 或 **Deny**。
+5. 点击 **Add rule**，然后选择 **Resource Type** 和 **Permission**。
+6. 点击 **Add condition**，并选择条件来源：
+   - **Resource tag**：输入 **Tag Key**、运算符和 **Tag Value**。在策略中使用资源标签之前，请先[创建资源标签](/langsmith/set-up-resource-tags)。
+   - **Root-run metadata**：首先为 **Resource Type** 选择 **Project**，为 **Permission** 选择 `runs:read`。输入 **Metadata Key** 和 **Metadata Value**。运算符固定为 `equals`，**Metadata Value** 会预填 `${user.ls_user_id}`，用于匹配当前用户。若要匹配固定值，请将其替换为字面值。相关要求和示例请参阅[在 UI 中创建 root run metadata 策略](#create-a-root-run-metadata-policy-in-the-ui)。
+7. 点击 **Save condition**，按需添加更多条件，然后点击 **Add rule** 返回策略编辑器。一个 rule 内的所有条件都必须匹配，多个 rule 之间使用 OR 逻辑。
+8. （可选）将策略附加到角色。策略只有在你将其附加到角色或 [team](/langsmith/teams#access-policies) 后才会生效。在 **Roles** 下的对话框中，点击 **Add role**。选择该策略适用的工作区角色，然后点击 **Add roles**。添加之前，你可以查看每个角色的权限。你也可以稍后再将策略附加到角色。
+9. 完成时，点击 **Create policy**。
+
+<Tip>
+如需改用 JSON 编写策略，请点击策略编辑器中 **UI** 旁的 **JSON editor** 图标（<Icon icon="code" />）。JSON 编辑器会以[访问策略结构](#access-policy-structure)展示目前已构建的策略。
+</Tip>
+
+### 编辑或删除访问策略
+
+在 **Policies** 标签页中，使用策略 **Actions** 列中的图标。要编辑策略（包括附加或移除角色），点击其编辑图标，进行修改，然后点击 **Save changes**。要删除策略，点击其删除图标，输入策略名称以确认，然后点击 **Delete**。
+
+<Warning>
+删除策略会移除其角色和 team 附加关系。删除 deny 策略可能会授予访问。删除 allow 策略可能会移除访问。
+</Warning>
+
+### 将策略附加到 teams
+
+[Teams](/langsmith/teams) 不创建策略，只附加已有策略：
 
 - 将策略附加到 team 需要 `organization:teams:manage-policies`。
 - Workspace Admin 可在其工作区中把已有策略作为[仅工作区策略](/langsmith/teams#add-workspace-only-members-and-policies)附加到 team，所需权限为 `workspaces:teams:manage-policies`。
@@ -179,23 +208,21 @@ Teams 不创建策略，只附加已有策略：
 
 在决定是否允许访问资源时，系统会同时考虑 [RBAC](/langsmith/rbac) 权限和 ABAC 策略：
 
-- ABAC **deny** 策略会覆盖 RBAC 权限
-- ABAC **allow** 策略即使在没有 RBAC 权限的情况下，也可以授予访问
-- 如果没有任何 ABAC 策略匹配，系统就会回退到 RBAC
+- ABAC **deny** 策略会覆盖 RBAC 权限。
+- ABAC **allow** 策略即使在没有 RBAC 权限的情况下，也可以授予访问。
+- 如果没有任何 ABAC 策略匹配，系统就会回退到 RBAC。
 
 当用户属于多个 [teams](/langsmith/teams) 时，LangSmith 会同时评估用户角色和每个 team 带来的权限与策略。只要其中任一来源存在匹配的 deny 策略，访问仍会被拒绝。
 
-### 策略评估结果
-
-**功能组合：**
+访问模型取决于组织启用了哪些功能：
 
 | RBAC enabled | ABAC enabled | 行为 |
 | --- | --- | --- |
 | ✗ | ✗ | 所有工作区成员都拥有 Admin 级访问 |
-| ✓ | ✗ | 标准 RBAC，根据角色权限决定访问 |
-| ✓ | ✓ | RBAC + ABAC，提供基于标签的细粒度访问控制 |
+| ✓ | ✗ | 标准 RBAC（根据角色权限决定访问） |
+| ✓ | ✓ | RBAC + ABAC（细粒度、基于属性的访问控制） |
 
-**当 RBAC 和 ABAC 同时启用时：**
+当 RBAC 和 ABAC 同时启用时，每个请求按如下方式解析：
 
 | RBAC permits | Allow policy matches | Deny policy matches | 结果 |
 | --- | --- | --- | --- |
@@ -211,7 +238,9 @@ Teams 不创建策略，只附加已有策略：
 
 <a id="control-access-to-run-inputs-and-outputs"></a>
 
-`runs:read` 控制用户能否看到某个 run。`runs:read-inputs` 和 `runs:read-outputs` 控制用户能否看到该 run 的输入与输出。这些权限的访问策略使用 `resource_type: "project"`，并基于每个 run 的父 project 进行评估，因此你可以在部分 project 中隐藏输入、输出或两者，同时保持工作区中其他 project 不受影响。这些权限的 RBAC 与 ABAC 组合方式与其他任何权限相同。详见 [ABAC 与 RBAC 如何协同工作](#how-abac-works-with-rbac)。
+`runs:read` 控制用户能否看到某个 run。`runs:read-inputs` 和 `runs:read-outputs` 控制用户能否看到该 run 的输入与输出。消息与轨迹视图需要同时具备这两个权限。
+
+这些权限的策略使用 `resource_type: "project"`，并评估每个 run 的父 project 的标签。你可以用它们在敏感 project 中隐藏输入、输出或两者，同时保持工作区中其他 project 不受影响。这些权限的 RBAC 与 ABAC 组合方式与其他任何权限相同，详见 [ABAC 与 RBAC 如何协同工作](#how-abac-works-with-rbac)。示例请参阅[在敏感 project 中隐藏 run 输入与输出](#6-hide-run-inputs-and-outputs-in-sensitive-projects)。
 
 ## 使用 root run metadata 控制 trace 访问
 
@@ -230,6 +259,27 @@ Teams 不创建策略，只附加已有策略：
 条件组可以把 `root_run_metadata` 条件与 `resource_tag_key` 条件组合使用。标签条件用于选择该组适用的 projects，metadata 条件用于选择这些 project 中的 traces。组内所有条件都必须匹配。
 
 条件只评估 root run，因此一条 trace 中的所有 runs 要么全部可见，要么全部隐藏。请在摄取之前为 root run 设置好 metadata key 和 value。root run metadata 在摄取后不可变，因此你无法事后再添加或修改它来让某条 trace 匹配策略。关于如何添加 metadata，请参阅[为 traces 添加 metadata 与标签](/langsmith/add-metadata-tags)。
+
+### 在 UI 中创建 root run metadata 策略
+
+<Note>
+**Root-run metadata** 选项需要 **Project** 资源类型和 `runs:read` 权限。你的组织还必须启用 root run metadata 条件。该选项在自托管 UI 中不可用；在自托管安装中，请改用 [API](#7-hide-traces-by-root-run-metadata) 创建 root run metadata 策略。在 cloud 上，如果你在选择该资源类型和权限后该选项被禁用，请联系你的 LangChain 代表。
+</Note>
+
+以下示例创建一条 deny 策略，隐藏 root run 的 `source` 为 `customer` 的 traces。
+
+要创建该策略：
+
+1. 打开策略编辑器，步骤与[在 UI 中创建访问策略](#create-an-access-policy-in-the-ui)的第 1、2 步相同。在 **Name** 中输入 `Hide Customer Traces`，并将 **Effect** 设为 **Deny**。
+2. 点击 **Add rule**。为 **Resource Type** 选择 **Project**，为 **Permission** 选择 `runs:read`。
+3. 点击 **Add condition**，将来源从 **Resource tag** 改为 **Root-run metadata**。
+4. 在 **Metadata Key** 中输入 `source`。运算符固定为 `equals`。将 **Metadata Value** 中预填的 `${user.ls_user_id}` 替换为 `customer`。
+5. 点击 **Save condition**，然后点击 **Add rule**。
+6. 在 **Roles** 下，添加不应看到这些 traces 的工作区角色。点击 **Create policy**。
+
+这会生成[按 root run metadata 隐藏 traces](#7-hide-traces-by-root-run-metadata)示例策略。向同一个 rule 添加资源标签条件，可将其限制到特定 projects。
+
+如需[只向用户显示标记给他们的 traces](#8-show-users-only-the-traces-labeled-for-them)，请改用 **Allow**。将 **Metadata Key** 设为 `allowed_ls_user_id`，并保留 **Metadata Value** 中预填的 `${user.ls_user_id}`。将该策略附加到没有 `runs:read` 的角色上。如果角色拥有 `runs:read`，其 RBAC 权限仍会授予对其他 traces 的访问。
 
 ### metadata 条件如何与 RBAC 结合
 

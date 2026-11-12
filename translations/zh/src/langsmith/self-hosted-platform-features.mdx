@@ -40,6 +40,7 @@ listener 数据模型仅适用于 self-hosted 部署。control plane 与 listene
 | 小数形式的 `cpu` 和 `queue_cpu` 值（例如 `0.5`） | 高于 0.12.x。listener 0.12.x 会拒绝小数值。 |
 | `redis_cpu` 和 `redis_cpu_limit` | 0.13.22 或更高。更早的 listener 会忽略这些字段。 |
 | 低于 `2048` 的 `redis_memory_mb` | 0.13.27 或更高。更早的 listener 要求至少为 `2048`。 |
+| `volumes` 和 `volume_mounts` | 0.11.30 或更高。更早的 listener 会忽略这些字段，deployment 会在没有该 volume 的情况下启动。 |
 
 升级 listener 不会重启已有的 deployments。升级后，请用完整的 `resource_spec` `PATCH` 每个 deployment，以应用新值。关于接受的取值范围和 `PATCH` 行为，请参阅 [Resource spec](/langsmith/api-ref-control-plane#resource-spec)。
 
@@ -50,6 +51,56 @@ listener 数据模型仅适用于 self-hosted 部署。control plane 与 listene
 `db_*` 字段设定 control plane 创建的 PostgreSQL 实例的规格，`redis_*` 字段设定 Redis 实例的规格。如果 deployment 使用[自定义 PostgreSQL](#custom-postgresql) 或[自定义 Redis](#custom-redis)，对应的字段不会生效。
 
 deployment 资源没有组织或 workspace 级别的默认值。未设置的字段会回退为该 deployment 类型的默认值，因此创建每个 deployment 时都要发送完整的 `resource_spec`。关于调优建议，请参阅 [Configure Agent Server for scale](/langsmith/agent-server-scale)。
+
+## Volumes
+
+你可以将 Kubernetes volumes 挂载到 deployment 的 pods 中。例如，挂载一个由 Amazon EFS、NFS 或其他 CSI driver 支持的 PersistentVolumeClaim。挂载的 volume 让 agent 能够读写文件，这些文件在重启后仍然存在，或由多个副本共享。operator 会将这些 volumes 添加到 API server 和 queue worker pods 的主容器中。
+
+这些 volumes 是 agent 运行时的存储，与 LangSmith 平台自身使用的存储（例如 PostgreSQL、Redis 和 blob storage）相互独立。LangSmith 不会预配存储，也不会创建 PersistentVolumeClaim。这两者都由你在集群中创建，deployment 只负责挂载它们。
+
+可以通过以下两个位置之一设置 volumes：
+
+- **单个 deployment**：通过 [control plane API](/langsmith/api-ref-control-plane) 在 deployment 的 `resource_spec` 中设置 `volumes` 和 `volume_mounts`。这些字段要求 listener 0.11.30 或更高版本。参见 [Listener 版本要求](#listener-version-requirements)。你无法在 LangSmith UI 中添加 PersistentVolumeClaims 或其他通用 volumes。在 UI 中保存 deployment 设置会保留你通过 API 设置的 volumes 和 mounts。
+- **所有 deployments**：在你的 Helm values（`operator.templates.deployment`）中，将 `volumes` 和 `volumeMounts` 添加到 operator 的基础 deployment 模板。有关编辑该模板的示例，请参阅[为私有 registry 配置认证](/langsmith/enable-self-hosted-deployment#configure-authentication-for-private-registries)。
+
+如果基础模板和 deployment 的 `resource_spec` 设置了同名（相同 `name`）的 volume 或 volume mount，则以 deployment 的 `resource_spec` 为准。
+
+要在单个 deployment 上挂载 volume：
+
+1. 在 deployment 运行所在的 Kubernetes namespace 中创建 PersistentVolumeClaim。对于 Amazon EFS，请安装 [Amazon EFS CSI driver](https://docs.aws.amazon.com/eks/latest/userguide/efs-csi.html)，并使用访问模式为 `ReadWriteMany` 的 EFS StorageClass。`ReadWriteMany` 允许每个副本挂载该 volume。
+1. 调用 `PATCH /v2/deployments/{deployment_id}`，并在 `source_config.resource_spec` 中包含该 volume 及其 mount。包含 `resource_spec` 的 `PATCH` 会替换整个对象，因此请一并包含现有的 `min_scale`、`max_scale`、`cpu`、`memory_mb` 和其他 `resource_spec` 值。每个 `volumes` 条目需要一个 `name` 和且仅一个 volume source：`persistentVolumeClaim`、`csi`、`nfs`、`configMap`、`secret`、`emptyDir`、`projected` 或 `downwardAPI`。control plane 会将 source 对象原样传递给 Kubernetes。请用 Kubernetes 的 camelCase 书写其键，例如 `claimName`：
+
+    ```json
+    {
+      "source_config": {
+        "resource_spec": {
+          "min_scale": 1,
+          "max_scale": 3,
+          "cpu": 1,
+          "memory_mb": 2048,
+          "volumes": [
+            {
+              "name": "shared-files",
+              "persistentVolumeClaim": { "claimName": "efs-claim" }
+            }
+          ],
+          "volume_mounts": [
+            { "name": "shared-files", "mountPath": "/mnt/shared" }
+          ]
+        }
+      }
+    }
+    ```
+
+    Volume 名称必须唯一，并且是有效的 DNS label：小写字母、数字和连字符，最多 63 个字符。每个 `mountPath` 必须是绝对路径。`volume_mounts` 中任意两个条目不能使用相同的 `mountPath`。
+
+    更多信息，请参阅 [Resource spec](/langsmith/api-ref-control-plane#resource-spec)。
+1. 轮询新 revision，直到其 `status` 为 `DEPLOYED`。
+1. 确认 app 容器能在 API server 和 queue worker pods 中的 `mountPath` 处读写。`Bound` 状态的 PersistentVolumeClaim 并不保证容器用户对该 volume 具有写入权限。要检查写入权限，请对每个 pod 运行以下命令：
+
+    ```bash
+    kubectl exec <pod-name> -n <namespace> -- sh -c 'touch /mnt/shared/.write-test && rm /mnt/shared/.write-test'
+    ```
 
 ## PodDisruptionBudgets
 

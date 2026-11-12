@@ -19,9 +19,9 @@ GCP 上的 BYOC 处于 [beta](/langsmith/release-stages) 阶段。输入和行�
 
 - **在你的组织上启用 BYOC**：在 [smith.langchain.com](https://smith.langchain.com) 的 LangSmith 中创建一个组织，或复用现有组织，然后将其组织 ID 发送给 LangChain 团队以启用 BYOC。
 - **一个组织管理员**：创建 data plane 需要 organization admin 角色，以及该用户的 API key。
-- **一个用于 data plane 的 GCP 项目**：请使用仅存放 LangSmith 资源的项目，因为 provisioner 的访问权限覆盖整个项目。详细信息请参阅 [LangChain 可以访问和无法访问的内容](/langsmith/byoc-architecture-gcp#what-langchain-can-and-cannot-access)。
-- **该项目的权限**：创建 service accounts、授予项目 IAM 角色以及启用 API 的权限。
-- **Terraform**：Terraform 1.11.0 或更高版本，并使用 Google provider `~> 6.0`。
+- **一个用于 data plane 的 GCP 项目**：请使用仅存放 LangSmith 资源的项目。provisioner 的大多数权限仅适用于名称以 `langsmith-` 开头的资源，但有些权限覆盖整个项目。如果该项目还存放其他资源，请在[第 2 步](#step-2-run-the-terraform-module)中设置 `byo_iam = true`。该项目必须尚未有 `managed_by` 标签键，并且只能包含一份 Terraform module。详细信息请参阅 [LangChain 可以访问和无法访问的内容](/langsmith/byoc-architecture-gcp#what-langchain-can-and-cannot-access)。
+- **该项目的权限**：创建 service accounts、授予项目 IAM 角色、启用 API 以及创建标签的权限。标签需要项目上的 Tag Administrator（`roles/resourcemanager.tagAdmin`）。
+- **Terraform**：Terraform 1.11.0 或更高版本，并使用 Google provider 6.0 或更高版本、9.0 以下版本。
 - **一个 GCP region**：GCP 上的 BYOC 可以在任意 GCP region 中运行。如果你需要的 region 尚未启用，请联系 LangChain 团队添加。
 - **资源位置策略**：如果你的 GCP 组织限制了资源位置，请允许 data plane 所在的 region 和 `us-central1`。data plane 会在 `us-central1` 中创建指向 LangSmith 的 Private Service Connect endpoint。
 
@@ -30,12 +30,11 @@ GCP 上的 BYOC 处于 [beta](/langsmith/release-stages) 阶段。输入和行�
 ```mermaid
 flowchart LR
   A["1. Get the<br>external ID"] --> B["2. Run the<br>Terraform module"]
-  B --> C["3. Send your project<br>number to LangChain"]
-  C --> D["4. Create the<br>data plane"]
-  D --> E["5. Wait until<br>active"]
+  B --> C["3. Create the<br>data plane"]
+  C --> D["4. Wait until<br>active"]
 
   classDef process fill:#E5F4FF,stroke:#006DDD,stroke-width:2px,color:#030710
-  class A,B,C,D,E process
+  class A,B,C,D process
 ```
 
 ### Step 1. Get the external ID
@@ -48,7 +47,8 @@ flowchart LR
 
 - 启用 data plane 使用的 API。如果你在其他地方管理项目的 API，请设置 `enable_apis = false`。
 - 创建 provisioner service account `langsmith-byoc-provisioner`，并将其描述设置为你的 external ID。
-- 为其授予自定义角色，其中仅包含预置和拆除所需的权限。
+- 为其授予自定义角色，其中仅包含预置和拆除所需的权限。其中大多数权限仅适用于名称以 `langsmith-` 开头的资源。
+- 在项目中创建标签 `managed_by: langsmith`，并仅对带有该标签的 GKE cluster 授予 LangSmith control plane service account `roles/container.admin`。LangSmith 会为其创建的 data plane GKE cluster 和 Cloud SQL instance 打上标签，而 Postgres 设置账号的 Cloud SQL 权限仅适用于带标签的 instance。
 - 允许 LangSmith control plane service account `byoc-crossplane@langchain-prod.iam.gserviceaccount.com` 通过 Service Account Token Creator 角色模拟它。该 module 不信任任何其他 LangSmith 身份。
 
 ```hcl
@@ -57,7 +57,7 @@ provider "google" {
 }
 
 module "langsmith_byoc_service_account" {
-  source = "github.com/langchain-ai/terraform//modules/byoc/gcp/langsmith-byoc-service-account?ref=v0.17.60"
+  source = "github.com/langchain-ai/terraform//modules/byoc/gcp/langsmith-byoc-service-account?ref=v0.17.80"
 
   project_id                 = "<project-id>"
   crossplane_service_account = "byoc-crossplane@langchain-prod.iam.gserviceaccount.com"
@@ -69,23 +69,13 @@ output "provisioner_service_account" {
 }
 ```
 
-请使用 v0.17.58 或更高版本的 module。更早的版本缺少一项权限，而项目中的第一个 data plane 需要该权限来创建其 Private Service Connect endpoint。
+LangSmith 要求使用 v0.17.80 或更高版本的 module。如果你应用了更早的版本，请在 v0.17.80 或更高版本上重新应用该 module。
 
-如果你要自行创建 data plane 的 service accounts 及其项目角色，请在项目中创建 data plane 之前设置 `byo_iam = true`。此时 provisioner 无法创建 service accounts 或更改项目 IAM 策略。创建 data plane 时，请将 `byoiam_enabled` 设置为 `true`。更多信息，请参阅[自带 IAM](/langsmith/byoc-architecture-gcp#bring-your-own-iam)。
+如果你要自行创建 data plane 的 service accounts 及其项目角色，请在项目中创建 data plane 之前设置 `byo_iam = true`。此时 provisioner 无法创建 service accounts 或更改项目 IAM 策略。如果项目中存放了不属于 LangSmith 的资源，请设置它。创建 data plane 时，请将 `byoiam_enabled` 设置为 `true`。更多信息，请参阅[自带 IAM](/langsmith/byoc-architecture-gcp#bring-your-own-iam)。
 
-### Step 3. Send your project number to LangChain
+### Step 3. Create the data plane
 
-LangChain 必须允许你的项目通过 Private Service Connect 连接到 LangSmith。在此之前，预置无法完成。
-
-获取你的项目编号：
-
-```bash
-gcloud projects describe <project-id> --format='value(projectNumber)'
-```
-
-将其发送给 LangChain 团队，并在创建 data plane 之前等待确认。
-
-### Step 4. Create the data plane
+LangSmith 会在预置过程中自动将你的项目添加到 Private Service Connect accept list。你无需将项目编号发送给 LangChain，也无需在创建 data plane 之前等待手动批准。
 
 使用组织管理员的 API key，通过 LangSmith API 创建 data plane：
 
@@ -119,7 +109,7 @@ curl -X POST https://api.smith.langchain.com/orgs/current/data-planes \
 
 API 返回 `202`，并附带 data plane 的 `id`、`api_url` 和 `status`。在接受请求之前，LangSmith 会检查它能否模拟 provisioner，以及 provisioner 是否位于该项目中并带有你的 external ID。如果检查失败，响应中会指出问题。参见[排查创建错误](#troubleshoot-create-errors)。
 
-### Step 5. Wait until active
+### Step 4. Wait until active
 
 LangSmith 会在你的项目中预置基础设施。data plane 状态会从 `requested` 转到 `provisioning`，再到 `active`。你可以在 **Settings > Data Planes** 中跟踪它，或使用 `GET /orgs/current/data-planes/<id>`。
 
@@ -127,7 +117,7 @@ LangSmith 会在你的项目中预置基础设施。data plane 状态会从 `req
 预置最多可能需要 3 小时。超过 3 小时后，状态会变为 `provisioning_failed`。如果出现这种情况，请联系 LangChain 团队。
 </Note>
 
-data plane 处于 active 状态后，其中会有一个名为 `dp-<data_plane_name>` 的 workspace 可用，你可以像在 AWS 上一样创建更多 workspaces。参见 [BYOC 入门](/langsmith/byoc-onboarding-aws)中的 **Create workspaces** 步骤。
+data plane 处于 active 状态后，其中会有一个名为 `dp-<data_plane_name>` 的 workspace 可用，你可以创建更多 workspaces。参见 [BYOC 入门](/langsmith/byoc-onboarding-aws)中的 **Create workspaces** 步骤。
 
 ## 使用你的 data plane
 
@@ -196,9 +186,19 @@ GKE 节点会在 GKE `REGULAR` release channel 上自动升级。
 
 要删除 data plane：
 
-1. 使用 `DELETE /orgs/current/data-planes/<id>` 删除 data plane。你可以在它处于 `active`、`provisioning` 或 `provisioning_failed` 状态时删除它。LangSmith 会删除它在项目中创建的资源，以及这些资源中的所有数据。
+1. 使用 `DELETE /orgs/current/data-planes/<id>` 删除 data plane。你可以在它处于 `active`、`provisioning` 或 `provisioning_failed` 状态时删除它。LangSmith 会删除它在项目中创建的资源，但数据除外：Cloud Storage 存储桶及其对象会保留，Cloud SQL 备份的存续时间会超过 instance。参见[拆除会保留的内容](#what-teardown-keeps)。
 1. 等待 data plane 从 **Settings > Data Planes** 中消失。
 1. 如果没有其他 data plane 使用该项目，请运行 `terraform destroy`。
+
+### 拆除会保留的内容
+
+拆除会在你的项目中保留 data plane 的数据：
+
+- **Cloud Storage 存储桶**：存储桶及其对象会保留。其标签包含 data plane ID。
+- **最终的 Cloud SQL 备份**：Cloud SQL 在删除 instance 时会创建一份最终备份，并保留 365 天。
+- **自动 Cloud SQL 备份**：instance 的自动备份会保留，并每天过期一份。
+
+LangSmith 之后不会删除它们，`terraform destroy` 也不会。当你不再需要它们时，请自行删除。
 
 ## 获取帮助
 

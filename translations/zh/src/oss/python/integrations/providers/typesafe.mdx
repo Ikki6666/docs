@@ -5,19 +5,23 @@ description: "使用 LangChain 集成 TypeSafe"
 
 [Jev](https://docs.typesafe.ai/models) 是一个 [System One model](https://docs.typesafe.ai/concepts/system-one)，它读取自然语言，但返回带类型的答案和经过校准的概率，而不是生成的文本。
 
-`TypeSafeClassifier` 将这些决策以 LangChain `Runnable` 的形式暴露出来，因此你可以调用它们、批量处理，或与其他 runnable 组合。它接受字符串、结构化 JSON 和 [LangChain 消息对象](/oss/langchain/messages)，并在 LangSmith 中记录 traces 和 token usage。可以用它处理聚焦的决策，例如路由请求、选择模型，或检查某个工具调用是否可以安全运行。
+`TypeSafeClassifier` 通过 `BaseDecisionModel` 实现 LangChain Decisions API。它是一个 `Runnable`，因此你可以调用它、批量处理，或与其他 runnable 组合。它接受字符串、结构化 JSON 和 [LangChain 消息对象](/oss/langchain/messages)，并在 LangSmith 中记录 traces 和 token usage。可以用它处理聚焦的决策，例如路由请求、选择模型，或检查某个工具调用是否可以安全运行。
 
 在 LangChain middleware 中使用 TypeSafe 决策，可以在特定的生命周期节点控制 `create_agent` 行为，包括使用对 agent 状态进行分类的自定义 middleware。示例请参见 [Agent middleware](#agent-middleware)。
 
 ## 设置
 
+<Note>
+这些示例需要 `langchain-typesafe>=0.1.0` 和 Python 3.11 或更高版本。此版本使用 `langchain_core.decisions` 中的共享决策类型。
+</Note>
+
 <CodeGroup>
 ```bash uv
-uv add langchain-typesafe
+uv add "langchain-typesafe>=0.1.0"
 ```
 
 ```bash pip
-pip install langchain-typesafe
+pip install "langchain-typesafe>=0.1.0"
 ```
 </CodeGroup>
 
@@ -44,7 +48,8 @@ export TYPESAFE_BASE_URL=https://gateway.example.com
 </Note>
 
 ```python
-from langchain_typesafe import Choice, Noul, Score, TypeSafeClassifier
+from langchain_core.decisions import Choice, Noul, Score
+from langchain_typesafe import TypeSafeClassifier
 
 classifier = TypeSafeClassifier()
 
@@ -76,39 +81,51 @@ print(response.choices["team"].choice, response.choices["team"].confidence)
 print(response.scores["severity"].score)
 ```
 
-答案以你提供的问题 ID 为键，并按类型分组到 `nouls`、`choices` 和 `scores` 上。响应还携带做出回答的 `model`、token `usage`，以及 TypeSafe 的 `request_id`。
+答案以你提供的问题 ID 为键，并按类型分组到 `nouls`、`choices`、`scores` 和 `boxes` 上。响应还携带做出回答的 `model`、可选的 token `usage`，以及 TypeSafe 的 `request_id`。
+
+在 0.1 版本中，`usage` 是一个字典，而不是带有 token 计数属性的对象。读取它之前请先检查是否为 `None`：
+
+```python
+if response.usage is not None:
+    print(response.usage["input_tokens"])
+    print(response.usage["output_tokens"])
+    print(response.usage["total_tokens"])
+```
 
 请求的 `state` 可以是字符串、JSON 对象或数组，也可以是 LangChain 消息。`BaseMessage` 或消息序列会被转换为 role/content JSON，包括嵌套在更大对象中的情况。
 
 ## 决策类型
 
-每个问题都是三种[原语](https://docs.typesafe.ai/primitives)之一：
+请从 `langchain_core.decisions` 导入问题类型。为保持兼容，`langchain_typesafe` 的重导出仍然可用。每个问题都是四种原语之一：
 
 | Primitive | 提问 | 返回 | 何时使用 |
 |---|---|---|---|
 | [`Noul`](https://docs.typesafe.ai/primitives/noul) | 这是否为真？ | `noul`，即回答为 yes 的概率 | 你的代码基于 `if` 分支 |
 | [`Choice`](https://docs.typesafe.ai/primitives/choice) | 这些选项中的哪一个？ | `choice`，外加 `probabilities` 和 `confidence` | 选项对应不同的代码路径 |
 | [`Score`](https://docs.typesafe.ai/primitives/score) | 哪个级别？ | `score`，外加 `legend`、`probabilities` 和 `confidence` | 答案是一个需要与阈值比较的连续谱 |
+| `Box` | 它在图像中的哪个位置？ | `box`，带有归一化边缘，以及可选的 `confidence` | 答案用于定位一个对象或区域 |
 
-`Noul` 是唯一没有 `confidence` 的，因为概率本身就是答案。对于连续谱请使用 `Score` 而不是 `Noul`：`Noul` 为 `0.5` 表示 yes 和 no 均势对半，而不是“中等”。
+`Noul` 没有 `confidence`，因为概率本身就是答案。对于连续谱请使用 `Score` 而不是 `Noul`：`Noul` 为 `0.5` 表示 yes 和 no 均势对半，而不是“中等”。
+
+TypeSafe 接受 PNG 和 JPEG 图像，形式为包含 base64 数据或 base64 `data:` URL 的 LangChain 图像内容块。图像可以出现在 state、问题 instructions 或 criteria 中。远程图像 URL 不会被下载。对于 `Box` 问题，请读取 `response.boxes[question_id].box`；它的 `top`、`bottom`、`left` 和 `right` 边缘范围从 `0` 到 `1`。
 
 ## Agent middleware
 
-该包包含两个实验性的 [middleware](/oss/langchain/middleware/overview)，它们把分类器放到 agent 的决策点上。请从 `langchain_typesafe.experimental.middleware` 导入。
+LangChain 提供两个由决策驱动的 [middleware](/oss/langchain/middleware/overview)，它们通过 `classifier=` 接受 `TypeSafeClassifier`。
 
 <Note>
-这些 middleware 是实验性的，需要 `langchain-typesafe[experimental]`。它们的 API 可能会在没有通知的情况下变化。
+这些 middleware 处于 beta 阶段，需要 `langchain>=1.5.0`。从 `langchain_typesafe.experimental.middleware` 的导入在 `langchain-typesafe>=0.1.0` 中已弃用。请改为从 `langchain.agents.middleware` 导入，并传入 `classifier=TypeSafeClassifier()`。
 </Note>
 
-下面的示例使用 OpenAI 模型。使用之前，请安装 experimental extra 和 OpenAI 集成：
+下面的示例使用 OpenAI 模型。使用之前，请安装 LangChain 和 OpenAI 集成：
 
 <CodeGroup>
 ```bash uv
-uv add "langchain-typesafe[experimental]" langchain-openai
+uv add "langchain>=1.5.0" "langchain-typesafe>=0.1.0" langchain-openai
 ```
 
 ```bash pip
-pip install "langchain-typesafe[experimental]" langchain-openai
+pip install "langchain>=1.5.0" "langchain-typesafe>=0.1.0" langchain-openai
 ```
 </CodeGroup>
 
@@ -123,12 +140,11 @@ pip install "langchain-typesafe[experimental]" langchain-openai
 
 ```python
 from langchain.agents import create_agent
-from langchain_typesafe.experimental.middleware import (
-    ModelChoice,
-    ModelRouterMiddleware,
-)
+from langchain.agents.middleware import ModelChoice, ModelRouterMiddleware
+from langchain_typesafe import TypeSafeClassifier
 
 router = ModelRouterMiddleware(
+    classifier=TypeSafeClassifier(),
     choices={
         "fast": ModelChoice(
             model="openai:gpt-5.6-terra",
@@ -163,10 +179,9 @@ print(result["model_route"].choice)
 
 ```python
 from langchain.agents import create_agent
-from langchain.messages import ToolMessage
+from langchain.agents.middleware import AutoModeMiddleware
 from langchain.tools import tool
-from langchain_typesafe import NoulCriteria
-from langchain_typesafe.experimental.middleware import AutoModeMiddleware
+from langchain_typesafe import TypeSafeClassifier
 
 
 @tool
@@ -178,16 +193,21 @@ def delete_all_backups() -> str:
 agent = create_agent(
     "openai:gpt-6-astra",
     tools=[delete_all_backups],
-    middleware=[AutoModeMiddleware(tools=[delete_all_backups])],
+    middleware=[
+        AutoModeMiddleware(
+            tools=[delete_all_backups],
+            classifier=TypeSafeClassifier(),
+        )
+    ],
 )
 
 result = agent.invoke(
     {"messages": [{"role": "user", "content": "Delete all backups."}]}
 )
-print(result["messages"][-1].content)
+print(result["messages"][-1].content_blocks)
 ```
 
-可以覆盖 `instructions`，或传入 `criteria=NoulCriteria(true=..., false=...)`，以描述你自己的工具的风险。
+可以覆盖 `instructions`，或从 `langchain_core.decisions` 传入 `criteria=NoulCriteria(true=..., false=...)`，以描述你自己的工具的风险。
 
 <Warning>
 除非可以接受把密钥发送给 TypeSafe，否则不要把密钥放在工具参数或对话状态中。该 middleware 会拒绝有风险的调用。它不会请求批准。当你希望由人来批准这些调用时，请将它与 [human-in-the-loop middleware](/oss/langchain/middleware/built-in) 搭配使用。
@@ -200,7 +220,8 @@ print(result["messages"][-1].content)
 ```python
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, AgentState, Runtime
-from langchain_typesafe import Choice, ChoiceAnswer, TypeSafeClassifier
+from langchain_core.decisions import Choice, ChoiceAnswer
+from langchain_typesafe import TypeSafeClassifier
 from typing_extensions import NotRequired
 
 
