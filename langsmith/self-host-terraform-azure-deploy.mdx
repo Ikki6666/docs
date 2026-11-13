@@ -11,7 +11,7 @@ description: 使用 LangChain Terraform modules 在 Azure AKS 上预配 LangSmit
 1. **Infrastructure**：Terraform 预配 AKS、Postgres、Redis、Blob Storage、Key Vault、cert-manager、KEDA 和 ingress。
 2. **Application**：Helm 在集群上安装 LangSmith chart。
 
-完成基础安装后，通过设置开关并重新部署来启用可选 add-on（LangSmith Deployment、Fleet、Insights、Polly、SmithDB 和 LLM Gateway）以及 SSO。
+完成基础安装后，通过设置开关并重新部署来启用可选 add-on（Agent Server hosting、Fleet、Insights、Polly、SmithDB 和 LLM Gateway）以及 SSO。
 
 <Note>
 这些页面遵循 module 的 `v0.17.*` release tag，它们部署 LangSmith Helm chart 0.17 线。在 module tag 中，前两个数字表示 chart 线，最后一个数字是 module 修订号，因此 `v0.17.4` 部署的仍是 0.17 chart 的最新补丁。`v0.16.*` tag 部署 chart 0.16。它们没有 LLM Gateway 或 SSO 开关，联合的是 8 个 Workload Identity ServiceAccount 而不是 10 个。从 v0.16.56 起，只有在设置 `langsmith_helm_chart_version = "~0.17.0"` 时才部署 SmithDB。已运行 chart 0.17 的部署无法回退到 0.16。
@@ -454,13 +454,13 @@ make k8s-secrets    # re-create langsmith-config-secret from Key Vault
 
 每个 add-on 都由 `infra/terraform.tfvars` 中的一个开关控制。设置开关后，重新运行 `make init-values` 重新生成 values，然后重新运行 `make deploy`。
 
-### LangSmith Deployment
+### Agent Server hosting {#langsmith-deployment}
 
-启用 [LangSmith Deployment](/langsmith/enable-self-hosted-deployment)，让你可以直接从 [LangSmith UI](https://smith.langchain.com?utm_source=docs&utm_medium=cta&utm_campaign=langsmith-signup&utm_content=langsmith-self-host-terraform-azure-deploy) 以 API server 的形式部署和管理 agent。这会新增三个 pods。
+启用 [Agent Server hosting](/langsmith/enable-self-hosted-deployment)，让你可以直接从 [LangSmith UI](https://smith.langchain.com?utm_source=docs&utm_medium=cta&utm_campaign=langsmith-signup&utm_content=langsmith-self-host-terraform-azure-deploy) 以 API server 的形式部署和管理 agent。这会新增三个 pods。
 
 | Pod | 角色 | Workload Identity |
 |---|---|---|
-| `langsmith-host-backend` | LangSmith Deployment control plane API。管理 deployment 生命周期，状态存储在共享 PostgreSQL 中。 | 是 |
+| `langsmith-host-backend` | Agent Server control plane API。管理 deployment 生命周期，状态存储在共享 PostgreSQL 中。 | 是 |
 | `langsmith-listener` | 监听 host-backend，在 Kubernetes 中创建和更新 `LangGraphPlatform` CRD。 | 是 |
 | `langsmith-operator` | 调谐 CRD。为每个 deployment 创建 Deployment、StatefulSet 和 Service。 | 否 |
 
@@ -484,7 +484,7 @@ make init-values    # picks up enable_deployments = true → generates add-on ov
 make deploy         # rolls out host-backend + listener + operator
 ```
 
-`make init-values` 会把 LangSmith Deployment add-on overlay（`langsmith-values-agent-deploys.yaml`）追加到 values 链。它会自动注入：
+`make init-values` 会把 Agent Server hosting add-on overlay（`langsmith-values-agent-deploys.yaml`）追加到 values 链。它会自动注入：
 
 ```yaml
 config:
@@ -502,10 +502,10 @@ config:
 # All three pods Running
 kubectl get pods -n langsmith | grep -E "host-backend|listener|operator"
 
-# LangSmith Deployment CRDs registered
+# Agent Server hosting CRDs registered
 kubectl get crd | grep langchain
 
-# List LangSmith Deployments (empty on first deploy, populated when you create a deployment)
+# List Agent Servers (empty on first deploy, populated when you create an Agent Server)
 kubectl get lgp -n langsmith
 ```
 
@@ -566,7 +566,7 @@ make deploy
 
 ### Insights 与 Polly
 
-两个功能，彼此独立；可以单独启用其中任何一个。Polly 运行在 LangSmith Deployment 上，因此设置它时要同时设置 `enable_deployments = true`。部署脚本不会检查这一点。
+两个功能，彼此独立；可以单独启用其中任何一个。Polly 运行在 Agent Server 上，因此设置它时要同时设置 `enable_deployments = true`。部署脚本不会检查这一点。
 
 - **Insights**：AI 驱动的 trace 分析。发现 LangSmith traces 中的模式和异常。以静态 `standalone-insights` api-server 和 queue pods 运行。overlay 设置顶层 `insights.enabled: true`。
 - **Polly**：AI 驱动的评估与监控 agent。以静态 `standalone-polly` api-server 和 queue pods 运行。overlay 设置顶层 `polly.enabled: true`。
@@ -575,7 +575,7 @@ make deploy
 
 ```hcl
 # infra/terraform.tfvars
-enable_deployments = true    # Polly runs on LangSmith Deployment
+enable_deployments = true    # Polly runs on Agent Server
 enable_insights    = true    # Insights analytics
 enable_polly       = true    # Polly AI evaluation agent
 ```
@@ -602,7 +602,7 @@ helm get values langsmith -n langsmith | grep -A3 insights
 **加密密钥在首次启用后绝不能更改。** 更改 `insights_encryption_key` 或 `polly_encryption_key` 会永久损坏所有已加密数据。没有恢复途径。这些 key 存放在 Key Vault 中，从不自动轮换。
 </Warning>
 
-首次启用后，如果 Polly UI 显示 "Unable to connect to LangGraph server"，说明 frontend 在 `langsmith-polly-config` ConfigMap 存在之前就已启动。运行 `kubectl rollout restart deployment langsmith-frontend -n langsmith`。
+首次启用后，如果 Polly UI 显示 `Unable to connect to LangGraph server`，说明 frontend 在 `langsmith-polly-config` ConfigMap 存在之前就已启动。运行 `kubectl rollout restart deployment langsmith-frontend -n langsmith`。
 
 ### SmithDB
 
@@ -691,7 +691,7 @@ make deploy
 | 阶段 | 新增 pods | 运行总数（约） |
 |---|---|---|
 | 基础安装 | LangSmith 核心（backend、frontend、queue、ingest-queue、clickhouse 等） | 约 17 |
-| LangSmith Deployment | `host-backend`、`listener`、`operator` | 约 20 |
+| Agent Server hosting | `host-backend`、`listener`、`operator` | 约 20 |
 | Fleet | `fleet-tool-server`、`fleet-trigger-server`，以及 Fleet 的 in-cluster Redis | 不定 |
 | Insights 与 Polly | `standalone-insights` 和 `standalone-polly` api-server 和 queue pods | 不定 |
 | LLM Gateway | `agent-gateway`，加上带 PII 脱敏的 `presidio-analyzer` | 不定 |
@@ -782,7 +782,7 @@ kubectl -n langsmith create secret generic <secret-name> --from-file=ca.crt=ca-b
 - 查阅 [Azure 变量](/langsmith/self-host-terraform-azure-variables)和[速查参考](/langsmith/self-host-terraform-azure-quick-reference)。
 - 查看 [Azure 架构](/langsmith/self-host-terraform-azure-architecture)，了解 module 结构、流量路径和 Workload Identity。
 - 出现问题时，请查阅 [Azure 故障排查指南](/langsmith/self-host-terraform-azure-troubleshooting)。
-- 使用 [LangSmith Deployment](/langsmith/enable-self-hosted-deployment) 在 UI 中启用 agent 部署。
+- 使用 [Agent Server hosting](/langsmith/enable-self-hosted-deployment) 在 UI 中启用 agent 部署。
 
 ---
 
