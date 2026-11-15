@@ -1,0 +1,101 @@
+---
+title: 需要监控的常见 SmithDB 问题
+sidebarTitle: 需要监控的常见问题
+description: 自托管 LangSmith 上首先应检查的指标，以及如何发现并修复生产环境中最常见的 SmithDB 问题。
+---
+
+使用这些信号可以判断 SmithDB 的 ingestion、查询和 compaction 是否健康，以及应优先排查哪个方面。对于下面每个常见问题，本页列出需要监控哪些信号、如何找出原因，以及要更改什么。关于每个指标衡量什么以及如何使用，请参见 [SmithDB 指标参考](/langsmith/self-host-smithdb-metrics)。
+
+## 检查 SmithDB 健康状况
+
+下面的每个症状都列出了显示该症状的指标。要找出原因，请阅读 [SmithDB 指标参考](/langsmith/self-host-smithdb-metrics)中该指标对应的小节。
+
+- **SDK 发送 traces 后，traces 迟迟才出现**：[`langsmith_ingestion_e2e_latency_seconds`](/langsmith/self-host-smithdb-metrics#langsmith_ingestion_e2e_latency_seconds)。请参见 [LangSmith ingestion 落后](#langsmith-ingestion-falls-behind)。
+- **写入失败并不断重试**：[`langsmith_asynq_ingestion_queue_retry`](/langsmith/self-host-smithdb-metrics#langsmith_asynq_ingestion_queue_retry)。请参见 [LangSmith ingestion 落后](#langsmith-ingestion-falls-behind)。
+- **新 run 需要很长时间才能在 SmithDB 中持久化**：[`ingest_batch_latency`](/langsmith/self-host-smithdb-metrics#ingest_batch_latency)。请继续阅读 [SmithDB ingestion 指标](/langsmith/self-host-smithdb-metrics#smithdb-ingestion)。
+- **ingestion 积压持续增长且不消退**：[`ingest_pending_segment_entry_count`](/langsmith/self-host-smithdb-metrics#ingest_pending_segment_entry_count)。请继续阅读 [SmithDB ingestion 指标](/langsmith/self-host-smithdb-metrics#smithdb-ingestion)。
+- **UI 或 API 的 trace 读取很慢**：[query pod 上的 `server_requests_duration`](/langsmith/self-host-smithdb-metrics#server_requests_duration-on-query-pods)。请参见 [compaction 落后导致查询变慢](#compaction-falls-behind-and-queries-get-slow)和[一类查询负载拖慢其他查询](#one-kind-of-query-load-slows-down-other-queries)。
+- **compaction worker 完成的工作少于 scheduler 规划的工作**：[`compaction_jobs_scheduled`、`compaction_jobs_executed`](/langsmith/self-host-smithdb-metrics#compaction_jobs_scheduled-compaction_jobs_executed)。请参见 [compaction 落后导致查询变慢](#compaction-falls-behind-and-queries-get-slow)。
+- **某一类 compaction job 反复失败**：[`compaction_job_completion`](/langsmith/self-host-smithdb-metrics#compaction_job_completion)。
+- **compaction 落后持续数小时**：[`compaction_queue_job_count`](/langsmith/self-host-smithdb-metrics#compaction_queue_job_count)。请参见 [compaction 落后导致查询变慢](#compaction-falls-behind-and-queries-get-slow)。
+
+## LangSmith ingestion 落后
+
+LangSmith 会把每个新 run 保留在 Redis 中，直到某个 ingest queue worker 将其写入 SmithDB。如果 ingestion 跟不上，Redis 中的队列就会增长，用户会较晚看到自己的 run。如果队列过旧，或 Redis 已满，LangSmith 会丢失 run。
+
+### 监控 ingestion 积压
+
+- **丢失的 run**：[`langsmith_asynq_ingestion_queue_archived`](/langsmith/self-host-smithdb-metrics#langsmith_asynq_ingestion_queue_archived)。每次增长都意味着有 run 丢失。对每次增长都设置告警。
+- **积压**：[`langsmith_asynq_ingestion_queue_pending`](/langsmith/self-host-smithdb-metrics#langsmith_asynq_ingestion_queue_pending)。将其与你正常的流量进行对比。流量稳定而队列增长就是问题。
+- **失败的写入**：[`langsmith_asynq_ingestion_queue_retry`](/langsmith/self-host-smithdb-metrics#langsmith_asynq_ingestion_queue_retry)。数值持续偏高意味着写入 SmithDB 失败。
+- **积压的存续时间**：[`langsmith_asynq_queue_latency_seconds`](/langsmith/self-host-smithdb-metrics#langsmith_asynq_queue_latency_seconds)。经过 `config.settings.redisRunsExpirySeconds` 设定的时间（默认 6 小时）后，LangSmith 会删除 Redis 中的 run 数据。重试不会延长这一时间。请在该时间接近之前尽早告警。
+- **Redis**：相对其限额的内存使用量、被逐出的键，以及每个分片的 CPU。任何逐出都意味着 Redis 删除了 LangSmith 仍然需要的数据。
+
+### 找出积压的原因
+
+| 你看到的现象 | 原因 |
+|---|---|
+| pending 队列和 [`langsmith_ingestion_api_to_worker_latency_seconds`](/langsmith/self-host-smithdb-metrics#langsmith_ingestion_api_to_worker_latency_seconds) 增长。重试次数和 [`langsmith_ingestion_worker_to_store_latency_seconds`](/langsmith/self-host-smithdb-metrics#langsmith_ingestion_worker_to_store_latency_seconds) 保持稳定。 | ingest queue worker 数量不足。 |
+| 重试次数或 `langsmith_ingestion_worker_to_store_latency_seconds` 增长。 | 写入缓慢或失败。请继续阅读 [SmithDB ingestion 指标](/langsmith/self-host-smithdb-metrics#smithdb-ingestion)。 |
+| Redis 内存接近其限额，或 Redis 逐出键。 | 相对于积压来说，Redis 太小。 |
+| 一个 Redis 分片的 CPU 使用率远高于其他分片。 | 队列负载集中在同一个分片上。更多 worker 会增加该分片的连接数。 |
+
+### 减少积压
+
+- **根据队列长度扩缩 ingest queue worker。** 这些 worker 大部分时间在等待网络，因此当队列增长时，它们的 CPU 仍然很低。基于 CPU 的 autoscaler 不会增加 worker。请为 ingest queue 启用 [KEDA](/langsmith/self-host-scale#keda-autoscaling-for-langsmith-queues)，它按队列长度扩缩。如果 NetworkPolicy 限制了命名空间内的流量，请确保 KEDA 仍能读取队列长度。如果无法读取，KEDA 不会扩缩 worker，也不会显示错误。
+- **根据你的峰值负载设置最大 replica 数量。** chart 的默认最大值只是一个起点，并不适用于你的负载。每个 worker 都会打开到 Redis 的连接，因此请以小步幅提高最大值，并监控最繁忙 Redis 分片的 CPU。
+- **按积压规模设定 Redis 的容量。** Redis 必须保存所有 pending run，直到 worker 将其写入，包括写入缓慢期间。如果其内存接近限额，或开始逐出键，请使用更大的 Redis 实例。
+- 如果写入缓慢或失败，请**扩缩 SmithDB ingestion**。请参见[按规模配置 SmithDB](/langsmith/self-host-smithdb-scale)。
+
+## compaction 落后导致查询变慢
+
+SmithDB ingestion 会写入许多小 segment。compaction 将它们合并成数量更少、更大的 segment。如果 compaction 落后，每个查询都必须打开更多 segment。随后查询会变慢、超时，或被 SmithDB 拒绝。
+
+### 监控 compaction 和查询
+
+对于 compaction：
+
+- **Pending job**：带 `status="pending"` 的 [`compaction_queue_job_count`](/langsmith/self-host-smithdb-metrics#compaction_queue_job_count)。数值持续数小时偏高意味着 compaction 已经延迟。
+- **最旧的 pending job**：[`compaction_queue_oldest_pending_created_at_seconds`](/langsmith/self-host-smithdb-metrics#compaction_queue_oldest_pending_created_at_seconds)。存续时间持续增长意味着 compaction 跟不上。
+- **worker 容量**：[`compaction_worker_capacity_used` 和 `compaction_worker_capacity_limit`](/langsmith/self-host-smithdb-metrics#compaction_worker_capacity_used-compaction_worker_capacity_limit)。如果大部分 worker 持续接近其限额，job 就会等待。
+- **worker 重启**：compaction worker pod 被 OOM kill。重启的 worker 会丢失正在运行的 job，compaction 也就无法推进。
+
+对于查询：
+
+- **扫描分区**：[`query_fanout_partitions`](/langsmith/self-host-smithdb-metrics#query_fanout_partitions)。如果流量稳定而 p99 上升，通常是 compaction 延迟。
+- **被拒绝的查询**：[`query_fanout_limit_exceeded_total`](/langsmith/self-host-smithdb-metrics#query_fanout_limit_exceeded_total)。持续存在的速率意味着用户查询在失败。
+- **缓慢和失败的请求**：[query pod 上的 `server_requests_duration`](/langsmith/self-host-smithdb-metrics#server_requests_duration-on-query-pods)。按 `status` 拆分：`4` 表示请求超时，`1` 表示请求被取消。
+
+### 找出查询变慢的原因
+
+查询也可能因其他原因变慢。在扩缩 compaction 之前，请对比以下信号：
+
+| 你看到的现象 | 原因 |
+|---|---|
+| 扫描分区和 pending compaction job 增长。 | compaction 延迟。 |
+| [admission 队列](/langsmith/self-host-smithdb-metrics#query_admission_queue_length)非空、拒绝请求，或 query pod 被 OOM kill。 | query pod 内存不足。请参见[一类查询负载拖慢其他查询](#one-kind-of-query-load-slows-down-other-queries)。 |
+| 所有组件上的 [`object_store_op_duration`](/langsmith/self-host-smithdb-metrics#object_store_op_duration) 同时增长。 | object storage 或到它的网络缓慢。 |
+| 只有部分请求缓慢，且它们覆盖的时间范围很宽。 | 这些查询读取了过多数据。 |
+
+### 帮助 compaction 跟上
+
+- **增加 compaction worker。** 默认情况下，autoscaler 按 CPU（而不是按 pending job）扩缩 compaction worker。要按 pending job 扩缩，请参见[改用 KEDA 扩缩](/langsmith/self-host-smithdb-scale#scale-with-keda-instead)。如果 worker 已达到最大 replica 数量，请提高最大值。
+- 如果 compaction worker 被 OOM kill，或其中大部分持续接近容量限额，请**为其分配更多内存**。worker 容量是 pod 内存限额的 80%，因此更多内存可以让更大的 job 运行。选择更大的[层级](/langsmith/self-host-smithdb-scale#baseline-tiers)，或设置 compaction worker 的资源。
+- **限制查询的时间范围。** 不带开始时间进行查询的脚本和 API 客户端会让 SmithDB 读取所有日期的数据。
+- **使用基于时间的 trace ID。** 如果你的应用程序自行设置 run 或 trace ID，请使用 UUIDv7 值。SmithDB 会利用 ID 中的时间定位某个 trace 的数据。随机 ID（例如 UUIDv4）会让查询和删除读取多得多的数据。
+
+## 一类查询负载拖慢其他查询
+
+在 cluster 模式下，query 服务承载所有 SmithDB 读取。某一类繁重负载（例如大型项目上的 run 统计）可能拖慢所有其他查询。[专用查询服务](/langsmith/self-host-smithdb-scale#dedicated-query-services)会把一类负载移到它自己的 pod 上，这样你可以单独设定其规格并扩缩。
+
+对于大型 deployment（例如 large [层级](/langsmith/self-host-smithdb-scale#baseline-tiers)），请启用专用查询服务。每个服务都需要自己的 replica，并使用 query 层级的资源。
+
+对于较小的 deployment，当你看到下表中某个服务的信号时，就启用该服务。要找出哪类请求占用 query pod，请按 `path` 拆分 [query pod 上的 `server_requests_duration`](/langsmith/self-host-smithdb-metrics#server_requests_duration-on-query-pods)。
+
+| 服务 | 启用条件 |
+|---|---|
+| Stats query | 项目页面和仪表板加载缓慢，同时其他查询也变慢。当用户打开 run 很多或时间范围很长的项目时，query pod 内存耗尽，或 SmithDB 以 [`query_fanout_limit_exceeded_total`](/langsmith/self-host-smithdb-metrics#query_fanout_limit_exceeded_total) 拒绝查询。 |
+| Mutations | query pod 承受负载时，feedback 和 run 删除失败或延迟。ingest queue 日志显示带 `Unavailable` 代码的 `IngestFeedback` 错误。没有该服务时，feedback 写入和删除会在 query pod 上运行。当这些 pod 重启时，feedback 写入也会失败。 |
+| Run rules | 你有很多 automation 规则或在线评估器，并且规则运行时查询延迟上升。超时的规则查询会被重试，这会给 SmithDB 和 LangSmith PostgreSQL 数据库增加负载。 |
+
+query pod 常常用尽全部内存，而 CPU 仍保持较低。在这种情况下，基于 CPU 的 autoscaler 不会增加 replica。请设置一个能承载你正常负载的最小 replica 数量，或为这些 pod 分配更多内存。
