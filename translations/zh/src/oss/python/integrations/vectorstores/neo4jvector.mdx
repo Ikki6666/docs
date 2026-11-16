@@ -1,6 +1,9 @@
 ---
 title: "Neo4j vector index 集成"
 description: "使用 LangChain Python 集成 Neo4j vector index 向量存储。"
+integration:
+  name: Neo4j vector index
+  pypi: langchain-neo4j
 ---
 
 import LangchainCommunityUnmaintained from '/snippets/oss/langchain-community-unmaintained.mdx';
@@ -9,13 +12,13 @@ import LangchainCommunityUnmaintained from '/snippets/oss/langchain-community-un
 
 它支持：
 
-- approximate nearest neighbor search
-- Euclidean similarity and cosine similarity
-- Hybrid search combining vector and keyword searches
+- 近似最近邻搜索
+- 欧几里得相似度和余弦相似度
+- 结合向量搜索与关键字搜索的混合搜索
 
 本笔记介绍如何使用 Neo4j vector index（`Neo4jVector`）。
 
-请参阅 [installation instruction](https://neo4j.com/docs/operations-manual/current/installation/)。
+请参阅[安装说明](https://neo4j.com/docs/operations-manual/current/installation/)。
 
 ```python
 # Pip install necessary package
@@ -223,7 +226,7 @@ relationship_vector.similarity_search("Example")
 ### 元数据过滤
 
 Neo4j 向量存储还支持通过结合 parallel runtime 与 exact nearest neighbor search 来执行元数据过滤。
-_Requires Neo4j 5.18 or greater version._
+_需要 Neo4j 5.18 或更高版本。_
 
 等值过滤语法如下：
 
@@ -257,4 +260,204 @@ existing_graph.similarity_search(
     "Slovenia",
     filter={"hobby": {"$eq": "Bicycle"}, "age": {"$gt": 15}},
 )
+```
+
+```python
+[Document(page_content='\nname: Tomaz\nlocation: Slovenia', metadata={'age': 33, 'hobby': 'Bicycle'})]
+```
+
+你也可以在过滤器之间使用 `OR` 运算符。
+
+```python
+existing_graph.similarity_search(
+    "Slovenia",
+    filter={"$or": [{"hobby": {"$eq": "Bicycle"}}, {"age": {"$gt": 15}}]},
+)
+```
+
+```python
+[Document(page_content='\nname: Tomaz\nlocation: Slovenia', metadata={'age': 33, 'hobby': 'Bicycle'})]
+```
+
+### 添加文档
+
+我们可以向现有向量存储添加文档。
+
+```python
+store.add_documents([Document(page_content="foo")])
+```
+
+```python
+['acbd18db4cc2f85cedef654fccc4a4d8']
+```
+
+```python
+docs_with_score = store.similarity_search_with_score("foo")
+```
+
+```python
+docs_with_score[0]
+```
+
+```text
+(Document(page_content='foo'), 0.9999997615814209)
+```
+
+## 使用检索查询自定义响应
+
+你也可以使用自定义 Cypher 片段来定制响应，从图中获取其他信息。
+底层最终构造的 Cypher 语句如下：
+
+```
+read_query = (
+  "CALL db.index.vector.queryNodes($index, $k, $embedding) "
+  "YIELD node, score "
+) + retrieval_query
+```
+
+检索查询必须返回以下三列：
+
+- `text`：Union[str, Dict] = 用于填充文档 `page_content` 的值
+- `score`：Float = 相似度分数
+- `metadata`：Dict = 文档的附加元数据
+
+更多内容请参阅这篇[博客文章](https://medium.com/neo4j/implementing-rag-how-to-write-a-graph-retrieval-query-in-langchain-74abf13044f2)。
+
+```python
+retrieval_query = """
+RETURN "Name:" + node.name AS text, score, {foo:"bar"} AS metadata
+"""
+retrieval_example = Neo4jVector.from_existing_index(
+    OpenAIEmbeddings(),
+    url=url,
+    username=username,
+    password=password,
+    index_name="person_index",
+    retrieval_query=retrieval_query,
+)
+retrieval_example.similarity_search("Foo", k=1)
+```
+
+```python
+[Document(page_content='Name:Tomaz', metadata={'foo': 'bar'})]
+```
+
+下面是一个示例，将除 `embedding` 之外的所有节点属性作为字典传给 `text` 列，
+
+```python
+retrieval_query = """
+RETURN node {.name, .age, .hobby} AS text, score, {foo:"bar"} AS metadata
+"""
+retrieval_example = Neo4jVector.from_existing_index(
+    OpenAIEmbeddings(),
+    url=url,
+    username=username,
+    password=password,
+    index_name="person_index",
+    retrieval_query=retrieval_query,
+)
+retrieval_example.similarity_search("Foo", k=1)
+```
+
+```python
+[Document(page_content='name: Tomaz\nage: 33\nhobby: Bicycle\n', metadata={'foo': 'bar'})]
+```
+
+你也可以向检索查询传递 Cypher 参数。
+参数可用于额外过滤、遍历等……
+
+```python
+retrieval_query = """
+RETURN node {.*, embedding:Null, extra: $extra} AS text, score, {foo:"bar"} AS metadata
+"""
+retrieval_example = Neo4jVector.from_existing_index(
+    OpenAIEmbeddings(),
+    url=url,
+    username=username,
+    password=password,
+    index_name="person_index",
+    retrieval_query=retrieval_query,
+)
+retrieval_example.similarity_search("Foo", k=1, params={"extra": "ParamInfo"})
+```
+
+```python
+[Document(page_content='location: Slovenia\nextra: ParamInfo\nname: Tomaz\nage: 33\nhobby: Bicycle\nembedding: None\n', metadata={'foo': 'bar'})]
+```
+
+## 混合搜索（向量 + 关键字）
+
+Neo4j 同时集成了向量索引和关键字索引，因此你可以使用混合搜索方法。
+
+```python
+# The Neo4jVector Module will connect to Neo4j and create a vector and keyword indices if needed.
+hybrid_db = Neo4jVector.from_documents(
+    docs,
+    OpenAIEmbeddings(),
+    url=url,
+    username=username,
+    password=password,
+    search_type="hybrid",
+)
+```
+
+要从现有索引加载混合搜索，必须同时提供向量索引和关键字索引。
+
+```python
+index_name = "vector"  # default index name
+keyword_index_name = "keyword"  # default keyword index name
+
+store = Neo4jVector.from_existing_index(
+    OpenAIEmbeddings(),
+    url=url,
+    username=username,
+    password=password,
+    index_name=index_name,
+    keyword_index_name=keyword_index_name,
+    search_type="hybrid",
+)
+```
+
+## 检索器选项
+
+本节展示如何将 `Neo4jVector` 用作检索器。
+
+```python
+retriever = store.as_retriever()
+retriever.invoke(query)[0]
+```
+
+```python
+Document(page_content='Tonight. I call on the Senate to: Pass the Freedom to Vote Act. Pass the John Lewis Voting Rights Act. And while you’re at it, pass the Disclose Act so Americans can know who is funding our elections. \n\nTonight, I’d like to honor someone who has dedicated his life to serve this country: Justice Stephen Breyer—an Army veteran, Constitutional scholar, and retiring Justice of the United States Supreme Court. Justice Breyer, thank you for your service. \n\nOne of the most serious constitutional responsibilities a President has is nominating someone to serve on the United States Supreme Court. \n\nAnd I did that 4 days ago, when I nominated Circuit Court of Appeals Judge Ketanji Brown Jackson. One of our nation’s top legal minds, who will continue Justice Breyer’s legacy of excellence.', metadata={'source': '../../how_to/state_of_the_union.txt'})
+```
+
+## 带来源的问答
+
+本节介绍如何基于索引进行带来源的问答。它使用 `RetrievalQAWithSourcesChain`，由该链从索引中查找文档。
+
+```python
+from langchain_classic.chains import RetrievalQAWithSourcesChain
+from langchain_openai import ChatOpenAI
+```
+
+```python
+chain = RetrievalQAWithSourcesChain.from_chain_type(
+    ChatOpenAI(temperature=0), chain_type="stuff", retriever=retriever
+)
+```
+
+```python
+chain.invoke(
+    {"question": "What did the president say about Justice Breyer"},
+    return_only_outputs=True,
+)
+```
+
+```text
+{'answer': 'The president honored Justice Stephen Breyer for his service to the country and mentioned his retirement from the United States Supreme Court.\n',
+ 'sources': '../../how_to/state_of_the_union.txt'}
+```
+
+```python
+
 ```

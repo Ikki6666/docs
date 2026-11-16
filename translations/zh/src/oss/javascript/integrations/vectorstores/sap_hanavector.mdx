@@ -1,5 +1,8 @@
 ---
 title: SAP HANA Cloud Vector Engine
+integration:
+  name: SAP HANA Cloud Vector Engine
+  npm: '@sap/hana-langchain'
 ---
 
 >[SAP HANA Cloud Vector Engine](https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-vector-engine-guide/sap-hana-cloud-sap-hana-database-vector-engine-guide) 是完全集成在 `SAP HANA Cloud` 数据库中的 vector store。
@@ -30,10 +33,16 @@ const connectionParams = {
 };
 const client = hanaClient.createConnection(connectionParams);
 
+// connect to hanaDB
 await new Promise<void>((resolve, reject) => {
   client.connect((err: Error) => {
-    if (err) reject(err);
-    else resolve();
+    // Use arrow function here
+    if (err) {
+      reject(err);
+    } else {
+      console.log("Connected to SAP HANA successfully.");
+      resolve();
+    }
   });
 });
 ```
@@ -53,7 +62,9 @@ const embeddings = new OpenAIEmbeddings({ model: "text-embedding-3-large" });
 
 ### 使用内部 embeddings
 
-你也可以直接在 SAP HANA 中通过 `VECTOR_EMBEDDING()` 函数计算 embeddings。更多信息请参阅 [SAP HANA VECTOR_EMBEDDING Function](https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-vector-engine-guide/vector-embedding-function-vector)。
+你也可以直接在 SAP HANA 中通过其原生的 `VECTOR_EMBEDDING()` 函数计算 embeddings。如果你的 TypeScript 环境支持内部 embedding，可以类似地初始化并传给 `HanaDB`。关于内部 embedding 的更多信息，请参阅 [SAP HANA VECTOR_EMBEDDING Function](https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-vector-engine-guide/vector-embedding-function-vector)。
+
+> 注意：请确保你的 SAP HANA Cloud 实例已启用 NLP。
 
 ```typescript
 import { HanaInternalEmbeddings } from "@sap/hana-langchain";
@@ -62,22 +73,41 @@ const internalEmbeddings = new HanaInternalEmbeddings({
   internalEmbeddingModelId:
     process.env.HANA_DB_EMBEDDING_MODEL_ID || "SAP_NEB.20240715",
 });
+// optionally, you can specify a remote source to use models from your deployed SAP AI CORE instance:
+/*
+const internalEmbeddings = new HanaInternalEmbeddings({
+  internalEmbeddingModelId:
+    process.env.HANA_DB_EMBEDDING_REMOTE_MODEL_ID || "YOUR_EMBEDDING_MODEL_ID",
+  remoteSourceSchema:
+    process.env.HANA_DB_EMBEDDING_REMOTE_SOURCE_SCHEMA || "YOUR_REMOTE_SOURCE_SCHEMA_NAME",
+  remoteSource:
+    process.env.HANA_DB_EMBEDDING_REMOTE_SOURCE || "YOUR_REMOTE_SOURCE_NAME",
+});
+*/
 ```
 
-然后创建 vector store：
+有了连接和 embedding 实例后，将它们连同用于存储向量的表名一起传给 `HanaDB`，即可创建 vector store：
 
 ```typescript
+// define instance args
+// check the interface to see all possible options
 const args: HanaDBArgs = {
   connection: client,
   tableName: "MY_TABLE",
 };
+// Create a LangChain VectorStore interface for the HANA database and specify the table (collection) to use in args.
 const db = new HanaDB(embeddings, args);
+// need to initialize once an instance is created.
 await db.initialize()
 ```
 
 ## 管理 vector store
 
-### 添加内容
+创建 vector store 后，我们可以通过添加和删除不同条目来与之交互。
+
+### 向 vector store 添加条目
+
+我们可以使用 `addDocuments` 函数向 vector store 添加条目。
 
 ```typescript
 import { Document } from "@langchain/core/documents";
@@ -85,7 +115,7 @@ const docs = [new Document({ pageContent: "Some text" }), new Document({ pageCon
 await db.addDocuments(docs);
 ```
 
-添加带 metadata 的文档：
+添加带 metadata 的文档
 
 ```typescript
 await db.addDocuments([
@@ -94,17 +124,17 @@ await db.addDocuments([
 ]);
 ```
 
-通过 map merge 插入文档
+使用 map merge 插入添加文档
 
 > 注意，`useMapMerge` 仅允许用于 `HanaInternalEmbeddings` 实例。
 
 ```typescript
-// 可以在 options 中传入 useMapMerge 标志以加速插入
-// map merge 仅适用于内部 Embeddings
+// A useMapMerge flag can be supplied in the options for faster insertion
+// map merge only works with internal Embeddings
 await db.addDocuments(docs, { useMapMerge: true });
 ```
 
-### 删除内容
+### 从 vector store 删除条目
 
 ```typescript
 await db.delete({ filter: { quality: "bad" } });
@@ -112,46 +142,92 @@ await db.delete({ filter: { quality: "bad" } });
 
 ## 查询 vector store
 
-### 相似度搜索
+### 直接查询
+
+#### 相似度搜索
+
+可以对 metadata 进行过滤并执行简单的相似度搜索，如下所示：
 
 ```typescript
+// With filtering on {"quality": "bad"}, only one document should be returned
 const docs = await db.similaritySearch("foobar", 2, { quality: "bad" });
+console.log(docs);
 ```
 
-### MMR 搜索
+```text
+[
+    {
+    pageContent: "foo",
+    metadata: { start: 100, end: 150, docName: "foo.txt", quality: "bad" }
+    }
+]
+```
+
+#### MMR 搜索
+
+可以对 metadata 进行过滤并执行最大边际相关性（Maximal Marginal Relevance，MMR）搜索，如下所示：
 
 ```typescript
 const docsMMR = await db.maxMarginalRelevanceSearch("foobar", {
-  k: 2,
-  fetchK: 5,
-  filter: { quality: "bad" },
+    k: 2,
+    fetchK: 5,
+    filter: { quality: "bad" },
 });
+console.log(docsMMR);
 ```
 
-### 转成 retriever 后查询
+```text
+[
+    {
+    pageContent: "foo",
+    metadata: { start: 100, end: 150, docName: "foo.txt", quality: "bad" }
+    }
+]
+```
+
+### 转换为 retriever 后查询
+
+你还可以将 vector store 转换为 retriever，以便在链中更轻松地使用。
 
 ```typescript
 const retriever = db.asRetriever();
 const docsRetriever = await retriever.invoke("foobar", {filter: { quality: "good" }});
+console.log(docsRetriever);
 ```
 
-## 距离算法
+```text
+[
+    {
+    pageContent: "bar",
+    metadata: { start: 200, end: 250, docName: "bar.txt", quality: "good" }
+    }
+]
+```
 
-`HanaDB` 支持：
-- Cosine Similarity，默认
-- Euclidean Distance，L2
+## 距离相似度算法
+
+`HanaDB` 支持以下距离相似度算法：
+- 余弦相似度（默认）
+- 欧氏距离（L2）
+
+你可以在初始化 `HanaDB` 实例时通过 `distanceStrategy` 参数指定距离策略。
 
 ```typescript
 const argsDist: HanaDBArgs = {
   connection: client,
   tableName: "MY_TABLE",
   distanceStrategy: "EUCLIDEAN",
+    // distanceStrategy: "COSINE", // (default)
 };
 const dbDist = new HanaDB(embeddings, argsDist);
 await dbDist.initialize();
 ```
 
 ## 创建 HNSW 索引
+
+向量索引可以显著加速向量的 top-k 最近邻查询。用户可以使用 `createHnswIndex` 函数创建分层可导航小世界（Hierarchical Navigable Small World，HNSW）向量索引。
+
+有关在数据库层面创建索引的更多信息，请参阅[官方文档](https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-vector-engine-guide/create-vector-index-statement-data-definition)。
 
 ```typescript
 const argsHnsw: HanaDBArgs = {
@@ -162,31 +238,278 @@ const dbHnsw = new HanaDB(embeddings, argsHnsw);
 await dbHnsw.initialize();
 dbHnsw.createHnswIndex({
   indexName: "MY_HNSW_INDEX",
-  efSearch: 100,
-  m: 200,
-  efConstruction: 500,
+  efSearch: 100, // Max number of neighbors per graph node (valid range: 4 to 1000)
+  m: 200, // Max number of candidates during graph construction (valid range: 1 to 100000)
+  efConstruction: 500, // Min number of candidates during the search (valid range: 1 to 100000)
 });
 ```
 
+如果未指定其他参数，将使用默认值
+
+默认值：m=64, ef_construction=128, ef_search=200
+
+默认索引名将是："\<TABLE_NAME>_idx"
+
 ## 高级过滤
 
-支持的过滤操作符包括：
+除了基本的基于值的过滤能力外，还可以使用更高级的过滤。下表列出了可用的过滤操作符。
 
-| Operator | Semantic                 | Supported data types for Operands |
+| 操作符 | 语义                 | 操作数支持的数据类型 |
 |----------|-------------------------|-----------------------------------|
-| `$eq`    | Equality (==)           | number, string, boolean, DateValue, null      |
-| `$ne`    | Inequality (!=)         | number, string, boolean, DateValue, null     |
-| `$lt`    | Less than (<)           | number, string, DateValue         |
-| `$lte`   | Less than or equal (<=) | number, string, DateValue         |
-| `$gt`    | Greater than (>)        | number, string, DateValue       |
-| `$gte`   | Greater than or equal (>=) | number, string, DateValue        |
-| `$in`    | Contained in a set of given values  (in)    | Array of same values of type (number, string, boolean, DateValue) |
-| `$nin`   | Not contained in a set of given values  (not in)  | Array of same values of type (number, string, boolean, DateValue) |
-| `$between` | Between the range of two boundary values | Array of 2 values of (number, string, DateValue) |
-| `$like`  | Text equality based on the "LIKE" semantics in SQL (using "%" as wildcard)  | string |
-| `$contains` | Filters documents containing a specific keyword | non-empty string |
-| `$and`   | Logical "and", supporting two or more operands | list(Filter) |
-| `$or`    | Logical "or", supporting two or more operands | list(Filter) |
+| `$eq`    | 相等（==）           | number, string, boolean, DateValue, null      |
+| `$ne`    | 不相等（!=）         | number, string, boolean, DateValue, null     |
+| `$lt`    | 小于（&lt;）           | number, string, DateValue         |
+| `$lte`   | 小于或等于（&lt;=） | number, string, DateValue         |
+| `$gt`    | 大于（>）        | number, string, DateValue       |
+| `$gte`   | 大于或等于（>=） | number, string, DateValue        |
+| `$in`    | 包含在给定值集合中（in）    | 相同类型值的数组（number、string、boolean、DateValue） |
+| `$nin`   | 不包含在给定值集合中（not in）  | 相同类型值的数组（number、string、boolean、DateValue） |
+| `$between` | 位于两个边界值范围之间 | 包含 2 个值的数组（number、string、DateValue） |
+| `$like`  | 基于 SQL 中 "LIKE" 语义的文本相等匹配（使用 "%" 作为通配符）  | string |
+| `$contains` | 过滤包含特定关键词的文档 | 非空字符串 |
+| `$and`   | 逻辑 "and"，支持两个或更多操作数 | list(Filter) |
+| `$or`    | 逻辑 "or"，支持两个或更多操作数 | list(Filter) |
+
+```typescript
+const docs: Document[] = [
+  {
+    pageContent: "First",
+    metadata: { name: "Adam Smith", is_active: true, id: 1, height: 10.0 },
+  },
+  {
+    pageContent: "Second",
+    metadata: { name: "Bob Johnson", is_active: false, id: 2, height: 5.7 },
+  },
+  {
+    pageContent: "Third",
+    metadata: { name: "Jane Doe", is_active: true, id: 3, height: 2.4 },
+  },
+];
+
+const args: HanaDBArgs = {
+  connection: client,
+  tableName: "LANGCHAIN_DEMO_ADVANCED_FILTER",
+};
+
+const vectorStore = new HanaDB(embeddings, args);
+// need to initialize once an instance is created.
+await vectorStore.initialize();
+
+// Delete already existing documents from the table
+await vectorStore.delete({ filter: {} });
+await vectorStore.addDocuments(docs);
+
+// Helper function to print filter results
+function printFilterResult(result: Document[]) {
+  if (result.length === 0) {
+    console.log("<empty result>");
+  } else {
+    result.forEach((doc) => console.log(JSON.stringify(doc.metadata)) );
+  }
+}
+```
+
+使用 `$ne`、`$gt`、`$gte`、`$lt`、`$lte` 进行过滤
+
+```typescript
+let advancedFilter;
+
+advancedFilter = { id: { $ne: 1 } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = { id: { $gt: 1 } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = { id: { $gte: 1 } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = { id: { $lt: 1 } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = { id: { $lte: 1 } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+```
+
+```text
+Filter: {"id":{"$ne":1}}
+{ name: 'Bob Johnson', is_active: false, id: 2, height: 5.7 }
+{ name: 'Jane Doe', is_active: true, id: 3, height: 2.4 }
+Filter: {"id":{"$gt":1}}
+{ name: 'Bob Johnson', is_active: false, id: 2, height: 5.7 }
+{ name: 'Jane Doe', is_active: true, id: 3, height: 2.4 }
+Filter: {"id":{"$gte":1}}
+{ name: 'Adam Smith', is_active: true, id: 1, height: 10 }
+{ name: 'Bob Johnson', is_active: false, id: 2, height: 5.7 }
+{ name: 'Jane Doe', is_active: true, id: 3, height: 2.4 }
+Filter: {"id":{"$lt":1}}
+<empty result>
+Filter: {"id":{"$lte":1}}
+{ name: 'Adam Smith', is_active: true, id: 1, height: 10 }
+```
+
+使用 `$between`、`$in`、`$nin` 进行过滤
+
+```typescript
+advancedFilter = { id: { $between: [1, 2] } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = { name: { $in: ["Adam Smith", "Bob Johnson"] } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = { name: { $nin: ["Adam Smith", "Bob Johnson"] } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+```
+
+```text
+Filter: {"id":{"$between":[1,2]}}
+{ name: 'Adam Smith', is_active: true, id: 1, height: 10 }
+{ name: 'Bob Johnson', is_active: false, id: 2, height: 5.7 }
+Filter: {"name":{"$in":["Adam Smith","Bob Johnson"]}}
+{ name: 'Adam Smith', is_active: true, id: 1, height: 10 }
+{ name: 'Bob Johnson', is_active: false, id: 2, height: 5.7 }
+Filter: {"name":{"$nin":["Adam Smith","Bob Johnson"]}}
+{ name: 'Jane Doe', is_active: true, id: 3, height: 2.4 }
+```
+
+使用 `$like` 进行文本过滤
+
+```typescript
+advancedFilter = { name: { $like: "a%" } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = { name: { $like: "%a%" } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+```
+
+```text
+Filter: {"name":{"$like":"a%"}}
+{ name: 'Adam Smith', is_active: true, id: 1, height: 10 }
+Filter: {"name":{"$like":"%a%"}}
+{ name: 'Adam Smith', is_active: true, id: 1, height: 10 }
+{ name: 'Jane Doe', is_active: true, id: 3, height: 2.4 }
+```
+
+使用 `$contains` 进行文本过滤
+
+```typescript
+advancedFilter = { name: { $contains: "bob" } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = { name: { $contains: "bo" } };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = {"name": {"$contains": "Adam Johnson"}}
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = {"name": {"$contains": "Adam Smith"}}
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+```
+
+```text
+Filter: {"name":{"$contains":"bob"}}
+{ name: 'Bob Johnson', is_active: false, id: 2, height: 5.7 }
+Filter: {"name":{"$contains":"bo"}}
+<empty result>
+Filter: {'name': {'$contains': 'Adam Johnson'}}
+<empty result>
+Filter: {'name': {'$contains': 'Adam Smith'}}
+{'name': 'Adam Smith', 'is_active': True, 'id': 1, 'height': 10.0}
+```
+
+使用 `$and`、`$or` 进行组合过滤
+
+```typescript
+advancedFilter = { $or: [{ id: 1 }, { name: "bob" }] };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = { $and: [{ id: 1 }, { id: 2 }] };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = { $and: [{ name: { $contains: "bob" } }, { id: 2 }] };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = { $or: [{ id: 1 }, { id: 2 }, { id: 3 }] };
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+
+advancedFilter = {
+  $and: [{ $or: [{ id: 1 }, { id: 2 }] }, { height: { $gte: 5.0 } }],
+};
+console.log(`Filter: ${JSON.stringify(advancedFilter)}`);
+printFilterResult(
+  await vectorStore.similaritySearch("just testing", 5, advancedFilter)
+);
+```
+
+```text
+Filter: {'$or': [{'id': 1}, {'name': 'bob'}]}
+{'name': 'Adam Smith', 'is_active': True, 'id': 1, 'height': 10.0}
+Filter: {"$and":[{"id":1},{"id":2}]}
+<empty result>
+Filter: {"$and":[{"name":{"$contains":"bob"}},{"id":2}]}
+{ name: 'Bob Johnson', is_active: false, id: 2, height: 5.7 }
+Filter: {"$or":[{"id":1},{"id":2},{"id":3}]}
+{ name: 'Adam Smith', is_active: true, id: 1, height: 10 }
+{ name: 'Bob Johnson', is_active: false, id: 2, height: 5.7 }
+{ name: 'Jane Doe', is_active: true, id: 3, height: 2.4 }
+Filter: {"$and":[{"$or":[{"id":1},{"id":2}]},{"height":{"$gte":5.0}}]}
+{ name: 'Adam Smith', is_active: true, id: 1, height: 10 }
+{ name: 'Bob Johnson', is_active: false, id: 2, height: 5.7 }
+```
 
 ## 结果重排序
 
@@ -194,13 +517,13 @@ dbHnsw.createHnswIndex({
 
 `rerank_config` 字典支持以下字段：
 
-- **`query`** *(string, required)* — 用于重排序的查询文本。若未提供，则使用原始相似度搜索的查询。
+- **`query`** *（string，必填）*：用于重排序的查询文本。若未提供，则使用原始相似度搜索的查询。
 
-- **`modelId`** *(string, required)* — 用于重排序的 cross-encoding 模型的模型 ID。
+- **`modelId`** *（string，必填）*：用于重排序的 cross-encoding 模型的模型 ID。
 
-- **`topN`** *(number, optional)* — 重排序后返回的顶部结果数量。默认为 3。
+- **`topN`** *（number，可选）*：重排序后返回的顶部结果数量。默认为 3。
 
-- **`rankFields`** *(string[], optional)* — 参与重排序的 metadata 字段列表。指定后，这些字段会与内容拼接在一起用于评分。
+- **`rankFields`** *（string[]，可选）*：参与重排序的 metadata 字段列表。指定后，这些字段会与内容拼接在一起用于评分。
 
 > **注意：** 要使用重排序功能，请确保 SAP HANA Cloud 实例已启用 NLP。更多详情请参阅 [SAP HANA Database Additional Features](https://help.sap.com/docs/hana-cloud/sap-hana-cloud-administration-guide/sap-hana-database-additional-features?version=hanacloud)。
 
@@ -403,10 +726,516 @@ Top 2 reranked results:
   [3] Score: 0.0342 - Deep learning applications
 ```
 
-### 用于检索增强生成
+## 用于检索增强生成
 
-关于如何将这个 vector store 用于检索增强生成，RAG，请参阅以下内容：
+关于如何将此 vector store 用于检索增强生成（RAG）的指南，请参阅以下章节：
 
-- [Tutorials](/oss/deepagents/rag)
-- [How-to: Question and answer with RAG](/oss/deepagents/rag)
-- [Retrieval conceptual docs](/oss/langchain/retrieval)
+- [教程](/oss/deepagents/rag)
+- [操作指南：使用 RAG 进行问答](/oss/deepagents/rag)
+- [检索概念文档](/oss/langchain/retrieval)
+
+## 标准表与带向量数据的自定义表
+
+默认情况下，embeddings 表包含三列：
+
+- `VEC_TEXT`：文档文本
+- `VEC_META`：文档 metadata
+- `VEC_VECTOR`：embedding 向量
+
+自定义表必须至少包含三列，且语义与标准表一致：
+
+- 用于文本/上下文的 `NCLOB`/`NVARCHAR` 列
+- 用于 metadata 的 `NCLOB`/`NVARCHAR` 列
+- 用于 embedding 向量的 `REAL_VECTOR` 列
+
+允许存在额外列；请确保它们在新文档插入时接受 NULL。
+
+```typescript
+//  Access the vector DB with a new table
+const dbDefaultArgs: HanaDBArgs = {
+  connection: client,
+  tableName: "LANGCHAIN_DEMO_NEW_TABLE"
+};
+
+const dbDefault = new HanaDB(embeddings, dbDefaultArgs);
+await dbDefault.initialize();
+
+//  Delete already existing entries from the table
+await dbDefault.delete({ filter: {} });
+
+//  Add a simple document with some metadata
+docs = [
+    new Document({
+        pageContent: "A simple document",
+        metadata: { start: 100, end: 150, docName: "simple.txt" }
+    })
+]
+await dbDefault.addDocuments(docs);
+```
+
+展示 "LANGCHAIN_DEMO_NEW_TABLE" 表中的列
+
+```typescript
+const result = await new Promise<any[]>((resolve, reject) => {
+  client.exec(
+    `SELECT COLUMN_NAME, DATA_TYPE_NAME FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME = CURRENT_SCHEMA AND TABLE_NAME = 'LANGCHAIN_DEMO_NEW_TABLE'`,
+    (err: Error, rows: any) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(rows);
+      }
+    }
+  );
+});
+row.forEach((r) => {
+  console.log(`${r.COLUMN_NAME}: ${r.DATA_TYPE_NAME}`);
+});
+```
+
+```text
+VEC_TEXT: NCLOB
+VEC_META: NCLOB
+VEC_VECTOR: REAL_VECTOR
+```
+
+展示插入文档在这三列中的值
+
+由于 HANA 的 dbapi 驱动默认将向量列输出为 Buffer 对象，我们将创建一个辅助函数，将其转换为数字列表。
+
+```typescript
+// Helper function to parse fvecs format for REAL_VECTOR
+function parseFvecs(b: ArrayBuffer): number[] {
+    const v = new DataView(b)
+    const d = v.getUint32(0, true)
+    return Array.from({ length: d }, (_, i) => v.getFloat32(4 + i * 4, true))
+}
+
+const resultVal = await new Promise<any[]>((resolve, reject) => {
+  client.exec(
+    `SELECT * FROM LANGCHAIN_DEMO_NEW_TABLE LIMIT 1`,
+    (err: Error, rows: any) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(rows);
+      }
+    }
+  );
+});
+rowVal.forEach((r) => {
+  console.log(`VEC_TEXT: ${r.VEC_TEXT}`); // The text
+  console.log(`VEC_META: ${r.VEC_META}`); // The metadata
+  const embedding = parseFvecs(r.VEC_VECTOR);
+  console.log(`VEC_VECTOR: ${embedding.length, embedding.slice(0, 3).concat(['...']).concat(embedding.slice(-3))}`); // The vector
+});
+```
+
+```text
+VEC_TEXT: A simple document
+VEC_META: {"start": 100, "end": 150, "docName": "simple.txt"}
+VEC_VECTOR: 768 [-0.01989901065826416, 0.02785174734890461, 0.0020877711940556765, '...', 0.0183248370885849, 0.009469633921980858, 0.04312701150774956]
+```
+
+自定义表必须至少包含三列，且语义与标准表一致
+
+- 类型为 `NCLOB` 或 `NVARCHAR` 的列，用于 embeddings 的文本/上下文
+- 类型为 `NCLOB` 或 `NVARCHAR` 的列，用于 metadata
+- 类型为 `REAL_VECTOR` 或 `HALF_VECTOR` 的列，用于 embedding 向量
+
+表中可以包含额外列。当向表中插入新 Document 时，这些额外列必须允许 NULL 值。
+
+```typescript
+// Create a new table "MY_OWN_TABLE_ADD" with three "standard" columns and one additional column
+const myOwnTableName = "MY_OWN_TABLE_ADD";
+await new Promise<void>((resolve, reject) => {
+  client.exec(
+    `CREATE TABLE MY_OWN_TABLE_ADD (
+      SOME_OTHER_COLUMN NVARCHAR(42),
+      MY_TEXT NVARCHAR(2048),
+      MY_METADATA NVARCHAR(1024),
+      MY_VECTOR REAL_VECTOR,
+    )`,
+    (err: Error) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve();
+      }
+    }
+  );
+});
+
+// Create a HanaDB instance with the own table
+const dbOwnTableArgs: HanaDBArgs = {
+  connection: client,
+  tableName: myOwnTableName,
+  textColumnName: "MY_TEXT",
+  metadataColumnName: "MY_METADATA",
+  vectorColumnName: "MY_VECTOR",
+};
+const dbOwnTable = new HanaDB(embeddings, dbOwnTableArgs);
+await dbOwnTable.initialize();
+
+// Add a simple document with some metadata
+docs = [
+    new Document({
+        pageContent: "Some other text",
+        metadata: {start: 400, end: 450, docName: "other.txt"}
+    })
+]
+await dbOwnTable.addDocuments(docs);
+
+//  Check if data has been inserted into our own table
+const resultOwnTable = await new Promise<any[]>((resolve, reject) => {
+  client.exec(
+    `SELECT * FROM ${myOwnTableName} LIMIT 1`,
+    (err: Error, rows: any) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(rows);
+      }
+    }
+  );
+});
+rowOwnTable.forEach((r) => {
+  console.log(`SOME_OTHER_COLUMN: ${r.SOME_OTHER_COLUMN}`); // should be NULL
+  console.log(`MY_TEXT: ${r.MY_TEXT}`); // The text
+  console.log(`MY_METADATA: ${r.MY_METADATA}`); // The metadata
+  const embedding = parseFvecs(r.MY_VECTOR);
+  console.log(`MY_VECTOR: ${embedding.length, embedding.slice(0, 3).concat(['...']).concat(embedding.slice(-3))}`); // The vector
+});
+```
+
+```text
+SOME_OTHER_COLUMN: null
+MY_TEXT: Some other text
+MY_METADATA: {"start":400,"end":450,"docName":"other.txt"}
+MY_VECTOR: 768 [0.016170687973499298, -0.01129427831619978, -0.0005921399570070207, '...', 0.017849743366241455, 0.0003932560794055462, -0.00045805066474713385]
+```
+
+添加另一个文档并在自定义表上执行相似度搜索。
+
+```typescript
+const moreDocs = [
+    new Document({
+        pageContent: "ome more text",
+        metadata: {start: 800, end: 950, docName: "more.txt"}
+    })
+]
+
+awwait dbOwnTable.addDocuments(moreDocs);
+
+const foundDocs = await dbOwnTable.similaritySearch("What's up?", 2);
+foundDocs.forEach((doc) => {
+    console.log("-".repeat(80));
+    console.log(doc.pageContent);
+});
+```
+
+```text
+--------------------------------------------------------------------------------
+Some more text
+--------------------------------------------------------------------------------
+Some other text
+```
+
+### 使用自定义列优化过滤性能
+
+为了支持灵活的 metadata 值，默认情况下所有 metadata 都以 JSON 形式存储在 metadata 列中。如果已知部分 metadata 键和值类型，可以将它们改存到额外列中：创建目标表时以这些键名作为列名，并通过 `specificMetadataColumns` 列表将它们传给 HanaDB 构造函数。插入时，匹配这些值的 metadata 键会被复制到特殊列中。对于 `specificMetadataColumns` 列表中的键，过滤会使用特殊列而不是 metadata JSON 列。
+
+```typescript
+// Create a new table "PERFORMANT_CUSTOMTEXT_FILTER" with three "standard" columns and one additional column
+const performantTableName = "PERFORMANT_CUSTOMTEXT_FILTER";
+await new Promise<void>((resolve, reject) => {
+  client.exec(
+    `CREATE TABLE ${performantTableName} (
+      CUSTOMTEXT NVARCHAR(500),
+      MY_TEXT NVARCHAR(2048),
+      MY_METADATA NVARCHAR(1024),
+      MY_VECTOR REAL_VECTOR,
+    )`,
+    (err: Error) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve();
+      }
+    }
+  );
+});
+
+// Create a HanaDB instance with the table
+const dbPerformantArgs: HanaDBArgs = {
+  connection: client,
+  tableName: performantTableName,
+  textColumnName: "MY_TEXT",
+  metadataColumnName: "MY_METADATA",
+  vectorColumnName: "MY_VECTOR",
+  specificMetadataColumns: ["CUSTOMTEXT"],
+};
+const dbPerformant = new HanaDB(embeddings, dbPerformantArgs);
+await dbPerformant.initialize();
+
+// Add a simple document with some metadata
+
+const performantDocs = [
+    new Document({
+        pageContent: "Some other text",
+        metadata: {
+            start: 400,
+            end: 450,
+            docName: "other.txt",
+            CUSTOMTEXT: "Filters on this value are very performant"
+        }
+    })
+]
+
+await dbPerformant.addDocuments(performantDocs);
+// Check if data has been inserted into our own table
+const resultPerformant = await new Promise<any[]>((resolve, reject) => {
+  client.exec(
+    `SELECT * FROM ${performantTableName} LIMIT 1`,
+    (err: Error, rows: any) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(rows);
+      }
+    }
+  );
+});
+rowPerformant.forEach((r) => {
+  console.log(`CUSTOMTEXT: ${r.CUSTOMTEXT}`); // The custom text metadata
+  console.log(`MY_TEXT: ${r.MY_TEXT}`); // The text
+  console.log(`MY_METADATA: ${r.MY_METADATA}`); // The metadata
+  const embedding = parseFvecs(r.MY_VECTOR);
+  console.log(`MY_VECTOR: ${embedding.length, embedding.slice(0, 3).concat(['...']).concat(embedding.slice(-3))}`); // The vector
+});
+```
+
+```text
+CUSTOMTEXT: Filters on this value are very performant
+MY_TEXT: Some other text
+MY_METADATA: {"start":400,"end":450,"docName":"other.txt","CUSTOMTEXT":"Filters on this value are very performant"}
+768 [0.016170687973499298, -0.01129427831619978, -0.0005921399570070207, '...', 0.017849743366241455, 0.0003932560794055462, -0.00045805066474713385]
+```
+
+特殊列对 LangChain 接口的其余部分完全透明。一切仍像以前一样工作，只是性能更好。
+
+```typescript
+const advancedFilter = { CUSTOMTEXT: { $like: "%value%" } };
+const foundPerformantDocs = await dbPerformant.similaritySearch("What's up?", 2, advancedFilter);
+
+foundPerformantDocs.forEach((doc) => {
+    console.log("-".repeat(80));
+    console.log(doc.pageContent);
+});
+```
+
+```text
+--------------------------------------------------------------------------------
+Some more text
+--------------------------------------------------------------------------------
+Some other text
+```
+
+## 一个简单示例
+
+加载示例文档 "state_of_the_union.txt" 并从中创建分块。
+
+首先，安装 `@langchain/textsplitters` 包：
+
+```bash
+npm install @langchain/textsplitters
+```
+
+```typescript
+import { TextLoader } from "@langchain/classic/document_loaders/fs/text";
+import { CharacterTextSplitter } from "@langchain/textsplitters";
+
+// Load documents from file
+const loader = new TextLoader("./state_of_the_union.txt");
+const textDocuments = await loader.load();
+const textSplitter = new CharacterTextSplitter({
+  chunkSize: 500,
+  chunkOverlap: 0,
+});
+const textChunks = await textSplitter.splitDocuments(textDocuments);
+console.log("Number of document chunks:", textChunks.length);
+```
+
+```text
+Number of document chunks: 88
+```
+
+将加载的文档分块添加到表中。在此示例中，我们会删除表中可能因之前运行而存在的任何先前内容。
+
+```typescript
+// Delete already existing documents from the table
+await db.delete({ filter: {} });
+// add the loaded document chunks
+await db.addDocuments(textChunks);
+```
+
+执行查询，从上一步添加的文档分块中获取两个最匹配的文档分块。
+默认情况下，搜索使用 "Cosine Similarity"。
+
+```typescript
+const query = "What did the president say about Ketanji Brown Jackson";
+const docs = await db.similaritySearch(query, 2);
+docs.forEach((doc) => {
+  console.log("-".repeat(80));
+  console.log(doc.pageContent);
+});
+```
+
+```text
+--------------------------------------------------------------------------------
+One of the most serious constitutional responsibilities a President has is nominating
+someone to serve on the United States Supreme Court.
+
+And I did that 4 days ago, when I nominated Circuit Court of Appeals Judge Ketanji Brown Jackson.
+One of our nation’s top legal minds, who will continue Justice Breyer’s legacy of excellence.
+--------------------------------------------------------------------------------
+As I said last year, especially to our younger transgender Americans, I will always have your back as your President,
+so you can be yourself and reach your God-given potential.
+
+While it often appears that we never agree, that isn’t true. I signed 80 bipartisan bills into law last year.
+From preventing government shutdowns to protecting Asian-Americans from still-too-common hate crimes to reforming military justice
+```
+
+使用 "Euclidean Distance" 查询相同内容。结果应与 "Cosine Similarity" 相同。
+
+```typescript
+const argsL2d: HanaDBArgs = {
+  connection: client,
+  tableName: "STATE_OF_THE_UNION",
+  distanceStrategy: "EUCLIDEAN",
+};
+const dbL2d = new HanaDB(embeddings, argsL2d);
+await dbL2d.initialize();
+
+const docsL2d = await dbL2d.similaritySearch(query, 2);
+docsL2d.forEach((doc) => {
+  console.log("-".repeat(80));
+  console.log(doc.pageContent);
+});
+```
+
+```text
+--------------------------------------------------------------------------------
+One of the most serious constitutional responsibilities a President has is nominating
+someone to serve on the United States Supreme Court.
+
+And I did that 4 days ago, when I nominated Circuit Court of Appeals Judge Ketanji Brown Jackson.
+One of our nation’s top legal minds, who will continue Justice Breyer’s legacy of excellence.
+--------------------------------------------------------------------------------
+As I said last year, especially to our younger transgender Americans, I will always have your back as your President,
+so you can be yourself and reach your God-given potential.
+
+While it often appears that we never agree, that isn’t true. I signed 80 bipartisan bills into law last year.
+From preventing government shutdowns to protecting Asian-Americans from still-too-common hate crimes to reforming military justice
+```
+
+### 最大边际相关性搜索（MMR）
+
+`Maximal marginal relevance` 同时优化与查询的相似性以及所选文档之间的多样性。首先会从数据库中检索前 20（fetch_k）个条目。然后 MMR 算法会找出最佳的 2（k）个匹配。
+
+```typescript
+const docsMMR = await db.maxMarginalRelevanceSearch(query, {
+  k: 2,
+  fetchK: 20,
+});
+docsMMR.forEach((doc) => {
+  console.log("-".repeat(80));
+  console.log(doc.pageContent);
+});
+```
+
+```text
+--------------------------------------------------------------------------------
+One of the most serious constitutional responsibilities a President has is nominating someone
+to serve on the United States Supreme Court.
+
+And I did that 4 days ago, when I nominated Circuit Court of Appeals Judge Ketanji Brown Jackson.
+One of our nation’s top legal minds, who will continue Justice Breyer’s legacy of excellence.
+--------------------------------------------------------------------------------
+Groups of citizens blocking tanks with their bodies. Everyone from students to retirees teachers turned
+soldiers defending their homeland.
+
+In this struggle as President Zelenskyy said in his speech to the European Parliament “Light will win over darkness.”
+The Ukrainian Ambassador to the United States is here tonight.
+
+Let each of us here tonight in this Chamber send an unmistakable signal to Ukraine and to the world.
+```
+
+### 创建 HNSW 向量索引
+
+向量索引可以显著加速向量的 top-k 最近邻查询。用户可以使用 `createHnswIndex` 函数创建分层可导航小世界（Hierarchical Navigable Small World，HNSW）向量索引。
+
+有关在数据库层面创建索引的更多信息，请参阅[官方文档](https://help.sap.com/docs/hana-cloud-database/sap-hana-cloud-sap-hana-database-vector-engine-guide/create-vector-index-statement-data-definition)。
+
+```typescript
+// HanaDB instance uses cosine similarity as default
+const argsCosine: HanaDBArgs = {
+  connection: client,
+  tableName: "STATE_OF_THE_UNION",
+};
+
+// Initialize both HanaDB instances
+const dbCosine = new HanaDB(embeddings, argsCosine);
+await dbCosine.initialize();
+
+// Attempting to create the HNSW index with default parameters
+await dbCosine.createHnswIndex(); // If no other parameters are specified, the default values will be used
+// Default values: m=64, efConstruction=128, efSearch=200
+// The default index name will be: STATE_OF_THE_UNION_COSINE_idx
+
+// Second instance using the existing table "STATE_OF_THE_UNION" but with L2 Euclidean distance
+const argsL2: HanaDBArgs = {
+  connection: client,
+  tableName: "STATE_OF_THE_UNION",
+  distanceStrategy: "EUCLIDEAN", // Use Euclidean distance for this instance
+};
+
+const dbL2 = new HanaDB(embeddings, argsL2);
+await dbL2.initialize();
+
+// This will create an index based on L2 distance strategy.
+await dbL2.createHnswIndex({
+  indexName: "STATE_OF_THE_UNION_L2_index",
+  efSearch: 400, // Max number of neighbors per graph node (valid range: 4 to 1000)
+  m: 50, // Max number of candidates during graph construction (valid range: 1 to 100000)
+  efConstruction: 150, // Min number of candidates during the search (valid range: 1 to 100000)
+});
+
+// Use L2 index to perform MMR
+const docsL2HNSW = await dbL2.maxMarginalRelevanceSearch(query, {
+  k: 2,
+  fetchK: 20,
+});
+docsL2HNSW.forEach((doc) => {
+  console.log("-".repeat(80));
+  console.log(doc.pageContent);
+});
+```
+
+```text
+--------------------------------------------------------------------------------
+One of the most serious constitutional responsibilities a President has is nominating someone to serve on the United States Supreme Court.
+
+And I did that 4 days ago, when I nominated Circuit Court of Appeals Judge Ketanji Brown Jackson. One of our nation’s top legal minds, who will continue Justice Breyer’s legacy of excellence.
+--------------------------------------------------------------------------------
+Groups of citizens blocking tanks with their bodies. Everyone from students to retirees teachers turned soldiers defending their homeland.
+
+In this struggle as President Zelenskyy said in his speech to the European Parliament “Light will win over darkness.” The Ukrainian Ambassador to the United States is here tonight.
+
+Let each of us here tonight in this Chamber send an unmistakable signal to Ukraine and to the world.
+```
+
+**要点**：
+
+- **相似度函数**：索引的相似度函数默认是**余弦相似度**。如果你想使用不同的相似度函数（例如 `L2` 距离），需要在初始化 `HanaDB` 实例时指定。
+- **默认参数**：在 `createHnswIndex` 函数中，如果用户未提供 `m`、`efConstruction` 或 `efSearch` 等参数的自定义值，将自动使用默认值（例如 `m=64`、`efConstruction=128`、`efSearch=200`）。这些值确保在无需用户干预的情况下以合理的性能创建索引。

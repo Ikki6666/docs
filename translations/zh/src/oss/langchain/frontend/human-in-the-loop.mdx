@@ -370,7 +370,7 @@ function MultiActionReview({
             })
           }
         >
-          提交所有决策
+          Submit All Decisions
         </button>
       )}
     </div>
@@ -401,21 +401,21 @@ export interface FormField {
   default?: unknown;
 }
 
-/** 用户通过它来完成 interrupt。 */
+/** What the user resolves the interrupt with. */
 export interface ReviewDecision {
   approved: boolean;
-  /** 经过编辑/收集后的表单值，工具将基于这些值继续执行。 */
+  /** Edited / collected form values the tool should act on. */
   values?: Record<string, unknown>;
 }
 
-/** interrupt 传给前端的表单规格（“卡片”）。 */
+/** The form spec ("card") an interrupt hands to the frontend. */
 export interface InterruptCard {
   formType: "flight-booking" | "refund-approval" | "content-review";
   tool: string;
   title: string;
   context: Record<string, unknown>;
   fields: FormField[];
-  /** 前端在把已解决的卡片写回状态时填充。 */
+  /** Populated by the frontend when it commits the resolved card to state. */
   resolved?: boolean;
   decision?: ReviewDecision;
 }
@@ -466,7 +466,7 @@ const bookFlight = tool(
 
 ### 为每个工具渲染不同表单
 
-在客户端，卡片会以 `stream.interrupt.value` 的形式到达。从你的 agent 模块中导入 `InterruptCard` 和 `ReviewDecision` 类型，这样表单和 payload 就能保持同步。根据 `formType` 选择对应表单，并把 `fields` 传给输入组件：
+在客户端，卡片会以 `stream.interrupt.value` 的形式到达。从你的 agent 模块中导入 `InterruptCard` 和 `ReviewDecision` 类型，这样表单和 payload 就能保持同步；根据 `formType` 选择对应表单，并把 `fields` 传给输入组件：
 
 ```tsx
 import { useStream } from "@langchain/react";
@@ -485,3 +485,58 @@ function Chat() {
       {stream.messages.map((msg) => (
         <Message key={msg.id} message={msg} />
       ))}
+      {card && <InterruptForm card={card} onResolve={handleResolve} />}
+    </div>
+  );
+}
+
+// `InterruptForm` renders a flight / refund / content card based on
+// `card.formType`, collects `card.fields`, and calls `onResolve` with the
+// user's decision and edited values.
+```
+
+### 使用 `respond(decision, { update })` 让卡片留在屏幕上
+
+当你解决一个普通的 interrupt 时，卡片会在 interrupt 清除的瞬间消失，只返回工具结果。这意味着一个丰富的审查卡片会在运行中途消失。要让它留在屏幕上，可以使用 @[`useStream`] 的 `respond`，在**同一个** superstep 中解决 interrupt，**并**把携带该卡片的消息提交到 state：
+
+```tsx
+import { AIMessage } from "langchain";
+
+function handleResolve(decision: ReviewDecision) {
+  // Snapshot the card with the decision baked in so it renders read-only.
+  const resolvedCard = { ...card, resolved: true, decision };
+  const cardMessage = new AIMessage({
+    content: `Review ${decision.approved ? "approved" : "declined"}.`,
+    response_metadata: { cards: resolvedCard },
+  });
+
+  // Resume the interrupt AND push the card into state atomically. Maps to
+  // LangGraph's `Command(resume, update)`: one checkpoint, no extra state write.
+  stream.respond(decision, { update: { messages: [cardMessage] } });
+}
+```
+
+`respond(response, { update })` 会**乐观地**应用 `update`：卡片会立即绘制出来，等恢复后的运行回传同一条消息时再按 ID 进行协调。后端永远不会重新发出这张卡片，因此在（可能较慢的）工具运行期间，它会持续渲染而不会闪烁。通过从消息中读回卡片来渲染已解决的卡片：
+
+```tsx
+{stream.messages.map((msg) => {
+  const card = (msg.response_metadata as { cards?: InterruptCard })?.cards;
+  if (card) return <InterruptForm key={msg.id} card={card} readOnly />;
+  return <Message key={msg.id} message={msg} />;
+})}
+```
+
+<Tip>
+由于已解决的卡片保存在消息历史中，它能经受刷新，并对每个读取该 thread 的组件可见，而且人类的决策会成为持久 transcript 的一部分，而不只是短暂的 UI 状态。
+</Tip>
+
+## 最佳实践
+
+实现 HITL 工作流时，请牢记以下准则：
+
+- **展示清晰的上下文**。始终显示智能体想做什么以及为什么。包含动作描述和完整参数。
+- **让批准成为最简单的路径**。如果动作看起来正确，批准应当只需一次点击。把多步骤流程留给拒绝/编辑。
+- **校验编辑后的参数**。当用户编辑动作参数时，在发送前校验 JSON 结构。对格式错误输入显示内联错误。
+- **持久化 interrupt 状态**。如果用户刷新页面，interrupt 仍应可见。@[`useStream`] 会通过 thread 的 checkpoint 处理这一点。
+- **记录所有决策**。为了审计，记录每一次批准/拒绝/编辑决策，包括时间戳和做出决策的用户。
+- **合理设置超时**。长时间运行的智能体不应无限期地等待人工审核。考虑显示智能体已经等待了多久。

@@ -1,15 +1,23 @@
 ---
 title: "Bedrock（knowledge bases）集成"
 description: "使用 LangChain Python 集成 Bedrock（knowledge bases）retriever。"
+integration:
+  name: AmazonKnowledgeBasesRetriever
+  pypi: langchain-aws
+  self_host: false
+  cloud_offering: true
+  package_md: '[`langchain-aws`](https://reference.langchain.com/python/langchain-aws/retrievers/bedrock/AmazonKnowledgeBasesRetriever)'
 ---
 
-本指南将帮助你开始使用 AWS Knowledge Bases [retriever](/oss/langchain/retrieval/)。
+本指南将帮助你开始使用 AWS Knowledge Bases [retriever](/oss/deepagents/retrieval)。
 
 [Knowledge Bases for Amazon Bedrock](https://aws.amazon.com/bedrock/knowledge-bases/) 是 Amazon Web Services (AWS) 提供的一项能力，可通过使用你的私有数据定制 FM 响应，从而快速构建 RAG 应用。
 
 实现 `RAG` 通常需要组织执行若干繁琐步骤，将数据转换为 embeddings（vectors），把 embeddings 存储到专用向量数据库中，并构建到数据库的自定义集成以搜索和检索与用户查询相关的文本。这一过程可能既耗时又低效。
 
 有了 `Knowledge Bases for Amazon Bedrock`，你只需把数据指向 `Amazon S3` 中的位置，`Knowledge Bases for Amazon Bedrock` 就会负责把数据摄取到向量数据库的整个工作流。如果你没有现成的向量数据库，Amazon Bedrock 会为你创建一个 Amazon OpenSearch Serverless vector store。进行检索时，可通过 LangChain - Amazon Bedrock 集成中的 Retrieve API，从 knowledge bases 中为用户查询检索相关结果。
+
+**Amazon Bedrock 现在还提供 [Managed Knowledge Bases](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-build-managed.html)**，可自动处理 embedding、存储和检索，无需外部 vector store。请参阅下文的 [Managed Knowledge Base](#managed-knowledge-base) 部分。
 
 ## 设置
 
@@ -27,12 +35,16 @@ os.environ["LANGSMITH_TRACING"] = "true"
 这个 retriever 位于 `langchain-aws` 包中：
 
 ```python
-pip install -qU langchain-aws
+pip install -qU "langchain-aws>=1.6.3"
 ```
+
+**SDK 要求：** 托管搜索和 agentic retrieval 需要 `langchain-aws>=1.6.3`，它会安装 `boto3>=1.43.32`。
 
 ## 实例化
 
-现在可以实例化 retriever：
+### Vector Knowledge Base
+
+对于传统的基于向量的 knowledge bases（使用 OpenSearch Serverless、Pinecone 等）：
 
 ```python
 from langchain_aws.retrievers import AmazonKnowledgeBasesRetriever
@@ -42,6 +54,40 @@ retriever = AmazonKnowledgeBasesRetriever(
     retrieval_config={"vectorSearchConfiguration": {"numberOfResults": 4}},
 )
 ```
+
+### Managed Knowledge Base
+
+对于 [Managed Knowledge Bases](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-build-managed.html)（推荐，无需 vector store）：
+
+```python
+from langchain_aws.retrievers import AmazonKnowledgeBasesRetriever
+
+retriever = AmazonKnowledgeBasesRetriever(
+    knowledge_base_id="YOUR_MANAGED_KB_ID",
+    retrieval_config={"managedSearchConfiguration": {"numberOfResults": 4}},
+)
+```
+
+Managed knowledge bases 会自动处理 embedding、分块、存储和检索。它们还支持托管 reranking，以提升结果质量。
+
+### Agentic Retrieval
+
+对于能从查询分解和托管 reranking 中获益的复杂查询，请使用独立的 `agentic_retrieve` helper：
+
+```python
+from langchain_aws.retrievers import agentic_retrieve
+
+result = agentic_retrieve(
+    knowledge_base_id="YOUR_MANAGED_KB_ID",
+    query="What are the differences between S3 storage classes?",
+    region_name="us-west-2",
+)
+
+for doc in result["results"]:
+    print(doc["content"]["text"])
+```
+
+Agentic retrieval 使用 `AgenticRetrieveStream`，它会执行智能查询分解和托管 reranking。它需要 `langchain-aws>=1.6.3`，并且只适用于 managed knowledge bases。
 
 ## 用法
 
@@ -54,20 +100,45 @@ retriever.invoke(query)
 ## 在 chain 中使用
 
 ```python
-from botocore.client import Config
-from langchain_classic.chains import RetrievalQA
-from langchain_aws import Bedrock
+from langchain_aws import ChatBedrock
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 
-model_kwargs_claude = {"temperature": 0, "top_k": 10, "max_tokens_to_sample": 3000}
+llm = ChatBedrock(model_id="anthropic.claude-sonnet-4-20250514-v1:0")
 
-llm = Bedrock(model_id="anthropic.claude-v2", model_kwargs=model_kwargs_claude)
-
-qa = RetrievalQA.from_chain_type(
-    llm=llm, retriever=retriever, return_source_documents=True
+prompt = ChatPromptTemplate.from_template(
+    "Answer the question based on the context:\n\nContext: {context}\n\nQuestion: {question}"
 )
 
-qa(query)
+chain = (
+    {"context": retriever, "question": RunnablePassthrough()}
+    | prompt
+    | llm
+    | StrOutputParser()
+)
+
+chain.invoke("What are the key features?")
 ```
+
+## 必需的 IAM 权限
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "bedrock:Retrieve",
+    "bedrock:AgenticRetrieveStream"
+  ],
+  "Resource": "arn:aws:bedrock:<region>:<account-id>:knowledge-base/<kb-id>"
+}
+```
+
+## 资源
+
+- [Build a Managed Knowledge Base](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-build-managed.html)
+- [Retrieve API](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-test-retrieve.html)
+- [Agentic Retrieval](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-test-agentic-retrieve.html)
 
 ---
 
