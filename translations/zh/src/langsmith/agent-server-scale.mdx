@@ -15,6 +15,15 @@ LangSmith Agent Server 的默认配置，旨在处理多种不同工作负载下
 
 对于 [Cloud](/langsmith/cloud-platform-features#scaling)，平台会自动扩缩容，因此下方的 Helm 配置并不适用。
 
+## 请求并发与 run 并发
+
+有两种相互独立的并发类型决定 Agent Server 如何扩缩容，它们分别控制：
+
+- **请求并发（Request concurrency）** 指 deployment 同时处理多少个 API 请求（创建 runs、读取 thread 状态、流式返回结果）。API servers 异步处理请求，请求并发随 API server 副本数水平扩展。
+- **Run 并发** 指同时执行多少个 runs。单个 queue worker 最多并发执行 [`N_JOBS_PER_WORKER`](/langsmith/env-var-self-hosted) 个 runs（默认 10）。Run 并发上限为 queue workers 数量乘以 `N_JOBS_PER_WORKER`。
+
+创建 run 是一次快速的写入请求：API server 持久化一个 pending run 后立即返回，无需等待 run 执行。如果所有 run 槽位都已占用，额外的 runs 会在[队列](/langsmith/agent-server#run-execution-lifecycle)中等待，直到有空槽释放。提高 `N_JOBS_PER_WORKER` 或增加 queue workers 可以提升 run 吞吐量，但不会改变 deployment 能同时处理多少请求。
+
 ## 写入负载
 
 写入负载主要由以下因素驱动：
@@ -40,9 +49,10 @@ LangSmith Agent Server 的默认配置，旨在处理多种不同工作负载下
 调整 `N_JOBS_PER_WORKER` 的一些一般性建议：
 
 - 如果你的 assistant 是 CPU bounded，默认值 10 通常已经足够。如果你发现 queue workers 的 CPU 使用过高，或 run 执行出现延迟，可以考虑降低 `N_JOBS_PER_WORKER`。
+- 如果你的 assistant 是 memory bounded，或 queue workers 的内存已接近上限，请降低 `N_JOBS_PER_WORKER`，以减少每个 worker 的并发 runs 数量。
 - 如果你的 assistant 是 IO bounded，可以提高 `N_JOBS_PER_WORKER`，让每个 worker 处理更多并发 runs。
 
-`N_JOBS_PER_WORKER` 没有上限。不过，queue workers 在拉取新 runs 时是贪婪的，这意味着它们会尽可能领取自己还有空余 job slots 的所有 runs，并立即开始执行。在流量具有突发性的环境中，如果把 `N_JOBS_PER_WORKER` 设得过高，可能会导致 worker 利用率不均，以及 run 执行时间增加。
+`N_JOBS_PER_WORKER` 没有上限。不过，queue workers 在拉取新 runs 时是贪婪的，这意味着它们会尽可能领取自己还有空余 job slots 的所有 runs，并立即开始执行。在流量具有突发性的环境中，如果把 `N_JOBS_PER_WORKER` 设得过高，可能会导致 worker 利用率不均、run 执行时间增加，以及 queue workers 内存占用过高。
 
 ### 避免同步阻塞操作
 
@@ -98,6 +108,8 @@ queue:
 这样会把队列管理工作从 API server 卸载到专门的 queue workers 上，减轻 API server 的负载，让它专注于处理请求。
 
 ### 根据预期吞吐量配置 jobs 数
+
+本节调整的是 run 执行能力（queue workers），它与请求处理能力（API server 副本）相互独立。更多信息请参阅[请求并发与 run 并发](#request-vs-run-concurrency)。
 
 并行执行的 runs 越多，你需要处理负载的 jobs 就越多。扩展可用 jobs 的主要参数有两个：
 
@@ -179,7 +191,7 @@ stream_memory_bytes = peak_streamed_bytes_per_second * (RESUMABLE_STREAM_TTL_SEC
 确切的最优配置取决于你的应用复杂度、请求模式和数据需求。请结合前面各节的信息以及你的具体使用情况，按需更新 deployment 配置。如果你有任何问题，请通过 [support.langchain.com](https://support.langchain.com) 联系支持团队。
 </Note>
 
-下表概览了不同负载模式下（每秒读取请求数 / 每秒写入请求数）Agent Server 的不同配置，以及标准 assistant 特征（平均 run 执行时间为 1 秒，CPU 和内存使用中等）的对比：
+下表概览了不同负载模式下（每秒读取请求数 / 每秒写入请求数）Agent Server 的不同配置，以及标准 assistant 特征（平均 run 执行时间为 1 秒，CPU 和内存使用中等）的对比。这些请求速率决定了所需的稳态 run 吞吐量，而稳态 run 吞吐量通过 queue workers 和 `N_JOBS_PER_WORKER` 来确定规模；API server 副本数则按请求量本身来确定规模：
 
 |  | **[Low / low](#low-reads-low-writes)** | **[Low / high](#low-reads-high-writes)** | **[High / low](#high-reads-low-writes)** | [Medium / medium](#medium-reads-medium-writes) | [High / high](#high-reads-high-writes) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -281,9 +293,6 @@ queue:
       cpu: "2"
       memory: "4Gi"
 
-config:
-  numberOfJobsPerWorker: 10  # Default
-
 redis:
   resources:
     requests:
@@ -330,9 +339,6 @@ queue:
     limits:
       cpu: "2"
       memory: "4Gi"
-
-config:
-  numberOfJobsPerWorker: 10
 
 redis:
   resources:
