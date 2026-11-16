@@ -134,31 +134,37 @@ const result = await agent.invoke({
 
 ```typescript
 import { RemoveMessage } from "@langchain/core/messages";
-import { createAgent, createMiddleware, trimMessages } from "langchain";
-import { MemorySaver } from "@langchain/langgraph";
-import { REMOVE_ALL_MESSAGES } from "@langchain/langgraph";
+import { createAgent, createMiddleware } from "langchain";
+import { MemorySaver, REMOVE_ALL_MESSAGES } from "@langchain/langgraph";
 
-const trimMessageHistory = createMiddleware({
+const trimMessages = createMiddleware({
   name: "TrimMessages",
-  beforeModel: async (state) => {
-    const trimmed = await trimMessages(state.messages, {
-      maxTokens: 384,
-      strategy: "last",
-      startOn: "human",
-      endOn: ["human", "tool"],
-      tokenCounter: (msgs) => msgs.length,
-    });
+  beforeModel: (state) => {
+    const messages = state.messages;
+
+    if (messages.length <= 3) {
+      return; // No changes needed
+    }
+
+    const firstMsg = messages[0];
+    const recentMessages =
+      messages.length % 2 === 0 ? messages.slice(-3) : messages.slice(-4);
+    const newMessages = [firstMsg, ...recentMessages];
+
     return {
-      messages: [new RemoveMessage({ id: REMOVE_ALL_MESSAGES }), ...trimmed],
+      messages: [
+        new RemoveMessage({ id: REMOVE_ALL_MESSAGES }),
+        ...newMessages,
+      ],
     };
   },
 });
 
 const checkpointer = new MemorySaver();
 const agent = createAgent({
-  model: "gpt-5-nano",
-  tools: [],
-  middleware: [trimMessageHistory],
+  model: "gpt-6.1-sol",
+  tools: [...],
+  middleware: [trimMessages],
   checkpointer,
 });
 ```
@@ -200,6 +206,437 @@ const deleteMessages = (state) => {
     * 大多数 provider 要求带 tool call 的 `assistant` 消息后面必须跟对应的 `tool` result 消息
 </Warning>
 
+
+
+```typescript
+import { RemoveMessage } from "@langchain/core/messages";
+import { createAgent, createMiddleware } from "langchain";
+import { MemorySaver } from "@langchain/langgraph";
+
+const deleteOldMessages = createMiddleware({
+  name: "DeleteOldMessages",
+  afterModel: (state) => {
+    const messages = state.messages;
+    if (messages.length > 2) {
+      // remove the earliest two messages
+      return {
+        messages: messages
+          .slice(0, 2)
+          .map((m) => new RemoveMessage({ id: m.id! })),
+      };
+    }
+    return;
+  },
+});
+
+const agent = createAgent({
+  model: "gpt-6.1-sol",
+  tools: [],
+  systemPrompt: "Please be concise and to the point.",
+  middleware: [deleteOldMessages],
+  checkpointer: new MemorySaver(),
+});
+
+const config = { configurable: { thread_id: "1" } };
+
+const streamA = await agent.streamEvents(
+  { messages: [{ role: "user", content: "hi! I'm bob" }] },
+  { ...config, version: "v3" }
+);
+for await (const snapshot of streamA.values) {
+  const messageDetails = snapshot.messages.map((message) => [
+    message.getType(),
+    message.content,
+  ]);
+  console.log(messageDetails);
+}
+
+const streamB = await agent.streamEvents(
+  { messages: [{ role: "user", content: "write a short poem about cats" }] },
+  { ...config, version: "v3" }
+);
+for await (const snapshot of streamB.values) {
+  const messageDetails = snapshot.messages.map((message) => [
+    message.getType(),
+    message.content,
+  ]);
+  console.log(messageDetails);
+}
+
+const streamC = await agent.streamEvents(
+  { messages: [{ role: "user", content: "what's my name?" }] },
+  { ...config, version: "v3" }
+);
+for await (const snapshot of streamC.values) {
+  const messageDetails = snapshot.messages.map((message) => [
+    message.getType(),
+    message.content,
+  ]);
+  console.log(messageDetails);
+}
+```
+
+```
+[["human", "hi! I'm bob"]]
+[["human", "hi! I'm bob"], ["ai", "Hi Bob! Nice to meet you. How can I help you today? I can answer questions, brainstorm ideas, draft text, explain things, or help with code."]]
+[["human", "hi! I'm bob"], ["ai", "Hi Bob! Nice to meet you. How can I help you today? I can answer questions, brainstorm ideas, draft text, explain things, or help with code."], ["human", "write a short poem about cats"]]
+[["human", "hi! I'm bob"], ["ai", "Hi Bob! Nice to meet you. How can I help you today? I can answer questions, brainstorm ideas, draft text, explain things, or help with code."], ["human", "write a short poem about cats"], ["ai", "There once was a cat on a wall, Who barely moved at all..."]]
+[["human", "write a short poem about cats"], ["ai", "There once was a cat on a wall, Who barely moved at all..."]]
+[["human", "write a short poem about cats"], ["ai", "There once was a cat on a wall, Who barely moved at all..."], ["human", "what's my name?"]]
+[["human", "write a short poem about cats"], ["ai", "There once was a cat on a wall, Who barely moved at all..."], ["human", "what's my name?"], ["ai", "I don't know your name - you haven't told me!"]]
+[["human", "what's my name?"], ["ai", "I don't know your name - you haven't told me!"]]
+```
+
+
+### 总结消息
+
+如上所示，裁剪或移除消息的问题在于：剔除消息队列中的内容可能会让你丢失信息。
+因此，一些应用会受益于使用 chat model 对消息历史进行总结这种更精细的方案。
+
+![Summary](/oss/images/summary.png)
+
+
+
+要在智能体中总结消息历史，请使用内置的 [`summarizationMiddleware`](/oss/javascript/langchain/middleware#summarization)：
+
+```typescript
+import { createAgent, summarizationMiddleware } from "langchain";
+import { MemorySaver } from "@langchain/langgraph";
+
+const checkpointer = new MemorySaver();
+
+const agent = createAgent({
+  model: "gpt-6.1-sol",
+  tools: [],
+  middleware: [
+    summarizationMiddleware({
+      model: "gpt-5.4-mini",
+      trigger: { tokens: 4000 },
+      keep: { messages: 20 },
+    }),
+  ],
+  checkpointer,
+});
+
+const config = { configurable: { thread_id: "1" } };
+await agent.invoke({ messages: "hi, my name is bob" }, config);
+await agent.invoke({ messages: "write a short poem about cats" }, config);
+await agent.invoke({ messages: "now do the same but for dogs" }, config);
+const finalResponse = await agent.invoke({ messages: "what's my name?" }, config);
+
+console.log(finalResponse.messages.at(-1)?.content);
+// Your name is Bob!
+```
+
+关于更多配置选项，请参见 [`summarizationMiddleware`](/oss/javascript/langchain/middleware#summarization)。
+
+
+## 访问记忆
+
+你可以通过多种方式访问并修改智能体的短期记忆（state）：
+
+### 工具
+
+#### 在工具中读取短期记忆
+
+使用 `runtime` 参数（类型为 `ToolRuntime`）在工具中访问短期记忆（state）。
+
+`runtime` 参数会从工具签名中隐藏（因此模型看不到它），但工具可以通过它访问 state。
+
+
+```typescript
+import { createAgent, tool, type ToolRuntime } from "langchain";
+import { StateSchema } from "@langchain/langgraph";
+import * as z from "zod";
+
+const CustomState = new StateSchema({
+  userId: z.string(),
+});
+
+const getUserInfo = tool(
+  async (_, config: ToolRuntime<typeof CustomState.State>) => {
+    const userId = config.state.userId;
+    return userId === "user_123" ? "John Doe" : "Unknown User";
+  },
+  {
+    name: "get_user_info",
+    description: "Get user info",
+    schema: z.object({}),
+  }
+);
+
+const agent = createAgent({
+  model: "gpt-5-nano",
+  tools: [getUserInfo],
+  stateSchema: CustomState,
+});
+
+const result = await agent.invoke(
+  {
+    messages: [{ role: "user", content: "what's my name?" }],
+    userId: "user_123",
+  },
+  {
+    context: {},
+  }
+);
+
+console.log(result.messages.at(-1)?.content);
+// Outputs: "Your name is John Doe."
+```
+
+
+#### 从工具中写入短期记忆
+
+要在执行期间修改智能体的短期记忆（state），你可以直接从工具中返回 state 更新。
+
+这对于持久化中间结果，或让后续工具或提示能够访问信息非常有用。
+
+
+
+```typescript
+import { tool, createAgent, ToolMessage, type ToolRuntime } from "langchain";
+import { Command, StateSchema } from "@langchain/langgraph";
+import * as z from "zod";
+
+const CustomState = new StateSchema({
+  userId: z.string().optional(),
+  userName: z.string().optional(),
+});
+
+const updateUserInfo = tool(
+  async (_, config: ToolRuntime<typeof CustomState.State>) => {
+    const userId = config.state.userId;
+    const name = userId === "user_123" ? "John Smith" : "Unknown user";
+    return new Command({
+      update: {
+        userName: name,
+        // update the message history
+        messages: [
+          new ToolMessage({
+            content: "Successfully looked up user information",
+            tool_call_id: config.toolCall?.id ?? "",
+          }),
+        ],
+      },
+    });
+  },
+  {
+    name: "update_user_info",
+    description: "Look up and update user info.",
+    schema: z.object({}),
+  }
+);
+
+const greet = tool(
+  async (_, config: ToolRuntime<typeof CustomState.State>) => {
+    const userName = config.state.userName;
+    return `Hello ${userName}!`;
+  },
+  {
+    name: "greet",
+    description: "Use this to greet the user once you found their info.",
+    schema: z.object({}),
+  }
+);
+
+const agent = createAgent({
+  model: "openai:gpt-5-mini",
+  tools: [updateUserInfo, greet],
+  stateSchema: CustomState,
+});
+
+const result = await agent.invoke({
+  messages: [{ role: "user", content: "greet the user" }],
+  userId: "user_123",
+});
+
+console.log(result.messages.at(-1)?.content);
+// Output: "Hello John Smith! It's great to meet you. How can I help you today?"
+```
+
+
+### 提示词
+
+在 middleware 中访问短期记忆（state），以基于对话历史或自定义 state 字段创建动态提示词。
+
+
+```typescript
+import * as z from "zod";
+import { createAgent, tool, dynamicSystemPromptMiddleware } from "langchain";
+
+const contextSchema = z.object({
+  userName: z.string(),
+});
+type ContextSchema = z.infer<typeof contextSchema>;
+
+const getWeather = tool(
+  async ({ city }) => {
+    return `The weather in ${city} is always sunny!`;
+  },
+  {
+    name: "get_weather",
+    description: "Get user info",
+    schema: z.object({
+      city: z.string(),
+    }),
+  }
+);
+
+const agent = createAgent({
+  model: "gpt-5-nano",
+  tools: [getWeather],
+  contextSchema,
+  middleware: [
+    dynamicSystemPromptMiddleware<ContextSchema>((_, config) => {
+      return `You are a helpful assistant. Address the user as ${config.context?.userName}.`;
+    }),
+  ],
+});
+
+const result = await agent.invoke(
+  {
+    messages: [{ role: "user", content: "What is the weather in SF?" }],
+  },
+  {
+    context: {
+      userName: "John Smith",
+    },
+  }
+);
+
+for (const message of result.messages) {
+  console.log(message);
+}
+/**
+ * HumanMessage {
+ *   "content": "What is the weather in SF?",
+ *   // ...
+ * }
+ * AIMessage {
+ *   // ...
+ *   "tool_calls": [
+ *     {
+ *       "name": "get_weather",
+ *       "args": {
+ *         "city": "San Francisco"
+ *       },
+ *       "type": "tool_call",
+ *       "id": "call_tCidbv0apTpQpEWb3O2zQ4Yx"
+ *     }
+ *   ],
+ *   // ...
+ * }
+ * ToolMessage {
+ *   "content": "The weather in San Francisco is always sunny!",
+ *   "tool_call_id": "call_tCidbv0apTpQpEWb3O2zQ4Yx"
+ *   // ...
+ * }
+ * AIMessage {
+ *   "content": "John Smith, here's the latest: The weather in San Francisco is always sunny!\n\nIf you'd like more details (temperature, wind, humidity) or a forecast for the next few days, I can pull that up. What would you like?",
+ *   // ...
+ * }
+ */
+```
+
+
+### 模型调用前
+
+
+
+
+```mermaid
+%%{
+    init: {
+        "fontFamily": "monospace",
+        "flowchart": {
+        "curve": "basis"
+        }
+    }
+}%%
+graph TD
+    S(["`\_\_start\_\_`"])
+    PRE(before_model)
+    MODEL(model)
+    TOOLS(tools)
+    END(["`\_\_end\_\_`"])
+    S --> PRE
+    PRE --> MODEL
+    MODEL -.-> TOOLS
+    MODEL -.-> END
+    TOOLS --> PRE
+    classDef blueHighlight fill:#E5F4FF,stroke:#006DDD,color:#030710;
+    classDef neutral fill:#F2FAFF,stroke:#40668D,stroke-width:2px,color:#2F4B68;
+    class S blueHighlight;
+    class END blueHighlight;
+    class PRE,MODEL,TOOLS neutral;
+```
+
+
+```typescript
+import { RemoveMessage } from "@langchain/core/messages";
+import { createAgent, createMiddleware, trimMessages } from "langchain";
+import { MemorySaver } from "@langchain/langgraph";
+import { REMOVE_ALL_MESSAGES } from "@langchain/langgraph";
+
+const trimMessageHistory = createMiddleware({
+  name: "TrimMessages",
+  beforeModel: async (state) => {
+    const trimmed = await trimMessages(state.messages, {
+      maxTokens: 384,
+      strategy: "last",
+      startOn: "human",
+      endOn: ["human", "tool"],
+      tokenCounter: (msgs) => msgs.length,
+    });
+    return {
+      messages: [new RemoveMessage({ id: REMOVE_ALL_MESSAGES }), ...trimmed],
+    };
+  },
+});
+
+const checkpointer = new MemorySaver();
+const agent = createAgent({
+  model: "gpt-5-nano",
+  tools: [],
+  middleware: [trimMessageHistory],
+  checkpointer,
+});
+```
+
+
+### 模型调用后
+
+
+
+```mermaid
+%%{
+    init: {
+        "fontFamily": "monospace",
+        "flowchart": {
+        "curve": "basis"
+        }
+    }
+}%%
+graph TD
+    S(["`__start__`"])
+    MODEL(model)
+    POST(after_model)
+    TOOLS(tools)
+    END(["`__end__`"])
+    S --> MODEL
+    MODEL --> POST
+    POST -.-> END
+    POST -.-> TOOLS
+    TOOLS --> MODEL
+    classDef blueHighlight fill:#E5F4FF,stroke:#006DDD,color:#030710;
+    classDef greenHighlight fill:#F6FFDB,stroke:#6E8900,color:#2E3900;
+    classDef neutral fill:#F2FAFF,stroke:#40668D,stroke-width:2px,color:#2F4B68;
+    class S blueHighlight;
+    class END blueHighlight;
+    class POST greenHighlight;
+    class MODEL,TOOLS neutral;
+```
 
 
 ```typescript

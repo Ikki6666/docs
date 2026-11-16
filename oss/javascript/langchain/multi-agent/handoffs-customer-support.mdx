@@ -1,6 +1,6 @@
 ---
 title: 使用 handoffs 构建客户支持
-sidebarTitle: "Handoffs: Customer support"
+sidebarTitle: "Handoffs：客户支持"
 ---
 
 import ChatModelTabsPy from '/snippets/javascript/chat-model-tabs.mdx';
@@ -84,11 +84,11 @@ pnpm add langchain
 
 
 <CodeGroup>
-```bash bash
+```bash Shell
 export LANGSMITH_TRACING="true"
 export LANGSMITH_API_KEY="..."
 ```
-```typescript typescript
+```typescript TypeScript
 process.env.LANGSMITH_TRACING = "true";
 process.env.LANGSMITH_API_KEY = "...";
 ```
@@ -109,6 +109,26 @@ process.env.LANGSMITH_API_KEY = "...";
 先定义一个自定义 state schema，用来跟踪当前处于哪个 step：
 
 
+
+```typescript
+import { StateSchema } from "@langchain/langgraph";
+import { z } from "zod";
+
+// Define the possible workflow steps
+const SupportStepSchema = z.enum(["warranty_collector", "issue_classifier", "resolution_specialist"]);  // [!code highlight]
+const WarrantyStatusSchema = z.enum(["in_warranty", "out_of_warranty"]);
+const IssueTypeSchema = z.enum(["hardware", "software"]);
+
+// State for customer support workflow
+const SupportState = new StateSchema({  // [!code highlight]
+  currentStep: SupportStepSchema.optional(),  // [!code highlight]
+  warrantyStatus: WarrantyStatusSchema.optional(),
+  issueType: IssueTypeSchema.optional(),
+});
+```
+
+
+`current_step` 字段是 state machine pattern 的核心—它决定了每一轮加载哪种配置（prompt + tools）。
 
 ## 2. 创建管理 workflow state 的工具
 
@@ -175,7 +195,7 @@ const recordIssueType = tool(
 
 const escalateToHuman = tool(
   async (input) => {
-    // 在真实系统里，这里会创建工单、通知工作人员等。
+    // In a real system, this would create a ticket, notify staff, etc.
     return `Escalating to human support. Reason: ${input.reason}`;
   },
   {
@@ -202,59 +222,59 @@ const provideSolution = tool(
 ```
 
 
-这个步骤管理工具会把 `warranty_status` 和 `issue_type` 记录到 state 里，并把 `current_step` 更新到下一阶段。
+请注意，`record_warranty_status` 和 `record_issue_type` 返回的 `Command` 对象会同时更新数据（`warranty_status`、`issue_type`）和 `current_step`。这正是 state machine 的工作方式—工具控制 workflow 的推进。
 
 ## 3. 定义 step 配置
 
-为每个 step 定义 prompt 和 tools。先把每个 step 的 prompt 写成常量：
+为每个 step 定义 prompt 和 tools。先定义每个 step 的 prompt：
 
 <Accordion title="查看完整 prompt 定义">
 
 
 
 ```typescript
-// 为每个 step 定义常量，便于引用
-const WARRANTY_COLLECTOR_PROMPT = `你是一个帮助处理设备问题的客户支持 agent。
+// Define prompts as constants for easy reference
+const WARRANTY_COLLECTOR_PROMPT = `You are a customer support agent helping with device issues.
 
 CURRENT STAGE: Warranty verification
 
-在这个步骤里，你需要：
-1. 友好地向客户打招呼
-2. 询问设备是否仍在保修期内
-3. 使用 record_warranty_status 记录回复并进入下一步
+At this step, you need to:
+1. Greet the customer warmly
+2. Ask if their device is under warranty
+3. Use record_warranty_status to record their response and move to the next step
 
-保持对话自然友好，不要一次问太多问题。`;
+Be conversational and friendly. Don't ask multiple questions at once.`;
 
-const ISSUE_CLASSIFIER_PROMPT = `你是一个帮助处理设备问题的客户支持 agent。
+const ISSUE_CLASSIFIER_PROMPT = `You are a customer support agent helping with device issues.
 
 CURRENT STAGE: Issue classification
 CUSTOMER INFO: Warranty status is {warranty_status}
 
-在这个步骤里，你需要：
-1. 让客户描述遇到的问题
-2. 判断它是硬件问题（物理损坏、部件损坏）还是软件问题（应用崩溃、性能问题）
-3. 使用 record_issue_type 记录分类并进入下一步
+At this step, you need to:
+1. Ask the customer to describe their issue
+2. Determine if it's a hardware issue (physical damage, broken parts) or software issue (app crashes, performance)
+3. Use record_issue_type to record the classification and move to the next step
 
-如果信息不清楚，先追问再分类。`;
+If unclear, ask clarifying questions before classifying.`;
 
-const RESOLUTION_SPECIALIST_PROMPT = `你是一个帮助处理设备问题的客户支持 agent。
+const RESOLUTION_SPECIALIST_PROMPT = `You are a customer support agent helping with device issues.
 
 CURRENT STAGE: Resolution
 CUSTOMER INFO: Warranty status is {warranty_status}, issue type is {issue_type}
 
-在这个步骤里，你需要：
-1. 对于 SOFTWARE 问题：使用 provide_solution 提供排查步骤
-2. 对于 HARDWARE 问题：
-   - 如果 IN WARRANTY：使用 provide_solution 说明保修维修流程
-   - 如果 OUT OF WARRANTY：使用 escalate_to_human 提供付费维修选项
+At this step, you need to:
+1. For SOFTWARE issues: provide troubleshooting steps using provide_solution
+2. For HARDWARE issues:
+   - If IN WARRANTY: explain warranty repair process using provide_solution
+   - If OUT OF WARRANTY: escalate_to_human for paid repair options
 
-给出的解决方案要具体且有帮助。`;
+Be specific and helpful in your solutions.`;
 ```
 
 
 </Accordion>
 
-然后用字典把 step 名称映射到对应配置：
+然后用字典把 step 名称映射到各自的配置：
 
 
 
@@ -282,7 +302,7 @@ const STEP_CONFIG = {
 
 这个基于字典的配置方式很适合：
 - 一眼看清所有 step
-- 只要再加一个 entry 就能新增 step
+- 添加新 step（只需再加一条 entry）
 - 理解 workflow 的依赖关系（`requires` 字段）
 - 使用带 state 变量的 prompt 模板（例如 `{warranty_status}`）
 
@@ -299,26 +319,26 @@ const applyStepMiddleware = createMiddleware({
   name: "applyStep",
   stateSchema: SupportState,
   wrapModelCall: async (request, handler) => {
-    // 获取当前 step（首次交互默认是 warranty_collector）
+    // Get current step (defaults to warranty_collector for first interaction)
     const currentStep = request.state.currentStep ?? "warranty_collector"; // [!code highlight]
 
-    // 查找 step 配置
+    // Look up step configuration
     const stepConfig = STEP_CONFIG[currentStep]; // [!code highlight]
 
-    // 校验所需 state 是否存在
+    // Validate required state exists
     for (const key of stepConfig.requires) {
       if (request.state[key] === undefined) {
         throw new Error(`${key} must be set before reaching ${currentStep}`);
       }
     }
 
-    // 用 state 值格式化 prompt（支持 {warrantyStatus}、{issueType} 等）
+    // Format prompt with state values (supports {warrantyStatus}, {issueType}, etc.)
     let systemPrompt: string = stepConfig.prompt;
     for (const [key, value] of Object.entries(request.state)) {
       systemPrompt = systemPrompt.replace(`{${key}}`, String(value ?? ""));
     }
 
-    // 注入 system prompt 和 step 专属 tools
+    // Inject system prompt and step-specific tools
     return handler({
       ...request, // [!code highlight]
       systemPrompt, // [!code highlight]
@@ -331,15 +351,17 @@ const applyStepMiddleware = createMiddleware({
 
 这个 middleware 会：
 
-1. **读取当前 step**：从 state 里拿 `current_step`（默认是 `warranty_collector`）。
-2. **查找配置**：找到 `STEP_CONFIG` 里对应的配置项。
-3. **校验依赖**：确认所需的 state 字段已经存在。
+1. **读取当前 step**：从 state 获取 `current_step`（默认是 "warranty_collector"）。
+2. **查找配置**：找到 `STEP_CONFIG` 中匹配的 entry。
+3. **校验依赖**：确保必需的 state 字段存在。
 4. **格式化 prompt**：把 state 值注入 prompt 模板。
-5. **注入 tools**：把当前 step 对应的 tools 传给模型。
+5. **应用配置**：覆盖 system prompt 和可用的 tools。
+
+`request.override()` 方法是关键—它让我们可以基于 state 动态改变 agent 的行为，而无需创建独立的 agent 实例。
 
 ## 5. 创建 agent
 
-现在创建带有 step middleware 和 checkpointer 的 agent：
+现在创建带 step-based middleware 的 agent，并配上用于 state 持久化的 checkpointer：
 
 
 
@@ -348,7 +370,7 @@ import { createAgent } from "langchain";
 import { MemorySaver } from "@langchain/langgraph";
 import { ChatOpenAI } from "@langchain/openai";
 
-// 收集所有 step 配置里的 tools
+// Collect all tools from all step configurations
 const allTools = [
   recordWarrantyStatus,
   recordIssueType,
@@ -356,13 +378,13 @@ const allTools = [
   escalateToHuman,
 ];
 
-// 初始化模型
+// Initialize the model
 const model = new ChatOpenAI({
   model: "gpt-5.4-mini",
   temperature: 0.7,
 });
 
-// 使用 step-based configuration 创建 agent
+// Create the agent with step-based configuration
 const agent = createAgent({
   model,
   tools: allTools,
@@ -377,15 +399,15 @@ const agent = createAgent({
 **为什么需要 checkpointer？** checkpointer 会在对话轮次之间保存 state。没有它，`current_step` 在用户发送下一条消息时就会丢失，workflow 也会断掉。
 </Note>
 
-## 6. Test the workflow
+## 6. 测试 workflow
 
-测试完整 workflow：
+测试完整的 workflow：
 
 
 
 ```typescript
 import { HumanMessage } from "@langchain/core/messages";
-import { uuid7 } from "langsmith";
+import { v7 as uuid7 } from "uuid";
 
 // Configuration for this conversation thread
 const threadId = uuid7();
@@ -435,16 +457,16 @@ for (const msg of result.messages) {
 ```
 
 
-Expected flow:
-1. **Warranty verification step**: Asks about warranty status.
-2. **Issue classification step**: Asks about the problem and determines that it is hardware.
-3. **Resolution step**: Provides warranty repair instructions.
+预期流程：
+1. **保修核验步骤**：询问保修状态。
+2. **问题分类步骤**：询问问题，并判定为硬件问题。
+3. **解决步骤**：提供保修维修说明。
 
-## 7. Understanding state transitions
+## 7. 理解 state 转换
 
-让我们逐轮看一下会发生什么：
+我们来追踪每一轮会发生什么：
 
-### Turn 1: Initial message
+### 第 1 轮：初始消息
 
 
 
@@ -457,14 +479,14 @@ Expected flow:
 
 
 middleware 会应用：
-- System prompt: `WARRANTY_COLLECTOR_PROMPT`
-- Tools: `[record_warranty_status]`
+- System prompt：`WARRANTY_COLLECTOR_PROMPT`
+- Tools：`[record_warranty_status]`
 
-### Turn 2: After warranty recorded
+### 第 2 轮：记录保修状态之后
 
 
 
-Tool call: `recordWarrantyStatus("in_warranty")` returns:
+工具调用：`recordWarrantyStatus("in_warranty")` 返回：
 ```typescript
 new Command({
   update: {
@@ -476,14 +498,14 @@ new Command({
 
 
 下一轮，middleware 会应用：
-- System prompt: `ISSUE_CLASSIFIER_PROMPT`（使用 `warranty_status="in_warranty"` 格式化）
-- Tools: `[record_issue_type]`
+- System prompt：`ISSUE_CLASSIFIER_PROMPT`（使用 `warranty_status="in_warranty"` 格式化）
+- Tools：`[record_issue_type]`
 
-### Turn 3: After issue classified
+### 第 3 轮：问题分类之后
 
 
 
-Tool call: `recordIssueType("hardware")` returns:
+工具调用：`recordIssueType("hardware")` 返回：
 ```typescript
 new Command({
   update: {
@@ -495,12 +517,12 @@ new Command({
 
 
 下一轮，middleware 会应用：
-- System prompt: `RESOLUTION_SPECIALIST_PROMPT`（使用 `warranty_status` 和 `issue_type` 格式化）
-- Tools: `[provide_solution, escalate_to_human]`
+- System prompt：`RESOLUTION_SPECIALIST_PROMPT`（使用 `warranty_status` 和 `issue_type` 格式化）
+- Tools：`[provide_solution, escalate_to_human]`
 
 关键点在于：**Tools drive the workflow**，它们通过更新 `current_step` 推进流程；**middleware responds**，在下一轮应用对应配置。
 
-## 8. Manage message history
+## 8. 管理消息历史
 
 随着 agent 逐步推进，message history 会增长。可以使用 [summarization middleware](/oss/javascript/langchain/short-term-memory#summarize-messages) 压缩早期消息，同时保留对话上下文：
 
@@ -529,7 +551,7 @@ const agent = createAgent({
 
 更多记忆管理技巧请参见 [short-term memory guide](/oss/javascript/langchain/short-term-memory)。
 
-## 9. Add flexibility: Go back
+## 9. 增加灵活性：回退
 
 有些 workflow 需要允许用户返回上一步来更正信息，例如修改保修状态或问题分类。不过，并不是所有跳转都合理，例如退款完成后通常不能回退。对于这个支持流程，我们会添加工具，让用户能回到保修核验和问题分类步骤。
 
@@ -537,7 +559,7 @@ const agent = createAgent({
 如果你的 workflow 需要在大多数步骤之间任意跳转，可以先想想是否真的需要结构化 workflow。这个模式最适合“清晰顺序推进、偶尔允许回退更正”的场景。
 </Tip>
 
-给 resolution 步骤添加“返回上一步”工具：
+给 resolution 步骤添加“回退”工具：
 
 
 
@@ -613,37 +635,281 @@ const result = await agent.invoke(
 ```
 
 
-## Complete example
+## 完整示例
 
-下面把所有内容放到一个可运行脚本里：
+下面把所有内容整合到一个可运行脚本中：
 
 <Expandable title="Complete code" defaultOpen={false}>
 
 
 ```typescript
-import { HumanMessage } from "@langchain/core/messages";
-import { createAgent, createMiddleware } from "langchain";
-import { ChatOpenAI } from "@langchain/openai";
-import { MemorySaver, Command } from "@langchain/langgraph";
-import { z } from "zod";
+import { createMiddleware, createAgent } from "langchain";
 
-const SupportStepSchema = z.enum(["warranty_collector", "issue_classifier", "resolution_specialist"]);
+import { z } from "zod";
+import { tool, ToolMessage, type ToolRuntime, HumanMessage } from "langchain";
+import { Command, MemorySaver, StateSchema } from "@langchain/langgraph";
+import { ChatOpenAI } from "@langchain/openai";
+import { uuid7 } from "langsmith";
+
+// Define the possible workflow steps
+const SupportStepSchema = z.enum([
+  "warranty_collector",
+  "issue_classifier",
+  "resolution_specialist",
+]);
 const WarrantyStatusSchema = z.enum(["in_warranty", "out_of_warranty"]);
 const IssueTypeSchema = z.enum(["hardware", "software"]);
 
+// State for customer support workflow
 const SupportState = new StateSchema({
   currentStep: SupportStepSchema.optional(),
   warrantyStatus: WarrantyStatusSchema.optional(),
   issueType: IssueTypeSchema.optional(),
 });
 
-// ... rest of the full JS example
-```
+const recordWarrantyStatus = tool(
+  async (input, config: ToolRuntime<typeof SupportState.State>) => {
+    return new Command({
 
+      update: {
+
+        messages: [
+          new ToolMessage({
+            content: `Warranty status recorded as: ${input.status}`,
+            tool_call_id: config.toolCallId,
+          }),
+        ],
+        warrantyStatus: input.status,
+        currentStep: "issue_classifier",
+      },
+    });
+  },
+  {
+    name: "record_warranty_status",
+    description:
+      "Record the customer's warranty status and transition to issue classification.",
+    schema: z.object({
+      status: WarrantyStatusSchema,
+    }),
+  }
+);
+
+const recordIssueType = tool(
+  async (input, config: ToolRuntime<typeof SupportState.State>) => {
+    return new Command({
+
+      update: {
+
+        messages: [
+          new ToolMessage({
+            content: `Issue type recorded as: ${input.issueType}`,
+            tool_call_id: config.toolCallId,
+          }),
+        ],
+        issueType: input.issueType,
+        currentStep: "resolution_specialist",
+      },
+    });
+  },
+  {
+    name: "record_issue_type",
+    description:
+      "Record the type of issue and transition to resolution specialist.",
+    schema: z.object({
+      issueType: IssueTypeSchema,
+    }),
+  }
+);
+
+const escalateToHuman = tool(
+  async (input) => {
+    // In a real system, this would create a ticket, notify staff, etc.
+    return `Escalating to human support. Reason: ${input.reason}`;
+  },
+  {
+    name: "escalate_to_human",
+    description: "Escalate the case to a human support specialist.",
+    schema: z.object({
+      reason: z.string(),
+    }),
+  }
+);
+
+const provideSolution = tool(
+  async (input) => {
+    return `Solution provided: ${input.solution}`;
+  },
+  {
+    name: "provide_solution",
+    description: "Provide a solution to the customer's issue.",
+    schema: z.object({
+      solution: z.string(),
+    }),
+  }
+);
+
+// Define prompts as constants for easy reference
+const WARRANTY_COLLECTOR_PROMPT = `You are a customer support agent helping with device issues.
+
+CURRENT STAGE: Warranty verification
+
+At this step, you need to:
+1. Greet the customer warmly
+2. Ask if their device is under warranty
+3. Use record_warranty_status to record their response and move to the next step
+
+Be conversational and friendly. Don't ask multiple questions at once.`;
+
+const ISSUE_CLASSIFIER_PROMPT = `You are a customer support agent helping with device issues.
+
+CURRENT STAGE: Issue classification
+CUSTOMER INFO: Warranty status is {warranty_status}
+
+At this step, you need to:
+1. Ask the customer to describe their issue
+2. Determine if it's a hardware issue (physical damage, broken parts) or software issue (app crashes, performance)
+3. Use record_issue_type to record the classification and move to the next step
+
+If unclear, ask clarifying questions before classifying.`;
+
+const RESOLUTION_SPECIALIST_PROMPT = `You are a customer support agent helping with device issues.
+
+CURRENT STAGE: Resolution
+CUSTOMER INFO: Warranty status is {warranty_status}, issue type is {issue_type}
+
+At this step, you need to:
+1. For SOFTWARE issues: provide troubleshooting steps using provide_solution
+2. For HARDWARE issues:
+   - If IN WARRANTY: explain warranty repair process using provide_solution
+   - If OUT OF WARRANTY: escalate_to_human for paid repair options
+
+Be specific and helpful in your solutions.`;
+
+// Step configuration: maps step name to (prompt, tools, required_state)
+const STEP_CONFIG = {
+  warranty_collector: {
+    prompt: WARRANTY_COLLECTOR_PROMPT,
+    tools: [recordWarrantyStatus],
+    requires: [],
+  },
+  issue_classifier: {
+    prompt: ISSUE_CLASSIFIER_PROMPT,
+    tools: [recordIssueType],
+    requires: ["warrantyStatus"],
+  },
+  resolution_specialist: {
+    prompt: RESOLUTION_SPECIALIST_PROMPT,
+    tools: [provideSolution, escalateToHuman],
+    requires: ["warrantyStatus", "issueType"],
+  },
+} as const;
+
+const applyStepMiddleware = createMiddleware({
+  name: "applyStep",
+  stateSchema: SupportState,
+  wrapModelCall: async (request, handler) => {
+    // Get current step (defaults to warranty_collector for first interaction)
+    const currentStep = request.state.currentStep ?? "warranty_collector";
+
+    // Look up step configuration
+    const stepConfig = STEP_CONFIG[currentStep];
+
+    // Validate required state exists
+    for (const key of stepConfig.requires) {
+      if (request.state[key] === undefined) {
+        throw new Error(`${key} must be set before reaching ${currentStep}`);
+      }
+    }
+
+    // Format prompt with state values (supports {warrantyStatus}, {issueType}, etc.)
+    let systemPrompt: string = stepConfig.prompt;
+    for (const [key, value] of Object.entries(request.state)) {
+      systemPrompt = systemPrompt.replace(`{${key}}`, String(value ?? ""));
+    }
+
+    // Inject system prompt and step-specific tools
+    return handler({
+      ...request,
+      systemPrompt,
+      tools: [...stepConfig.tools],
+    });
+  },
+});
+
+// Collect all tools from all step configurations
+const allTools = [
+  recordWarrantyStatus,
+  recordIssueType,
+  provideSolution,
+  escalateToHuman,
+];
+
+const model = new ChatOpenAI({
+  model: "gpt-5.4-mini",
+});
+
+// Create the agent with step-based configuration
+const agent = createAgent({
+  model,
+  tools: allTools,
+  middleware: [applyStepMiddleware],
+  checkpointer: new MemorySaver(),
+});
+
+// Configuration for this conversation thread
+const threadId = uuid7();
+const config = { configurable: { thread_id: threadId } };
+
+// Turn 1: Initial message - starts with warranty_collector step
+console.log("=== Turn 1: Warranty Collection ===");
+let result = await agent.invoke(
+  { messages: [new HumanMessage("Hi, my phone screen is cracked")] },
+  config
+);
+for (const msg of result.messages) {
+  console.log(msg.content);
+}
+
+// Turn 2: User responds about warranty
+console.log("\n=== Turn 2: Warranty Response ===");
+result = await agent.invoke(
+  { messages: [new HumanMessage("Yes, it's still under warranty")] },
+  config
+);
+for (const msg of result.messages) {
+  console.log(msg.content);
+}
+console.log(`Current step: ${result.currentStep}`);
+
+// Turn 3: User describes the issue
+console.log("\n=== Turn 3: Issue Description ===");
+result = await agent.invoke(
+  {
+    messages: [
+      new HumanMessage("The screen is physically cracked from dropping it"),
+    ],
+  },
+  config
+);
+for (const msg of result.messages) {
+  console.log(msg.content);
+}
+console.log(`Current step: ${result.currentStep}`);
+
+// Turn 4: Resolution
+console.log("\n=== Turn 4: Resolution ===");
+result = await agent.invoke(
+  { messages: [new HumanMessage("What should I do?")] },
+  config
+);
+for (const msg of result.messages) {
+  console.log(msg.content);
+}
+```
 
 </Expandable>
 
-## Next steps
+## 下一步
 
 - 了解 [subagents pattern](/oss/javascript/langchain/multi-agent/subagents-personal-assistant)，用于集中编排。
 - 浏览 [middleware](/oss/javascript/langchain/middleware)，看看还能实现哪些动态行为。

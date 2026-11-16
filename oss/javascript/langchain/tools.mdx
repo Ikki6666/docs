@@ -42,7 +42,7 @@ import * as z from "zod"
 import { tool } from "langchain"
 
 const searchDatabase = tool(
-  ({ query, limit }) => `Found  results for ''`,
+  ({ query, limit }) => `Found ${limit} results for '${query}'`,
   {
     name: "search_database",
     description: "Search the customer database for records matching the query.",
@@ -66,73 +66,115 @@ const searchDatabase = tool(
 
 
 
-## 无头工具
+## 访问上下文
 
-有些工具应该在**用户应用运行的地方**执行，通常是浏览器，而不是在进程内部执行。**无头工具（headless tools）** 是一种 tool 定义，它包含 name、description 和参数 schema，由你在**服务端**和 agent 一起注册。真正的**实现**只在**客户端**注册，并在一次短暂的 interrupt/resume 握手之后执行。
-
-这和普通工具不同，普通工具的函数体是在服务端运行的；它也不同于 [server-side tool use](#server-side-tool-use)，后者是模型提供商在远程执行内置工具。
-
-### 何时使用无头工具
-
-当工作依赖于只有客户端才有的**环境、设备或 UI**时就使用它们。例如：
-
-- **Browser APIs:** Geolocation、IndexedDB、Clipboard、Canvas 2D、文件选择器、Battery API 等。
-- **隐私和本地性:** 数据保留在设备上，例如存储在 IndexedDB 里的本地“memory”。
-- **延迟:** 对纯本地操作，不需要额外的服务端往返。
-- **结构化、安全的副作用:** 更适合使用许多小而类型明确的工具，例如每个 canvas primitive 一个工具，而不是把任意代码发给 `eval`。
-
-### 这个模式如何工作
-
-在两个运行时里，模型看到的都是一个正常可调用的 tool，但真正的执行发生在服务端进程之外。
+当工具能够访问对话历史、用户数据和持久化记忆等运行时信息时，它们的作用才能充分发挥。本节介绍如何在工具内部访问和更新这些信息。
 
 
 
-1. **定义** tool，使用 `langchain` 里的 `tool({ name, description, schema })`。这里仅提供元数据和校验，没有服务端 runner。
-2. **挂接** 真实行为，用 `.implement(async (args) => { ... })`，它会返回一个 **headless tool implementation**（定义 + `execute` 函数）。
-3. **注册** 第 1 步里的定义到 `createAgent` 或你的 graph，这样模型就能在标准 tool-calling loop 中看到这个 tool。
-4. **把** 第 2 步的 implementation 传给 streaming hook 的 `tools` 选项。
+### Context
 
-<Info>
-    把**工具定义**（`tool({ name, description, schema })`）和**实现**（`.implement(...)`）放在**不同模块**里。服务端 agent 和前端都从共享定义文件导入，这样 name 和 schema 保持一致；把只在客户端运行的 execute 逻辑放进服务端永远不会加载的 implementation 模块。
-</Info>
+Context 提供在调用时传入的不可变配置数据。它适用于 user ID、session 详情，或对话期间不应改变的应用程序特定设置。
 
-
-当模型对这些工具发出 tool call 时，运行会**中断**，而不是在本地执行工具。你的应用可以检查 payload、在正确环境里执行动作，例如浏览器、另一个服务或人工 review，然后用 tool result **恢复** graph。使用受支持的 JS SDK hooks 时，它们可以检测 headless-tool interrupt、运行匹配的客户端实现，并自动提交 resume command。
-
-你可以使用可选的 **`onTool`** 回调来观察生命周期事件（`start`、`success`、`error`），用于 spinner 或 toast 这类 UI 反馈。
-
-<Card
-    title="无头工具前端模式"
-    href="/oss/javascript/langchain/frontend/headless-tools"
-    icon="device-desktop"
-    arrow="true"
-    horizontal
->
-    查看一个端到端示例，演示如何用 `useStream` 在客户端执行仅有 schema 的工具。
-</Card>
-
-## 预构建工具
-
-LangChain 提供了大量预构建工具和工具包，可用于 web search、代码解释、数据库访问等常见任务。这些开箱即用的工具可以直接集成到 agent 里，而不需要你自己写代码。
-
-完整可用工具列表请见 [tools and toolkits](/oss/javascript/integrations/tools) 集成页面，按类别整理。
-
-## 来自 MCP 服务器的工具
-
-[Model Context Protocol（MCP）](https://modelcontextprotocol.io) 是一个开放协议，用于标准化应用向语言模型暴露工具的方式。你无需手动编写工具，只需连接到 MCP 服务器，把它提供的工具适配为 LangChain 工具，就可以像其他工具一样传给 agent。
+<Note>
+`thread_id`（通过 `config={"configurable": {"thread_id": ...}}` 传入）划定的是*对话*范围，即消息历史和 checkpoint；而 `context` 承载的是你的工具和 middleware 在调用时读取的*每次运行*数据。持久化需要 [checkpointer](/oss/javascript/langchain/short-term-memory)。在生产环境中，你通常会为每个对话传入稳定的 `thread_id`，并在每次 invoke 时传入一个 `context` 对象。
+</Note>
 
 
 
-LangChain agent 通过 [`@langchain/mcp-adapters`](https://github.com/langchain-ai/langchainjs/tree/main/libs/langchain-mcp-adapters) 库调用 MCP 服务器上定义的工具。该库会发现服务器提供的工具，并把它们适配为 LangChain 工具。
+工具可以通过 `config` 参数访问 agent 的 runtime context。配置 [checkpointer](/oss/javascript/langchain/short-term-memory)，并传入带稳定 `thread_id` 的 `context`，这样对话就能在多次调用之间保持持久化：
 
-关于配置、传输方式和身份验证，请参见 [Model Context Protocol（MCP）](/oss/javascript/langchain/mcp)。
+<ToolRuntimeContextThreadJs />
 
 
-## 服务端工具使用
 
-有些 chat model 提供由模型提供商在服务端执行的内置工具。这类能力包括 web search 和 code interpreter，不需要你自己定义或托管工具逻辑。
+### 长期记忆（Store）
 
-关于如何启用和使用这些内置工具，请参见各个 [chat model integration pages](/oss/javascript/integrations/providers) 以及 [tool calling documentation](/oss/javascript/langchain/models#server-side-tool-use)。
+[`BaseStore`](https://reference.langchain.com/javascript/langchain-core/stores/BaseStore) 提供跨对话持久存在的存储。与 state（短期记忆）不同，保存到 store 的数据在未来的 session 中仍然可用。
+
+
+
+通过 `config.store` 访问 store。store 使用 namespace/key 模式来组织数据：
+
+<Tip>
+    对于生产部署，请使用 [`PostgresStore`](https://reference.langchain.com/javascript/langchain-langgraph-checkpoint-postgres/store/PostgresStore)、`MongoDBStore` 或 `RedisStore` 这类持久化 store 实现，而不是 `InMemoryStore`。配置细节请参见 [memory documentation](/oss/javascript/langgraph/add-memory)。
+</Tip>
+
+```ts expandable
+import * as z from "zod";
+import { createAgent, tool } from "langchain";
+import { InMemoryStore } from "@langchain/langgraph";
+import { ChatOpenAI } from "@langchain/openai";
+
+const store = new InMemoryStore();
+
+// Access memory
+const getUserInfo = tool(
+  async ({ user_id }) => {
+    const value = await store.get(["users"], user_id);
+    console.log("get_user_info", user_id, value);
+    return value;
+  },
+  {
+    name: "get_user_info",
+    description: "Look up user info.",
+    schema: z.object({
+      user_id: z.string(),
+    }),
+  }
+);
+
+// Update memory
+const saveUserInfo = tool(
+  async ({ user_id, name, age, email }) => {
+    console.log("save_user_info", user_id, name, age, email);
+    await store.put(["users"], user_id, { name, age, email });
+    return "Successfully saved user info.";
+  },
+  {
+    name: "save_user_info",
+    description: "Save user info.",
+    schema: z.object({
+      user_id: z.string(),
+      name: z.string(),
+      age: z.number(),
+      email: z.string(),
+    }),
+  }
+);
+
+const agent = createAgent({
+  model: new ChatOpenAI({ model: "gpt-6.1-sol" }),
+  tools: [getUserInfo, saveUserInfo],
+  store,
+});
+
+// First session: save user info
+await agent.invoke({
+  messages: [
+    {
+      role: "user",
+      content: "Save the following user: userid: abc123, name: Foo, age: 25, email: foo@langchain.dev",
+    },
+  ],
+});
+
+// Second session: get user info
+const result = await agent.invoke({
+  messages: [
+    { role: "user", content: "Get user info for user with id 'abc123'" },
+  ],
+});
+
+console.log(result);
+// Here is the user info for user with ID "abc123":
+// - Name: Foo
+// - Age: 25
+// - Email: foo@langchain.dev
+```
+
+
+
 ### Stream writer
 
 在工具执行期间流式输出实时更新。这对长时间运行的操作提供进度反馈很有用。
@@ -232,6 +274,13 @@ const getAssistantScopedData = tool(
 ```
 
 `serverInfo` 在工具没有运行在 Agent Server 上时为 `null`。
+
+
+
+
+<Note>
+需要 `deepagents>=1.9.0`（或 `@langchain/langgraph>=1.2.8`）。
+</Note>
 
 
 
@@ -389,7 +438,7 @@ const captureScreenshot = tool(
 
 ### State 注入
 
-在工具签名中加入 `runtime: ToolRuntime` 即可访问 state。调用时，[`ToolNode`](https://reference.langchain.com/javascript/langchain-langgraph/prebuilt/ToolNode) 会自动注入该值；该参数不会包含在发送给模型的工具 schema 中。用 `runtime.state` 读取当前对话 state：
+工具通过 [`ToolRuntime`](https://reference.langchain.com/javascript/langchain/index/Runtime) 访问 graph state。state、context、store 和 streaming API 请参见 [Access context](#access-context)。
 
 
 

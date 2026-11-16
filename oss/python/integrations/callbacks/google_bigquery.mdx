@@ -1,6 +1,9 @@
 ---
 title: "BigQuery 回调处理器集成"
 description: 将 LangChain 和 LangGraph 的事件记录到 Google BigQuery，以便对 LLM 应用进行监控、审计和实时分析。
+integration:
+  name: Bigquery callback handler
+  pypi: langchain-google-community
 ---
 
 # BigQuery 回调处理器
@@ -41,7 +44,6 @@ description: 将 LangChain 和 LangGraph 的事件记录到 Google BigQuery，�
   [BigQuery 文档](https://cloud.google.com/bigquery/pricing?e=48754805&hl=en#data-ingestion-pricing)。
 </Warning>
 
-
 ## 安装
 
 需要安装带有 `bigquery` 扩展依赖的 `langchain-google-community`。本示例还需要 `langchain-google-genai` 和 `langgraph`。
@@ -67,12 +69,15 @@ pip install "langchain-google-community[bigquery]" langchain langchain-google-ge
 - 表级 `roles/bigquery.dataEditor`，用于写入日志或事件数据。
 - 如果使用 GCS 卸载：目标 bucket 上需要 `roles/storage.objectCreator` 和 `roles/storage.objectViewer`。
 
-
 ## 与 LangGraph agent 一起使用
 
 要将 `BigQueryCallbackHandler` 用于 LangGraph agent，请使用 Google Cloud 项目 ID 和数据集 ID 实例化它。处理器会在首次运行时创建事件表，以及按事件类型划分的分析视图。使用 `graph_context()` 方法跟踪顶层调用边界，它会在进入时发出 `INVOCATION_STARTING`，在结束时发出 `INVOCATION_COMPLETED`，如果发生异常则发出 `INVOCATION_ERROR`，并附带准确的延迟信息。
 
 调用 agent 时，通过 `config` 对象中的 `metadata` 字典传入 `session_id`、`user_id`，以及可选的 `agent`。如果未设置 `agent`，处理器会自动从 `metadata['langgraph_node']` 推导它，从而将每个子代理的事件正确归因。
+
+<Note>
+  LangGraph 的 `graph_name` 和 `graph_context()` 等功能需要 `langchain-google-community>=4.0.0`。
+</Note>
 
 ```python
 import os
@@ -143,7 +148,7 @@ def run_agent_example(project_id: str):
     # 3. 创建 LLM 和 agent
     # Gemini Enterprise Agent Platform 使用 project 参数，Gemini Developer API 使用 api_key
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-4-hydrogen",
         project=project_id,  # 供 Gemini Enterprise Agent Platform 使用
     )
     tools = [get_current_time, get_weather, convert_currency]
@@ -217,6 +222,651 @@ if __name__ == "__main__":
 <ParamField body="shutdown_timeout" type="float" default="10.0">
   关闭期间等待日志刷新完成的秒数。
 </ParamField>
+
+<ParamField body="event_allowlist" type="List[str]" default="None">
+  要记录的事件类型列表。如果为 `None`，则除 `event_denylist` 中的事件外，记录所有事件。
+</ParamField>
+
+<ParamField body="event_denylist" type="List[str]" default="None">
+  要跳过记录的事件类型列表。
+</ParamField>
+
+<ParamField body="log_multi_modal_content" type="bool" default="True">
+  是否记录详细的内容部分（包括 GCS 引用）。
+</ParamField>
+
+<ParamField body="table_id" type="str" default="agent_events">
+  如果未显式传给回调处理器构造函数，则使用的默认表 ID。
+</ParamField>
+
+<ParamField body="retry_config" type="RetryConfig" default="RetryConfig()">
+  写入 BigQuery 失败时重试逻辑的配置（最大重试次数、延迟、倍数）。
+</ParamField>
+
+<ParamField body="queue_max_size" type="int" default="10000">
+  在丢弃新事件之前，内部缓冲队列中可容纳的最大事件数量。
+</ParamField>
+
+<ParamField body="skip_internal_chain_events" type="bool" default="False">
+  当为 `True` 时，丢弃由框架内部 Runnable（`ChannelWrite`、`ChannelRead`、`Branch`、`RunnableLambda`、`RunnableSequence`、`RunnableParallel`、`RunnableAssign`、`RunnablePassthrough`、`RunnableBinding`、`Pregel`、`__start__`、`__end__`）发出的 `CHAIN_*` 事件。被跳过的运行仍会注册到 trace registry 中，因此子级 LLM/tool 事件会保留真实图根作为其 `trace_id`（不会出现断裂的 trace）。每次抑制都会记录一行 `DEBUG` 日志，因此该启发式规则可审计。
+</ParamField>
+
+<ParamField body="custom_tags" type="dict[str, Any]" default="{}">
+  写入每一事件行 `attributes.custom_tags` 的静态标签。适合按部署、群组或实验对仪表盘进行切片（例如 `{"env": "prod", "agent_role": "sales"}`）。
+</ParamField>
+
+<ParamField body="log_session_metadata" type="bool" default="True">
+  当为 `True` 时，将用户提供的 `RunnableConfig` 元数据（去掉已提升为一等列的键，如 `session_id`、`user_id`、`agent`、`langgraph_node`）转储到 `attributes.session_metadata` 下。
+</ParamField>
+
+<ParamField body="content_formatter" type="Callable[[Any, str], Any]" default="None">
+  可选的 `(raw_content, event_type) -> formatted` 钩子，在内容解析之前调用。适合用于 PII 脱敏或转换自定义负载。失败时会回退到原始内容并给出警告，因此格式化器不会破坏 agent。
+</ParamField>
+
+<ParamField body="auto_schema_upgrade" type="bool" default="True">
+  当为 `True` 时，对处理器未来版本添加到事件 schema 的任何新字段执行增量式 `ALTER TABLE ADD COLUMN`。由 `langchain_bq_schema_version` 表标签做门控，保证差异检查每个 schema 版本最多运行一次。绝不删除、重命名或更改列类型。
+</ParamField>
+
+<ParamField body="create_views" type="bool" default="True">
+  当为 `True` 时，自动在事件表旁 `CREATE OR REPLACE` 按事件类型划分的分析视图。每个视图会将 JSON 列展开为强类型的顶层列（参见下文[自动创建的分析视图](#auto-created-analytics-views)）。
+</ParamField>
+
+<ParamField body="view_prefix" type="str" default="v">
+  自动创建的视图名称前缀（`v_llm_request`、`v_tool_completed` 等）。当多个处理器实例共享同一数据集时，按表设置以避免冲突。
+</ParamField>
+
+以下代码示例展示了如何为 BigQuery 回调处理器定义带事件过滤的配置：
+
+```python
+from langchain_google_community.callbacks.bigquery_callback import (
+    BigQueryCallbackHandler,
+    BigQueryLoggerConfig,
+)
+
+# 1. Configure BigQueryLoggerConfig
+config = BigQueryLoggerConfig(
+    enabled=True,
+    event_allowlist=["LLM_REQUEST", "LLM_RESPONSE"],  # Only log these specific events
+    shutdown_timeout=10.0,  # Wait up to 10s for logs to flush on exit
+    max_content_length=500,  # Truncate content to 500 characters
+)
+
+# 2. Initialize the Callback Handler
+handler = BigQueryCallbackHandler(
+    project_id="your-project-id",
+    dataset_id="your_dataset",
+    table_id="your_table",
+    config=config,
+)
+```
+
+## Schema 与生产环境设置
+
+如果表不存在，插件会自动创建它。不过，对于生产环境，我们建议使用以下 DDL 手动创建表，它利用 **JSON** 类型获得灵活性，并使用 **REPEATED RECORD** 处理多模态内容。
+
+**推荐的 DDL：**
+
+```sql
+CREATE TABLE `your-gcp-project-id.adk_agent_logs.agent_events`
+(
+  timestamp TIMESTAMP NOT NULL OPTIONS(description="The UTC timestamp when the event occurred."),
+  event_type STRING OPTIONS(description="The category of the event."),
+  agent STRING OPTIONS(description="The name of the agent."),
+  session_id STRING OPTIONS(description="A unique identifier for the conversation session."),
+  invocation_id STRING OPTIONS(description="A unique identifier for a single turn."),
+  user_id STRING OPTIONS(description="The identifier of the end-user."),
+  trace_id STRING OPTIONS(description="OpenTelemetry trace ID."),
+  span_id STRING OPTIONS(description="OpenTelemetry span ID."),
+  parent_span_id STRING OPTIONS(description="OpenTelemetry parent span ID."),
+  content JSON OPTIONS(description="The primary payload of the event."),
+  content_parts ARRAY<STRUCT<
+    mime_type STRING,
+    uri STRING,
+    object_ref STRUCT<
+      uri STRING,
+      version STRING,
+      authorizer STRING,
+      details JSON
+    >,
+    text STRING,
+    part_index INT64,
+    part_attributes STRING,
+    storage_mode STRING
+  >> OPTIONS(description="For multi-modal events, contains a list of content parts."),
+  attributes JSON OPTIONS(description="Arbitrary key-value pairs."),
+  latency_ms JSON OPTIONS(description="Latency measurements."),
+  status STRING OPTIONS(description="The outcome of the event."),
+  error_message STRING OPTIONS(description="Detailed error message."),
+  is_truncated BOOLEAN OPTIONS(description="Flag indicating if content was truncated.")
+)
+PARTITION BY DATE(timestamp)
+CLUSTER BY event_type, agent, user_id;
+```
+
+## 自动创建的分析视图
+
+当处理器创建事件表时，它还会在旁边为每种事件类型创建一个
+`CREATE OR REPLACE VIEW`（由 `create_views` 控制，默认为 `True`）。每个视图会将 JSON 列展开为
+强类型的顶层列，因此分析查询不必每次都写出
+`JSON_VALUE(...)`：
+
+```sql
+-- With the auto-view
+SELECT agent, SUM(usage_total_tokens) AS tokens
+FROM `PROJECT.DATASET.v_llm_response`
+GROUP BY agent;
+
+-- Equivalent against the raw table
+SELECT agent,
+       SUM(CAST(JSON_VALUE(attributes, '$.usage.total_tokens') AS INT64)) AS tokens
+FROM `PROJECT.DATASET.agent_events`
+WHERE event_type = 'LLM_RESPONSE'
+GROUP BY agent;
+```
+
+默认视图名称（可通过 `view_prefix` 配置）以及每个视图在始终包含的列之外
+额外提供的强类型列：
+
+| 视图 | 额外强类型列 |
+|---|---|
+| `v_invocation_starting` | _（无，仅有始终包含的列）_ |
+| `v_invocation_completed` / `v_invocation_error` | `total_ms` |
+| `v_agent_starting` | `node_name`、`step` |
+| `v_agent_completed` | `node_name`、`step`、`total_ms` |
+| `v_agent_error` | `node_name`、`total_ms` |
+| `v_llm_request` | `model`、`request_content`、`llm_config`、`tools` |
+| `v_llm_response` | `response`、`usage_prompt_tokens`、`usage_completion_tokens`、`usage_total_tokens`、`usage_cached_tokens`、`context_cache_hit_rate`、`total_ms`、`ttft_ms`、`model_version`、`usage_metadata`、`cache_metadata` |
+| `v_llm_error` | `total_ms` |
+| `v_tool_starting` | `tool_name`、`tool_args` |
+| `v_tool_completed` | `tool_name`、`tool_result`、`total_ms` |
+| `v_tool_error` | `tool_name`、`total_ms` |
+| `v_retriever_start` | `query` |
+| `v_retriever_end` / `v_retriever_error` | `total_ms` |
+
+每个视图还会暴露原始表中始终包含的列
+（`timestamp`、`event_type`、`agent`、`session_id`、`invocation_id`、
+`user_id`、`trace_id`、`span_id`、`parent_span_id`、`status`、
+`error_message`、`is_truncated`），以及从
+`attributes` JSON 中提取的三个列：`root_agent_name`、`custom_tags`、`session_metadata`。
+
+## 自动升级 schema
+
+当处理器的 schema 新增列时，现有表会以增量方式自动升级。处理器在启动时读取表，并对任何新字段执行
+`ALTER TABLE ADD COLUMN`，由 `langchain_bq_schema_version` 表标签做门控，保证差异检查
+每个 schema 版本最多运行一次。**绝不**删除、重命名或更改列类型。
+可通过 `auto_schema_upgrade=False` 禁用。
+
+## 子代理归因
+
+对于多代理 LangGraph 部署，BigQuery 的 `agent` 列会按以下回退链
+自动推导：
+
+1. `metadata["agent"]`：用户显式提供的值（优先级最高）
+2. `metadata["langgraph_node"]`：当前活跃的 LangGraph 节点，因此每个
+   子代理的事件都会打上该节点名称
+3. `metadata["checkpoint_ns"]`：LangGraph checkpoint 命名空间
+4. `handler.graph_name`：顶层 `INVOCATION_*` 事件的回退值
+
+因此，多代理图（例如 supervisor → `TheCritic`、`TheMeteo` 等）产生的遥测数据中，
+每个事件都会归因到发起它的子代理，无需任何用户改动。
+
+## 事件类型与负载
+
+`content` 列包含一个特定于 `event_type` 的 **JSON** 对象。
+`content_parts` 列提供内容的结构化视图，对图片或已卸载的数据尤其有用。
+
+<Note>
+  **内容截断**
+  - 可变内容字段会截断到 `max_content_length`（在 `BigQueryLoggerConfig` 中配置，默认 500KB）。
+  - 如果配置了 `gcs_bucket_name`，大内容会卸载到 GCS 而不是被截断，并在 `content_parts.object_ref` 中存储引用。
+</Note>
+
+<Note>
+  **`content` 始终带有 `summary` 键**
+
+  每个事件行的 `content` JSON 对象都包含一个 `summary` 字符串，其中是
+  负载的人类可读预览（上限为 `max_content_length`）。
+  为保持下文各事件表的结构可读，`summary` 被省略，但它在磁盘上始终存在。
+</Note>
+
+### LLM 交互
+
+这些事件跟踪发送给 LLM 的原始请求以及从 LLM 收到的响应。
+
+| 事件类型 | 内容（JSON）结构 | 属性（JSON） |
+|---|---|---|
+| `LLM_REQUEST` | **Chat Model：** `{"messages": [<dumped messages>]}`<br/>**Legacy Model：** `{"prompt": [<prompts>]}` | `{"tags": ["..."], "model": "...", "llm_config": {"temperature": 0.2, ...}, "tools": ["get_weather", ...]}` |
+| `LLM_RESPONSE` | `{"response": "<generation text>"}` | `{"usage": {"prompt_tokens": 100, "completion_tokens": 25, "total_tokens": 125}, "model_version": "gemini-2.5-flash-001", "usage_metadata": {"cached_content_token_count": 30, ...}, "cache_metadata": {...}}` |
+| `LLM_ERROR` | `{"data": null}`（实际的异常文本位于 `error_message` 列） | `{}` |
+
+### 子代理（LangGraph 节点）与调用生命周期
+
+这些事件来自 LangGraph 的节点和图上下文生命周期。
+当没有显式设置 `agent` 时，`agent` 会自动从 `metadata['langgraph_node']` 推导，
+因此事件会按子代理打标。
+
+| 事件类型 | 说明 |
+|---|---|
+| `AGENT_STARTING` / `AGENT_COMPLETED` / `AGENT_ERROR` | LangGraph 节点开始 / 结束 / 出错 |
+| `INVOCATION_STARTING` / `INVOCATION_COMPLETED` / `INVOCATION_ERROR` | 顶层图调用开始 / 结束 / 出错（由 `handler.graph_context()` 发出） |
+
+### 工具使用
+
+这些事件跟踪 agent 对工具的执行。工具名称也会出现在
+`attributes.tool_name` 中，并且（对于自动视图）会作为强类型的 `tool_name` 列暴露。
+
+| 事件类型 | 内容（JSON）结构 |
+|---|---|
+| `TOOL_STARTING` | `{"tool": "<name>", "input": "<input string>"}`，例如 `{"tool": "get_weather", "input": "city='Paris'"}` |
+| `TOOL_COMPLETED` | `{"tool": "<name>", "result": "<output string>"}`，例如 `{"tool": "get_weather", "result": "25°C, Sunny"}` |
+| `TOOL_ERROR` | `{"data": null}`（实际的异常文本位于 `error_message` 列） |
+
+### 链执行
+
+这些事件针对非图的 LangChain `Runnable` 生命周期触发（图调用和
+LangGraph 节点改用上面列出的 `INVOCATION_*` / `AGENT_*` 事件）。
+
+| 事件类型 | 内容（JSON）结构 |
+|---|---|
+| `CHAIN_START` | `{"data": "<JSON-stringified inputs>"}` |
+| `CHAIN_END`  | `{"data": "<JSON-stringified outputs>"}` |
+| `CHAIN_ERROR` | `{"data": null}`（参见 `error_message` 列） |
+
+### Retriever 使用
+
+这些事件跟踪 retriever 的执行。
+
+| 事件类型 | 内容（JSON）结构 |
+|---|---|
+| `RETRIEVER_START` | `{"data": "<query string>"}`，例如 `{"data": "What is the capital of France?"}` |
+| `RETRIEVER_END`   | `{"data": "<JSON-stringified list of documents>"}` |
+| `RETRIEVER_ERROR` | `{"data": null}`（实际的异常文本位于 `error_message` 列） |
+
+### Agent 操作
+
+这些事件来自旧版 LangChain `AgentExecutor` 风格的 agent
+（`on_agent_action` / `on_agent_finish`）。`data` 字段包含 action / finish 负载的
+JSON 序列化字符串。
+
+| 事件类型 | 内容（JSON）结构 |
+|---|---|
+| `AGENT_ACTION` | `{"data": "{\"tool\": \"Calculator\", \"input\": \"2 + 2\"}"}` |
+| `AGENT_FINISH` | `{"data": "{\"output\": \"The answer is 4\"}"}` |
+
+### 其他事件
+
+| 事件类型 | 内容（JSON）结构 |
+|---|---|
+| `TEXT` | `{"data": "<text>"}`，例如 `{"data": "Some logging text..."}` |
+
+## 高级分析查询
+
+当 agent 开始运行并记录事件后，就可以对 `agent_events` 表进行强大的分析。
+
+### 1. 重建 Trace（对话轮次）
+使用 `trace_id` 将属于单次执行流的所有事件（Chain、LLM、Tool）分组。
+
+```sql
+SELECT
+  timestamp,
+  event_type,
+  span_id,
+  parent_span_id,
+  -- Extract summary or specific content based on event type
+  COALESCE(
+    JSON_VALUE(content, '$.messages[0].content'),
+    JSON_VALUE(content, '$.summary'),
+    JSON_VALUE(content)
+  ) AS summary,
+  JSON_VALUE(latency_ms, '$.total_ms') AS duration_ms
+FROM
+  `your-gcp-project-id.adk_agent_logs.agent_events`
+WHERE
+    -- Replace with a specific trace_id from your logs
+  trace_id = '019bb986-a0db-7da1-802d-2725795ab340'
+ORDER BY
+  timestamp ASC;
+```
+
+### 2. 分析 LLM 延迟与 token 用量
+计算 LLM 调用的平均延迟和总 token 用量。
+
+```sql
+SELECT
+  JSON_VALUE(attributes, '$.model') AS model,
+  COUNT(*) AS total_calls,
+  AVG(CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64)) AS avg_latency_ms,
+  SUM(CAST(JSON_VALUE(attributes, '$.usage.total_tokens') AS INT64)) AS total_tokens
+FROM
+  `your-gcp-project-id.adk_agent_logs.agent_events`
+WHERE
+  event_type = 'LLM_RESPONSE'
+GROUP BY
+  1;
+```
+
+### 3. 使用 BigQuery Remote Model（Gemini）分析多模态内容
+
+如果将图片卸载到了 GCS，可以使用 BigQuery ML 直接分析它们。
+
+```sql
+SELECT
+  logs.session_id,
+  -- Get a signed URL for the image (optional, for viewing)
+  STRING(OBJ.GET_ACCESS_URL(parts.object_ref, "r").access_urls.read_url) as signed_url,
+  -- Analyze the image using a remote model (e.g., gemini-4-hydrogen)
+  AI.GENERATE(
+    ('Describe this image briefly. What company logo?', parts.object_ref)
+  ) AS generated_result
+FROM
+  `your-gcp-project-id.adk_agent_logs.agent_events` logs,
+  UNNEST(logs.content_parts) AS parts
+WHERE
+  parts.mime_type LIKE 'image/%'
+ORDER BY logs.timestamp DESC
+LIMIT 1;
+```
+
+### 4. 分析 Span 层级与耗时
+使用 span ID 可视化 agent 操作（LLM 调用、工具使用）的执行流和性能。
+
+```sql
+SELECT
+  span_id,
+  parent_span_id,
+  event_type,
+  timestamp,
+  -- Extract duration from latency_ms for completed operations
+  CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64) as duration_ms,
+  -- Identify the specific tool or operation
+  COALESCE(
+    JSON_VALUE(content, '$.tool'),
+    'LLM_CALL'
+  ) as operation
+FROM `your-gcp-project-id.adk_agent_logs.agent_events`
+WHERE trace_id = 'your-trace-id'
+  AND event_type IN ('LLM_RESPONSE', 'TOOL_COMPLETED')
+ORDER BY timestamp ASC;
+```
+
+### 5. 查询已卸载的内容（获取签名 URL）
+
+```sql
+SELECT
+  timestamp,
+  event_type,
+  part.mime_type,
+  part.storage_mode,
+  part.object_ref.uri AS gcs_uri,
+  -- Generate a signed URL to read the content directly (requires connection_id configuration)
+  STRING(OBJ.GET_ACCESS_URL(part.object_ref, 'r').access_urls.read_url) AS signed_url
+FROM `your-gcp-project-id.adk_agent_logs.agent_events`,
+UNNEST(content_parts) AS part
+WHERE part.storage_mode = 'GCS_REFERENCE'
+ORDER BY timestamp DESC
+LIMIT 10;
+```
+
+### 6. 高级 SQL 场景
+
+这些高级模式演示如何对数据做会话化、分析工具使用情况，并使用 BigQuery ML 执行根因分析。
+
+```sql
+-- 1. Sessionize Conversation History (Create View)
+-- Consolidates all events into a single row per session with a formatted history.
+CREATE OR REPLACE VIEW `your-project.your-dataset.agent_sessions` AS
+SELECT
+  session_id,
+  user_id,
+  MIN(timestamp) AS session_start,
+  MAX(timestamp) AS session_end,
+  ARRAY_AGG(
+    STRUCT(timestamp, event_type, TO_JSON_STRING(content) as content, error_message)
+    ORDER BY timestamp ASC
+  ) AS events,
+  STRING_AGG(
+      CASE
+          -- LLM_REQUEST carries the user's prompt under content.messages
+          WHEN event_type = 'LLM_REQUEST' THEN CONCAT('User: ', JSON_VALUE(content, '$.summary'))
+          WHEN event_type = 'LLM_RESPONSE' THEN CONCAT('Agent: ', JSON_VALUE(content, '$.summary'))
+          WHEN event_type = 'TOOL_STARTING' THEN CONCAT('SYS: Calling ', JSON_VALUE(content, '$.tool'))
+          WHEN event_type = 'TOOL_COMPLETED' THEN CONCAT('SYS: Result from ', JSON_VALUE(content, '$.tool'))
+          WHEN event_type = 'TOOL_ERROR' THEN CONCAT('SYS: ERROR in ', JSON_VALUE(content, '$.tool'))
+          ELSE NULL
+      END,
+      '\n' ORDER BY timestamp ASC
+  ) AS full_conversation
+FROM
+  `your-project.your-dataset.agent_events`
+GROUP BY
+  session_id, user_id;
+
+-- 2. Tool Usage Analysis
+-- Extract tool names from content (the auto-view `v_tool_completed`
+-- exposes `tool_name` directly if you'd rather skip the JSON_VALUE).
+SELECT
+  JSON_VALUE(content, '$.tool') AS tool_name,
+  event_type,
+  COUNT(*) as count
+FROM `your-project.your-dataset.agent_events`
+WHERE event_type IN ('TOOL_STARTING', 'TOOL_COMPLETED', 'TOOL_ERROR')
+GROUP BY 1, 2
+ORDER BY tool_name, event_type;
+
+-- 3. Granular Cost & Token Estimation
+-- Estimate tokens based on content character length (approx 4 chars/token)
+SELECT
+  session_id,
+  COUNT(*) as interaction_count,
+  SUM(LENGTH(TO_JSON_STRING(content))) / 4 AS estimated_tokens,
+  -- Example cost: $0.0001 per 1k tokens
+  ROUND((SUM(LENGTH(TO_JSON_STRING(content))) / 4) / 1000 * 0.0001, 6) AS estimated_cost_usd
+FROM `your-project.your-dataset.agent_events`
+GROUP BY session_id
+ORDER BY estimated_cost_usd DESC
+LIMIT 5;
+
+-- 4. AI-Powered Root Cause Analysis (Requires BigQuery ML)
+-- Use Gemini to analyze failed sessions
+SELECT
+  session_id,
+  AI.GENERATE(
+    ('Analyze this conversation and explain the failure root cause. Log: ', full_conversation),
+    connection_id => 'your-project.us.bqml_connection',
+    endpoint => 'gemini-4-hydrogen'
+  ).result AS root_cause_explanation
+FROM `your-project.your-dataset.agent_sessions`
+WHERE error_message IS NOT NULL
+LIMIT 5;
+```
+
+## BigQuery 中的对话式分析
+
+<Note>
+  **对话式分析**
+
+  你还可以使用 [BigQuery Conversational Analytics](https://cloud.google.com/bigquery/docs/conversational-analytics) 以自然语言分析 agent 日志。
+  只需提出类似这样的问题：
+  * "显示一段时间内的错误率"
+  * "最常见的工具调用有哪些？"
+  * "找出 token 用量较高的会话"
+</Note>
+
+## Looker Studio 仪表盘
+
+可以使用预构建的 [Looker Studio 仪表盘模板](https://lookerstudio.google.com/c/reporting/f1c5b513-3095-44f8-90a2-54953d41b125/page/8YdhF) 可视化 agent 的表现。
+
+要将此仪表盘连接到自己的 BigQuery 表，请使用以下链接格式，并将占位符替换为具体的 project、dataset 和 table ID：
+
+```text
+https://lookerstudio.google.com/reporting/create?c.reportId=f1c5b513-3095-44f8-90a2-54953d41b125&ds.ds3.connector=bigQuery&ds.ds3.type=TABLE&ds.ds3.projectId=<your-project-id>&ds.ds3.datasetId=<your-dataset-id>&ds.ds3.tableId=<your-table-id>
+```
+
+## LangGraph 集成
+
+`BigQueryCallbackHandler` 为 LangGraph agent 提供增强支持，包括自动节点检测、图级跟踪和延迟测量。
+
+### LangGraph 事件类型
+
+除标准 LangChain 事件外，回调处理器还会自动检测并记录 LangGraph 特有的事件：
+
+| 事件类型 | 说明 |
+|---|---|
+| `AGENT_STARTING` | LangGraph 节点开始执行时发出 |
+| `AGENT_COMPLETED` | LangGraph 节点成功完成时发出 |
+| `AGENT_ERROR` | LangGraph 节点失败时发出 |
+| `INVOCATION_STARTING` | 图执行开始时发出（通过上下文管理器） |
+| `INVOCATION_COMPLETED` | 图执行完成时发出 |
+| `INVOCATION_ERROR` | 图执行失败时发出 |
+
+### 图上下文管理器
+
+使用 `graph_context()` 方法显式标记图执行的边界。这样可以发出带准确延迟测量的 `INVOCATION_STARTING` 和 `INVOCATION_COMPLETED` 事件：
+
+```python
+from langchain.agents import create_agent
+from langchain.messages import HumanMessage
+from langchain_google_community.callbacks.bigquery_callback import (
+    BigQueryCallbackHandler,
+    BigQueryLoggerConfig,
+)
+
+# Initialize handler with graph name
+handler = BigQueryCallbackHandler(
+    project_id="your-project-id",
+    dataset_id="agent_analytics",
+    table_id="agent_events",
+    graph_name="my_agent",
+)
+
+# Create your agent
+agent = create_agent(llm, tools)
+
+# Use the graph context manager for proper INVOCATION_STARTING/INVOCATION_COMPLETED events
+run_metadata = {
+    "session_id": "session-123",
+    "user_id": "user-456",
+    "agent": "my_agent",
+}
+
+with handler.graph_context("my_agent", metadata=run_metadata):
+    result = agent.invoke(
+        {"messages": [HumanMessage(content="What is the weather in Tokyo?")]},
+        config={
+            "callbacks": [handler],
+            "metadata": run_metadata,
+        },
+    )
+```
+
+### 延迟跟踪
+
+回调处理器会自动跟踪所有操作的延迟，并将测量结果存储在 `latency_ms` JSON 列中：
+
+```sql
+-- Query latency by event type
+SELECT
+    event_type,
+    agent,
+    COUNT(*) as count,
+    ROUND(AVG(CAST(JSON_EXTRACT_SCALAR(latency_ms, '$.total_ms') AS FLOAT64)), 2) as avg_latency_ms,
+    ROUND(APPROX_QUANTILES(CAST(JSON_EXTRACT_SCALAR(latency_ms, '$.total_ms') AS FLOAT64), 100)[OFFSET(95)], 2) as p95_latency_ms
+FROM `your-project.your-dataset.agent_events`
+WHERE DATE(timestamp) = CURRENT_DATE()
+  AND event_type IN ('LLM_RESPONSE', 'TOOL_COMPLETED', 'INVOCATION_COMPLETED')
+GROUP BY event_type, agent
+ORDER BY avg_latency_ms DESC;
+```
+
+### 事件过滤
+
+使用 `event_allowlist` 和 `event_denylist` 控制记录哪些事件：
+
+```python
+from langchain_google_community.callbacks.bigquery_callback import (
+    BigQueryCallbackHandler,
+    BigQueryLoggerConfig,
+)
+
+# Production config: Only log important events
+config = BigQueryLoggerConfig(
+    event_allowlist=[
+        "LLM_RESPONSE",
+        "LLM_ERROR",
+        "TOOL_COMPLETED",
+        "TOOL_ERROR",
+        "INVOCATION_COMPLETED",
+        "INVOCATION_ERROR",
+    ],
+)
+
+handler = BigQueryCallbackHandler(
+    project_id="your-project-id",
+    dataset_id="agent_analytics",
+    config=config,
+)
+```
+
+或者排除噪声事件：
+
+```python
+# Exclude chain events but log everything else
+config = BigQueryLoggerConfig(
+    event_denylist=["CHAIN_START", "CHAIN_END"],
+)
+```
+
+## 示例与资源
+
+### 示例代码
+
+以下示例演示了 BigQuery 回调处理器的各种功能：
+
+| 示例 | 说明 |
+|---------|-------------|
+| [基础示例](https://github.com/langchain-ai/langchain-google/blob/main/libs/community/examples/bigquery_callback/basic_example.py) | 使用 LLM 调用的基本回调用法 |
+| [LangGraph agent](https://github.com/langchain-ai/langchain-google/blob/main/libs/community/examples/bigquery_callback/langgraph_agent_example.py) | 带 6 个真实工具的完整 ReAct agent |
+| [异步示例](https://github.com/langchain-ai/langchain-google/blob/main/libs/community/examples/bigquery_callback/async_example.py) | 支持并发查询的异步处理器 |
+| [事件过滤](https://github.com/langchain-ai/langchain-google/blob/main/libs/community/examples/bigquery_callback/event_filtering_example.py) | allowlist/denylist 配置 |
+| [示例数据生成器](https://github.com/langchain-ai/langchain-google/blob/main/libs/community/examples/bigquery_callback/populate_sample_data.py) | 为多种 agent 类型生成示例数据 |
+
+### 分析 notebook
+
+[LangGraph Agent Analytics notebook](https://github.com/langchain-ai/langchain-google/blob/main/libs/community/examples/bigquery_callback/langgraph_agent_analytics.ipynb) 提供了全面的 BigQuery 分析查询，涵盖：
+
+- 实时事件监控
+- 工具使用分析
+- 延迟分析与趋势
+- 错误调试
+- 用户参与度指标
+- 时间序列可视化
+
+### 实时监控仪表盘
+
+我们提供了一个[基于 FastAPI 的监控仪表盘](https://github.com/langchain-ai/langchain-google/tree/main/libs/community/examples/bigquery_callback/webapp)，用于实时监控 agent：
+
+**功能：**
+- 通过 Server-Sent Events（SSE）的实时事件流
+- 事件分布和延迟趋势的交互式图表
+- 带详细时间线视图的会话追踪
+- 20+ 个用于分析查询的 REST API endpoint
+- 每 5 秒自动刷新
+
+```bash
+# Run the dashboard
+cd libs/community/examples/bigquery_callback/webapp
+pip install -r requirements.txt
+uvicorn main:app --port 8001
+# Open http://localhost:8001
+```
+## 反馈
+欢迎对 BigQuery Agent Analytics 提供反馈。如果有问题、建议或遇到任何问题，请通过 bqaa-feedback@google.com 联系团队。
+
+## 附加资源
+
+-   [BigQuery Storage Write API](https://cloud.google.com/bigquery/docs/write-api)
+-   [Object Tables 简介](https://cloud.google.com/bigquery/docs/object-table-introduction)
+-   [示例代码与 notebook](https://github.com/langchain-ai/langchain-google/tree/main/libs/community/examples/bigquery_callback)
 
 ---
 

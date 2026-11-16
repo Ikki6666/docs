@@ -1,6 +1,9 @@
 ---
 title: "Composio 集成"
 description: 通过 Composio 的统一 API 平台，为 AI agents 访问 500+ 工具和集成，支持 OAuth 处理、事件驱动工作流和多用户支持。
+integration:
+  name: Composio
+  npm: '@composio/langchain'
 ---
 
 [Composio](https://composio.dev) 是一个集成平台，可访问 GitHub、Slack、Notion 等常见应用中的 500+ 工具。它通过统一 API 让 AI agents 与外部服务交互，同时处理认证、权限和事件驱动工作流。
@@ -278,6 +281,254 @@ const agent1 = createAgent({ model, tools: toolsUser1 });
 // User 2's agent will act on User 2's GitHub account
 const agent2 = createAgent({ model, tools: toolsUser2 });
 ```
+
+## 事件驱动工作流
+
+Composio 支持基于外部事件触发 agents。当已连接的应用中发生事件时，例如新的 GitHub commit 或 Slack 消息，triggers 会自动向你的应用发送结构化 payload。
+
+### 创建 trigger
+
+首先，为你想要监控的事件创建一个 trigger：
+
+```typescript
+import { Composio } from '@composio/core';
+
+const composio = new Composio({ apiKey: 'your_api_key' });
+const userId = 'user_123';
+
+// Check what configuration is required for the trigger
+const triggerType = await composio.triggers.getType('GITHUB_COMMIT_EVENT');
+console.log(triggerType.config);
+
+// Create trigger with required configuration
+const trigger = await composio.triggers.create(
+    userId,
+    'GITHUB_COMMIT_EVENT',
+    {
+        triggerConfig: {
+            owner: 'composiohq',
+            repo: 'composio'
+        }
+    }
+);
+
+console.log(`Trigger created: ${trigger.triggerId}`);
+```
+
+### 订阅 triggers（开发环境）
+
+对于本地开发和原型验证，你可以直接订阅 triggers：
+
+```typescript
+import { Composio } from '@composio/core';
+
+const composio = new Composio({ apiKey: 'your_api_key' });
+
+// Subscribe to trigger events
+composio.triggers.subscribe(
+    (data) => {
+        console.log(`New commit detected:`, data);
+        // Process the event with your agent
+        // ... invoke your agent with the task
+    },
+    {
+        triggerId: 'your_trigger_id',
+        // You can also filter by:
+        // userId: 'user@acme.com',
+        // toolkits: ['github', 'slack'],
+        // triggerSlug: ["GITHUB_COMMIT_EVENT"],
+        // authConfigId: "ac_1234567890"
+    }
+);
+
+// Note: For production, use webhooks instead
+```
+
+### 类型安全的 trigger 处理
+
+为了获得更好的类型安全性，可以定义 payload 类型：
+
+```typescript
+import { TriggerEvent } from '@composio/core';
+
+// Define type-safe payload
+export type GitHubStarAddedEventPayload = {
+    action: 'created';
+    repository_id: number;
+    repository_name: string;
+    repository_url: string;
+    starred_at: string;
+    starred_by: string;
+};
+
+// Type-safe handler
+function handleGitHubStarAddedEvent(event: TriggerEvent<GitHubStarAddedEventPayload>) {
+    console.log(`⭐ ${event.data.repository_name} starred by ${event.data.starred_by}`);
+}
+```
+
+### Webhooks（生产环境）
+
+在生产环境中，请在 [Composio dashboard](https://platform.composio.dev/settings/events) 中配置 webhooks：
+
+```typescript
+import type { NextApiRequest, NextApiResponse } from 'next';
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+    if (req.method !== 'POST') {
+        return res.status(405).json({ error: 'Method not allowed' });
+    }
+
+    try {
+        const payload = req.body;
+
+        console.log('Received trigger event:', payload);
+
+        // Process the event with your agent
+        if (payload.triggerSlug === 'GITHUB_COMMIT_EVENT') {
+            const commitData = payload.payload;
+            // ... invoke your agent with commitData
+        }
+
+        res.status(200).json({ status: 'success' });
+    } catch (error) {
+        console.error('Error processing webhook:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+}
+```
+
+更多细节请参阅 [Composio Triggers 文档](https://docs.composio.dev/docs/using-triggers)
+
+## 高级特性
+
+### 自定义工具
+
+Composio 允许你创建可与内置工具一起使用的自定义工具。共有两种类型：
+
+#### 独立工具
+
+不需要认证的简单工具：
+
+```typescript
+import { Composio } from '@composio/core';
+import { z } from 'zod';
+
+const composio = new Composio({
+    apiKey: process.env.COMPOSIO_API_KEY
+});
+
+const tool = await composio.tools.createCustomTool({
+    slug: 'CALCULATE_SQUARE',
+    name: 'Calculate Square',
+    description: 'Calculates the square of a number',
+    inputParams: z.object({
+        number: z.number().describe('The number to calculate the square of'),
+    }),
+    execute: async input => {
+        const { number } = input;
+        return {
+            data: { result: number * number },
+            error: null,
+            successful: true,
+        };
+    },
+});
+
+// Use with your agent
+const allTools = [...tools, tool];
+```
+
+#### 基于 toolkit 的工具
+
+需要认证、并且可以使用 toolkit 凭证的工具：
+
+```typescript
+import { Composio } from '@composio/core';
+import { z } from 'zod';
+
+const composio = new Composio({
+    apiKey: process.env.COMPOSIO_API_KEY
+});
+
+const tool = await composio.tools.createCustomTool({
+    slug: 'GITHUB_STAR_COMPOSIOHQ_REPOSITORY',
+    name: 'Github star composio repositories',
+    toolkitSlug: 'github',
+    description: 'Star any specified repo of `composiohq` user',
+    inputParams: z.object({
+        repository: z.string().describe('The repository to star'),
+        page: z.number().optional().describe('Pagination page number'),
+        customHeader: z.string().optional().describe('Custom header'),
+    }),
+    execute: async (input, connectionConfig, executeToolRequest) => {
+        // This method makes authenticated requests to the relevant API
+        // Composio will automatically inject the baseURL
+        const result = await executeToolRequest({
+            endpoint: `/user/starred/composiohq/${input.repository}`,
+            method: 'PUT',
+            body: {},
+            // Add custom headers or query parameters
+            parameters: [
+                // Add query parameters
+                {
+                    name: 'page',
+                    value: input.page?.toString() || '1',
+                    in: 'query',
+                },
+                // Add custom headers
+                {
+                    name: 'x-custom-header',
+                    value: input.customHeader || 'default-value',
+                    in: 'header',
+                },
+            ],
+        });
+        return result;
+    },
+});
+```
+
+执行自定义工具：
+
+```typescript
+import { Composio } from '@composio/core';
+
+const composio = new Composio({
+    apiKey: process.env.COMPOSIO_API_KEY
+});
+
+const result = await composio.tools.execute('TOOL_SLUG', {
+    arguments: {
+        // Tool input parameters
+    },
+    userId: 'user-id',
+    connectedAccountId: 'optional-account-id', // Required for toolkit-based tools
+});
+```
+
+更多细节请参阅 [Composio Custom Tools 文档](https://docs.composio.dev/docs/custom-tools)
+
+### 细粒度权限
+
+控制工具可以执行哪些动作：
+
+```typescript
+// Get tools with specific permissions
+const tools = await composio.tools.get('default', 'GITHUB', {
+    // Limit to read-only operations
+    permissions: ['read']
+});
+```
+
+---
+
+## API 参考
+
+关于 Composio 所有特性和配置的详细文档，请访问：
+- [Composio Documentation](https://docs.composio.dev)
+- [LangChain Provider Guide](https://docs.composio.dev/providers/langchain)
+- [Available Tools & Actions](https://docs.composio.dev/toolkits/introduction)
 
 ---
 

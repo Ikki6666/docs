@@ -12,7 +12,7 @@ Tunnels 目前处于 [alpha](/langsmith/release-stages) 阶段。要为你的组
 
 Tunnel 让 LangSmith 能够访问运行在你私有网络中的服务，例如 model endpoint 或 MCP server，而无需将该服务开放到互联网。你在自己的网络内运行一个小型 connector。该 connector 会建立一条到 LangSmith 的出站连接，LangSmith 则通过这条连接发送对你的服务的请求。如果要让 sandbox 的出站连接改经你的网络，请使用 [relay](/langsmith/relays)。
 
-Tunnels 在每个区域的 [LangSmith Cloud](/langsmith/cloud) 上都可用。self-hosted 或 hybrid 部署不支持 Tunnels。
+Tunnels 在每个区域的 [LangSmith Cloud](/langsmith/cloud) 上都可用。self-hosted 或 hybrid 部署，以及个人组织不支持 Tunnels。
 
 ## Tunnels 的工作原理
 
@@ -20,7 +20,7 @@ Tunnels 在每个区域的 [LangSmith Cloud](/langsmith/cloud) 上都可用。se
 2. 你在自己的网络内运行 connector，并使用 tunnel ID、API key 以及一个或多个 **target** 对其进行配置。Target 是映射到私有地址的名称，例如 `litellm` 映射到 `http://litellm.internal:4000`。
 3. Connector 通过 HTTPS（端口 443）出站连接到 LangSmith。没有任何连接会接入你的网络，connector 也不暴露任何端口。
 4. 每个 HTTP target 都会获得一个 **tunnel URL**。在 LangSmith 中，凡是原本使用服务地址的地方，你都可以使用该 URL。
-5. 当 LangSmith 功能调用 tunnel URL 时，LangSmith 会检查调用方是否属于该 tunnel 的组织，然后将请求发送给 connector，由 connector 转发给 target。
+5. 当请求到达 tunnel URL 时，LangSmith 会检查调用方是否属于该 tunnel 的组织。随后，LangSmith 会将请求发送给 connector，由 connector 转发给 target。
 
 ## 设置 tunnel
 
@@ -29,8 +29,6 @@ Tunnels 在每个区域的 [LangSmith Cloud](/langsmith/cloud) 上都可用。se
 <Steps>
   <Step title="打开 Tunnels 设置" icon="settings">
     在 LangSmith 中，进入 **Settings**，然后在 **Infrastructure** 下选择 **Tunnels**。
-
-    ![Tunnels settings page with no tunnels and a Create tunnel button](/langsmith/images/tunnels-empty.png)
   </Step>
   <Step title="创建 tunnel" icon="plus">
     选择 **Create tunnel**。输入名称和可选的描述，然后选择 **Create tunnel**。
@@ -122,6 +120,7 @@ Tunnels 在每个区域的 [LangSmith Cloud](/langsmith/cloud) 上都可用。se
 - [Model configurations](/langsmith/model-configurations) 和 [custom model endpoints](/langsmith/custom-endpoint)，作为 base URL。这涵盖了使用该模型的 Playground、experiments 和 online evaluators。
 - [LangSmith Fleet](/langsmith/fleet)，作为 model 的 base URL 或 MCP server URL。
 - 使用 OAuth 的 MCP server，用于其 token endpoint。Authorization endpoint 必须保持可以从浏览器访问，因此它不能是 tunnel URL。
+- LangSmith Cloud 上的 [Agent Server](/langsmith/deploy-to-cloud)，从你的 agent 自己的代码中调用。请参阅[从 Agent Server 调用 tunnel](#call-a-tunnel-from-an-agent-server)。
 
 请注意以下几点：
 
@@ -129,6 +128,34 @@ Tunnels 在每个区域的 [LangSmith Cloud](/langsmith/cloud) 上都可用。se
 - 通过 tunnel 发送的请求不会跟随 redirects。
 - 通过 tunnel 访问的 model 需要在其配置中提供自己的 API key。LLM auth proxy credentials 不会通过 tunnel 发送。
 - 你的 target 必须在 30 秒内开始响应。单个请求最多可以流式传输 1 小时，请求体最大为 32 MiB。
+
+## 从 Agent Server 调用 tunnel {#call-a-tunnel-from-an-agent-server}
+
+运行在 LangSmith Cloud 上 Agent Server 中的 agent 可以从自己的代码中调用 tunnel URL。Tunnel 所属组织中的任何 Agent Server 都可以调用该 tunnel，无论其位于哪个工作区。在 `X-Api-Key` header 中发送 Agent Server 的 LangSmith API key。你无需创建 key：control plane 会为它创建的每个 Agent Server 设置 `LANGSMITH_API_KEY`。更多信息，请参阅 [LangSmith 集成](/langsmith/control-plane#langsmith-integration)。
+
+```python
+import os
+
+import httpx
+
+TUNNEL_URL = "https://<handle>.tunnels.smith.langchain.com"
+
+response = httpx.get(
+    TUNNEL_URL,
+    headers={"X-Api-Key": os.environ["LANGSMITH_API_KEY"]},
+)
+```
+
+LangSmith 会检查该 key，将其移除，然后将请求转发给你的服务。不带该 key 的请求会返回 `403`，并带有 `connection access denied`。
+
+`Authorization` header 会原样透传。如果你的服务期望的是自己的 `X-Api-Key` 或 `Cookie` header，请改为以 `X-Tunnel-Origin-X-Api-Key` 或 `X-Tunnel-Origin-Cookie` 发送它。LangSmith 会在请求到达你的服务之前将其重命名回原来的名称：
+
+```python
+headers = {
+    "X-Api-Key": os.environ["LANGSMITH_API_KEY"],
+    "X-Tunnel-Origin-X-Api-Key": os.environ["MY_SERVICE_API_KEY"],
+}
+```
 
 ## 安全性
 
@@ -151,7 +178,7 @@ Connector 会通过 TLS 在端口 443 上向所在区域的 LangSmith API endpoi
 
 在请求到达你的服务之前，LangSmith 会移除自己的 credentials 和 identity header：`X-Service-Key`、`X-Api-Key`、`X-Tenant-Id`、`X-Organization-Id`、`X-User-Id`、`X-Data-Plane-Auth`、`Cookie`，以及任何以 `X-Langsmith-` 或 `X-Langchain-` 开头的 header。`Authorization` 会透传，因此使用 bearer token 进行认证的服务无需更改即可工作。
 
-如果你的服务使用自己的 `X-Api-Key` 或 `Cookie` header 进行认证，LangSmith 功能会将你配置的 header 传递给你的服务。与 LangSmith identity header 同名的 header（例如 `X-Tenant-Id`）永远不会到达你的服务。
+如果你的服务使用自己的 `X-Api-Key` 或 `Cookie` header 进行认证，LangSmith 功能会将你配置的 header 传递给你的服务。从你自己的代码中调用时，请按照[从 Agent Server 调用 tunnel](#call-a-tunnel-from-an-agent-server)中所述，使用 `X-Tunnel-Origin-` 前缀发送该 header。与 LangSmith identity header 同名的 header（例如 `X-Tenant-Id`）永远不会到达你的服务。
 
 ### 加密
 

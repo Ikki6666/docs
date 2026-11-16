@@ -8,7 +8,7 @@ import HitlBasicConfigJs from '/snippets/python/code-samples/hitl-basic-config-j
 import HitlConditionalInterruptsPy from '/snippets/python/code-samples/hitl-conditional-interrupts-py.mdx';
 import HitlDecisionTypesTable from '/snippets/python/oss/hitl-decision-types-table.mdx';
 
-某些工具操作可能比较敏感，需要在执行前获得人工批准。Deep Agents 通过 LangGraph 的 interrupt 能力支持 human-in-the-loop 工作流。你可以使用 `interrupt_on` 参数配置哪些工具需要批准。设置 `interrupt_on` 后，`HumanInTheLoopMiddleware` 会被添加到 [Deep Agents 栈](/oss/python/deepagents/customization#deep-agents-stack)中。如果在工具返回结果之前运行被取消或中断，堆栈中的 [PatchToolCallsMiddleware](https://reference.langchain.com/python/deepagents/middleware/patch_tool_calls/PatchToolCallsMiddleware) 会自动修复消息历史。
+某些工具操作可能比较敏感，需要在执行前获得人工批准。Deep Agents 通过 LangGraph 的 interrupt 能力支持 human-in-the-loop 工作流。你可以使用 `interrupt_on` 参数配置哪些工具需要批准。设置 `interrupt_on` 后，`HumanInTheLoopMiddleware` 会被添加到 [Deep Agents 栈](/oss/python/deepagents/customization#deep-agents-stack)中。如果在工具返回结果之前运行被取消或中断，堆栈中的 [`PatchToolCallsMiddleware`](https://reference.langchain.com/python/deepagents/middleware/patch_tool_calls/PatchToolCallsMiddleware) 会自动修复消息历史。
 
 ```mermaid
 graph LR
@@ -48,7 +48,7 @@ graph LR
 
 - **`False`**：为这个工具禁用中断
 - **`InterruptOnConfig`**：自定义配置。设置 `allowed_decisions` 来控制审核选项。
-  在 Python 中，你还可以添加一个可选 `when` 谓词，只对特定调用中断（见[条件中断](#conditional-interrupts)）。
+  在 Python 中，你还可以添加一个 `when` 谓词（可选），只对特定调用中断（见[条件中断](#conditional-interrupts)）。
 
 
 <HitlBasicConfigPy />
@@ -75,13 +75,13 @@ graph LR
 
 ```python
 interrupt_on = {
-    # 敏感操作：允许所有选项
+    # Sensitive operations: allow all options
     "delete_file": {"allowed_decisions": ["approve", "edit", "reject"]},
 
-    # 中等风险：只允许批准或拒绝
+    # Moderate risk: approval or rejection only
     "write_file": {"allowed_decisions": ["approve", "reject"]},
 
-    # 必须批准（不允许拒绝）
+    # Must approve (no rejection allowed)
     "critical_operation": {"allowed_decisions": ["approve"]},
 }
 ```
@@ -112,45 +112,48 @@ interrupt_on = {
 from langchain_core.utils.uuid import uuid7
 from langgraph.types import Command
 
-# 创建包含 thread_id 的 config，用于状态持久化
+# Create config with thread_id for state persistence
 config = {"configurable": {"thread_id": str(uuid7())}}
 
-# 调用 agent
+# Invoke the agent
 result = agent.invoke(
     {"messages": [{"role": "user", "content": "Delete the file temp.txt"}]},
     config=config
 )
 
-# 检查是否被中断
+# Check if execution was interrupted
 if result.get("__interrupt__"):  # [!code highlight]
-    # 提取 interrupt 信息
+    # Extract interrupt information
     interrupt_value = result["__interrupt__"][0].value  # [!code highlight]
     action_requests = interrupt_value["action_requests"]
     review_configs = interrupt_value["review_configs"]
 
-    # 从工具名创建 review config 查找表
+    # Create a lookup map from tool name to review config
     config_map = {cfg["action_name"]: cfg for cfg in review_configs}
 
-    # 向用户展示待处理动作
+    # Display the pending actions to the user
     for action in action_requests:
         review_config = config_map[action["name"]]
         print(f"Tool: {action['name']}")
         print(f"Arguments: {action['args']}")
         print(f"Allowed decisions: {review_config['allowed_decisions']}")
 
-    # 获取用户决策（与 action_request 一一对应，按顺序）
+    # Get user decisions (one per action_request, in order)
     decisions = [
         {
             "type": "reject",
-            "message": "用户拒绝删除 temp.txt。不要重试删除。",
+            "message": "User rejected deleting temp.txt. Do not retry deletion.",
         }
     ]
 
-    # 用决策恢复执行
+    # Resume execution with decisions
     result = agent.invoke(
         Command(resume={"decisions": decisions}),
-        config=config  # 必须使用同一个 config！
+        config=config  # Must use the same config!
     )
+
+# Process final result
+print(result["messages"][-1].content)  # [!code highlight]
 ```
 
 
@@ -218,6 +221,46 @@ print()
 组合 `"messages"` 和 `"updates"` 两种流模式，既能向用户实时展示 LLM token，又能捕获 HITL interrupts。`"messages"` 模式流式传输 token；`"updates"` 模式传递 interrupt 负载。
 </Tip>
 
+## 多个 tool call
+
+当 agent 调用多个需要批准的工具时，所有 interrupts 会一起打包进一个 interrupt。你必须按顺序为每个工具提供决策。
+
+```python
+config = {"configurable": {"thread_id": str(uuid7())}}
+
+result = agent.invoke(
+    {"messages": [{
+        "role": "user",
+        "content": "Delete temp.txt and send an email to admin@example.com"
+    }]},
+    config=config
+)
+
+if result.get("__interrupt__"):  # [!code highlight]
+    interrupt_value = result["__interrupt__"][0].value  # [!code highlight]
+    action_requests = interrupt_value["action_requests"]
+
+    # Two tools need approval
+    assert len(action_requests) == 2
+
+    # Provide decisions in the same order as action_requests
+    decisions = [
+        {"type": "approve"},  # First tool: delete_file
+        {
+            "type": "reject",
+            "message": "User rejected this action. Do not retry this tool call.",
+        }  # Second tool: send_email
+    ]
+
+    result = agent.invoke(
+        Command(resume={"decisions": decisions}),
+        config=config
+    )
+```
+
+
+
+
 ## 拒绝消息
 
 当审查者返回 `reject` 决策时，Deep Agents 会跳过该 tool call，并把拒绝反馈发回给 agent。如果你省略 `message`，默认反馈会告诉模型该工具没有执行，并且除非用户要求，否则不要重试同一个 tool call。
@@ -228,7 +271,7 @@ print()
 decisions = [
     {
         "type": "reject",
-        "message": "用户拒绝删除这个文件。不要重试删除。请改为询问要归档哪个文件。",
+        "message": "User rejected deleting this file. Do not retry deletion. Ask which file to archive instead.",
     }
 ]
 ```
@@ -245,14 +288,14 @@ if result.get("__interrupt__"):  # [!code highlight]
     interrupt_value = result["__interrupt__"][0].value  # [!code highlight]
     action_request = interrupt_value["action_requests"][0]
 
-    # 来自 agent 的原始参数
+    # Original args from the agent
     print(action_request["args"])  # {"to": "everyone@company.com", ...}
 
-    # 用户决定编辑收件人
+    # User decides to edit the recipient
     decisions = [{
         "type": "edit",
         "edited_action": {
-            "name": action_request["name"],  # 必须包含工具名
+            "name": action_request["name"],  # Must include the tool name
             "args": {"to": "team@company.com", "subject": "...", "body": "..."}
         }
     }]
@@ -276,7 +319,7 @@ if result.get("__interrupt__"):  # [!code highlight]
 
 ```python
 agent = create_deep_agent(
-    model="google_genai:gemini-3.5-flash",
+    model="google_genai:gemini-4-hydrogen",
     tools=[delete_file, read_file],
     interrupt_on={
         "delete_file": True,
@@ -323,7 +366,7 @@ from deepagents.middleware.subagents import CompiledSubAgent
 @tool(description="Request human approval before proceeding with an action.")
 def request_approval(action_description: str) -> str:
     """Request human approval using the interrupt() primitive."""
-    # interrupt() 会暂停执行，并返回传给 Command(resume=...) 的值
+    # interrupt() pauses execution and returns the value passed to Command(resume=...)
     approval = interrupt({
         "type": "approval_request",
         "action": action_description,
@@ -350,7 +393,7 @@ def main():
     )
 
     parent_agent = create_deep_agent(
-        model="google_genai:gemini-3.5-flash",
+        model="google_genai:gemini-4-hydrogen",
         checkpointer=checkpointer,
         subagents=[
             CompiledSubAgent(
@@ -378,7 +421,7 @@ def main():
         config=config
     )
 
-    # 检查是否有 interrupt
+    # Check for interrupt
     if result.get("__interrupt__"):  # [!code highlight]
         interrupt_value = result["__interrupt__"][0].value  # [!code highlight]
         print(f"\nInterrupt received!")
@@ -394,7 +437,7 @@ def main():
 
         if "__interrupt__" not in result2:  # [!code highlight]
             print("\nExecution completed!")
-            # 查找 tool 返回值
+            # Find the tool response
             tool_msgs = [m for m in result2.get("messages", []) if m.type == "tool"]  # [!code highlight]
             if tool_msgs:
                 print(f"  Tool result: {tool_msgs[-1].content}")
@@ -408,46 +451,148 @@ if __name__ == "__main__":
     main()
 ```
 
+运行时，输出如下：
+
+```text
+Invoking agent - sub-agent will use request_approval tool...
+
+Interrupt received!
+  Type: approval_request
+  Action: deploying to production
+  Message: Please approve or reject: deploying to production
+
+Resuming with Command(resume={'approved': True})...
+
+Execution completed!
+  Tool result: Great! The approval request has been processed. The action **"deploying to production"** was **APPROVED**. You can now proceed with the production deployment.
+```
 
 
 
 
 
-## 多个 tool call
+## 文件系统权限 interrupts
 
-当 agent 调用多个需要批准的工具时，所有 interrupts 会一起打包进一个 interrupt。你必须按顺序为每个工具提供决策。
+<Note>
+文件系统权限 interrupts 需要 `deepagents>=0.6.8`。
+</Note>
+
+除了 `interrupt_on`，你还可以通过将[权限规则](/oss/python/deepagents/permissions)标记为 `mode="interrupt"` 来暂停内置的文件系统工具。当 agent 对匹配 interrupt 模式规则的路径调用 `write_file` 或 `edit_file` 时，`create_deep_agent` 会触发与已配置工具相同的 human-in-the-loop interrupt，并使用文件系统工具的名称作为 action name。
 
 ```python
-config = {"configurable": {"thread_id": str(uuid7())}}
+from deepagents import FilesystemPermission, create_deep_agent
+from langgraph.checkpoint.memory import MemorySaver
+
+
+agent = create_deep_agent(
+    model=model,
+    permissions=[
+        FilesystemPermission(
+            operations=["write"],
+            paths=["/secrets/**"],
+            mode="interrupt",
+        ),
+    ],
+    checkpointer=MemorySaver(),  # Required to pause and resume
+)
+```
+
+处理和恢复该 interrupt 的方式与 tool call interrupt 相同：一直运行到它暂停，检查请求，然后使用决策恢复。
+
+```python
+from langgraph.types import Command
+
+config = {"configurable": {"thread_id": "fs-thread-1"}}
 
 result = agent.invoke(
-    {"messages": [{
-        "role": "user",
-        "content": "Delete temp.txt and send an email to admin@example.com"
-    }]},
-    config=config
+    {"messages": [{"role": "user", "content": "Save the API key to /secrets/key.txt"}]},
+    config=config,
 )
 
+if result.get("__interrupt__"):
+    action = result["__interrupt__"][0].value["action_requests"][0]
+    print(f"Approve {action['name']} on {action['args']}?")
+
+    # Resume with the human decision (approve, edit, or reject).
+    result = agent.invoke(
+        Command(resume={"decisions": [{"type": "approve"}]}),
+        config=config,  # Same thread ID
+    )
+```
+
+文件系统权限 interrupts 会与你传入的任何 `interrupt_on` 合并，因此单个审核步骤可以同时覆盖自定义工具和受保护的文件系统路径。
+
+
+
+## 最佳实践
+
+### 始终使用 checkpointer
+
+Human-in-the-loop 需要 checkpointer 在 interrupt 和 resume 之间持久化 agent 状态：
+
+```python
+from langgraph.checkpoint.memory import MemorySaver
+
+checkpointer = MemorySaver()
+agent = create_deep_agent(
+    model="google_genai:gemini-4-hydrogen",
+    tools=[...],
+    interrupt_on={...},
+    checkpointer=checkpointer  # Required for HITL
+)
+```
+
+### 使用相同的 thread ID
+
+恢复时，必须使用包含相同 `thread_id` 的同一个 config：
+
+```python
+# First call
+config = {"configurable": {"thread_id": "my-thread"}}
+result = agent.invoke(input, config=config)
+
+# Resume (use same config)
+result = agent.invoke(Command(resume={...}), config=config)
+```
+
+### 让决策顺序与动作一致
+
+decisions 列表必须与 `action_requests` 的顺序一致：
+
+```python
 if result.get("__interrupt__"):  # [!code highlight]
     interrupt_value = result["__interrupt__"][0].value  # [!code highlight]
     action_requests = interrupt_value["action_requests"]
 
-    # 需要批准两个工具
-    assert len(action_requests) == 2
-
-    # 按 action_requests 的顺序提供决策
-    decisions = [
-        {"type": "approve"},  # 第一个工具：delete_file
-        {
-            "type": "reject",
-            "message": "用户拒绝该动作。不要重试这个 tool call。",
-        }  # 第二个工具：send_email
-    ]
+    # Create one decision per action, in order
+    decisions = []
+    for action in action_requests:
+        decision = get_user_decision(action)  # Your logic
+        decisions.append(decision)
 
     result = agent.invoke(
         Command(resume={"decisions": decisions}),
         config=config
     )
+```
+
+### 按风险定制配置
+
+根据工具的风险级别配置不同的工具：
+
+```python
+interrupt_on = {
+    # High risk: full control (approve, edit, reject)
+    "delete_file": {"allowed_decisions": ["approve", "edit", "reject"]},
+    "send_email": {"allowed_decisions": ["approve", "edit", "reject"]},
+
+    # Medium risk: no editing allowed
+    "write_file": {"allowed_decisions": ["approve", "reject"]},
+
+    # Low risk: no interrupts
+    "read_file": False,
+    "ls": False,
+}
 ```
 
 ---
