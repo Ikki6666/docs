@@ -2,6 +2,14 @@
 title: "ChatGoogle 集成"
 sidebarTitle: "聊天"
 description: "使用 LangChain JavaScript 集成 ChatGoogle 聊天模型。"
+integration:
+  name: ChatGoogle
+  npm: '@langchain/google'
+  featured: true
+  stream: true
+  tool_calling: true
+  structured_output: true
+  multimodal: true
 ---
 
 该库支持访问多种 Google 模型，包括 Gemini 系列模型，以及它们的 Nano Banana 图像生成模型。你可以通过 Google 的 [Google AI](https://ai.google.dev/) API（有时也称 Generative AI API 或 AI Studio API）或 Google Cloud Platform 的 [Gemini Enterprise Agent Platform](https://cloud.google.com/products/gemini-enterprise-agent-platform) 服务来访问这些模型。
@@ -219,67 +227,482 @@ const aiMsg = await llm.invoke([
 console.log(aiMsg.text);
 ```
 
+```text
+J'adore programmer.
+```
+
 ## 响应元数据
+
+`AIMessage` 响应中包含本次生成的元数据，包括 token 使用情况和 log probabilities。
 
 ### Token Usage
 
-`ChatGoogle` 会把 token 使用情况暴露到标准的 `usage_metadata` 和 provider 特定的 `response_metadata` 中，便于你做成本和性能分析。
+`usage_metadata` 属性可用于查看 token 计数。
+
+```typescript
+const res = await llm.invoke("Hello, how are you?");
+
+console.log(res.usage_metadata);
+```
+
+```text
+{ input_tokens: 6, output_tokens: 7, total_tokens: 13 }
+```
 
 ### Logprobs
 
-Google Gemini 支持 logprobs，但与其他一些提供方相比，能力更受限。若你要依赖该特性，请同时参考对应模型与 provider 文档。
+如果你在模型配置中启用了 `logprobs`，它们会出现在 `response_metadata` 中。
+
+```typescript
+const llmWithLogprobs = new ChatGoogle({
+  model: "gemini-4-hydrogen",
+  logprobs: 2, // Number of top candidates to return
+});
+
+const resWithLogprobs = await llmWithLogprobs.invoke("Hello");
+
+console.log(resWithLogprobs.response_metadata.logprobs_result);
+```
 
 ## 安全设置
 
-Gemini 模型具有默认安全设置，这些设置可以被覆盖。如果模型经常返回安全拦截结果，可以调整 `safetySettings`。
+默认情况下，当前版本的 Gemini 已关闭安全设置。
+
+如果你想为各类别启用安全设置，可以使用模型的 `safetySettings` 属性。
+
+```typescript
+import { ChatGoogle } from "@langchain/google";
+
+const llm = new ChatGoogle({
+  model: "gemini-4-hydrogen",
+  safetySettings: [
+    {
+      category: "HARM_CATEGORY_HARASSMENT",
+      threshold: "BLOCK_LOW_AND_ABOVE",
+    },
+  ],
+});
+```
+
+{/* TODO: Add section for enableEnhancedCivicAnswers */}
 
 ## 结构化输出
 
-`ChatGoogle` 支持结构化输出，可以把 schema 传给模型，以获得更稳定的 JSON 形状结果。
+你可以使用 `withStructuredOutput` 方法从模型获取结构化的 JSON 输出。
+
+```typescript
+import { ChatGoogle } from "@langchain/google";
+import { z } from "zod";
+
+const llm = new ChatGoogle("gemini-4-hydrogen");
+
+const schema = z.object({
+  people: z.array(z.object({
+    name: z.string().describe("The name of the person"),
+    age: z.number().describe("The age of the person"),
+  })),
+});
+
+const structuredLlm = llm.withStructuredOutput(schema);
+
+const res = await structuredLlm.invoke("John is 25 and Jane is 30.");
+console.log(res);
+```
+
+```json
+{
+  "people": [
+    { "name": "John", "age": 25 },
+    { "name": "Jane", "age": 30 }
+  ]
+}
+```
 
 ## 工具调用
 
+`ChatGoogle` 既支持标准的 LangChain [工具调用](/oss/langchain/tools)，也支持 Gemini 特有的“Specialty Tools”（例如代码执行和 Grounding）。
+
 ### 标准工具
 
-`ChatGoogle` 支持标准工具调用模式，你可以像在其他模型上一样绑定工具 schema，并让模型决定何时调用。
+你可以使用以 Zod schema 定义的标准 LangChain 工具。
+
+```typescript
+import { ChatGoogle } from "@langchain/google";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
+
+const weatherTool = tool((input) => {
+  return "It is sunny and 75 degrees.";
+}, {
+  name: "get_weather",
+  description: "Get the weather for a location",
+  schema: z.object({
+    location: z.string(),
+  }),
+});
+
+const llm = new ChatGoogle("gemini-4-hydrogen")
+  .bindTools([weatherTool]);
+
+const res = await llm.invoke("What is the weather in SF?");
+console.log(res.tool_calls);
+```
 
 ### 专用工具
 
-Google 还提供一些更偏 provider 原生能力的工具，例如 grounding、代码执行、图像和媒体相关能力。这些工具的使用方式和普通工具类似，但通常会有模型支持范围或额外参数限制。
+Gemini 提供若干内置工具，用于代码执行和 grounding。
+
+<Warning>
+  你不能在同一次请求中混合使用这些“Specialty Tools”（代码执行、Google Search 等）与标准 LangChain 工具（例如上面的 weather 工具）。
+</Warning>
+
+#### 代码执行
+
+Gemini 模型支持代码执行，允许模型生成并运行 Python 代码来解决复杂问题。
+
+```typescript
+import { ChatGoogle } from "@langchain/google";
+
+const llm = new ChatGoogle("gemini-4-hydrogen")
+  .bindTools([
+    {
+      codeExecution: {},
+    },
+  ]);
+
+const res = await llm.invoke("Calculate the 100th Fibonacci number.");
+console.log(res.contentBlocks);
+```
+
+#### 使用 Google Search 进行 Grounding
+
+你可以使用 `googleSearch` 工具，通过 Google Search 为回答提供依据（grounding）。这对于涉及时事或特定事实的问题很有用。
+
+<Note>
+  `googleSearchRetrieval` 工具为向后兼容而保留，但推荐使用 `googleSearch`。
+</Note>
+
+```typescript
+import { ChatGoogle } from "@langchain/google";
+
+const llm = new ChatGoogle("gemini-4-hydrogen")
+  .bindTools([
+    {
+      googleSearch: {},
+    },
+  ]);
+
+const res = await llm.invoke("Who won the latest World Series?");
+console.log(res.text);
+```
+
+#### 使用 URL Retrieval 进行 Grounding
+
+你也可以使用特定 URL 为回答提供依据。
+
+```typescript
+import { ChatGoogle } from "@langchain/google";
+
+const llm = new ChatGoogle("gemini-4-hydrogen")
+  .bindTools([
+    {
+      urlContext: {},
+    },
+  ]);
+
+const prompt = "Summarize this page: https://docs.langchain.com/";
+const res = await llm.invoke(prompt);
+console.log(res.text);
+```
+
+#### 使用 data store 进行 Grounding
+
+如果你使用的是 Gemini Enterprise Agent Platform（`platformType: "gcp"`），可以使用 Agent Search data store 为回答提供依据。
+
+```typescript
+import { ChatGoogle } from "@langchain/google";
+
+const projectId = "YOUR_PROJECT_ID";
+const datastoreId = "YOUR_DATASTORE_ID";
+
+const searchRetrievalToolWithDataset = {
+  retrieval: {
+    vertexAiSearch: {
+      datastore: `projects/${projectId}/locations/global/collections/default_collection/dataStores/${datastoreId}`,
+    },
+    disableAttribution: false,
+  },
+};
+
+const llm = new ChatGoogle({
+  model: "gemini-3.1-pro-preview",
+  platformType: "gcp",
+}).bindTools([searchRetrievalToolWithDataset]);
+
+const res = await llm.invoke(
+  "What is the score of Argentina vs Bolivia football game?"
+);
+console.log(res.text);
+```
 
 ## 上下文缓存
 
-Google 支持上下文缓存，用于在多次请求中复用大块稳定上下文，以降低延迟和成本。
+默认情况下，Gemini 模型会进行隐式上下文缓存。如果你发送给 Gemini 的历史记录开头与 Gemini 缓存中的上下文完全匹配，它就会降低该请求的 token 成本。
+
+你也可以显式地将一些内容一次性传给模型，缓存输入 token，然后在后续请求中引用这些缓存的 token，以降低成本和延迟。LangChain 不支持创建这种显式缓存，但如果你已经创建了缓存，就可以在调用中引用它。
+
+```typescript
+import { ChatGoogle } from "@langchain/google";
+
+const llm = new ChatGoogle("gemini-3.1-pro-preview");
+
+// Pass the cache name to the model
+const res = await llm.invoke("Summarize this document", {
+  cachedContent: "projects/123/locations/us-central1/cachedContents/456",
+});
+```
 
 ## 多模态请求
 
+`ChatGoogle` 模型支持多模态请求，允许你在发送文本的同时发送图片、音频和视频。你可以在消息中使用 `contentBlocks` 字段以结构化方式提供这些输入。
+
 ### 图片
 
-`ChatGoogle` 支持图片输入，可通过标准多模态消息格式传入。
+```typescript
+import { ChatGoogle } from "@langchain/google";
+import { HumanMessage } from "@langchain/core/messages";
+import * as fs from "fs";
+
+const llm = new ChatGoogle("gemini-4-hydrogen");
+
+const image = fs.readFileSync("./hotdog.jpg").toString("base64");
+
+const res = await llm.invoke([
+  new HumanMessage({
+    contentBlocks: [
+      {
+        type: "text",
+        text: "What is in this image?",
+      },
+      {
+        type: "image",
+        mimeType: "image/jpeg",
+        data: image,
+      },
+    ],
+  }),
+]);
+
+console.log(res.text);
+```
 
 ### 音频
 
-支持的模型还可以接受音频输入。
+```typescript
+const audio = fs.readFileSync("./speech.wav").toString("base64");
+
+const res = await llm.invoke([
+  new HumanMessage({
+    contentBlocks: [
+      {
+        type: "text",
+        text: "Summarize this audio.",
+      },
+      {
+        type: "audio",
+        mimeType: "audio/wav",
+        data: audio,
+      },
+    ],
+  }),
+]);
+
+console.log(res.text);
+```
 
 ### 视频
 
-支持的模型还可以接受视频输入。
+```typescript
+const video = fs.readFileSync("./movie.mp4").toString("base64");
+
+const res = await llm.invoke([
+  new HumanMessage({
+    contentBlocks: [
+      {
+        type: "text",
+        text: "Describe the video.",
+      },
+      {
+        type: "video",
+        mimeType: "video/mp4",
+        data: video,
+      },
+    ],
+  }),
+]);
+
+console.log(res.text);
+```
+
+{/* TODO: Add section for mediaResolution */}
+{/* TODO: Add section for video clipping intervals and frame rate */}
 
 ## 推理 / Thinking
 
-部分 Google 模型支持 reasoning / thinking 配置，用于控制模型在回答前进行更深入推理。
+Google 的 Gemini 2.5 和 Gemini 3 模型支持“thinking”或“reasoning”步骤。即使你没有显式配置，这些模型也可能执行推理，但只有在你显式设置推理/思考量时，库才会返回推理摘要（thought blocks）。
+
+该库在模型之间提供兼容性，允许你使用统一的参数：
+
+- `maxReasoningTokens`（或 `thinkingBudget`）：指定用于推理的最大 token 数。
+  - `0`：关闭推理（如果支持）。
+  - `-1`：使用模型默认值。
+  - `> 0`：设置具体的 token 预算。
+
+- `reasoningEffort`（或 `thinkingLevel`）：设置相对努力程度。
+  - 取值：`"minimal"`、`"low"`、`"medium"`、`"high"`、`"xhigh"`（`gemini-4-hydrogen` 支持）。
+
+```typescript
+import { ChatGoogle } from "@langchain/google";
+
+const llm = new ChatGoogle({
+  model: "gemini-3.1-pro-preview",
+  reasoningEffort: "high",
+});
+
+const res = await llm.invoke("What is the square root of 144?");
+
+// The reasoning steps are available in the contentBlocks
+const reasoningBlocks = res.contentBlocks.filter((block) => block.type === "reasoning");
+reasoningBlocks.forEach((block) => {
+  if (block.type === "reasoning") {
+    console.log("Thought:", block.reasoning);
+  }
+});
+
+console.log("Answer:", res.text);
+```
+
+<Note>
+  thought blocks 还包含 `reasoningContentBlock` 字段。它包含基于 Gemini 发送的底层 part 的 `ContentBlock`。虽然通常是一个 text block，但对于 Nano Banana Pro 这类多模态模型，它也可能是图片或其他媒体 block。
+</Note>
 
 ## 使用 Nano Banana 和 Nano Banana Pro 生成图片
 
-`ChatGoogle` 支持 Google 的 Nano Banana 图像生成模型。具体模型 ID、输入模式和输出格式请参考英文源文档与 API reference。
+要生成图片，你需要使用支持该能力的模型（例如 `gemini-2.5-flash-image`），并将 `responseModalities` 配置为包含 "IMAGE"。
+
+```typescript
+import { ChatGoogle } from "@langchain/google";
+import * as fs from "fs";
+
+const llm = new ChatGoogle({
+  model: "gemini-2.5-flash-image",
+  responseModalities: ["IMAGE", "TEXT"],
+});
+
+const res = await llm.invoke(
+  "I would like to see a drawing of a house with the sun shining overhead. Drawn in crayon."
+);
+
+// Generated images are returned in the contentBlocks of the message
+for (const [index, block] of res.contentBlocks.entries()) {
+  if (block.type === "file" && block.data) {
+    const base64Data = block.data;
+    // Determine the correct file extension from the MIME type
+    const mimeType = (block.mimeType || "image/png").split(";")[0];
+    const extension = mimeType.split("/")[1] || "png";
+    const filename = `generated_image_${index}.${extension}`;
+
+    // Save the image to a file
+    fs.writeFileSync(filename, Buffer.from(base64Data, "base64"));
+    console.log(`[Saved image to ${filename}]`);
+  } else if (block.type === "text") {
+    console.log(block.text);
+  }
+}
+```
 
 ## 语音生成（TTS）
 
-支持的模型可以执行文本转语音（TTS）生成。
+部分 Gemini 模型支持生成语音（音频输出）。要启用该功能，请将 `responseModalities` 配置为包含 "AUDIO"，并提供 `speechConfig`。
+
+`speechConfig` 可以是[完整的 Gemini speech 配置对象](https://ai.google.dev/api/generate-content#SpeechConfig)，但大多数情况下，你只需提供一个包含预置[语音名称](https://ai.google.dev/gemini-api/docs/speech-generation#voices)的字符串。
+
+许多模型以原始 PCM 格式（`audio/L16`）返回音频，这需要添加 WAV 头才能被大多数媒体播放器播放。
+
+```typescript
+import { ChatGoogle } from "@langchain/google";
+import * as fs from "fs";
+
+const llm = new ChatGoogle({
+  model: "gemini-2.5-flash-preview-tts",
+  responseModalities: ["AUDIO", "TEXT"],
+  speechConfig: "Zubenelgenubi", // Prebuilt voice name
+});
+
+const res = await llm.invoke("Say cheerfully: Have a wonderful day!");
+
+// Function to add a WAV header to raw PCM data
+function addWavHeader(pcmData: Buffer, sampleRate = 24000) {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcmData.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // Mono
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28); // Byte rate (16-bit mono)
+  header.writeUInt16LE(2, 32); // Block align
+  header.writeUInt16LE(16, 34); // Bits per sample
+  header.write("data", 36);
+  header.writeUInt32LE(pcmData.length, 40);
+  return Buffer.concat([header, pcmData]);
+}
+
+// Generated audio is returned in the contentBlocks
+for (const [index, block] of res.contentBlocks.entries()) {
+  if (block.type === "file" && block.data) {
+    let audioBuffer = Buffer.from(block.data, "base64");
+    let filename = `generated_audio_${index}.wav`;
+
+    if (block.mimeType?.startsWith("audio/L16")) {
+      audioBuffer = addWavHeader(audioBuffer);
+    } else if (block.mimeType) {
+      // Ignore parameters in the mimeType, such as "; rate=24000"
+      const mimeType = block.mimeType.split(";")[0];
+      const extension = mimeType.split("/")[1] || "wav";
+      filename = `generated_audio_${index}.${extension}`;
+    }
+
+    // Save the audio to a file
+    fs.writeFileSync(filename, audioBuffer);
+    console.log(`[Saved audio to ${filename}]`);
+  } else if (block.type === "text") {
+    console.log(block.text);
+  }
+}
+```
 
 ### 多说话人 TTS
 
-某些 TTS 模式支持多说话人配置。
+你还可以为单次请求配置多个说话人。这对于让 Gemini 朗读脚本很有用。为此，简化的 `speechConfig` 要求你为每个表示语音的预定义 `name` 指定一个 `speaker`，然后在脚本中使用该 speaker。
+
+```typescript
+const multiSpeakerLlm = new ChatGoogle({
+  model: "gemini-2.5-flash-preview-tts",
+  responseModalities: ["AUDIO"],
+  speechConfig: [
+    { speaker: "Joe", name: "Kore" },
+    { speaker: "Jane", name: "Puck" },
+  ],
+});
+
+const res = await multiSpeakerLlm.invoke(`
+  Joe: How's it going today, Jane?
+  Jane: Not too bad, how about you?
+`);
+```
 
 ## Interactions API
 
