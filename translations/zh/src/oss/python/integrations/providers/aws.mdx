@@ -390,6 +390,10 @@ from langchain_experimental.comprehend_moderation import AmazonComprehendModerat
 
 >[Amazon Bedrock AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agents-tools-runtime.html) 为 LangGraph agents 提供托管式无服务器执行环境，内置可观测性、自动扩展能力，并可无缝集成其他 AgentCore 服务。
 
+部署会用到两个需要分别安装的包：`bedrock-agentcore` Python SDK，它将编译后的图包装到 runtime entrypoint 中；以及 AgentCore CLI，它打包项目并将其部署。
+
+安装 SDK：
+
 <CodeGroup>
     ```bash pip
     pip install bedrock-agentcore
@@ -400,25 +404,82 @@ from langchain_experimental.comprehend_moderation import AmazonComprehendModerat
     ```
 </CodeGroup>
 
+将编译后的图包装到 entrypoint 中：
+
 ```python
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 
 app = BedrockAgentCoreApp()
 
+
 @app.entrypoint
 def agent_invocation(payload, context):
-    result = graph.invoke({"messages": [{"role": "user", "content": payload["prompt"]}]})
+    prompt = payload["prompt"]
+    if not isinstance(prompt, str):
+        raise ValueError("prompt must be a string")
+
+    # graph is your compiled LangGraph application
+    result = graph.invoke({"messages": [{"role": "user", "content": prompt}]})
     return {"result": result["messages"][-1].content}
 
-app.run()
+
+if __name__ == "__main__":
+    app.run()
 ```
 
-使用 AgentCore CLI 进行部署：
+安装 AgentCore CLI，它以 npm 包的形式发布：
 
 ```bash
-# Configure your agent
-agentcore configure
+npm install -g @aws/agentcore
+```
+
+<Note>
+    AgentCore CLI 要求 Node.js 20.12 或更高版本，其 Python 项目还需要 [uv](https://docs.astral.sh/uv/)。如果你的 `PATH` 上已经存在 Python 版的 `agentcore` 命令，它会遮蔽 npm 版本，因为两者使用相同的命令名。请卸载该 Python 命令，然后打开一个新的终端。
+</Note>
+
+基于 LangChain 模板创建项目，然后部署并 invoke agent：
+
+```bash
+# Create a project
+agentcore create --name MyAgent --template agent-python-langchain
+cd MyAgent
+
+# Run the agent locally
+agentcore dev
 
 # Deploy to AgentCore Runtime
-agentcore launch -e your_agent.py
+agentcore deploy
+
+# Invoke the deployed agent
+agentcore invoke --runtime agent --payload '{"prompt": "Hello"}'
 ```
+
+`agent-python-langchain` 模板会在 `app/agent/` 中搭建一个使用 @[create_agent] 构建的图，同时提供一个 `pyproject.toml` 以及 `agentcore/` 下的 CDK 项目。
+
+如需部署自己编写的 entrypoint，请向项目中添加一个空的 Python runtime：
+
+```bash
+agentcore add runtime --name MyAgent --language python
+```
+
+将 entrypoint 放到 `app/MyAgent/main.py`，并在其旁边放置一个 `pyproject.toml`，然后运行 `agentcore deploy`。CLI 会读取你的代码，并在每次 `dev`、`build` 和 `deploy` 时更新 `agentcore/agentcore.json`。
+
+更多信息请参见 [AgentCore CLI 入门](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-get-started-cli.html)。
+
+`agent-python-langchain` 模板已经声明了 traces 所需的依赖。对于你自己的 entrypoint，`pyproject.toml` 必须声明 AWS Distro for OpenTelemetry（ADOT），因为 AgentCore Runtime 会在 `opentelemetry-instrument` 下启动 entrypoint。同时还要添加 LangChain instrumentor，以便在 [CloudWatch 生成式 AI 可观测性](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html)中呈现 traces：
+
+```toml
+[project]
+dependencies = [
+    "aws-opentelemetry-distro>=0.18.0",
+    "opentelemetry-instrumentation-langchain>=0.55.0",
+]
+```
+
+ADOT 会在启动时发现 instrumentor，因此 agent 无需编写任何 instrumentation 代码。由 CLI 管理的部署已经会在 `opentelemetry-instrument` 下运行 entrypoint。若要在本地复现这一点，请运行：
+
+```bash
+opentelemetry-instrument python main.py
+```
+
+更多信息请参见 [为 AgentCore 设置 LangGraph 遥测](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/supported-frameworks-langgraph.html)。

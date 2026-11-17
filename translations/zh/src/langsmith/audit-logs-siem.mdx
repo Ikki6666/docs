@@ -1,0 +1,183 @@
+---
+title: 将审计日志转发到 SIEM
+sidebarTitle: 转发到 SIEM
+description: 按计划拉取 LangSmith 审计日志事件并发送到 SIEM，附 Splunk 的完整示例。
+---
+
+<Note>
+审计日志适用于 [**Enterprise** 方案](/langsmith/pricing-plans)。
+</Note>
+
+Organization Admin 和 Organization Operator 可以将 LangSmith [审计日志](/langsmith/audit-logs)转发到安全信息和事件管理（SIEM）系统。一个定时脚本会从[审计日志 API](/langsmith/audit-logs#query-audit-logs-via-api) 拉取事件，并将其发送到 SIEM 的 ingest 端点。随后，你的安全团队就可以在来自其他系统的日志旁搜索 LangSmith 活动，例如 agent access token 请求。
+
+本页以 Splunk 为例。相同的方法适用于任何通过 HTTP 接收 JSON 事件的 SIEM。
+
+## 前提条件
+
+满足[审计日志前提条件](/langsmith/audit-logs#prerequisites)。在 [self-hosted](/langsmith/self-hosted) 实例上，请先[启用审计日志](/langsmith/audit-logs#enable-audit-logs-for-self-hosted-deployments)。你还需要：
+
+- 一个具有 Organization Admin 或 Organization Operator 角色的 [personal access token 或 service key](/langsmith/create-account-api-key)。
+- 你的 organization ID。
+- SIEM 的 HTTP 端点和 token。
+- Python 3.10 或更高版本，用于运行示例脚本。
+
+## 按计划拉取事件
+
+LangSmith 不会将审计日志推送到其他系统。相反，由你按计划运行的脚本拉取每个新的时间窗口内的事件。事件遵循 [OCSF API Activity](https://schema.ocsf.io/1.7.0/classes/api_activity) schema，完整的 LangSmith 记录位于 `unmapped.original_audit_log` 下。
+
+编写脚本时：
+
+- **让窗口滞后**：LangSmith 会批量写入审计事件，因此事件可能在请求后约一分钟才出现。让每个窗口在当前时间之前 2 分钟结束。
+- **让窗口首尾相接**：调度周期与窗口长度保持一致。例如，每 5 分钟运行一次，处理 5 分钟的窗口。
+- **跟随 cursor**：每个响应最多返回 100 个事件。传入返回的 `cursor` 以获取下一页，直到某个响应不再包含 cursor。
+- **基于 `metadata.uid` 去重**：`start_time` 和 `end_time` 均为包含边界，因此位于窗口边界的事件可能同时出现在两个窗口中。`metadata.uid` 对每个事件都是唯一的。
+- **重试失败的窗口**：运行失败会跳过其窗口。带有死信队列的调度器（例如 [AWS Lambda 配合 EventBridge Scheduler](https://docs.aws.amazon.com/lambda/latest/dg/with-eventbridge-scheduler.html)）会记录需要重试的窗口。
+
+[Splunk 示例](#forward-events-to-splunk)遵循了除重试之外的所有要点。它在每次搜索中使用 `dedup metadata.uid` 去除重复项。要将事件发送到其他 SIEM，请替换其中的 `send_to_splunk` 函数。
+
+## 查找 agent access token 请求
+
+agent access token 是一种短时效 token，用于向其他服务标识已部署的 agent。LangSmith 每次签发一个 token 时，都会记录一个操作为 `mint_agent_access_token` 的事件：
+
+- 该事件属于 agent 所在的 organization 和 workspace。这也包括 [Fleet](/langsmith/fleet/index) agents，其 token 由 LangSmith 代表你请求。
+- 失败的请求不会记录事件。
+- token 本身永远不会被记录。
+
+token 的详细信息位于 `unmapped.original_audit_log.enrichments.agent_access_token` 下。每个字段使用 token 中对应 claim 的名称。要将事件与某个 token 匹配，请使用其 `jti` 或 `sub`。
+
+| 字段 | 说明 |
+| --- | --- |
+| `sub` | token 的 subject，格式为 `ws:<workspace_id>:agent:<agent_uuid>:env:<environment>`。 |
+| `ls_agent_id` | agent 的 ID。 |
+| `ls_agent_uuid` | agent 的 UUID。 |
+| `ls_env` | agent 的环境，例如 `PRODUCTION`。 |
+| `ls_deployment_id` | 请求该 token 的 deployment。 |
+| `ls_proof` | deployment 证明其身份的方式：`deployment_key`、`pod_token` 或 `sandbox_callback`。 |
+| `ls_user_id` | agent 所代表的用户。仅在 run 代表某个用户执行时存在。 |
+| `ls_trigger` | 启动该 run 的原因（例如 cron job），以 `kind` 和 `id` 表示。仅在由触发器启动的 runs 中存在。 |
+| `aud` | audience：该 token 所面向的服务。 |
+| `jti` | token 的唯一 ID。 |
+| `exp` | token 的过期时间，采用 RFC 3339 格式。 |
+
+事件的 actor 取决于 deployment 证明其身份的方式，该方式显示在 `ls_proof` 中：
+
+- **`deployment_key`**：`actor.user.credential_uid` 为该 key 的 ID。
+- **`sandbox_callback`**：某个 sandbox 代表某用户请求了该 token，`unmapped.original_audit_log.ls_user_id` 即为该用户。
+- **`pod_token`**：这两个字段均为空。这适用于你自己部署的、使用 pod token 的服务，以及 LangSmith 代表你运行的 agents（例如 Fleet agents）。
+
+`resources` 会列出 agent 的 UUID 和 deployment ID。要通过 [API](/langsmith/smith-api/audit-logs/get-audit-logs) 查找某个 agent 的 tokens，请将该 agent 的 UUID 作为 `resource_ids` 传入。
+
+面向 AWS、Azure 和 Google Cloud 的 tokens 也会记录事件。要将某个事件与你的云服务提供商的日志匹配，请使用 `sub`、`aud` 和时间。
+
+## 将事件转发到 Splunk
+
+本示例将事件发送到 Splunk [HTTP Event Collector](https://help.splunk.com/en/splunk-enterprise/get-started/get-data-in/10.6/get-data-with-http-event-collector/set-up-and-use-http-event-collector-in-splunk-web)（HEC），然后在这些事件中搜索 agent access token 请求。
+
+### 创建 HEC token
+
+按照 Splunk 的[在 Splunk Web 中设置 HEC](https://help.splunk.com/en/splunk-enterprise/get-started/get-data-in/10.6/get-data-with-http-event-collector/set-up-and-use-http-event-collector-in-splunk-web)指南，在 Splunk 中创建 HEC token。为该 token 取一个易于识别的名称，例如 `langsmith-audit-logs`，并记下它写入的 index。本页的搜索使用 `main`。复制该 token 的值供 forwarder 使用。
+
+在 Splunk Enterprise 上，事件端点为 `https://<splunk-host>:8088/services/collector/event`，其中 `8088` 是默认的 HEC 端口。
+
+### 运行 forwarder
+
+将以下脚本保存为 `splunk_forwarder.py`。每次运行会读取一个窗口内的事件，并在单个请求中将它们发送到 HEC。
+
+```python
+"""Forward LangSmith audit log events to the Splunk HTTP Event Collector."""
+import argparse
+import json
+import os
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+LANGSMITH_URL = os.environ.get("LANGSMITH_API_URL", "https://api.smith.langchain.com")
+LANGSMITH_HEADERS = {
+    "X-API-Key": os.environ["LANGSMITH_API_KEY"],
+    "X-Organization-Id": os.environ["LANGSMITH_ORG_ID"],
+}
+HEC_URL = os.environ["SPLUNK_HEC_URL"]
+HEC_HEADERS = {"Authorization": "Splunk " + os.environ["SPLUNK_HEC_TOKEN"]}
+
+
+def audit_events(start, end):
+    cursor = None
+    while True:
+        query = {"start_time": start.isoformat(), "end_time": end.isoformat(), "limit": 100}
+        if cursor:
+            query["cursor"] = cursor
+        url = f"{LANGSMITH_URL}/api/v1/audit-logs?{urllib.parse.urlencode(query)}"
+        page = json.load(urllib.request.urlopen(urllib.request.Request(url, headers=LANGSMITH_HEADERS)))
+        yield from page["items"]
+        cursor = page.get("cursor")
+        if not cursor or not page["items"]:
+            return
+
+
+def send_to_splunk(events):
+    body = "".join(
+        json.dumps({"time": event["time"], "source": "langsmith:audit_logs", "sourcetype": "_json", "event": event})
+        for event in events
+    )
+    urllib.request.urlopen(urllib.request.Request(HEC_URL, data=body.encode(), headers=HEC_HEADERS))
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--minutes", type=int, default=5)
+args = parser.parse_args()
+
+# Events can take about a minute to appear, so read a window that ended 2 minutes ago.
+end = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=2)
+start = end - timedelta(minutes=args.minutes)
+events = list(audit_events(start, end))
+if events:
+    send_to_splunk(events)
+print(f"sent {len(events)} events from {start:%H:%M} to {end:%H:%M} UTC")
+```
+
+设置四个环境变量，然后运行脚本：
+
+```bash
+export LANGSMITH_API_KEY=<api-key>
+export LANGSMITH_ORG_ID=<organization-id>
+export SPLUNK_HEC_URL=https://<splunk-host>:8088/services/collector/event
+export SPLUNK_HEC_TOKEN=<hec-token>
+python3 splunk_forwarder.py --minutes 5
+```
+
+`LANGSMITH_API_URL` 默认使用 GCP US 的 API URL。对于其他区域，请将其设置为 [Regions](/langsmith/cloud#regions) 中该区域的 API URL。在 self-hosted 实例上，请将其设置为你的实例的基础 URL，且不包含 `/api/v1`。
+
+要每 5 分钟运行该脚本，请添加一条 cron 条目：
+
+```bash
+*/5 * * * * python3 /path/to/splunk_forwarder.py --minutes 5
+```
+
+Cron 不会加载你的 shell profile，因此请在 crontab 或包装脚本中设置环境变量。
+
+### 搜索 agent access token 请求
+
+每次搜索都先去除重复事件，并将 token 较长的字段路径缩短为 `token.*`：
+
+```text
+index=main source="langsmith:audit_logs" api.operation=mint_agent_access_token
+| dedup metadata.uid
+| rename unmapped.original_audit_log.enrichments.agent_access_token.* as token.*
+```
+
+然后添加以下任一项：
+
+| 要查找的内容 | 添加 |
+| --- | --- |
+| 某个 agent 的所有 token | `\| search token.ls_agent_id="<agent-id>" \| table _time token.ls_env token.ls_proof token.aud token.jti` |
+| 按环境和 proof 分类的 token 请求 | `\| stats count by token.ls_env token.ls_proof` |
+| 单个 token | `\| search token.jti="<jti>"` |
+| agent 为某个用户请求的 tokens | `\| search token.ls_user_id="<user-id>"` |
+| 云服务提供商的 tokens | `\| search token.aud IN ("sts.amazonaws.com/langsmith-agents", "api://AzureADTokenExchange/langsmith-agents", "https://iam.googleapis.com/langsmith-agents") \| table _time token.sub token.aud token.exp` |
+
+## 另请参阅
+
+- [审计日志](/langsmith/audit-logs)
+- [OCSF API Activity 类](https://schema.ocsf.io/1.7.0/classes/api_activity)
+- [在 Splunk Web 中设置并使用 HTTP Event Collector](https://help.splunk.com/en/splunk-enterprise/get-started/get-data-in/10.6/get-data-with-http-event-collector/set-up-and-use-http-event-collector-in-splunk-web)

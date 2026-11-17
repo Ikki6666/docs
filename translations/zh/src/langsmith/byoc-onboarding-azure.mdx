@@ -9,39 +9,35 @@ icon: "rocket"
 Azure 上的 BYOC 处于 **[beta](/langsmith/release-stages)** 阶段。要开始使用，请[联系销售团队](https://www.langchain.com/contact-sales)。
 </Note>
 
-本页介绍如何在你的 Azure 订阅中创建 LangSmith BYOC data plane。有关 data plane 如何构建和保护，请参阅 [Azure 上的 BYOC 架构](/langsmith/byoc-architecture-azure)。AWS 指南请参阅 [BYOC 入门](/langsmith/byoc-onboarding-aws)。
-
-每个 data plane 都在你的订阅中拥有自己的 resource group。Terraform module 会创建该 resource group 及其中的 Key Vault，并仅在该 resource group 上为 LangSmith BYOC 应用授予角色。之后由 LangChain 在该 resource group 中创建并运维 data plane 资源。
+本页介绍如何在你的 Azure 订阅中创建 LangSmith BYOC data plane。每个 data plane 运行在自己的 resource group 中。Terraform module 仅授予 LangSmith 对该 resource group 的访问权限，随后 LangChain 会在其中创建并运维 data plane。有关设计细节，请参阅 [Azure 上的 BYOC 架构](/langsmith/byoc-architecture-azure)。AWS 相关说明请参阅 [BYOC 入门](/langsmith/byoc-onboarding-aws)。
 
 ## 开始之前
 
 你需要以下条件：
 
 - **Azure 上的 LangSmith 组织**：使用位于 [azure.smith.langchain.com](https://azure.smith.langchain.com) 的 Azure 上的 LangSmith control plane。将你的组织 ID 发送给 LangChain 团队以启用 BYOC。
-- **一个 Azure 订阅**：LangChain 建议使用专用于 LangSmith BYOC 的订阅，但这不是必需的。
-- **Azure 权限**：应用 Terraform 的人需要订阅上的 `Owner` 角色，因为 Terraform module 会创建自定义角色和角色分配，并注册 resource providers。你还需要一个 Microsoft Entra 角色，用于在你的租户中创建和更新多租户应用的 service principal，例如 `Cloud Application Administrator`。
+- **一个 Azure 订阅**：建议使用专用订阅，但并非必需。
+- **Azure 权限**：在订阅范围内具有 `Owner`，或 `Contributor` 和 `User Access Administrator`，用于应用 Terraform。需要一个能够创建 service principals 的 Microsoft Entra 角色，例如每个租户执行一次的 `Cloud Application Administrator`。这两项权限可由两人分担，如下文的 Terraform 步骤所示。如果你的 `User Access Administrator` 授权阻止了特权角色，请设置 `byo_iam = true` 并自行创建 identities。
 - **Terraform**：Terraform 1.11.0 或更高版本。
-- **LangSmith 中的组织管理员**：创建、更改和删除 data plane 需要 organization admin 角色。
-- **vCPU 配额**：AKS 系统节点池使用三个 `Standard_D2s_v6` VM。LangSmith 在创建时会检查该 region 在 **Total Regional vCPUs** 配额和 Dsv6 VM 系列配额中是否都至少有 6 个可用 vCPU。应用节点使用版本 5 或更高版本的 D、E 和 F 系列 VM，因此还需要为这些系列规划配额。参见[节点池](/langsmith/byoc-architecture-azure#compute)。
-- **一个 region**：Azure 上的 BYOC 可以在任意 Azure region 中运行。如果你需要的 region 尚未启用，请联系 LangChain 团队添加。
+- **LangSmith 中的组织管理员**：用于创建、更改和删除 data plane。
+- **vCPU 配额**：该 region 中至少 6 个可用 vCPU，分别在 **Total Regional vCPUs** 配额和 Dsv6 系列配额中，供三个 `Standard_D2s_v6` 系统节点使用。应用节点使用 v5 或更高版本的 D、E 和 F 系列，因此还需要为这些系列规划配额。参见[节点池](/langsmith/byoc-architecture-azure#compute)。
+- **一个 region**：任意 Azure region。要启用新的 region，请联系 LangChain 团队。
 
 ## 创建 data plane
 
 <Steps>
 
 <Step title="Copy the external ID">
-LangChain 会为你的组织分配一个 external ID。前往 LangSmith 中的 **Settings > Data Planes**，使用 **Data Planes** 标题旁的复制按钮复制它。不要自行创建该值。
-
-LangSmith 使用该 external ID 确认你订阅中的角色分配属于你的组织。
+在 LangSmith 中，转到 **Settings > Data Planes**，然后点击 **Data Planes** 标题旁的复制按钮。不要自行创建该值。LangSmith 使用该 external ID 确认你订阅中的角色分配属于你的组织。
 </Step>
 
 <Step title="Grant LangSmith access with Terraform">
-使用你复制的 external ID，在你的 Azure 订阅中应用 [`langsmith-byoc-access` Terraform module](https://github.com/langchain-ai/terraform/blob/main/modules/byoc/azure/langsmith-byoc-access/main.tf)。你必须使用此 module。对于其 `data_planes` 输入中的每个 data plane，它会创建：
+在你的订阅中应用 [`langsmith-byoc-access` Terraform module](https://github.com/langchain-ai/terraform/tree/main/modules/byoc/azure/langsmith-byoc-access)。你必须使用此 module。它会创建：
 
-- **LangSmith BYOC service principal**：LangSmith BYOC 多租户应用的 service principal，其应用（客户端）ID 为 `5b0a74cb-9f37-4797-b557-c15d7be80d3b`，位于你的 Microsoft Entra 租户中。每个租户只创建一次，该应用不请求任何 Microsoft Graph 权限。
-- **一个专用 resource group** `langsmith-byoc-<key>`：LangSmith 会将 data plane 部署到其中。不要在其中放置其他工作负载。
-- **resource group 中的一个 Key Vault**：它使用 Azure RBAC 授权，并禁用了公共网络访问。LangSmith 将 data plane 的 bootstrap secret 写入其中，data plane 通过私有 endpoint 读取它。
-- **该 resource group 上 service principal 的两个角色分配**：一个 `langsmith-byoc-<key>-<suffix>` 自定义角色，包含 LangSmith 所需的操作，以及 `User Access Administrator`。这两个角色只能在该 resource group 中使用，并且两个分配都以你的 external ID 作为描述。
+- **LangSmith service principal**，每个租户一次：你的 Entra 租户中 LangSmith 应用（客户端 ID `5b0a74cb-9f37-4797-b557-c15d7be80d3b`）的 identity。LangSmith control plane 在你的租户之外运行，并以该 identity 登录。它没有任何 Microsoft Graph 权限。resource group 中的 managed identities 用于 data plane 内的工作负载。
+- **一个 resource group** `langsmith-byoc-<key>`，对应 `data_planes` 中的每个条目。不要在其中放置其他工作负载。
+- **每个 resource group 中的一个 Key Vault**，使用 Azure RBAC 且无公共网络访问。LangSmith 将 data plane 的 bootstrap secret 写入其中。
+- **每个 resource group 上的两个角色分配**：一个 `langsmith-byoc-<key>-<suffix>` 自定义角色和 `User Access Administrator`。两者都以你的 external ID 作为描述。
 
 ```hcl
 terraform {
@@ -66,6 +62,7 @@ provider "azurerm" {
   resource_providers_to_register = [
     "Microsoft.Cache",
     "Microsoft.Compute",
+    "Microsoft.ContainerRegistry",
     "Microsoft.ContainerService",
     "Microsoft.DBforPostgreSQL",
     "Microsoft.KeyVault",
@@ -88,6 +85,9 @@ module "langsmith_byoc_access" {
   langsmith_app_client_id = "5b0a74cb-9f37-4797-b557-c15d7be80d3b"
   external_id             = var.external_id
 
+  # Set to false if an Entra admin already ran `az ad sp create`.
+  # create_service_principal = false
+
   data_planes = {
     prod = {
       location = "eastus"
@@ -100,17 +100,20 @@ output "langsmith_byoc_access" {
 }
 ```
 
-替换订阅 ID 和 region。`data_planes` 的键（示例中为 `prod`）用于命名 resource group：1 到 63 个小写字母、数字和连字符，以字母开头，以字母或数字结尾，且不能有连续的连字符。使用你的 external ID 应用该配置，例如 `terraform apply -var 'external_id=<external-id>'`。
+1. 将配置保存为空文件夹中的 `main.tf`。替换订阅 ID 和 region。`data_planes` 的键（`prod`）用于命名 resource group：最多 63 个小写字母、数字和连字符，以字母开头，以字母或数字结尾，且不能有连续的连字符。
+1. 如果应用 Terraform 的人无法创建 service principals，请先由 Entra 管理员运行 `az ad sp create --id 5b0a74cb-9f37-4797-b557-c15d7be80d3b`。然后你必须设置 `create_service_principal = false`。此时 Terraform 只会读取该 service principal。
+1. 运行：
 
-然后读取输出，供下一步使用：
+    ```bash
+    az login
+    terraform init
+    terraform apply -var 'external_id=<external-id>'
+    terraform output -json langsmith_byoc_access
+    ```
 
-```bash
-terraform output -json langsmith_byoc_access
-```
+1. 记下 `azure_entra_tenant_id`，以及 `data_planes` 下的 `region` 和 `resource_group_id`。
 
-你需要 `azure_entra_tenant_id`，以及 `data_planes` 下该 data plane 的 `region` 和 `resource_group_id`。
-
-有关每个角色允许的操作，请参阅[访问与权限](/langsmith/byoc-architecture-azure#access-and-permissions)。有关该 module 的所有输入，请参阅 [module README](https://github.com/langchain-ai/terraform/tree/main/modules/byoc/azure/langsmith-byoc-access)。
+有关每个角色允许的操作，请参阅[访问与权限](/langsmith/byoc-architecture-azure#access-and-permissions)。有关所有输入，请参阅 [module README](https://github.com/langchain-ai/terraform/tree/main/modules/byoc/azure/langsmith-byoc-access)。
 </Step>
 
 <Step title="Create the data plane">
@@ -129,26 +132,17 @@ terraform output -json langsmith_byoc_access
 
 1. 点击 **Create data plane**。LangSmith 会以 **Data plane requested** 确认。
 
-在 LangSmith 接受请求之前，会检查以下内容：
-
-- 该 resource group 上 LangSmith service principal 的角色分配以你的 external ID 作为描述。
-- 该 service principal 在该 resource group 上拥有所需的权限。
-- 该 resource group 中恰好包含一个 Key Vault，且该 vault 使用 Azure RBAC。
-- 你的订阅可以在该 region 中创建 AKS 系统节点规格和 PostgreSQL 规格，并且系统节点池有足够的 vCPU 配额。
-
-如果检查失败，表单会显示错误。解决问题后再次点击 **Create data plane**。参见[排查 data plane 创建问题](#troubleshoot-data-plane-creation)。
+LangSmith 会先检查 external ID、其权限、Key Vault、region 和 vCPU 配额。如果检查失败，表单会显示错误。参见[排查 data plane 创建问题](#troubleshoot-data-plane-creation)。
 </Step>
 
 <Step title="Wait for provisioning">
-LangChain 会在你的 resource group 中预置 data plane 资源。data plane 会从 `requested` 转到 `provisioning`，再到 `active`。你可以在 **Settings > Data Planes** 中跟踪其状态。
-
-如果 data plane 在 3 小时内未变为 active，就会转为 `provisioning_failed`。如果出现这种情况，请联系 LangChain 团队。
+data plane 会在 **Settings > Data Planes** 中从 `requested` 转到 `provisioning`，再到 `active`。如果它在 3 小时内未变为 active，就会转为 `provisioning_failed`。此时请联系 LangChain 团队。
 </Step>
 
 <Step title="Connect to the data plane">
 data plane URL 的形式为 `https://<data_plane_id>.azure.langchain-byoc.com`。你可以在 **Settings > Data Planes** 中找到它。
 
-- **内部 load balancer**（`public_load_balancer: false`）：用户和应用只能从 data plane 的 VNet 访问它。将你的网络连接到该 VNet，例如通过 VNet peering 或 VPN gateway。配置从你的网络到 VNet 链接的私有 DNS 区域的 DNS 解析。仅靠 peering 或 VPN 不提供 DNS 解析。
+- **内部 load balancer**（`public_load_balancer: false`）：只能从其 VNet 访问 data plane。将你的网络连接到该 VNet，例如通过 peering 或 VPN gateway，并通过其私有 DNS 区域解析 DNS。仅靠 peering 或 VPN 不提供 DNS 解析。
 - **公有 load balancer**（`public_load_balancer: true`）：用户和应用通过互联网访问 data plane。
 
 如果 LangSmith UI 无法访问你的 data plane，会提示你切换到可访问的 data plane 上的 workspace。
@@ -227,7 +221,7 @@ data_planes = {
 }
 ```
 
-Terraform 会就地更新自定义角色的操作，并删除 `User Access Administrator` 分配。自定义角色分配保持不变，因此 LangSmith 仍保有访问权限。Azure 最多需要 5 分钟应用该更改。使用缩减后的角色，LangChain 仍可以升级、扩缩容和修复 data plane，但无法删除 data plane、其数据库、其存储账户或其网络，也无法创建角色分配。在新增角色分配的升级之前，以及在删除或重新创建 data plane 之前，请将 `reduced_access` 设回 `false`。
+Terraform 会缩减自定义角色并删除 `User Access Administrator` 分配。Azure 最多需要 5 分钟应用该更改。LangChain 仍可以升级、扩缩容和修复 data plane。它无法删除 data plane、其数据库、存储或网络，也无法创建角色分配。在删除或重新创建 data plane 之前，以及在新增角色分配的升级之前，请将 `reduced_access` 设回 `false`。
 
 ## 删除 data plane
 
@@ -248,11 +242,11 @@ Azure 会在有限时间内保留已删除 PostgreSQL 服务器的备份，在�
 
 如果在同一 resource group 中创建同名的新 data plane，它会复用该 Key Vault 和保留的 Blob 存储账户。
 
-当不再需要保留的数据时，删除该 resource group 中的 Blob 存储账户，然后从 `data_planes` 中移除该 data plane 的键并运行 `terraform apply`。随后 Terraform 会删除该 resource group、Key Vault 和角色分配。使用默认的 `features {}` 块时，AzureRM provider 会拒绝删除仍包含 Terraform 未管理资源（例如保留的存储账户）的 resource group。
+当不再需要这些数据时，请先删除 Blob 存储账户。然后从 `data_planes` 中移除该键并运行 `terraform apply`，以删除该 resource group、Key Vault 和角色分配。
 
 ## 移除 LangSmith 访问权限
 
-要阻止 LangSmith 更改或删除 data plane，请移除其 resource group 上及其 AKS 集群上 LangSmith service principal 的角色分配。移除 Terraform module 会移除该 service principal 和所有角色分配，因此 LangSmith 将失去对该租户中每个 data plane 的访问权限。data plane 资源仍会保留在你的订阅中，但 LangChain 将无法再升级或修复它们。如果希望 LangSmith 清理其资源，请先删除 data plane。
+要阻止 LangSmith 更改 data plane，请移除其 resource group 和 AKS 集群上 LangSmith service principal 的角色分配。移除 Terraform module 会移除对该租户中每个 data plane 的访问权限。这些资源仍会保留在你的订阅中，但 LangChain 将无法再升级或修复它们。如果希望 LangSmith 清理资源，请先删除 data plane。
 
 ## 下一步
 

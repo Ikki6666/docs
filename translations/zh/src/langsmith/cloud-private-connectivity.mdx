@@ -1,0 +1,313 @@
+---
+title: 私有连接
+description: 使用 AWS PrivateLink、GCP Private Service Connect 或 Azure Private Link 连接到 LangSmith Cloud，而无需将流量暴露到公网。
+---
+
+## 私有连接（Enterprise）
+
+<Callout icon="lock" color="#4F46E5" iconType="regular">
+[**仅限 Enterprise。**](/langsmith/pricing-plans) Private connectivity 仅面向 Enterprise 客户提供。请联系你的客户代表或 [sales@langchain.dev](mailto:sales@langchain.dev) 以启用此功能。
+</Callout>
+
+Enterprise 客户可以使用 **AWS PrivateLink**、**GCP Private Service Connect (PSC)** 或 **Azure Private Link** 连接到 LangSmith，而无需将流量暴露到公网。
+
+### AWS PrivateLink
+
+在 **AWS** 上的客户可以通过 [AWS PrivateLink](https://docs.aws.amazon.com/vpc/latest/privatelink/) 连接到 LangSmith，从而从任意 VPC 建立私有连接，并原生支持跨区域连接。
+
+#### 端点服务名称
+
+| 区域 | 服务名称 |
+|--------|-------------|
+| US (`us-east-2`) | `com.amazonaws.vpce.us-east-2.vpce-svc-054f37092752bff6b` |
+
+#### 设置
+
+**1. 申请访问权限：** 联系你的客户代表或 [sales@langchain.dev](mailto:sales@langchain.dev)，并提供你的 AWS 账户 ID。LangChain 会将你的账户添加到端点服务的允许 principal 列表中。
+
+**2. 在你的 AWS 账户中创建 Interface VPC Endpoint。** 附加一个安全组，允许来自你的 VPC CIDR（或需要访问 LangSmith 的实例）的 **TCP 443 入站**流量：
+
+<CodeGroup>
+```bash AWS CLI
+aws ec2 create-vpc-endpoint \
+  --vpc-id <YOUR_VPC_ID> \
+  --service-name <SERVICE_NAME_FROM_TABLE_ABOVE> \
+  --vpc-endpoint-type Interface \
+  --subnet-ids <YOUR_SUBNET_IDS> \
+  --security-group-ids <YOUR_SECURITY_GROUP_ID> \
+  --region <YOUR_REGION>
+```
+
+```hcl Terraform
+resource "aws_vpc_endpoint" "langsmith" {
+  vpc_id              = "<YOUR_VPC_ID>"
+  service_name        = "<SERVICE_NAME_FROM_TABLE_ABOVE>"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = ["<YOUR_SUBNET_IDS>"]
+  security_group_ids  = ["<YOUR_SECURITY_GROUP_ID>"]
+}
+```
+</CodeGroup>
+
+**3. 等待接受。** LangChain 将接受该连接。端点状态会从 `pendingAcceptance` 变为 `available`。在接受后请等待几分钟，让变更完全生效，然后再测试连接。
+
+#### 配置 DNS
+
+配置 DNS，使 `aws.api.smith.langchain.com` 在你的 VPC 内解析到你 VPC endpoint 的私有 DNS 名称。你可以使用任意私有 DNS 方案：Route 53 Private Hosted Zones、企业 DNS 解析器，或从你的 VPC 可访问的任意 DNS 服务器。
+
+首先，获取你的 endpoint 的 DNS 名称：
+
+```bash
+aws ec2 describe-vpc-endpoints \
+  --vpc-endpoint-ids <YOUR_ENDPOINT_ID> \
+  --query 'VpcEndpoints[0].DnsEntries[0].DnsName' \
+  --output text --region <YOUR_REGION>
+```
+
+然后，为 `aws.api.smith.langchain.com` 创建一条指向该 DNS 名称的 CNAME 记录。以下是使用 Route 53 的示例：
+
+<CodeGroup>
+```bash AWS CLI
+aws route53 create-hosted-zone \
+  --name aws.api.smith.langchain.com \
+  --vpc VPCRegion=<YOUR_REGION>,VPCId=<YOUR_VPC_ID> \
+  --caller-reference langsmith-privatelink-$(date +%s) \
+  --hosted-zone-config PrivateZone=true
+
+aws route53 change-resource-record-sets \
+  --hosted-zone-id <HOSTED_ZONE_ID> \
+  --change-batch '{
+    "Changes": [{
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "aws.api.smith.langchain.com",
+        "Type": "CNAME",
+        "TTL": 300,
+        "ResourceRecords": [{"Value": "<ENDPOINT_DNS_NAME>"}]
+      }
+    }]
+  }'
+```
+
+```hcl Terraform
+resource "aws_route53_zone" "langsmith_privatelink" {
+  name = "aws.api.smith.langchain.com"
+
+  vpc {
+    vpc_id = "<YOUR_VPC_ID>"
+  }
+}
+
+resource "aws_route53_record" "langsmith_privatelink" {
+  zone_id = aws_route53_zone.langsmith_privatelink.zone_id
+  name    = "aws.api.smith.langchain.com"
+  type    = "CNAME"
+  ttl     = 300
+  records = [aws_vpc_endpoint.langsmith.dns_entry[0]["dns_name"]]
+}
+```
+</CodeGroup>
+
+#### 验证连接
+
+在你的 VPC 中的 EC2 实例或容器上执行：
+
+```bash
+curl https://aws.api.smith.langchain.com/ok
+```
+
+### GCP Private Service Connect
+
+在 **GCP** 上的 Enterprise 客户可以通过 [Private Service Connect (PSC)](https://cloud.google.com/vpc/docs/private-service-connect) 连接到 LangSmith，从而建立私有连接，而无需将流量暴露到公网。
+
+#### 服务附件 URI
+
+使用以下服务附件 URI 在你的 VPC 中创建 PSC endpoint：
+
+| 区域 | 服务附件 URI |
+|--------|----------------------|
+| US (`us-central1`) | `projects/langchain-prod/regions/us-central1/serviceAttachments/gateway-psc-publish` |
+| EU (`europe-west4`) | `projects/langchain-prod/regions/europe-west4/serviceAttachments/gateway-psc-publish` |
+| APAC (`australia-southeast1`) | `projects/langchain-apac-prod/regions/australia-southeast1/serviceAttachments/gateway-psc-publish` |
+
+#### PSC 域名
+
+完成设置后，使用以下域名通过你的 PSC 连接访问 LangSmith：
+
+| 区域 | 域名 |
+|--------|--------|
+| US | `us-central1.p.api.smith.langchain.com` |
+| EU | `europe-west4.p.api.smith.langchain.com` |
+| APAC | `australia-southeast1.p.api.smith.langchain.com` |
+
+#### 设置
+
+**申请访问权限：** 联系你的客户代表或 [sales@langchain.dev](mailto:sales@langchain.dev)，并提供你的 GCP 项目 ID。LangChain 会将你的项目添加到服务附件的允许使用方列表中。
+
+获得访问权限后，使用 gcloud CLI 或 Terraform 创建 PSC endpoint 并配置 DNS。
+
+#### 创建 PSC endpoint
+
+在你的 VPC 中创建一条指向该服务附件的转发规则：
+
+<CodeGroup>
+```bash gcloud CLI
+# Create the PSC endpoint
+gcloud compute forwarding-rules create langsmith-psc-endpoint \
+  --region=<REGION> \
+  --network=<YOUR_VPC_NETWORK> \
+  --subnet=<YOUR_SUBNET> \
+  --target-service-attachment=projects/langchain-prod/regions/<REGION>/serviceAttachments/gateway-psc-publish \
+  --load-balancing-scheme=""
+
+# Get the assigned IP address
+gcloud compute forwarding-rules describe langsmith-psc-endpoint \
+  --region=<REGION> \
+  --format="value(IPAddress)"
+```
+
+```hcl Terraform
+resource "google_compute_forwarding_rule" "langsmith_psc" {
+  name                  = "langsmith-psc-endpoint"
+  project               = "<YOUR_PROJECT_ID>"
+  region                = "<REGION>"
+  network               = "<YOUR_VPC_NETWORK>"
+  subnetwork            = "<YOUR_SUBNET>"
+  target                = "projects/langchain-prod/regions/<REGION>/serviceAttachments/gateway-psc-publish"
+  load_balancing_scheme = ""
+}
+```
+</CodeGroup>
+
+#### 配置 DNS
+
+在你的 VPC 中创建私有 DNS 区域，并添加一条指向 PSC endpoint IP 的 A 记录：
+
+<CodeGroup>
+```bash gcloud CLI
+# Create a private DNS zone
+gcloud dns managed-zones create langsmith-psc \
+  --dns-name="<REGION>.p.api.smith.langchain.com." \
+  --visibility=private \
+  --networks=<YOUR_VPC_NETWORK>
+
+# Add an A record pointing to the PSC endpoint IP
+gcloud dns record-sets create "<REGION>.p.api.smith.langchain.com." \
+  --zone=langsmith-psc \
+  --type=A \
+  --rrdatas=<PSC_ENDPOINT_IP>
+```
+
+```hcl Terraform
+resource "google_dns_managed_zone" "langsmith_psc" {
+  name        = "langsmith-psc"
+  project     = "<YOUR_PROJECT_ID>"
+  dns_name    = "<REGION>.p.api.smith.langchain.com."
+  visibility  = "private"
+
+  private_visibility_config {
+    networks {
+      network_url = "<YOUR_VPC_NETWORK_SELF_LINK>"
+    }
+  }
+}
+
+resource "google_dns_record_set" "langsmith_psc" {
+  name         = "<REGION>.p.api.smith.langchain.com."
+  project      = "<YOUR_PROJECT_ID>"
+  managed_zone = google_dns_managed_zone.langsmith_psc.name
+  type         = "A"
+  ttl          = 300
+  rrdatas      = [google_compute_forwarding_rule.langsmith_psc.ip_address]
+}
+```
+</CodeGroup>
+
+#### 验证连接
+
+在你的 VPC 中的虚拟机上执行：
+
+```bash
+curl https://<REGION>.p.api.smith.langchain.com/ok
+```
+
+### Azure Private Link
+
+在 **Azure** 上的客户可以通过 [Azure Private Link](https://learn.microsoft.com/en-us/azure/private-link/private-link-overview) 连接到 LangSmith Azure SaaS API。虚拟网络（VNet）中的私有终结点会连接到 LangSmith Private Link 服务。
+
+#### 申请访问权限
+
+联系你的客户代表或 [sales@langchain.dev](mailto:sales@langchain.dev)，并提供你的 Azure 订阅 ID 以及期望的终结点区域。LangChain 会将你的订阅添加到 Private Link 服务的自动批准列表中。LangChain 还会提供服务资源 ID。
+
+在创建私有终结点之前，请等待 LangChain 确认订阅访问已启用。来自允许列表内订阅的新连接会自动获得批准。来自其他订阅的连接需要手动批准。
+
+#### 创建私有终结点
+
+使用你 VNet 中已有的子网。将终结点位置设置为该子网所在的区域。将占位符替换为你的 Azure 资源详细信息以及 LangChain 提供的服务资源 ID。
+
+以下 Terraform 示例使用 [AzureRM provider](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint)：
+
+```hcl Terraform
+resource "azurerm_private_endpoint" "langsmith" {
+  name                = "langsmith-private-endpoint"
+  location            = "<YOUR_SUBNET_REGION>"
+  resource_group_name = "<YOUR_RESOURCE_GROUP>"
+  subnet_id           = "<YOUR_SUBNET_ID>"
+
+  private_service_connection {
+    name                           = "langsmith"
+    private_connection_resource_id = "<LANGSMITH_PRIVATE_LINK_SERVICE_RESOURCE_ID>"
+    is_manual_connection           = false
+  }
+}
+
+output "langsmith_private_endpoint_id" {
+  value = azurerm_private_endpoint.langsmith.id
+}
+```
+
+应用该配置，并等待连接状态变为 `Approved` 后再测试连接。如果连接一直处于 `Pending`，请将私有终结点 ID 发送给 LangChain，以确认订阅访问权限并处理该待处理请求。
+
+#### 配置 DNS
+
+配置私有 DNS，使 `azure.api.smith.langchain.com` 在你的 VNet 内解析到私有终结点的 IP 地址。将以下资源添加到同一份 Terraform 配置中：
+
+```hcl Terraform
+resource "azurerm_private_dns_zone" "langsmith" {
+  name                = "azure.api.smith.langchain.com"
+  resource_group_name = "<YOUR_RESOURCE_GROUP>"
+}
+
+resource "azurerm_private_dns_a_record" "langsmith" {
+  name                = "@"
+  zone_name           = azurerm_private_dns_zone.langsmith.name
+  resource_group_name = "<YOUR_RESOURCE_GROUP>"
+  ttl                 = 60
+  records             = [azurerm_private_endpoint.langsmith.private_service_connection[0].private_ip_address]
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "langsmith" {
+  name                  = "langsmith-api"
+  resource_group_name   = "<YOUR_RESOURCE_GROUP>"
+  private_dns_zone_name = azurerm_private_dns_zone.langsmith.name
+  virtual_network_id    = "<YOUR_VNET_ID>"
+  registration_enabled  = false
+
+  depends_on = [azurerm_private_dns_a_record.langsmith]
+}
+```
+
+如果你使用自定义 DNS 服务器，请将其配置为把 `azure.api.smith.langchain.com` 解析到私有终结点的 IP。仅将 Azure 私有 DNS 区域链接起来并不会配置你的自定义解析器。
+
+此示例仅配置对 API 主机名的私有访问。如需对 LangSmith UI 或其他服务的私有访问，请联系 LangChain 获取其他主机名。
+
+#### 验证连接
+
+在你 VNet 中的虚拟机或容器上，确认 DNS 返回私有终结点 IP 且 HTTPS 请求成功：
+
+```bash
+nslookup azure.api.smith.langchain.com
+curl --fail --show-error https://azure.api.smith.langchain.com/ok
+```
+
+继续将 `https://azure.api.smith.langchain.com` 用作你的 LangSmith API endpoint。API 密钥和工作区权限仍然适用。
