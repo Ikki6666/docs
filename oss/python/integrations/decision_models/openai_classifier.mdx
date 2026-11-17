@@ -1,0 +1,306 @@
+---
+title: "OpenAIClassifier 集成"
+sidebarTitle: "OpenAIClassifier"
+description: "使用 LangChain Python 集成 OpenAIClassifier 决策模型。"
+---
+
+`OpenAIClassifier` 通过 LangChain 标准的 `BaseDecisionModel` 接口，使用 [OpenAI Decisions API](https://developers.openai.com/api/docs/guides/decisions) 回答带类型的问题。它与其他 decision models（例如 [`TypeSafeClassifier`](/oss/python/integrations/providers/typesafe)）共享问题和响应类型，因此你无需更改应用程序代码即可切换 provider，还可以将其传递给 LangChain 由 decision 驱动的 [agent middleware](#agent-middleware)。
+
+`OpenAIClassifier` 是一个 `Runnable`，因此你可以 invoke、batch，或将其与其他 runnables 组合。它接受字符串、结构化 JSON、[LangChain message 对象](/oss/python/langchain/messages)和图像，并在 LangSmith 中记录 traces 和 token 用量。
+
+`OpenAIClassifier` 采用共享的 `BaseDecisionModel` 接口，该接口并未覆盖 Decisions API 的所有功能。例如，Decisions API 可以拒绝单个问题，但当它拒绝任何问题时，`OpenAIClassifier` 会抛出 `ModelRefusalError` 并丢弃其他答案。如需使用完整的 OpenAI 请求和响应格式，请改用 [`OpenAIDecisions`](/oss/python/integrations/decision_models/openai)。
+
+<Note>
+`OpenAIClassifier` 处于 beta 阶段，要求 `langchain-openai>=1.8.0`。其 API 可能会在不另行通知的情况下变更。
+</Note>
+
+## 设置
+
+<CodeGroup>
+```bash uv
+uv add "langchain-openai>=1.8.0"
+```
+
+```bash pip
+pip install "langchain-openai>=1.8.0"
+```
+</CodeGroup>
+
+在 [OpenAI dashboard](https://platform.openai.com/api-keys) 中创建 API key 并导出：
+
+```bash
+export OPENAI_API_KEY=...
+```
+
+<Note>
+（可选）设置 `OPENAI_API_BASE` 或 `OPENAI_BASE_URL`，以使用兼容的 gateway 或测试服务器。默认值为 OpenAI API endpoint。两者都设置时，`OPENAI_API_BASE` 优先。
+
+```bash
+export OPENAI_API_BASE=https://gateway.example.com/v1
+```
+</Note>
+
+## 快速开始
+
+创建一个带 decisions model 的 `OpenAIClassifier`，然后在每次调用时一起传入 state 和命名问题。共享同一 state 的问题会在一个请求中得到回答：
+
+```python
+from langchain_core.decisions import Choice, Noul, NoulCriteria, Score
+from langchain_openai.decisions import OpenAIClassifier
+
+classifier = OpenAIClassifier(model="gpt-6-luna")
+
+response = classifier.invoke(
+    {
+        "state": "The blue mug I ordered arrived cracked. Fix this today!",
+        "questions": {
+            "damaged": Noul(
+                instructions="Did the item arrive damaged?",
+                criteria=NoulCriteria(true="The item is broken, cracked, or dented."),
+            ),
+            "department": Choice(
+                instructions="Which team should handle this request?",
+                criteria={
+                    "billing": "Payment or refund questions.",
+                    "shipping": "Delivery problems or damaged items.",
+                    "other": None,
+                },
+            ),
+            "frustration": Score(
+                instructions="How frustrated does the customer appear?",
+                criteria=["Calm.", "Concerned but civil.", "Very angry."],
+            ),
+        },
+    }
+)
+
+print(response.nouls["damaged"].noul)
+print(response.choices["department"].choice, response.choices["department"].confidence)
+print(response.scores["frustration"].score)
+```
+
+答案以你提供的问题名称为键，并按类型分组到 `nouls`、`choices` 和 `scores`。所有答案也可通过 `answers` 获取。响应中会包含作答的 `model`、OpenAI `request_id` 和 token `usage`。
+
+`usage` 是一个字典；当 API 不返回 usage 时，它为 `None`。读取前请先检查是否为 `None`：
+
+```python
+if response.usage is not None:
+    print(response.usage["input_tokens"])
+    print(response.usage["output_tokens"])
+    print(response.usage["total_tokens"])
+```
+
+问题和响应类型（例如 `Noul` 和 `ClassifierResponse`）来自 `langchain_core.decisions`。
+
+## 问题类型
+
+每个问题都属于以下三种类型之一：
+
+| 类型 | 询问什么 | 返回什么 | 适用场景 |
+|---|---|---|---|
+| `Noul` | 这是真的吗？ | `noul`，即“是”的概率 | 你的代码依赖 `if` 分支时 |
+| `Choice` | 这些选项中的哪一个？ | `choice`，以及 `probabilities` 和 `confidence` | 各选项对应不同的代码路径时 |
+| `Score` | 哪个级别？ | `score`，以及 `legend`、`probabilities` 和 `confidence` | 答案是一个可与阈值比较的连续范围时 |
+
+- **`Noul`**：作为 `predicate` 问题发送到 API。接近 `0.5` 的值表示不确定，而不是“中等”，因此对于连续范围请使用 `Score`。predicate 问题没有用于描述结果的字段，因此 `OpenAIClassifier` 会将任何 `criteria` 作为文本追加到 instructions 中。`Noul` 答案没有 `confidence`，因为概率本身就是答案。
+- **`Choice`**：将每个标签映射到一个描述，当标签不需要描述时映射到 `None`。`Choice` 至少需要两个标签。当选项可能无法覆盖所有输入时，请包含一个 `other` 标签。答案会包含每个标签的 `probabilities`，以及单独的 `confidence` 分数。请使用你应用程序中的标注示例来设置阈值。
+- **`Score`**：采用从最低到最高排序、并从 `0` 开始索引的级别。返回的 `score` 是各级别索引的概率加权平均值，因此可能落在级别之间，`legend` 会将每个索引映射到你提供的级别。答案会包含每个级别的 `probabilities` 以及单独的 `confidence` 分数。
+
+instructions 可以是文本、结构化 JSON，也可以包含图像。criteria 仅接受文本或结构化 JSON，criteria 中的 media block 会抛出 `ValueError`。
+
+`langchain_core.decisions` 还定义了用于在图像中定位对象的 `Box` 问题类型。OpenAI Decisions API 不支持它，对于包含 `Box` 问题的请求，`OpenAIClassifier` 会抛出 `ValueError`。
+
+## State
+
+`state` 可以是字符串、JSON 对象或数组，或 LangChain messages：
+
+- **字符串**：按原样发送。
+- **LangChain messages**：位于 state 根部的单条 message 或 message 列表会作为原生 Decisions API 输入发送。Human、system、AI 和 tool messages 会保留其角色，tool calls 和 tool results 会作为 function call items 发送。
+- **JSON 对象和数组**：作为 JSON 放在单条 user message 中发送。嵌套在对象或数组内的 messages 会被转换为 JSON。
+
+要对 agent 对话（包括其 tool calls）进行分类，请将 messages 作为 state 传入：
+
+```python
+from langchain.messages import AIMessage, HumanMessage, ToolMessage
+
+response = classifier.invoke(
+    {
+        "state": [
+            HumanMessage("Where is my order?"),
+            AIMessage(
+                "",
+                tool_calls=[
+                    {"name": "track_order", "args": {"id": "A1"}, "id": "call_1"}
+                ],
+            ),
+            ToolMessage("Delivered yesterday.", tool_call_id="call_1"),
+            AIMessage("It was delivered yesterday."),
+            HumanMessage("It arrived smashed to pieces."),
+        ],
+        "questions": {
+            "damaged": Noul(instructions="Did the item arrive damaged?"),
+        },
+    }
+)
+```
+
+messages 接受文本和图像内容。图像可以是 base64 数据或公开的 `http` 或 `https` URL。文件和音频内容会抛出 `ValueError`，system messages 仅接受文本。要对图像进行分类，请将其放在 state 根部的 message 中传入：
+
+```python
+import base64
+from pathlib import Path
+
+image_data = base64.b64encode(Path("delivery.jpg").read_bytes()).decode()
+
+response = classifier.invoke(
+    {
+        "state": [
+            HumanMessage(
+                content_blocks=[
+                    {"type": "text", "text": "Photo of the delivered item."},
+                    {"type": "image", "base64": image_data, "mime_type": "image/jpeg"},
+                ]
+            )
+        ],
+        "questions": {
+            "damaged": Noul(instructions="Did the item arrive damaged?"),
+        },
+    }
+)
+```
+
+<Warning>
+JSON state 无法携带媒体。`OpenAIClassifier` 会丢弃对象或数组内的 media blocks（包括嵌套 messages 中的 blocks），并发出 `UserWarning`。若要包含图像，请将 messages 作为根 state 传入。
+</Warning>
+
+## 配置
+
+| 参数 | 描述 |
+|---|---|
+| `model` | Decisions model 名称，例如 `gpt-6-luna`。必填。 |
+| `api_key` | OpenAI API key，或返回该 key 的同步或异步 callable。默认值为 `OPENAI_API_KEY`。当请求通过 LangSmith gateway 路由时，默认值为 `LANGSMITH_GATEWAY_API_KEY`，其次是 `LANGSMITH_API_KEY`。 |
+| `base_url` | API 请求的 base URL。默认值为 `OPENAI_API_BASE`；设置 `LANGSMITH_GATEWAY` 时其次为 LangSmith gateway；然后是 `OPENAI_BASE_URL`。 |
+| `organization` | OpenAI 组织 ID。默认值为 `OPENAI_ORG_ID`，其次是 `OPENAI_ORGANIZATION`。 |
+| `timeout` | 请求超时时间，可以是 float 或 `httpx.Timeout`。 |
+| `max_retries` | 最大重试次数。未设置时使用 OpenAI SDK 的默认值。 |
+| `default_headers` | 随每个请求发送的 headers。 |
+| `default_query` | 随每个请求发送的查询参数。 |
+| `http_client` | 用于 `invoke` 和 `batch` 的 `httpx.Client`。其生命周期由你管理。 |
+| `http_async_client` | 用于 `ainvoke` 和 `abatch` 的 `httpx.AsyncClient`。其生命周期由你管理。 |
+
+异步 callable 形式的 `api_key` 仅适用于 `ainvoke` 和 `abatch`。
+
+## 错误
+
+- **`ValueError`**：在没有可用的 API key 时抛出；当请求不受 API 支持时，也会由 `invoke` 抛出：`Box` 问题、少于两个标签的 `Choice`、criteria 中的媒体、文件或音频内容、非文本的 system message 内容，或没有 ID 的 tool call。
+- **`TypeError`**：当 state 为 `None`、数字或布尔值时，由 `invoke` 抛出。
+- **`ModelRefusalError`**：当 API 拒绝请求中的任何问题时抛出。错误消息会指明被拒绝的问题，其他问题的答案会被丢弃。请从 `langchain_core.exceptions` 导入。
+
+## Agent middleware
+
+LangChain 包含两个 beta middleware，它们在 agent 的决策点使用 decision model。将 `OpenAIClassifier` 作为它们的 `classifier` 传入。两者都要求 `langchain>=1.5.0`：
+
+<CodeGroup>
+```bash uv
+uv add "langchain>=1.5.0" "langchain-openai>=1.8.0"
+```
+
+```bash pip
+pip install "langchain>=1.5.0" "langchain-openai>=1.8.0"
+```
+</CodeGroup>
+
+### 模型路由
+
+[`ModelRouterMiddleware`](/oss/python/langchain/middleware/built-in#model-router) 会根据最新的 human message，为每次 agent run 从你命名的 models 中选择一个：
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import ModelChoice, ModelRouterMiddleware
+from langchain_openai.decisions import OpenAIClassifier
+
+router = ModelRouterMiddleware(
+    choices={
+        "fast": ModelChoice(
+            model="openai:gpt-6-luna",
+            criteria="Simple, well-scoped tasks.",
+        ),
+        "powerful": ModelChoice(
+            model="openai:gpt-6-sol",
+            criteria="Complex tasks that need deeper reasoning.",
+        ),
+    },
+    instructions="Choose the least costly model that can complete the task.",
+    classifier=OpenAIClassifier(model="gpt-6-luna"),
+)
+
+agent = create_agent("openai:gpt-6-luna", middleware=[router])
+
+result = agent.invoke({"messages": [{"role": "user", "content": "What is 2 + 2?"}]})
+print(result["model_route"].choice)
+```
+
+### 工具调用拦截
+
+[`AutoModeMiddleware`](/oss/python/langchain/middleware/built-in#auto-mode) 会检查对你列出的 tools 的每次调用，并阻止 classifier 判定为有风险的调用：
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import AutoModeMiddleware
+from langchain.tools import tool
+from langchain_openai.decisions import OpenAIClassifier
+
+
+@tool
+def delete_file(path: str) -> str:
+    """Delete a file."""
+    return f"Deleted {path}."
+
+
+agent = create_agent(
+    "openai:gpt-6-sol",
+    tools=[delete_file],
+    middleware=[
+        AutoModeMiddleware(
+            tools=[delete_file],
+            classifier=OpenAIClassifier(model="gpt-6-luna"),
+        )
+    ],
+)
+
+result = agent.invoke({"messages": [{"role": "user", "content": "Delete notes.txt."}]})
+print(result["messages"][-1].text)
+```
+
+默认 instructions 会将破坏性操作视为有风险，即使用户要求执行这些操作也是如此。当 agent 调用 `delete_file` 时，middleware 会返回一条错误 `ToolMessage`，而不是运行该 tool，并且 agent 会报告该调用已被阻止。
+
+<Warning>
+除非可以接受将 secrets 发送到 OpenAI，否则不要将 secrets 放入 tool 参数或对话 state 中。此 middleware 会拒绝有风险的调用，但不会请求批准。如果你希望由人来批准这些调用，请将其与 [human-in-the-loop middleware](/oss/python/langchain/middleware/built-in) 配合使用。
+</Warning>
+
+## Tracing
+
+`OpenAIClassifier` 的 runs 会在 [LangSmith](/langsmith/observability) 中以 `openai` provider 和 model 名称进行 trace，因此你可以结合应用程序的其他部分检查 decisions 和 token 用量。
+
+## 另请参阅
+
+- [OpenAI Decisions 指南](https://developers.openai.com/api/docs/guides/decisions)
+- [OpenAI provider 概览](/oss/python/integrations/providers/openai)
+- [TypeSafe 集成](/oss/python/integrations/providers/typesafe)
+- [预构建 middleware](/oss/python/langchain/middleware/built-in)
+- [LangChain OpenAI API 参考](https://reference.langchain.com/python/langchain-openai)
+
+<Info>
+关于原生 OpenAI Decisions API 格式（包括按问题拒绝和 OpenAI 专用 middleware），请参阅 [OpenAI Decisions 集成](/oss/python/integrations/decision_models/openai)。
+</Info>
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/oss/python/integrations/decision_models/openai_classifier.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>
