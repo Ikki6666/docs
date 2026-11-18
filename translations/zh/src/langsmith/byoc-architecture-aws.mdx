@@ -5,11 +5,11 @@ description: LangSmith BYOC 部署如何跨越 LangChain control plane 和你的
 icon: "sitemap"
 ---
 
+AWS 上的 BYOC 在你的 AWS 账户中运行 LangSmith data plane，而 LangChain 在其位于 `us-east-2` 的自有云中运行 control plane。你的 trace 数据保留在你的账户中。本页介绍每个 plane 的组件、它们之间如何通信，以及 LangChain 会在你的账户中预置哪些资源。其他云上的 BYOC 请参阅 [GCP 上的 BYOC 架构](/langsmith/byoc-architecture-gcp) 和 [Azure 上的 BYOC 架构](/langsmith/byoc-architecture-azure)。
+
+要设置 data plane，请遵循 [AWS 上的 BYOC 入门](/langsmith/byoc-onboarding-aws)。
+
 ## Control plane 与 data plane 模型
-
-BYOC 部署被拆分到两个 plane 上。本页介绍每个 plane 的组成、它们之间如何通信，以及 LangChain 会在你的账户中预置哪些资源。
-
-本页介绍 AWS 上的 BYOC。GCP 上的 BYOC 请参阅 [GCP 上的 BYOC 架构](/langsmith/byoc-architecture-gcp)，Azure 上的 BYOC 请参阅 [Azure 上的 BYOC 架构](/langsmith/byoc-architecture-azure)。
 
 **Control plane** 运行在 LangChain 的云中，负责身份验证、组织配置和计费。它负责预置、监控和编排你的部署，但不持有任何敏感应用数据。
 
@@ -36,12 +36,25 @@ LangChain 会在你的账户中预置以下资源：
 - **存储**：S3 存储桶，用于存放 trace 数据的 blob store、SmithDB 对象存储以及 VPC flow logs。
 - **EKS**：一个带有托管附加组件的私有 EKS 集群。
 - **计算**：一个用于平台工作负载的 system node group，以及通过 Karpenter 管理的 application node groups。
-- **集群内资源**：LangSmith Helm chart、Istio、KEDA 以及其他集群内资源。
+- **集群内资源**：LangSmith Helm chart 及其依赖的[配套组件](#supporting-in-cluster-components)。
 - **IAM roles**：Kubernetes 资源所需的角色和权限。
 
 <Note>
 在 2026 年 10 月 21 日或之后创建的 data planes 仅在 [SmithDB](/langsmith/self-host-smithdb) 中存储和查询 traces。ClickHouse 已弃用，支持将于 LangSmith v0.19 结束。使用 ClickHouse 创建的 data planes 会保留它及其 S3 备份，直到迁移到 SmithDB。
 </Note>
+
+## 配套的集群内组件
+
+除 LangSmith Helm chart 外，LangChain 还会在 EKS 集群中安装和升级以下开源组件。每个组件都作为独立的 Helm release 运行：
+
+- **Istio**：包括 `istio/base`、`istiod` 和 `istio/gateway` releases。Istio ingress gateway 接收所有 data plane 流量，并将其路由到 LangSmith 服务。
+- **AWS Load Balancer Controller**：创建位于 Istio ingress gateway 前方的网络负载均衡器。其名称以 `-sm-istio` 结尾。
+- **External Secrets Operator**：通过 ClusterSecretStore 将 AWS Secrets Manager 中的 data plane secrets 同步到 Kubernetes secrets。
+- **Karpenter**：随着 pod 需求变化，预置和移除 application worker nodes。
+- **cert-manager**：签发和续订集群内 TLS 证书。其他组件依赖其自定义资源和 webhooks。
+- **KEDA**：自动扩缩容 LangSmith 服务。
+
+每个调用 AWS APIs 的组件都使用自己的 IAM role。使用 [BYOIAM](/langsmith/byoc-byoiam-aws) 时，由你自己创建这些角色。这些组件的升级节奏，请参阅[运维](/langsmith/byoc-operations-aws)。
 
 ## 跨账户 IAM 权限
 
