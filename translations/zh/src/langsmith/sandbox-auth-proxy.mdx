@@ -1,7 +1,7 @@
 ---
 title: Sandbox auth proxy
 sidebarTitle: Auth proxy
-description: 将凭证注入到出站请求中，并控制 sandbox 可以访问哪些目标。
+description: 将凭证或公共归因请求头注入到出站请求中，并控制 sandbox 可以访问哪些目标。
 ---
 
 auth proxy 让 sandbox 中的代码可以调用外部 API，例如 OpenAI、Anthropic、GitHub，而无需硬编码凭证。当你在 sandbox 上配置好它后，一个运行在 sandbox 之外的 egress proxy 会自动把身份验证请求头注入到匹配的出站请求中，所需凭证来自工作区密钥，或者来自你在 proxy 配置中提供的只写凭证。
@@ -30,7 +30,7 @@ auth proxy 让 sandbox 中的代码可以调用外部 API，例如 OpenAI、Anth
 ### 出站如何工作
 
 - **访问控制作用于每一条出站 TCP 连接**，无论是不是 HTTP。
-- **匹配到规则或 callback 的主机的 HTTPS 流量会被 proxy 解密**，以便注入 headers；sandbox 信任 proxy 的 CA。未匹配主机的 HTTPS 流量以及所有非 HTTP 连接（包括 PostgreSQL、SSH 和 Redis）则原样透传。80 和 443 端口保留给 HTTP 和 TLS；在这两个端口上运行非 HTTP 协议无法工作。
+- **匹配到规则或 callback 的主机的 HTTPS 流量会被 proxy 解密**，以便注入 headers；sandbox 信任 proxy 的 CA。启用的[归因规则或 callback](#add-public-attribution-headers)还会对 proxy 处理的每个 HTTPS 目标触发拦截。没有归因时，未匹配主机的 HTTPS 流量会原样透传。直接的非 HTTP 连接（包括 PostgreSQL、SSH 和 Redis）会通过其常规端口原样透传。80 和 443 端口保留给 HTTP 和 TLS；在这两个端口上运行非 HTTP 协议无法工作。
 - **默认使用主机名建立直接连接。** 到公共字面 IP 的原始 TCP 连接要求 `allow_list` 中有显式匹配的 IP 或 CIDR 条目，并且在 deny-list 模式下不可用。到字面 IP 的 HTTPS 也会被丢弃，因为 proxy 需要 TLS 握手中的主机名。80 端口上的明文 HTTP 可以使用字面 IP。
 - **只有 TCP 会离开 sandbox。** UDP（包括 QUIC）和 ICMP 会被丢弃。
 
@@ -183,9 +183,10 @@ await client.createSandbox({
 
 | Field | Description |
 |-------|-------------|
-| `rules` | Header 注入规则和 provider 认证规则。启用的 header 规则按列表顺序 first-match-wins；`aws` 和 `gcp` 规则无论位置如何都会匹配其 provider 的主机 |
-| `callbacks` | 动态凭证查找；参见 [Callback 凭证示例](#callback-凭证示例) |
+| `rules` | Header 注入、provider 认证、relay 和归因规则。启用的 header 规则按列表顺序 first-match-wins；`aws` 和 `gcp` 规则无论位置如何都会匹配其 provider 的主机。归因会独立于普通规则匹配来添加公共 headers |
+| `callbacks` | 动态凭证或选定的归因请求头；参见 [Callback 凭证示例](#callback-凭证示例)和 [callback 归因](#refresh-attribution-through-a-callback) |
 | `access_control` | `allow_list` 或 `deny_list`；参见[允许列表与拒绝列表](#允许列表与拒绝列表) |
+| `no_proxy` | 绕过 proxy 处理的目标。归因启用期间必须为空。组织级受限出站会禁用这些绕过 |
 | `description` | 可选，最多 1024 个字符。这份配置允许 sandbox 访问什么，便于交给 agent |
 
 每条规则都可以指定：
@@ -193,13 +194,13 @@ await client.createSandbox({
 | Field | Description |
 |-------|-------------|
 | `name` | 必填。规则的标识符 |
-| `type` | header 注入规则省略；provider 认证规则设为 `aws` 或 `gcp`；设为 `relay` 可让匹配的连接经由 [relay](/langsmith/relays) 发送 |
-| `match_hosts` | header 规则必填；在 `aws` 和 `gcp` 规则上会被拒绝。纯主机名，或在可注册域名前的 `*.` 通配符（`*.github.com`，而不是 `*.com` 或 `*`）。不带 scheme、路径或端口。通配符不匹配顶级域名 |
+| `type` | header 注入规则省略；provider 认证规则设为 `aws` 或 `gcp`；设为 `relay` 可让匹配的连接经由 [relay](/langsmith/relays) 发送；设为 `attribution` 可添加公共元数据 |
+| `match_hosts` | header 规则必填；在 `aws`、`gcp` 和归因规则上会被拒绝。纯主机名，或在可注册域名前的 `*.` 通配符（`*.github.com`，而不是 `*.com` 或 `*`）。不带 scheme、路径或端口。通配符不匹配顶级域名 |
 | `match_paths` | 要匹配的路径，为空则表示所有路径。仅限 header 规则。模式会与去掉查询字符串的请求路径匹配；参见[按路径或 header 匹配规则](#按路径或-header-匹配规则) |
 | `match_headers` | 必须全部存在的请求 header，每项写作 `"name: value"`，名称小写且值为精确匹配。仅限 header 规则；参见[按路径或 header 匹配规则](#按路径或-header-匹配规则) |
-| `headers` | 要注入的请求头，每个都包含 `name`、`type` 和 `value`。仅限 header 规则 |
+| `headers` | 要注入的请求头，每个都包含 `name`、`type` 和 `value`。仅限 header 和归因规则；归因要求 `plaintext` |
 | `aws` / `gcp` | Provider 凭据；参见[对 AWS 请求进行身份验证](#对-aws-请求进行身份验证)和[对 GCP 请求进行身份验证](#对-gcp-请求进行身份验证) |
-| `env_vars` | 在该规则启用期间为 sandbox 设置的环境变量 |
+| `env_vars` | 在该规则启用期间为 sandbox 设置的环境变量。归因规则不支持 |
 | `enabled` | 默认为 `true` |
 | `description` | 可选，最多 1024 个字符。这条规则允许 sandbox 访问什么 |
 
@@ -306,6 +307,138 @@ await client.createSandbox({
   "env_vars": {"GH_TOKEN": "proxy-injected"}
 }
 ```
+
+## 添加公共归因请求头 {#add-public-attribution-headers}
+
+归因规则会向 proxy 处理的每个出站 HTTP(S) 请求添加公共元数据，例如 `X-Agent-ID` 或 `X-Cost-Center`。当你的出站网关或某个目标需要识别是哪个 agent 发送了请求时，可以使用它。归因会与特定目标的凭证一起生效。
+
+<Note>
+自托管的字面量归因和 callback 归因要求 LangSmith API 和 sandbox-host 版本 0.18.26rc1 或更高。LangSmith Helm chart 0.18.0-rc.72 是第一个默认使用该版本的 chart。对于独立的 sandbox 集群，请使用 `langsmith-sandbox` chart 0.18.0-rc.7 或更高版本，并让 `appVersion` 与 LangSmith chart 匹配。
+
+这些最低版本是候选发布版本，并非正式可用版本。0.17 发行系列不包含归因支持。如果你覆盖了镜像 tag，请确认 API 和 sandbox-host 镜像都满足版本要求。
+
+对于自托管或 BYOC 部署，在启用归因之前请升级每个 sandbox 主机。较旧的主机会拒绝启用的归因规则，并且可能拒绝整个 proxy 配置，包括凭证和访问控制。API 不会把已禁用或空的归因规则发送给主机。
+</Note>
+
+<Warning>
+每个经由 proxy 的目标（包括第三方服务）都会收到这些值。API 会原样返回它们，尽管配置会静态加密。不要使用 token、个人数据或其他敏感值。API 不会拒绝 JWT 这类形似 token 的字符串。归因标签不是经过身份验证的身份，也不会强制执行出站策略。
+</Warning>
+
+在创建或更新 sandbox 时，向 `proxy_config.rules` 添加一条归因规则：
+
+```json
+{
+  "proxy_config": {
+    "rules": [
+      {
+        "name": "agent-attribution",
+        "type": "attribution",
+        "headers": [
+          {"name": "X-Agent-ID", "type": "plaintext", "value": "agent_123"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+该规则默认为 `enabled: true`。设为 `enabled: false` 可以保留标签但不注入它们。删除该规则或设置 `headers: []` 也会禁用归因。
+
+归因是附加的，不是通配符凭证规则。普通 header 规则仍然采用 first-match-wins 匹配。proxy 会在静态和 callback headers 之后应用归因，不区分大小写地替换同名 headers，并且这一应用发生在 provider 签名之前。
+
+更新 `proxy_config` 会替换整个配置，而不是追加一条规则。请在替换内容中保留已有的规则、`access_control`、`callbacks` 和其他设置。
+
+对于 [CLI](/langsmith/sandbox-cli#proxy-configuration)，请把内层的 `proxy_config` 对象保存到文件，并传入 `--proxy-config @proxy.json`。
+
+### 校验归因设置
+
+归因规则具有以下约束，即使处于禁用状态也是如此：
+
+- **规则数量**：每个配置最多一条归因规则，包括已禁用的规则。
+- **Header 数量**：最多 16 个 headers。
+- **Header 名称**：3 到 128 个 ASCII 字符，以 `X-` 开头。只能使用字母、数字和连字符。名称必须唯一，不区分大小写。
+- **Header 值**：字面量 `plaintext` 值最多 1024 字节。允许空值。值不能包含换行符、花括号或 secret 模板。不支持工作区密钥引用和 opaque 值。
+- **匹配与凭证**：不要在归因规则自身上设置 `match_hosts`、`match_paths`、`match_headers`、`env_vars`，也不要设置 provider、relay 或 rewrite 设置。请把凭证规则分开配置。
+
+保留名称检查不区分大小写。除了精确名称 `X-Sandbox-ID` 之外，只要 header 名称满足以下任一条件就会被拒绝：
+
+- 在名称的任意位置包含 `auth`、`token`、`secret`、`credential`、`cookie`、`session`、`signature`、`apikey`、`csrf` 或 `xsrf`。
+- 包含一个等于 `key` 的连字符分隔片段，例如 `X-Api-Key`。
+- 以以下表中的任一保留前缀开头。每个前缀都是字面量，包括其是否以连字符结尾。
+
+| 类别 | 保留前缀 |
+|----------|-------------------|
+| 路由与协议 | `X-Forward`, `X-Real-`, `X-Envoy-`, `X-Original-`, `X-Rewrite-`, `X-Http-`, `X-Method-`, `X-Proxy-`, `X-Upstream-`, `X-Ingress-`, `X-Remote-`, `X-Client-Cert`, `X-Ssl-`, `X-Host`, `X-Url` |
+| Provider | `X-Amz-`, `X-Aws-`, `X-Goog-`, `X-Gcp-`, `X-Ms-`, `X-Azure-` |
+| 平台 | `X-LangSmith-`, `X-LangChain-`, `X-Ls-`, `X-Sandbox-`, `X-Tenant-`, `X-Organization-`, `X-User-` |
+
+例如，`X-Session-ID` 和 `X-Tenant-ID` 会被拒绝。请改用 `X-Agent-ID` 或 `X-Cost-Center` 这样的公共标签。
+
+带有非空 headers 的已启用归因规则不能与非空的 `no_proxy` 列表或已启用的 relay 规则共存。请移除冲突或禁用归因。已禁用的归因和空 header 列表不会产生这些冲突。
+
+### 通过 callback 刷新归因 {#refresh-attribution-through-a-callback}
+
+带有 `attribution_headers` 的 callback 会为 proxy 处理的每个 HTTP(S) 请求提供选定的 headers。对于会过期的非敏感元数据，可以使用这种模式，而不必反复更新字面量配置。它会与目标凭证一起运行，而不只是在普通规则未能匹配时才运行。
+
+<Note>
+Callback 归因与字面量归因具有相同的版本要求。在启用此模式之前请升级主机。较旧的主机会拒绝该配置，并在实时更新失败时让之前的配置继续生效。在依赖归因之前，请确认配置已成功传播。
+</Note>
+
+要配置 callback 归因，请向 `proxy_config.callbacks` 添加一个 callback：
+
+```json
+{
+  "proxy_config": {
+    "callbacks": [{
+      "url": "https://callback.example.com/attribution",
+      "ttl_seconds": 240,
+      "request_headers": [{"name": "Authorization", "type": "opaque", "value": "callback-verification-secret"}],
+      "attribution_headers": ["X-Agent-ID"]
+    }]
+  }
+}
+```
+
+该 callback 必须省略 `match_hosts` 和 `full_request`。普通凭证 callback 仍然要求限定作用域的主机模式；单独的 `*` 仍然无效。最多配置一个归因 callback，callback 名称与启用的字面量 header 名称合计最多 16 个。名称必须唯一，不区分大小写。Callback 归因还会与 `no_proxy` 和已启用的 relay 规则冲突。删除该 callback 即可禁用它。
+
+选定的名称遵循与字面量名称相同的限制。API 和 proxy 会拒绝 `X-LangSmith-Agent-Access-Token`，包括大小写变体。身份验证 headers 请使用目标特定的凭证 callback。
+
+Callback 响应必须恰好包含选定的 headers 及其最早的绝对过期时间：
+
+```json
+{
+  "headers": {"X-Agent-ID": "build-runner"},
+  "expires_at": "2026-11-10T12:05:00Z"
+}
+```
+
+proxy 会强制执行以下响应约束：
+
+- **值**：非空、有效的 HTTP 字段值，每个最多 8192 字节。
+- **响应大小**：最多 64 KiB，不能缺少、多余或大小写重复的 header 名称。
+- **过期时间**：RFC 3339 格式的 `expires_at`，且必须比当前时间晚 30 秒以上。
+- **缓存**：按 sandbox、callback 配置、目标主机和端口缓存。条目在 `ttl_seconds` 之后过期，或在 `expires_at` 前 30 秒过期，以先到者为准。
+- **失败**：callback 错误、无效响应和刷新失败会阻止被覆盖的请求。proxy 绝不会复用陈旧值，也不会在没有所需归因的情况下转发请求。
+
+刷新发生在缓存过期后的下一个请求，而不是在后台进行。返回值保留在 proxy 内存中，不会变成 API 可读的字面量配置。callback 会收到目标主机和端口以及已签名的 sandbox 身份，而不会收到请求 headers 或 body 预览。在签发值之前，请验证 callback 请求的签名、受众、body 和 sandbox 身份。
+
+<Warning>
+这些 headers 会放在与源站绑定的 HTTP 请求内部传输，而不是外层的 `CONNECT` 请求中。被覆盖的目标可以将这些 headers 回显给 sandbox 代码。名称限制无法检测放在允许的元数据名称下的 secret。不要在归因请求头中返回 secret。归因不会强制执行网关路由，也不会在到达目标之前剥离 headers。
+</Warning>
+
+请通过 API 或 CLI JSON 配置创建或更新归因 callback。
+
+在降级 sandbox 主机之前，请同时移除字面量归因和归因 callback。在降级之前，请确认更新后的配置已成功传播到每个受影响的 sandbox。被拒绝的实时更新会让之前的配置继续保持启用状态。
+
+### 了解连接覆盖范围
+
+归因覆盖 80 端口上的透明 HTTP 和 443 端口上基于主机名的 HTTPS。它还覆盖通过显式 proxy 的 HTTP 和 HTTPS，包括非标准端口上的 HTTPS `CONNECT` 请求。
+
+HTTP/1.1 和 HTTP/2 请求会被覆盖。对于 WebSocket，归因会应用于 HTTP/1.1 升级握手，而不是后续的 WebSocket 帧。把已配置的归因名称声明为 trailer 的请求会被拒绝，并返回 `400 Bad Request`。
+
+HTTPS 拦截要求客户端信任 proxy CA，并且 proxy 主机信任目标证书。只在 sandbox 内部受信任的私有 CA 无法建立主机侧信任。固定证书的客户端可能会失败。归因启用期间，不支持通过显式 `CONNECT` 的非 TLS 协议，例如 SSH 或 PostgreSQL。拦截失败时，proxy 不会回退到未打标签的隧道。
+
+归因不会标记原始 TCP、直接的 sandbox 链接，或绕过 HTTP(S) 处理的流量，例如其他端口上的透明连接。重写为 sandbox 目标的 HTTP proxy 请求在授权检查后仍会被覆盖。归因不会扩大网络策略所允许的协议或目标。启用归因后，请重新连接已有的 opaque 隧道，或重启 sandbox。
 
 ## 对 AWS 请求进行身份验证
 
@@ -816,15 +949,18 @@ callbacks 与 rules 一样，都配置在 `proxy_config` 下：
 
 | Field | Description |
 |-------|-------------|
-| `match_hosts` | 要拦截的主机，语法与 rules 相同，支持 `*.github.com` 这样的 glob |
+| `match_hosts` | 凭证 callback 必填。要拦截的主机，语法与 rules 相同，支持 `*.github.com` 这样的 glob。归因 callback 请省略此项 |
 | `url` | 你的 callback endpoint。必须是解析到公共地址的 `http://` 或 `https://` URL；私有、回环、Kubernetes 内部和云元数据目标会被拒绝 |
 | `request_headers` | proxy 发往 callback 时附带的 headers，例如用于验证请求的 HMAC 或共享密钥。这里只允许 `plaintext` 和 `opaque` 类型，不允许 `workspace_secret` |
 | `ttl_seconds` | 必填。解析出的 headers 缓存多久后失效并重新触发 callback，范围必须在 60 到 3600 之间 |
+| `attribution_headers` | 为 proxy 处理的每个 HTTP(S) 请求解析的 header 名称，而不是为匹配主机解析凭证。有关单独的规则和响应契约，参见[通过 callback 刷新归因](#refresh-attribution-through-a-callback) |
 | `full_request` | 设为 `true` 时，对匹配主机的每个请求都会触发 callback（不缓存），并且 body 包含一个 `request` 快照：`method`、`url`、`scheme`、`host`、`path`、`query`、`headers`，以及最多 1 MiB 的 body（作为 `body_base64`，`body_truncated` 标记被截断） |
 
-**静态 rules 优先。** 如果一条启用的 header 注入规则同时匹配了主机和路径，那么该请求的 callback 就会被跳过。`rules` 内部是 first-match-wins，多个 callbacks 之间也是同样规则。
+**静态 rules 优先。** 对于凭证 callback，如果一条启用的 header 注入规则同时匹配了主机和路径，那么该请求的 callback 就会被跳过。`rules` 内部是 first-match-wins，多个凭证 callbacks 之间也是同样规则。归因 callback 绝不会以这种方式被跳过；它们会与目标凭证一起运行。
 
 ### Callback 协议
+
+本契约适用于凭证 callback。归因 callback 会收到相同的请求，但必须恰好返回选定的 headers 和一个 `expires_at`；参见[通过 callback 刷新归因](#refresh-attribution-through-a-callback)。
 
 每当 proxy 需要为一个匹配主机在缓存未命中的情况下解析凭证时，它会发起如下请求：
 
