@@ -35,6 +35,7 @@ Azure blob storage 从 Helm chart `0.8.9` 及以上版本可用。[删除 trace 
 
 * 一个用于存储数据的 bucket 或目录。强烈建议为 LangSmith 数据单独创建 bucket 或目录。
   * **如果你启用了 TTL**，则需要设置生命周期策略来删除旧数据。更多信息请参见 [配置 TTL](/langsmith/self-host-ttl)。这些策略应与你在 LangSmith 配置中设置的 TTL 保持一致，否则可能会发生数据丢失。关于如何设置生命周期规则，请参见 [blob storage 的 TTL 配置](#ttl-configuration)。
+  * 如果你使用自动化规则，请单独配置[自动化结果保留](#automation-outcome-retention)，即使 trace TTL 已禁用。
 
 * 允许 LangSmith Services 访问该 bucket 或目录的凭据
   * 你需要为 LangSmith 实例提供访问该 bucket 或目录所需的凭据。更多信息请阅读下方的认证[章节](#authentication)。
@@ -502,3 +503,105 @@ Neon Object Storage 会接受并存储 lifecycle 配置，但不会执行过期�
 要强制执行 TTL，请运行一个定时任务（例如 Kubernetes CronJob），删除超过各前缀 TTL 的对象。
   </Tab>
 </Tabs>
+
+## 自动化结果保留
+
+[自动化规则](/langsmith/rules)可以将结果详情存储在 LangSmith blob storage bucket 或 container 中的 `run_rules/outcomes/` 下。请配置一条生命周期规则，使这些对象在 30 天后过期。此策略独立于 trace 保留，且不适用于其他 `run_rules/` 对象或 SmithDB 数据。
+
+<Warning>
+请将此规则添加到现有的生命周期配置中。不要替换针对 `ttl_s/`、`ttl_l/` 或自定义保留前缀的现有规则。在任何灾难恢复 bucket 上也要保持相同的规则。
+
+该规则同时覆盖现有对象和未来对象。策略生效后，超过 30 天的现有对象将符合删除条件。对象年龄基于存储时间戳，而不是对象名称中的时间戳。生命周期处理是异步的，因此 30 天并非精确的删除截止期限。
+</Warning>
+
+<Tabs>
+  <Tab title="AWS">
+
+将此规则添加到现有的 `aws_s3_bucket_lifecycle_configuration` 资源中：
+
+```hcl
+rule {
+  id     = "automation-outcomes"
+  status = "Enabled"
+  filter {
+    prefix = "run_rules/outcomes/"
+  }
+  expiration {
+    days = 30
+  }
+  noncurrent_version_expiration {
+    noncurrent_days = 30
+  }
+}
+```
+
+在启用版本控制的 bucket 中，过期会添加删除标记，而不是永久删除当前版本。该示例还会在非当前版本变为非当前状态 30 天后将其删除。这可能会使数据在实际上传 30 天后仍被保留。请审查这一额外保留期以及你针对已过期删除标记的清理规则。请参见 [S3 生命周期操作](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html#intro-lifecycle-rules-actions)。
+
+  </Tab>
+  <Tab title="GCP">
+
+将此代码块添加到现有的 `google_storage_bucket` 资源中：
+
+```hcl
+lifecycle_rule {
+  condition {
+    age            = 30
+    matches_prefix = ["run_rules/outcomes/"]
+  }
+  action {
+    type = "Delete"
+  }
+}
+```
+
+不要将该规则限制为仅作用于活动对象。在没有 `is_live` 条件的情况下，它也会覆盖非当前版本。软删除的对象在该 bucket 的软删除保留期内仍可恢复。请参见 [Cloud Storage 生命周期管理](https://cloud.google.com/storage/docs/lifecycle)。
+
+  </Tab>
+  <Tab title="Azure">
+
+将此规则添加到现有的 `azurerm_storage_management_policy` 资源中。请将 `my-container` 替换为你的 LangSmith container 名称：
+
+```hcl
+rule {
+  name    = "automation-outcomes"
+  enabled = true
+  filters {
+    prefix_match = ["my-container/run_rules/outcomes/"]
+    blob_types   = ["blockBlob"]
+  }
+  actions {
+    base_blob {
+      delete_after_days_since_modification_greater_than = 30
+    }
+    snapshot {
+      delete_after_days_since_creation_greater_than = 30
+    }
+    version {
+      delete_after_days_since_creation = 30
+    }
+  }
+}
+```
+
+base blob 根据其最后修改时间过期。快照和先前版本根据其创建时间过期。软删除可能会使已删除的 blob 在这些期限之后仍被保留。请参见 [Azure 生命周期删除策略](https://learn.microsoft.com/en-us/azure/storage/blobs/lifecycle-management-policy-delete)。
+
+  </Tab>
+  <Tab title="MinIO">
+
+使用 MinIO 客户端添加一条限定前缀的过期规则。请将 `myminio/my-bucket` 替换为你配置的 alias 和 LangSmith bucket：
+
+```bash
+mc ilm rule add --prefix "run_rules/outcomes/" --expire-days 30 --noncurrent-expire-days 30 myminio/my-bucket
+```
+
+与 S3 一样，非当前版本的保留期从版本变为非当前状态时开始计算，而不是从上传时开始。MinIO 的 scanner 会异步处理过期规则。请参见 [MinIO 生命周期规则配置](https://docs.min.io/aistor/reference/cli/mc-ilm-rule/mc-ilm-rule-add/)。
+
+  </Tab>
+  <Tab title="Neon">
+
+Neon 不会运行生命周期过期规则。请扩展你的[定时清理任务](#neon-object-storage-lifecycle-rules)，删除 `run_rules/outcomes/` 下超过 30 天的对象。
+
+  </Tab>
+</Tabs>
+
+对象锁定、法律保留和存储保留策略可能会阻止删除。在依赖生命周期规则进行永久删除之前，请结合版本控制、快照和软删除一起审查这些设置。

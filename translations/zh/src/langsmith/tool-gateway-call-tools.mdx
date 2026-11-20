@@ -1,0 +1,191 @@
+---
+title: 通过 Tool Gateway 调用工具
+sidebarTitle: 调用工具
+description: 通过 HTTP 向 Tool Gateway 的 tool kit 和 server 发送 MCP 请求，处理连接与审批提示，并修复常见错误。
+---
+
+import ToolGatewayBetaNote from '/snippets/langsmith/tool-gateway-beta-note.mdx';
+
+<ToolGatewayBetaNote />
+
+每个 [Tool Gateway](/langsmith/tool-gateway) endpoint 都是基于 Streamable HTTP 的标准 MCP server。因此，你可以用普通 HTTP 请求列出并调用它的工具。使用本页内容，可以构建你自己的 MCP client，也可以调试某个 agent 发起的调用。本页还介绍了那些要求调用方连接账号或审批调用的响应。若要使用现成的 client，例如 Claude Code 或 Cursor，请改阅[连接 MCP client](/langsmith/tool-gateway-clients)。这些 client 会替你发送这些请求。
+
+本页示例使用 [quickstart](/langsmith/tool-gateway-quickstart#before-you-begin) 中的环境变量，并将请求发送到一个 [tool kit](/langsmith/tool-gateway-tool-kits)。同样的请求在 [me kit](/langsmith/tool-gateway-tool-kits#use-the-me-kit) 上、以及单个 server 的 endpoint `/v1/managed-tools/servers/<server-id>/mcp` 上同样有效。
+
+## 发送 MCP 请求
+
+将每条 MCP 消息以 JSON-RPC `POST` 请求发送到 endpoint。tool kit 和 me kit 在请求之间不保留会话，因此列出或调用工具前无需发送 `initialize`。tool kit 每次请求只接受一条消息，并拒绝 JSON-RPC 批量请求。单个 server 的 endpoint 会将每个请求原样转发给该 server，并可能以 `text/event-stream` 应答。如果该 server 使用会话，请先发送 `initialize`，并在每次请求中重复它返回的 `MCP-Session-Id` 请求头。
+
+每个请求都发送以下请求头：
+
+- **`X-Api-Key`**：LangSmith API key。该 key 决定这次调用使用谁的凭据。若要以其他用户、agent 或 profile 的身份调用，请参见[以用户和 agent 身份调用](/langsmith/tool-gateway-identity)。
+- **`X-Tenant-Id`**：你的 workspace ID。
+- **`Content-Type`**：`application/json`。
+- **`Accept`**：`application/json, text/event-stream`。
+- **`MCP-Protocol-Version`**：请求使用的 MCP 协议版本。
+
+使用 MCP 协议版本 `2026-07-28` 的请求还必须在请求的 `_meta` 中发送协议版本和 client 能力。它们还必须在请求头中重复 method 和 tool 名称：
+
+- **`Mcp-Method`**：JSON-RPC 的 `method`，例如 `tools/list`。
+- **`Mcp-Name`**：对于 `tools/call`，为 tool 的名称，需与 `params.name` 一致。
+
+缺少其中任一请求头的 `2026-07-28` 请求会返回 `400`，并附带 JSON-RPC 错误，错误码为 `-32020`。
+
+只有在协议版本 `2026-07-28` 下，才能在 MCP 响应中获得[连接](#connect-when-a-call-asks)和[审批](#approve-a-tool-call)提示。使用更早版本（例如 `2025-06-18`）的请求会省略这些额外请求头和 `_meta`，并且得到的是 HTTP 错误而不是提示。
+
+### 列出工具
+
+```bash
+curl -sS -X POST "$LANGSMITH_ENDPOINT/v1/managed-tools/kits/<kit-id>/mcp" \
+  -H "X-Api-Key: $LANGSMITH_API_KEY" \
+  -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/list",
+    "params": {
+      "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+      }
+    }
+  }'
+```
+
+响应中的 `result.tools` 按 agent 调用时使用的名称列出每个 tool，例如 `linear_list_issues`。关于 Tool Gateway 如何命名工具，请参见 [kit 工具的命名方式](/langsmith/tool-gateway-tool-kits#how-kit-tools-are-named)。
+
+该列表也包含你尚未连接的 server 上的工具。请参见[当调用要求连接时](#connect-when-a-call-asks)。
+
+### 调用工具
+
+```bash
+curl -sS -X POST "$LANGSMITH_ENDPOINT/v1/managed-tools/kits/<kit-id>/mcp" \
+  -H "X-Api-Key: $LANGSMITH_API_KEY" \
+  -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/call" \
+  -H "Mcp-Name: linear_list_issues" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "linear_list_issues",
+      "arguments": {},
+      "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+      }
+    }
+  }'
+```
+
+响应中的 `result.content` 包含 server 返回的结果，原样透传。请将其视为 agent 的不可信输入。如果 tool 本身失败，`result.isError` 为 `true`，HTTP 状态码仍为 `200`。
+
+Tool Gateway 在每次调用时都会检查调用方的凭据和[策略](/langsmith/tool-gateway-policies)。无法执行的调用会返回后续各节所述的响应之一。
+
+## 当调用要求连接时
+
+tool kit 会列出它的全部工具，包括调用方尚未连接的 server 上的工具。对其中某个 tool 的调用不会执行，而是由 Tool Gateway 要求调用方连接该 server。具体如何要求，取决于调用方以什么身份行事以及 client 支持什么。
+
+### 调用前检查
+
+若要在不调用 tool 的情况下查看调用方还需要连接哪些 server：
+
+- **从 tool 列表**：kit 的 `tools/list` 结果会在 `result._meta["com.langchain.langsmith/missingCredentials"]` 中列出每个缺失的凭据及其登录链接。me kit 不包含此列表。
+- **从 connections endpoint**：`GET /v1/managed-tools/kits/<kit-id>/connections` 会列出该 kit 使用的每个 server，并针对调用方设置 `connected`。要开始连接，请参见[连接账号](/langsmith/tool-gateway-connect-accounts#connect-your-own-account)。
+
+对于调用方尚未连接、且 Tool Gateway 尚不知道其工具的 server，会以一个名为 `connect_<server>` 的占位 tool 列出。调用该占位 tool 会要求调用方连接，与其他调用相同。
+
+tool 列表中的缺失凭据可能滞后于此后建立的连接。tool 调用始终检查调用方当前的凭据。
+
+### 当调用方是用户时
+
+用户可以连接自己的账号，因此调用会返回登录链接：
+
+- **支持 URL elicitation 的 client**：在协议 `2026-07-28` 上，声明了 `elicitation.url` 能力的 client 会收到 `input_required` 结果，其中为每个需要连接的 server 提供一个链接。client 会将链接展示给用户。用户完成连接后，调用继续。
+- **其他所有 client**：调用返回 `428`。打开响应体中的每个 `verification_url`，完成连接，然后重新发送调用。
+
+`428` 响应体因 endpoint 而异。tool kit 或 me kit 返回 `credentials` 数组，因为一次调用可能需要多个 server：
+
+```json
+{
+  "status": 428,
+  "detail": "Authorize the linked servers, then retry the MCP request",
+  "credentials": [
+    {
+      "kind": "oauth",
+      "slug": "mt-<server-id>",
+      "display_name": "Linear",
+      "verification_url": "<sign-in-url>",
+      "auth_id": "<auth-id>"
+    }
+  ]
+}
+```
+
+单个 server 的 endpoint 会将其唯一凭据的相同字段返回在顶层，不含 `credentials` 数组：
+
+```json
+{
+  "status": 428,
+  "kind": "oauth",
+  "slug": "mt-<server-id>",
+  "display_name": "Linear",
+  "verification_url": "<sign-in-url>",
+  "auth_id": "<auth-id>"
+}
+```
+
+对于使用 OAuth 登录的 server，`kind` 为 `oauth`；对于期望 API key 的 server，`kind` 为 `secret`。该链接会打开一个页面，用户在其中登录或输入 key。对于 OAuth，它可能直接跳转到服务自身的登录页面。只应由调用方打开该链接：谁登录，谁的账号就会关联到调用方。
+
+### 当调用方是 agent 或 profile 时
+
+agent 或 [profile](/langsmith/tool-gateway-connect-accounts#connect-an-account-for-a-profile) 无法连接自己的凭据，因为没有人可以执行登录。调用会返回 `409`，其 `credentials` 数组与 `428` 相同，但不含登录链接。workspace 管理员必须为 agent 或 profile 连接凭据，之后 agent 才能重试。请参见[连接账号](/langsmith/tool-gateway-connect-accounts)。
+
+## 审批 tool 调用
+
+[审批策略](/langsmith/tool-gateway-policies)会暂停每个匹配的调用，直到调用方批准。审批来自使用 MCP client 的人，而不是独立的审核者。请用它来在执行前确认调用，而不是将调用路由给管理员。
+
+在协议 `2026-07-28` 上，支持 form elicitation 的 client 会显示审批表单。表单会列出 tool、其 server、要求审批的策略以及调用的参数。
+
+- **Accept**：调用执行。
+- **Decline** 或 **Cancel**：调用不执行。结果为 tool 错误，文本为 "The user declined this tool call, so it did not run."
+
+无法显示表单的 client（包括任何使用更早协议版本的请求）会收到 `403`，且调用不执行。要调用该 tool，请使用支持 form elicitation 的 client，或请组织管理员更改策略。
+
+拒绝策略会以 `403` 和 `"code": "tool_call_blocked"` 阻止调用。Tool Gateway 因调用不安全而阻止时也会返回相同响应，因此响应不会说明是哪一个阻止了调用。请匹配 `code`，因为 `detail` 文本可能变化。被阻止的工具仍会出现在 tool 列表中。
+
+## 错误
+
+大多数错误响应是 JSON problem details。`detail` 字段说明出了什么问题，`remedy`（若存在）说明下一步该做什么。有两种错误使用其他响应体：身份验证失败可能返回 `{"error": "Unauthorized"}`，而缺失或不匹配的 `Mcp-Method` 或 `Mcp-Name` 请求头会返回 JSON-RPC 错误。
+
+| 状态码 | 含义 | 处理方式 |
+|--------|---------|------------|
+| `400` | 请求格式错误：例如 JSON-RPC 批量请求、`mode` 不是 `search`，或在协议 `2026-07-28` 上缺少 `Mcp-Method` 或 `Mcp-Name` 请求头。 | 每次请求只发送一条 JSON-RPC 消息，检查查询字符串，并检查请求头。 |
+| `401` | 身份验证缺失或无效。 | 检查 API key 和 `X-Tenant-Id`。 |
+| `403` | 拒绝策略阻止了调用、审批策略需要能显示表单的 client、workspace 管理员关闭了该 server，或调用方缺少权限。 | 阅读 `detail`。关于策略，请参见[审批 tool 调用](#approve-a-tool-call)。 |
+| `404` | tool kit、server 或 profile 不存在，或调用方看不到它。 | 检查 URL 中的 ID 或 `X-LangSmith-Profile` 请求头。 |
+| `409` | agent 或 profile 没有该调用所需的某个 server 的凭据。 | 请 workspace 管理员[连接它](/langsmith/tool-gateway-connect-accounts)。 |
+| `413` | 请求体大于 1 MB。 | 发送更小的请求。 |
+| `428` | 用户尚未连接该调用所需的某个 server。 | 打开每个 `verification_url`，完成连接，然后重试。请参见[当调用方是用户时](#when-the-caller-is-a-user)。 |
+| `429` | workspace 达到了请求速率限制，或某个按量计费的内置 server 达到了月度上限。 | 等待 `Retry-After` 请求头中指定的秒数，然后重试。 |
+| `502` | MCP server 不可达或返回了错误。 | 检查 server 的 URL 是否正确以及服务是否正常。 |
+| `503` | tool 调用暂时不可用。 | 稍后重试。 |
+| `504` | MCP server 未在 60 秒内开始响应。 | 重试，或检查服务的状态。 |
+
+单个 server 的 endpoint 会将 MCP server 返回的其他状态码原样透传。关于请求、响应和速率限制，请参见[限制](/langsmith/tool-gateway-how-it-works#limits)。
+
+## 另请参阅
+
+- [连接 MCP client](/langsmith/tool-gateway-clients)
+- [以用户和 agent 身份调用](/langsmith/tool-gateway-identity)
+- [连接账号](/langsmith/tool-gateway-connect-accounts)
+- [设置策略](/langsmith/tool-gateway-policies)
+- [Tool Gateway 的工作方式](/langsmith/tool-gateway-how-it-works)

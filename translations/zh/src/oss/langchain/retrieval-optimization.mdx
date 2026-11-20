@@ -1,0 +1,476 @@
+---
+title: 提升检索质量
+description: 在 LangChain 中通过元数据过滤、查询转换、混合搜索、最大边际相关性和重排来提升 RAG 的检索质量。
+---
+
+检索质量为 [RAG](/oss/deepagents/retrieval) 应用设定了上限：模型只能基于它收到的上下文来回答。当回答不完整或错误时，问题往往出在检索器而不是模型。本指南介绍提升检索器返回结果质量的方法，从低成本的配置改动到两阶段重排流水线。
+
+每种方法都会修改下面基线检索工具的函数体。按需组合使用，并在固定数据集上衡量每项改动，以便保留确实有效的部分。
+
+<Tip>
+用 [LangSmith](https://smith.langchain.com) 为这些实验打分。[RAG 评估教程](/langsmith/evaluate-rag-tutorial)展示了如何衡量检索质量和回答质量。
+</Tip>
+
+## 开始之前
+
+本指南假设你已经有一个建好索引的 `vector_store`，并把检索作为 [tool](/oss/langchain/tools) 暴露给 agent。有关索引的内容，请参阅[构建语义搜索引擎](/oss/langchain/knowledge-base)。
+
+基线检索工具执行一次相似度搜索：
+
+:::python
+```python
+from langchain.tools import tool
+
+
+@tool(response_format="content_and_artifact")
+def retrieve(query: str):
+    """Retrieve information related to a query."""
+    docs = vector_store.similarity_search(query, k=4)
+    serialized = "\n\n".join(
+        f"Source: {doc.metadata}\nContent: {doc.page_content}" for doc in docs
+    )
+    return serialized, docs
+```
+
+用 @[create_agent] 把该工具传给 agent：
+
+```python
+from langchain.agents import create_agent
+
+agent = create_agent("claude-sonnet-4-6", [retrieve])
+```
+:::
+
+:::js
+```typescript
+import * as z from "zod";
+import { tool } from "@langchain/core/tools";
+
+const retrieve = tool(
+  async ({ query }) => {
+    const docs = await vectorStore.similaritySearch(query, 4);
+    const serialized = docs
+      .map((doc) => `Source: ${doc.metadata.source}\nContent: ${doc.pageContent}`)
+      .join("\n\n");
+    return [serialized, docs];
+  },
+  {
+    name: "retrieve",
+    description: "Retrieve information related to a query.",
+    schema: z.object({ query: z.string() }),
+    responseFormat: "content_and_artifact",
+  },
+);
+```
+
+用 @[createAgent] 把该工具传给 agent：
+
+```typescript
+import { createAgent } from "langchain";
+
+const agent = createAgent({ model: "claude-sonnet-4-6", tools: [retrieve] });
+```
+:::
+
+## 选择一种方法
+
+从与你观察到的失败情况相匹配的方法开始，再按需叠加其他方法。对大多数应用而言，重排带来的收益最大，并且能很好地与宽泛的第一阶段检索配合。
+
+| 症状 | 方法 |
+|---------|-----------|
+| 结果来自错误的子集（租户、日期或类别不对） | [按元数据过滤](#filter-by-metadata) |
+| 相关文档的表述与问题不同时被漏检 | [转换查询](#transform-the-query) |
+| 精确的名称、编码或罕见关键词被漏检 | [结合语义搜索与关键词搜索](#combine-semantic-and-keyword-search) |
+| 多个近似重复的 chunk 挤掉了其他信息 | [用最大边际相关性让结果多样化](#diversify-results-with-maximal-marginal-relevance) |
+| 结果大致相关，但排序很差 | [重排检索到的文档](#rerank-retrieved-documents) |
+
+一条常见的高质量流水线会组合多种方法：先过滤到正确的范围，再用混合搜索检索一批宽泛的候选集，然后重排到一小批高精度结果。上线前，请在数据集上用 [LangSmith 评估](/langsmith/evaluate-rag-tutorial)验证这种组合。
+
+下面各节都会修改基线工具的函数体。每一节都是独立的，因此只需采用能解决你实际观察到的那些问题的部分。
+
+## 按元数据过滤
+
+元数据过滤会在运行相似度搜索之前把搜索范围限制到文档的一个子集。它通过缩小候选集来提高精确率并降低延迟，也是把检索限定到某个租户、某个日期范围、某个类别或某个章节的最可靠方式。
+
+过滤要求你在索引时为每个 chunk 附加元数据。当范围固定时，应用静态过滤：
+
+:::python
+```python
+docs = vector_store.similarity_search(
+    query,
+    k=4,
+    filter={"section": "introduction"},  # [!code highlight]
+)
+```
+:::
+
+:::js
+```typescript
+const docs = await vectorStore.similaritySearch(query, 4, {
+  section: "introduction",  // [!code highlight]
+});
+```
+:::
+
+要让模型自己选择范围，可以把过滤器暴露为工具参数。模型会从对话中填充它：
+
+:::python
+```python
+from typing import Literal
+
+from langchain.tools import tool
+
+
+@tool(response_format="content_and_artifact")
+def retrieve(query: str, section: Literal["introduction", "methods", "results"]):
+    """Retrieve information from a specific section of the document."""
+    docs = vector_store.similarity_search(query, k=4, filter={"section": section})
+    serialized = "\n\n".join(
+        f"Source: {doc.metadata}\nContent: {doc.page_content}" for doc in docs
+    )
+    return serialized, docs
+```
+:::
+
+:::js
+```typescript
+import * as z from "zod";
+import { tool } from "@langchain/core/tools";
+
+const retrieve = tool(
+  async ({ query, section }) => {
+    const docs = await vectorStore.similaritySearch(query, 4, { section });
+    const serialized = docs
+      .map((doc) => `Source: ${doc.metadata.source}\nContent: ${doc.pageContent}`)
+      .join("\n\n");
+    return [serialized, docs];
+  },
+  {
+    name: "retrieve",
+    description: "Retrieve information from a specific section of the document.",
+    schema: z.object({
+      query: z.string(),
+      section: z.enum(["introduction", "methods", "results"]),
+    }),
+    responseFormat: "content_and_artifact",
+  },
+);
+```
+:::
+
+<Note>
+过滤语法因 vector store 而异。这里展示的字典形式适用于大多数生产级 store，例如 Pinecone 和 PGVector。包括 `InMemoryVectorStore` 在内的一些 store 则接收谓词函数。详情请参阅你的 [vector store 集成](/oss/integrations/vectorstores)。
+</Note>
+
+## 转换查询
+
+用户的问题并不总是一个好的搜索查询。它可能含糊、口语化，或者包含多个不同的信息需求。在检索之前把问题转换成一个或多个聚焦的查询，可以提升召回率。
+
+用[结构化输出](/oss/langchain/structured-output)生成聚焦的查询，对每个查询分别执行搜索，然后合并结果：
+
+:::python
+```python
+from langchain.chat_models import init_chat_model
+from pydantic import BaseModel, Field
+
+
+class SearchQueries(BaseModel):
+    """Focused search queries derived from a user question."""
+
+    queries: list[str] = Field(description="One to three search queries.")
+
+
+query_model = init_chat_model("claude-sonnet-4-6").with_structured_output(SearchQueries)
+
+
+def expand_query(question: str) -> list[str]:
+    result = query_model.invoke(
+        f"Generate one to three focused search queries for: {question}"
+    )
+    return result.queries
+```
+
+对每个生成的查询执行检索，并对结果去重：
+
+```python
+from langchain.tools import tool
+
+
+@tool(response_format="content_and_artifact")
+def retrieve(query: str):
+    """Retrieve information related to a query."""
+    seen, docs = set(), []
+    for expanded in expand_query(query):
+        for doc in vector_store.similarity_search(expanded, k=4):
+            if doc.page_content not in seen:
+                seen.add(doc.page_content)
+                docs.append(doc)
+    serialized = "\n\n".join(
+        f"Source: {doc.metadata}\nContent: {doc.page_content}" for doc in docs
+    )
+    return serialized, docs
+```
+:::
+
+:::js
+```typescript
+import * as z from "zod";
+import { ChatAnthropic } from "@langchain/anthropic";
+
+const SearchQueries = z.object({
+  queries: z.array(z.string()).describe("One to three search queries."),
+});
+
+const queryModel = new ChatAnthropic({ model: "claude-sonnet-4-6" }).withStructuredOutput(
+  SearchQueries,
+);
+
+async function expandQuery(question: string): Promise<string[]> {
+  const result = await queryModel.invoke(
+    `Generate one to three focused search queries for: ${question}`,
+  );
+  return result.queries;
+}
+```
+
+对每个生成的查询执行检索，并对结果去重：
+
+```typescript
+import { tool } from "@langchain/core/tools";
+
+const retrieve = tool(
+  async ({ query }) => {
+    const seen = new Set<string>();
+    const docs = [];
+    for (const expanded of await expandQuery(query)) {
+      for (const doc of await vectorStore.similaritySearch(expanded, 4)) {
+        if (!seen.has(doc.pageContent)) {
+          seen.add(doc.pageContent);
+          docs.push(doc);
+        }
+      }
+    }
+    const serialized = docs
+      .map((doc) => `Source: ${doc.metadata.source}\nContent: ${doc.pageContent}`)
+      .join("\n\n");
+    return [serialized, docs];
+  },
+  {
+    name: "retrieve",
+    description: "Retrieve information related to a query.",
+    schema: z.object({ query: z.string() }),
+    responseFormat: "content_and_artifact",
+  },
+);
+```
+:::
+
+<Tip>
+agent 本身已经在某种程度上改写查询：它会根据对话决定要搜索什么。当你每轮只检索一次时（例如在两步 RAG 链中），或者当单次搜索会漏掉相关文档时，查询转换最有价值。
+</Tip>
+
+## 结合语义搜索与关键词搜索
+
+语义（稠密）搜索匹配的是含义，但可能漏掉精确的产品编码、标识符、名称和罕见关键词。关键词（稀疏）搜索则精确匹配这些词项。混合搜索会同时运行两者并合并排名，对于把概念与特定词项混在一起的查询，可以提升召回率。
+
+<Note>
+许多 vector store 集成原生支持混合搜索，这是处理大型语料库最高效的选择。请参阅你的 [vector store 集成](/oss/integrations/vectorstores)以启用它，然后在检索工具内请求混合搜索结果。
+</Note>
+
+:::python
+要自己组合检索器，可以把 vector store 与关键词检索器（例如 [`BM25Retriever`](/oss/integrations/retrievers)）配对，并用倒数排名融合（reciprocal rank fusion）合并两个排名。`BM25Retriever` 需要 `rank_bm25` 包，并会基于同一批 chunk 构建内存索引：
+
+```python
+from langchain.tools import tool
+from langchain_community.retrievers import BM25Retriever
+
+keyword_retriever = BM25Retriever.from_documents(chunks)
+keyword_retriever.k = 10
+
+
+def reciprocal_rank_fusion(result_lists, smoothing=60):
+    scores, docs_by_key = {}, {}
+    for docs in result_lists:
+        for rank, doc in enumerate(docs):
+            key = doc.page_content
+            docs_by_key[key] = doc
+            scores[key] = scores.get(key, 0) + 1 / (smoothing + rank)
+    ranked = sorted(scores, key=scores.get, reverse=True)
+    return [docs_by_key[key] for key in ranked]
+
+
+@tool(response_format="content_and_artifact")
+def retrieve(query: str):
+    """Retrieve information related to a query."""
+    dense = vector_store.similarity_search(query, k=10)
+    sparse = keyword_retriever.invoke(query)
+    docs = reciprocal_rank_fusion([dense, sparse])[:4]
+    serialized = "\n\n".join(
+        f"Source: {doc.metadata}\nContent: {doc.page_content}" for doc in docs
+    )
+    return serialized, docs
+```
+:::
+
+:::js
+没有第一方的 BM25 检索器。如果可用，优先使用你的 [vector store](/oss/integrations/vectorstores) 原生提供的混合搜索。对于可移植的兜底方案，可以在构建该 store 所用的同一批 `chunks` 上执行关键词搜索（示例使用简单的词项重叠；请将其替换为你所用 store 的关键词 API 或某个 BM25 库），然后用倒数排名融合合并排名：
+
+```typescript
+import * as z from "zod";
+import type { Document } from "@langchain/core/documents";
+import { tool } from "@langchain/core/tools";
+
+function keywordSearch(query: string, k = 10): Document[] {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  return chunks
+    .map((doc) => ({
+      doc,
+      score: terms.reduce(
+        (acc, term) => acc + (doc.pageContent.toLowerCase().includes(term) ? 1 : 0),
+        0,
+      ),
+    }))
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, k)
+    .map(({ doc }) => doc);
+}
+
+function reciprocalRankFusion(resultLists: Document[][], smoothing = 60): Document[] {
+  const scores = new Map<string, number>();
+  const docsByKey = new Map<string, Document>();
+  for (const docs of resultLists) {
+    docs.forEach((doc, rank) => {
+      const key = doc.pageContent;
+      docsByKey.set(key, doc);
+      scores.set(key, (scores.get(key) ?? 0) + 1 / (smoothing + rank));
+    });
+  }
+  return [...scores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([key]) => docsByKey.get(key)!);
+}
+
+const retrieve = tool(
+  async ({ query }) => {
+    const dense = await vectorStore.similaritySearch(query, 10);
+    const sparse = keywordSearch(query, 10);
+    const docs = reciprocalRankFusion([dense, sparse]).slice(0, 4);
+    const serialized = docs
+      .map((doc) => `Source: ${doc.metadata.source}\nContent: ${doc.pageContent}`)
+      .join("\n\n");
+    return [serialized, docs];
+  },
+  {
+    name: "retrieve",
+    description: "Retrieve information related to a query.",
+    schema: z.object({ query: z.string() }),
+    responseFormat: "content_and_artifact",
+  },
+);
+```
+:::
+
+## 用最大边际相关性让结果多样化
+
+普通的相似度搜索可能返回多个近似重复的 chunk，从而把上下文浪费在重复信息上。最大边际相关性（maximal marginal relevance，MMR）会选择既与查询相关、彼此之间又足够多样的结果。
+
+用 vector store 的最大边际相关性搜索替代 `similarity_search`：
+
+:::python
+```python
+docs = vector_store.max_marginal_relevance_search(
+    query,
+    k=4,  # number of documents to return
+    fetch_k=20,  # number of candidates to consider before selecting
+    lambda_mult=0.5,  # 1.0 favors relevance, 0.0 favors diversity
+)
+```
+:::
+
+:::js
+```typescript
+const docs = await vectorStore.maxMarginalRelevanceSearch(query, {
+  k: 4, // number of documents to return
+  fetchK: 20, // number of candidates to consider before selecting
+  lambda: 0.5, // 1.0 favors relevance, 0.0 favors diversity
+});
+```
+:::
+
+MMR 会按相似度取回 `fetch_k` 个候选，然后从中挑选 `k` 个在相关性与冗余度之间取得平衡的结果。并非所有 vector store 都实现了 MMR；请查看你的 [vector store 集成](/oss/integrations/vectorstores)。
+
+## 重排检索到的文档
+
+Embedding 相似度是一种粗糙的相关性信号，因此按相似度排在最前的结果不一定最相关。重排器会直接针对查询为每个候选打分并重新排序，这通常能带来单项最大的质量提升。采用两阶段检索：先用相似度搜索取回一批宽泛的候选集，再重排到一小批高精度结果。
+
+:::python
+在工具内调用重排器。本示例使用 [`CohereRerank`](/oss/integrations/retrievers/cohere-reranker)：
+
+```python
+from langchain.tools import tool
+from langchain_cohere import CohereRerank
+
+reranker = CohereRerank(model="rerank-v5.0-pro", top_n=4)
+
+
+@tool(response_format="content_and_artifact")
+def retrieve(query: str):
+    """Retrieve information related to a query."""
+    candidates = vector_store.similarity_search(query, k=20)  # [!code highlight]
+    docs = reranker.compress_documents(candidates, query)  # [!code highlight]
+    serialized = "\n\n".join(
+        f"Source: {doc.metadata}\nContent: {doc.page_content}" for doc in docs
+    )
+    return serialized, docs
+```
+:::
+
+:::js
+在工具内调用重排器。本示例使用来自 `@langchain/cohere` 的 `CohereRerank`：
+
+```typescript
+import { tool } from "@langchain/core/tools";
+import { CohereRerank } from "@langchain/cohere";
+
+const reranker = new CohereRerank({ model: "rerank-v5.0-pro", topN: 4 });
+
+const retrieve = tool(
+  async ({ query }) => {
+    const candidates = await vectorStore.similaritySearch(query, 20);
+    const docs = await reranker.compressDocuments(candidates, query);
+    const serialized = docs
+      .map((doc) => `Source: ${doc.metadata.source}\nContent: ${doc.pageContent}`)
+      .join("\n\n");
+    return [serialized, docs];
+  },
+  {
+    name: "retrieve",
+    description: "Retrieve information related to a query.",
+    schema: z.object({ query: z.string() }),
+    responseFormat: "content_and_artifact",
+  },
+);
+```
+:::
+
+:::python
+<Note>
+重排会多出一步，而托管式重排器每次检索都会增加一次 API 调用，从而增加延迟。在大多数 RAG 应用中，质量提升值得这点成本。若需要不调用 API 的本地方案，可以使用 [cross-encoder 重排器](/oss/integrations/document_transformers/cross_encoder_reranker)。其他托管方案包括 [Voyage AI](/oss/integrations/document_transformers/voyageai-reranker)。
+</Note>
+:::
+
+:::js
+<Note>
+重排会多出一步，而托管式重排器每次检索都会增加一次 API 调用，从而增加延迟。在大多数 RAG 应用中，质量提升值得这点成本。有关设置，请参阅 [Cohere 重排器集成](/oss/integrations/document_compressors/cohere_rerank)，或查看你所需的[检索器集成](/oss/integrations/retrievers)以了解其他方案。
+</Note>
+:::
+
+## 另请参阅
+
+- [检索](/oss/deepagents/retrieval)：概念与 RAG 架构
+- [构建语义搜索引擎](/oss/langchain/knowledge-base)：把文档索引到 vector store
+- [使用 Deep Agents 做 RAG](/oss/deepagents/rag)：用 Deep Agents 完成端到端检索与生成
+- [用 LangGraph 构建自定义 RAG agent](/oss/langgraph/agentic-rag)：用自定义图对文档打分并改写查询
+- [评估 RAG 应用](/langsmith/evaluate-rag-tutorial)：衡量检索质量和回答质量
+- [检索器集成](/oss/integrations/retrievers)与 [vector store 集成](/oss/integrations/vectorstores)

@@ -1,0 +1,266 @@
+---
+title: "Google Gemini Decisions 集成"
+sidebarTitle: "Google Gemini Decisions"
+description: "使用 LangChain JavaScript 集成 GoogleClassifier 决策模型。"
+---
+
+[Gemini Decisions API](https://aistudio.google.com/docs/decisions-api) 可读取文本、结构化 JSON 和媒体，并返回类型化答案和概率，而不是生成的文本。
+
+`GoogleClassifier` 将这些决策暴露为 LangChain `Runnable`，因此你可以调用、批处理它们，或将其与其他 runnable 组合。它接受字符串、JSON 对象和数组、[LangChain 消息对象](/oss/langchain/messages) 以及标准媒体块，并在 LangSmith 中记录 trace 和 token 用量。你也可以将其与 [agent middleware](#agent-middleware) 配合使用，以路由模型并为工具调用设置门控。它适用于聚焦型决策，例如路由请求、标记内容以供审核，或评定严重程度，在这类场景中，应用程序代码会根据概率或置信度采取行动。
+
+<Note>
+`GoogleClassifier` 处于实验阶段，需要 `@langchain/google` 0.2.16 或更高版本以及 `@langchain/core` 1.4.2 或更高版本。其 API 可能在不另行通知的情况下发生变化。
+</Note>
+
+## 设置
+
+<CodeGroup>
+```bash npm
+npm install @langchain/google @langchain/core
+```
+
+```bash yarn
+yarn add @langchain/google @langchain/core
+```
+
+```bash pnpm
+pnpm add @langchain/google @langchain/core
+```
+</CodeGroup>
+
+在 [Google AI Studio](https://aistudio.google.com/apikey) 中创建 API key 并导出它：
+
+```bash
+export GOOGLE_API_KEY=...
+```
+
+`GoogleClassifier` 读取 `GOOGLE_API_KEY`。请使用 Gemini Developer API（Google AI Studio）。
+
+## 快速开始
+
+使用 decisions 模型创建 `GoogleClassifier`，然后在每次调用中一并传入 state 和具名问题。共享同一 state 的问题会在一次请求中得到回答：
+
+```typescript
+import { GoogleClassifier } from "@langchain/google";
+
+const classifier = new GoogleClassifier("gemini-decision-1");
+
+const response = await classifier.invoke({
+  state: "The blue mug I ordered arrived cracked. Fix this today!",
+  questions: {
+    damaged: {
+      type: "noul",
+      instructions: "Did the item arrive damaged?",
+      criteria: { true: "The item is broken, cracked, or dented." },
+    },
+    department: {
+      type: "choice",
+      instructions: "Which team should handle this request?",
+      criteria: {
+        billing: "Payment or refund questions.",
+        shipping: "Delivery problems or damaged items.",
+        other: null,
+      },
+    },
+    frustration: {
+      type: "score",
+      instructions: "How frustrated does the customer appear?",
+      criteria: ["Calm.", "Concerned but civil.", "Very angry."],
+    },
+  },
+});
+
+console.log(response.nouls.damaged.noul);
+console.log(response.choices.department.choice, response.choices.department.confidence);
+console.log(response.scores.frustration.score);
+```
+
+答案以你提供的问题名称为键，并按类型分组到 `nouls`、`choices` 和 `scores` 中。所有答案也都可以在 `answers` 上获取。答案类型由问题推断而来，因此 `response.choices.department.choice` 的类型为 `"billing" | "shipping" | "other"`。响应中包含作答的 `model` 以及 `usage_metadata` 中的 token 用量。
+
+问题和响应类型（例如 `Noul` 和 `ClassifierResponse`）来自 `@langchain/core/decisions`。
+
+每个问题都需要 `instructions`。即使问题名称看起来不言自明，也要在其中写出完整的问题。
+
+## 问题类型
+
+每个问题属于以下三种类型之一：
+
+| 类型 | 说明 |
+|---|---|
+| `noul` | **询问**：这是真的吗？<br></br>**返回**：`noul`，即回答“是”的概率，介于 `0.01` 和 `0.99` 之间，因此高于 `0.99` 的阈值永远不会匹配。接近 `0.5` 的值表示不确定，而不是“中等”，因此若要表示一个谱系，请使用 `score`。当仅凭 instructions 仍留有解释空间时，传入包含 `true` 和 `false` 描述的 `criteria`。`noul` 答案没有 `confidence`，因为概率本身就是答案。<br></br>**适用场景**：你的代码基于 `if` 分支。 |
+| `choice` | **询问**：这些选项中哪一个？<br></br>**返回**：`choice`，以及 `probabilities` 和 `confidence`。将每个标签映射到一个描述，或在标签无需描述时映射到 `null`。一个 `choice` 至少需要两个标签。当你的选项可能无法覆盖所有输入时，加入一个 `other` 标签。使用你应用中的带标签示例来设置阈值。<br></br>**适用场景**：选项对应不同的代码路径。 |
+| `score` | **询问**：哪个级别？<br></br>**返回**：`score`，以及 `legend`、`probabilities` 和 `confidence`。接受两个或更多级别，从低到高排序，并从 `0` 开始索引。返回的 `score` 是级别索引的概率加权平均值，因此它可能落在级别之间，而 `legend` 会将每个索引映射到你提供的级别。<br></br>**适用场景**：答案是可与阈值比较的谱系。 |
+
+描述、criteria 和 instructions 可以是文本或结构化 JSON。JSON 内容会以 JSON 文本发送。Decisions API 在问题中只接受文本，因此 `instructions` 中的媒体块会抛出 `InvalidInputError`。
+
+`@langchain/core/decisions` 还定义了一种 `box` 问题类型，用于在图像中定位对象。Gemini Decisions API 不支持它，对于包含该类型的请求，`GoogleClassifier` 会抛出 `InvalidInputError`。
+
+## 状态
+
+`state` 可以是字符串、JSON 对象或数组、LangChain 消息，或标准媒体块：
+
+- **字符串**：按原样发送。
+- **JSON 对象和数组**：以 JSON 文本发送。嵌套在其中的 LangChain 消息会转换为文本记录。
+- **LangChain 消息**：转换为文本，每条消息一个条目，每个条目以其角色开头（例如 `user:` 或 `assistant:`）。消息内的媒体块会作为原生媒体发送。
+- **媒体块**：带有 base64 `data` 或 URL 的标准 `image`、`audio`、`video` 和 `file` 块，当它们出现在 `state` 根层级、作为根 `state` 数组的元素，或位于根消息内时，会作为原生媒体发送。嵌套在 JSON 对象内的媒体会抛出 `InvalidInputError`。
+
+要对一段对话进行分类，请将消息作为 state 传入：
+
+```typescript
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+
+const response = await classifier.invoke({
+  state: [
+    new HumanMessage("Where is my order?"),
+    new AIMessage("It was delivered yesterday."),
+    new HumanMessage("It arrived smashed to pieces."),
+  ],
+  questions: {
+    damaged: { type: "noul", instructions: "Did the item arrive damaged?" },
+  },
+});
+```
+
+要对图像进行分类，请在根 `state` 数组中包含一个标准媒体块。将 `delivery.jpg` 替换为你的图像路径：
+
+```typescript
+import { readFile } from "node:fs/promises";
+
+const imageData = (await readFile("delivery.jpg")).toString("base64");
+
+const response = await classifier.invoke({
+  state: [
+    "Photo of the delivered item.",
+    { type: "image", data: imageData, mimeType: "image/jpeg" },
+  ],
+  questions: {
+    damaged: { type: "noul", instructions: "Did the item arrive damaged?" },
+  },
+});
+```
+
+## 配置
+
+将模型名称作为第一个参数传入，将选项作为第二个参数传入，或者传入一个包含 `model` 的单一对象：
+
+| 参数 | 说明 |
+|---|---|
+| `model` | Decisions 模型名称，例如 `gemini-decision-1`。必填。 |
+| `apiKey` | Google API key。默认为 `GOOGLE_API_KEY`。 |
+| `endpoint` | API 主机或 base URL 覆盖项。 |
+| `apiVersion` | API 版本路径段。默认为 `v1beta`。 |
+| `mediaResolution` | 未自行设置分辨率的图像和视频块的默认分辨率：`"low"`、`"medium"`、`"high"` 或 `"ultra_high"`（仅图像）。 |
+| `detail` | `mediaResolution` 的 OpenAI 风格别名：`"auto"`、`"low"` 或 `"high"`。当两者都设置时，`mediaResolution` 优先。 |
+| `customHeaders` | 随每个请求发送的额外 HTTP 头。 |
+| `maxRetries` | 失败请求的最大重试次数。默认为 `6`。 |
+| `maxConcurrency` | 同时进行中的最大请求数。默认无限制。 |
+
+要通过 Application Default Credentials 或 `googleAuthOptions` 而不是 API key 进行身份验证，请从 `@langchain/google/node` 导入 `GoogleClassifier`。
+
+## 错误
+
+- **`ConfigurationError`**：当模型名称缺失或为空时抛出。
+- **`AuthError`**：当没有可用的 `apiKey` 或 `GOOGLE_API_KEY` 时抛出（并且 Node 入口点未配置凭据）。
+- **`InvalidInputError`**：当请求包含 `box` 问题、问题 instructions 包含媒体块，或媒体块嵌套在 `state` 中的 JSON 对象内时抛出。
+- **`PromptRefusedError`**：当 API 出于安全原因阻止输入时抛出。消息中会包含阻止原因。可使用 `@langchain/core/errors` 中的 `ModelRefusalError.isInstance(error)` 来检查。
+
+## Agent middleware
+
+`langchain` 包包含两个 beta middleware，它们在 agent 的决策点使用 decision 模型。将 `GoogleClassifier` 作为它们的 `classifier` 传入。两者都需要 `langchain` 1.6.5 或更高版本：
+
+<CodeGroup>
+```bash npm
+npm install langchain @langchain/google @langchain/core
+```
+
+```bash yarn
+yarn add langchain @langchain/google @langchain/core
+```
+
+```bash pnpm
+pnpm add langchain @langchain/google @langchain/core
+```
+</CodeGroup>
+
+### 路由模型
+
+`modelRouterMiddleware` 会根据最新的人类消息，为每次 agent 运行从你命名的模型中选择一个，并将完整的 `choice` 答案以 `modelRoute` 存储到 agent state 中：
+
+```typescript
+import { GoogleClassifier } from "@langchain/google";
+import { createAgent, modelRouterMiddleware } from "langchain";
+
+const router = modelRouterMiddleware({
+  choices: {
+    fast: {
+      model: "google:gemini-4-hydrogen",
+      criteria: "Simple, well-scoped tasks.",
+    },
+    powerful: {
+      model: "google:gemini-4-carbon",
+      criteria: "Complex tasks that need deeper reasoning.",
+    },
+  },
+  instructions: "Choose the least costly model that can complete the task.",
+  classifier: new GoogleClassifier("gemini-decision-1"),
+});
+
+const agent = createAgent({
+  model: "google:gemini-4-hydrogen",
+  middleware: [router],
+});
+
+const result = await agent.invoke({
+  messages: [{ role: "user", content: "What is 2 + 2?" }],
+});
+console.log(result.modelRoute?.choice);
+```
+
+### 为工具调用设置门控
+
+`autoModeMiddleware` 会在你列出的工具每次运行之前检查其调用。它会向分类器询问该调用存在风险或授权不足的概率，并阻止概率达到或超过 `0.5` 的调用：
+
+```typescript
+import { GoogleClassifier } from "@langchain/google";
+import { autoModeMiddleware, createAgent, tool } from "langchain";
+import { z } from "zod";
+
+const deleteFile = tool(async ({ path }) => `Deleted ${path}.`, {
+  name: "delete_file",
+  description: "Delete a file.",
+  schema: z.object({ path: z.string() }),
+});
+
+const agent = createAgent({
+  model: "google:gemini-4-hydrogen",
+  tools: [deleteFile],
+  middleware: [
+    autoModeMiddleware({
+      tools: [deleteFile],
+      criteria: {
+        true: "The call writes, deletes, publishes, or changes access.",
+        false: "The call only reads public or user-provided data.",
+      },
+      classifier: new GoogleClassifier("gemini-decision-1"),
+    }),
+  ],
+});
+
+const result = await agent.invoke({
+  messages: [{ role: "user", content: "Delete notes.txt." }],
+});
+console.log(result.messages.at(-1)?.text);
+```
+
+使用这些 `criteria` 时，删除文件会被视为有风险，因此 middleware 会返回一条错误 `ToolMessage`，而不是运行该工具，agent 会报告该调用已被阻止。如果没有 `criteria`，默认 instructions 会允许用户明确请求的调用，因此同一请求会运行该工具。未在 `tools` 中列出的工具会不经分类直接运行。
+
+## 追踪
+
+`GoogleClassifier` 运行会在 [LangSmith](/langsmith/observability) 中以 `google` provider 和模型名称进行追踪，因此你可以与应用的其他部分一起检查决策和 token 用量。
+
+## 另请参阅
+
+- [Gemini Decisions API 指南](https://aistudio.google.com/docs/decisions-api)
+- [Google provider 概览](/oss/integrations/providers/google)
+- [ChatGoogle](/oss/integrations/chat/google)
+- [内置 middleware](/oss/langchain/middleware/built-in)

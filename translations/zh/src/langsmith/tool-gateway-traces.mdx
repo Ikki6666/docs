@@ -1,0 +1,206 @@
+---
+title: Tool Gateway 的 traces 与审计日志
+sidebarTitle: Traces 与审计日志
+description: 为每次 Tool Gateway 工具调用记录一条 trace，并在组织的审计日志中查看工具调用和策略变更。
+---
+
+import ToolGatewayBetaNote from '/snippets/langsmith/tool-gateway-beta-note.mdx';
+
+<ToolGatewayBetaNote />
+
+[Tool Gateway](/langsmith/tool-gateway) 会在两个位置记录其工具调用。Traces 展示你的 agent 做了什么：运行了哪个工具、在哪个服务器上、以谁的身份，以及调用是如何结束的。[审计日志](/langsmith/audit-logs)展示谁调用了哪个工具、谁更改了策略，用于安全与合规审查。
+
+你可以通过两种方式记录 traces，二者可以任选其一或同时使用：
+
+- **在 agent 的 trace 中**：每次工具调用都会作为子 run 出现在发起该调用的 agent run 之下。你的 agent 在每次调用时发送 LangSmith tracing 请求头。请参阅[在 agent run 下嵌套工具调用](#nest-tool-calls-under-your-agent-run)。
+- **在工作区中**：工作区中的每次工具调用都会在同一个项目中成为独立的 trace，无论由哪个客户端发起。由工作区管理员开启。请参阅[记录工作区中的每次工具调用](#record-every-tool-call-in-the-workspace)。
+
+## trace 记录的内容
+
+Tool Gateway 的 trace 记录的是调用的元数据，而不是发送给工具或由工具返回的数据。它绝不会包含工具参数或结果。
+
+每条 trace 记录：
+
+- **Tool**：工具在其服务器上的名称，例如 `save_issue`。
+- **Server**：该调用所到达的 MCP 服务器或内置服务器。
+- **Tool kit**：该调用经过的工具包（如果有）。
+- **Acting as**：该调用使用了谁的凭证：LangSmith 用户、由你的后端指定的最终用户、agent、profile 或工作区。
+- **Outcome**：调用是如何结束的。请参阅下表。
+- **Policies**：阻止该调用的策略（如果有）。请参阅[设置策略](/langsmith/tool-gateway-policies)。
+- **Timing**：调用在 Tool Gateway 中花费的总时间，以及 MCP 服务器开始响应所花费的时间。
+
+| 结果（UI） | `ls_tool_gateway_outcome` | 含义 |
+|--------------|---------------------------|---------|
+| **Success** | `success` | 工具已运行并返回结果。 |
+| **Tool error** | `tool_error` | 工具已运行并返回错误。 |
+| **Needs credential** | `credential_required` | 调用方必须先连接或重新连接该服务器，调用才能运行。请参阅[连接账户](/langsmith/tool-gateway-connect-accounts)。 |
+| **Failed** | `failed` | Tool Gateway 或 MCP 服务器无法完成该调用，例如服务器超时或返回服务器错误。 |
+| **Blocked by policy** | `failed`，且 `ls_tool_gateway_blocked` 设为 `true` | [阻止策略](/langsmith/tool-gateway-policies)阻止了该调用。 |
+
+要查找 Tool Gateway 的运行记录，请按以下元数据键进行筛选：
+
+- `ls_tool_gateway`：每条 Tool Gateway run 上均为 `true`。
+- `ls_tool_gateway_tool`：工具在其服务器上的名称。
+- `ls_tool_gateway_server_id`：服务器的 ID，或内置服务器的 key，例如 `parallel`。
+- `ls_tool_gateway_kit_id`：工具包的 ID。
+- `ls_tool_gateway_outcome`：上表中的一个结果值。请处理此处未列出的值，因为 Tool Gateway 可能会新增结果值。
+- `ls_tool_gateway_reason`：说明调用结束原因的简短标签，例如 `upstream_timeout` 或 `tool_call_blocked`。成功时为 `none`。
+- `ls_tool_gateway_blocked`：策略阻止了该调用时为 `true`。
+
+关于如何按元数据筛选 run，请参阅[筛选 traces](/langsmith/filter-traces-in-application)。
+
+## 在 agent run 下嵌套工具调用
+
+如果你在 LangSmith 中[对 agent 进行 tracing](/langsmith/observability-quickstart)，请在每次工具调用时发送该 agent 的 tracing 请求头。这样 Tool Gateway 会在发起该调用的 agent run 下添加一个名为 `Tool Gateway: <server name>` 的 run。该 run 会进入同一个项目，并带有 `tool_gateway` 标签。
+
+这些请求头是标准的 LangSmith [分布式 tracing](/langsmith/distributed-tracing) 请求头：
+
+- **`langsmith-trace`**：标识父 run。
+- **`baggage`**：携带父 run 的项目、元数据和标签。Tool Gateway 的 run 会继承父 run 的元数据和标签。
+
+请在每次工具调用时设置这些请求头，而不是在创建客户端时只设置一次，这样每次调用都会嵌套在发起它的 run 之下。
+
+Tool Gateway 使用发起调用的 API 密钥来写入该 run。该密钥必须能够向 agent 的项目写入 traces。仅通过身份提供商令牌完成身份验证的调用方不会以这种方式被 tracing。这种 tracing 方式不依赖于下一节中的工作区设置。
+
+### 使用 LangChain MCP 适配器
+
+使用 `langchain-mcp-adapters` 时，可在工具拦截器中添加这些请求头。这适用于任何基于 LangChain 构建的 agent，例如使用 @[create_agent]、Deep Agents 或 LangGraph 创建的 agent。
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from langchain.agents import create_agent
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langsmith.run_helpers import get_current_run_tree
+
+
+async def trace_headers(request, handler):
+    # Nest each Tool Gateway call under the tool run that made it.
+    run = get_current_run_tree()
+    if run:
+        request = request.override(
+            headers={**(request.headers or {}), **run.to_headers()}
+        )
+    return await handler(request)
+
+
+client = MultiServerMCPClient(
+    {
+        "support-agent": {
+            "transport": "streamable_http",
+            "url": "https://api.smith.langchain.com/v1/managed-tools/kits/<kit-id>/mcp",
+            "headers": {
+                "X-Api-Key": "<langsmith-api-key>",
+                "X-Tenant-Id": "<workspace-id>",
+            },
+        }
+    },
+    tool_interceptors=[trace_headers],
+)
+
+
+async def main():
+    agent = create_agent("anthropic:claude-sonnet-5-5", tools=await client.get_tools())
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": "List my open issues."}]})
+    print(result["messages"][-1].content)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { MultiServerMCPClient } from "@langchain/mcp-adapters";
+import { createAgent } from "langchain";
+import { getCurrentRunTree } from "langsmith/singletons/traceable";
+
+const client = new MultiServerMCPClient({
+  mcpServers: {
+    "support-agent": {
+      transport: "http",
+      url: "https://api.smith.langchain.com/v1/managed-tools/kits/<kit-id>/mcp",
+      headers: {
+        "X-Api-Key": "<langsmith-api-key>",
+        "X-Tenant-Id": "<workspace-id>",
+      },
+    },
+  },
+  // Send the current run's tracing headers with each tool call.
+  beforeToolCall: () => ({ headers: getCurrentRunTree(true)?.toHeaders() }),
+});
+
+const agent = createAgent({
+  model: "anthropic:claude-sonnet-5-5",
+  tools: await client.getTools(),
+});
+```
+</CodeGroup>
+
+### 使用其他客户端
+
+在每次 `tools/call` 请求中发送当前 run 的 `langsmith-trace` 和 `baggage` 请求头。在 LangSmith SDK 中，`run_tree.to_headers()`（Python）和 `runTree.toHeaders()`（TypeScript）会返回它们。详细信息请参阅[分布式 tracing](/langsmith/distributed-tracing)。
+
+## 记录工作区中的每次工具调用
+
+工作区 traces 会将工作区中的每次工具调用记录为独立的 trace，无论由哪个客户端发起、调用方是谁。这些 traces 会进入一个名为 `tool-gateway` 的 tracing 项目，该项目由 Tool Gateway 在记录第一次调用时创建。
+
+工作区 traces 是免费的，不计入你的 trace 配额。
+
+开启或关闭工作区 traces 需要 Workspace Admin 角色（`workspaces:settings:manage`）。查看这些 traces 需要读取 `tool-gateway` 项目中 run 的权限。关于这些角色，请参阅[基于角色的访问控制](/langsmith/rbac)。
+
+<Tabs>
+  <Tab title="UI">
+    1. 进入 **Tools** > **Usage**。
+    1. 开启 **Record tool call traces**。
+
+    **Usage** 标签页会列出过去 7 天内最近的 100 次工具调用，包含每次调用的工具、服务器、结果、延迟和开始时间。点击某次调用可打开其 trace。要查看所有调用（支持分页和筛选），请点击 **View all in tracing**。
+  </Tab>
+  <Tab title="API">
+    发送 `PATCH /v1/platform/workspaces/current/info`。本页的 API 示例使用[快速入门](/langsmith/tool-gateway-quickstart)中的环境变量。
+
+    ```bash
+    curl -sS -X PATCH "$LANGSMITH_ENDPOINT/v1/platform/workspaces/current/info" \
+      -H "X-Api-Key: $LANGSMITH_API_KEY" \
+      -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+      -H "Content-Type: application/json" \
+      -d '{"tool_gateway_traces_enabled": true}'
+    ```
+
+    将 `tool_gateway_traces_enabled` 设为 `false` 可关闭工作区 traces。要检查当前设置，请向同一路径发送 `GET`，并读取响应中的 `config.tool_gateway_traces_enabled`。
+  </Tab>
+</Tabs>
+
+更改可能需要几分钟才能对工具调用生效。
+
+## 在审计日志中查看工具调用
+
+<Note>
+审计日志在[企业版方案](/langsmith/pricing-plans)中提供。
+</Note>
+
+Tool Gateway 会在你组织的审计日志中记录工具调用，以及对其服务器、工具包、profile 和策略的更改。每个事件都会记录操作者、时间、操作，以及是否成功。工具调用事件还会记录工具包、服务器和工具的名称。
+
+审计日志只记录工具调用，不记录列出工具的请求。
+
+要查看审计日志，请进入 **Organization Settings** > **Audit logs**。查看审计日志需要 Organization Admin 或 Organization Operator 角色。关于 API、筛选条件和保留期限，请参阅[审计日志](/langsmith/audit-logs)。
+
+Tool Gateway 会记录以下操作：
+
+| 操作（`api.operation`） | 记录时机 |
+|-----------------------------|---------------|
+| `invoke_mcp_gateway` | 通过工具包或 me 工具包调用工具时。 |
+| `invoke_mcp_server` | 通过单个服务器的端点调用工具时。 |
+| `create_mcp_server`、`update_mcp_server`、`delete_mcp_server`、`register_mcp_server_oauth` | 添加、更改或移除服务器，或注册其 OAuth 客户端时。 |
+| `create_mcp_credential_session` | 有人开始将账户连接到服务器时。 |
+| `create_mcp_gateway`、`update_mcp_gateway`、`delete_mcp_gateway`、`refresh_mcp_gateway_tools` | 创建、更改、删除工具包，或刷新其工具时。 |
+| `create_mcp_profile`、`update_mcp_profile`、`delete_mcp_profile` | 创建、更改或删除 profile 时。 |
+| `update_mcp_oidc_connection`、`delete_mcp_oidc_connection` | 身份提供商与工作区建立或解除关联时。 |
+| `create_agent_policy`、`update_agent_policy`、`delete_agent_policy` | 创建、更改、开启、关闭或删除策略时。 |
+
+## 另请参阅
+
+- [Tool Gateway 的工作原理](/langsmith/tool-gateway-how-it-works)
+- [设置策略](/langsmith/tool-gateway-policies)
+- [将 MCP 客户端连接到工具包](/langsmith/tool-gateway-clients)
+- [分布式 tracing](/langsmith/distributed-tracing)
+- [审计日志](/langsmith/audit-logs)

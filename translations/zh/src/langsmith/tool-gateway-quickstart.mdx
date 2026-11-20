@@ -1,0 +1,265 @@
+---
+title: Tool Gateway 快速入门
+sidebarTitle: 快速入门
+description: 向 Tool Gateway 添加两个 MCP 服务器，连接你的账户，创建一个工具包，并从 MCP 客户端调用其中的工具。
+---
+
+import ToolGatewayBetaNote from '/snippets/langsmith/tool-gateway-beta-note.mdx';
+
+<ToolGatewayBetaNote />
+
+[Tool Gateway](/langsmith/tool-gateway) 通过一个 MCP URL 提供来自任意数量 MCP 服务器的工具。它使用 LangSmith 为你存储的凭证调用每个工具。在本快速入门中，你将添加两个 MCP 服务器并连接你的账户。然后，你把这些服务器中的一组工具放入一个工具包，并从 MCP 客户端调用这些工具。
+
+## Before you begin
+
+你需要：
+
+- **一个 LangSmith [Plus 或 Enterprise 计划](https://www.langchain.com/pricing)。**
+- **Workspace Admin [角色](/langsmith/rbac#workspace-roles)。** 本快速入门要为整个工作区添加服务器和工具包，这需要 Workspace Admin。Workspace Editor 只能添加个人服务器和工具包。如果这适用于你，请按下面说明中的个人选项操作。
+- **一个[个人访问令牌](/langsmith/create-account-api-key)。** 创建服务器和工具包需要用户凭证。服务密钥不适用于这些步骤。
+- **你的工作区 ID**。每个 API 请求都会在 `X-Tenant-Id` 请求头中发送它。
+- **两个提供远程 MCP 服务器的服务账户。** 本快速入门使用 Linear 和 Notion。要使用其他服务，请替换为其 MCP URL 和工具名称。如果你按照 Linear 示例操作，请使用测试 Linear 工作区，因为该工具包包含一个可以创建 issue 的工具。
+- **一个支持 Streamable HTTP 且允许设置自定义请求头的 MCP 客户端**，该请求头携带你的 LangSmith API 密钥。本快速入门使用 [Claude Code](https://code.claude.com/docs/en/overview)。如果不想使用客户端，你也可以改用 `curl` 发送 HTTP 请求来调用工具。
+- **[jq](https://jqlang.org/)**，如果你按 API 步骤操作。命令使用它从每个响应中保存 ID。
+
+<Tip>
+如果你没有 Linear 或 Notion 账户，请改用公共的 [LangChain docs MCP 服务器](/use-these-docs)。将其添加为 **Public** 服务器（`"connection": {"type": "none"}`），URL 为 `https://docs.langchain.com/mcp`。对它跳过第 2 步，因为它不需要登录，并将其 `search_docs_by_lang_chain` 工具添加到你的工具包。
+</Tip>
+
+设置以下环境变量，以便直接粘贴本页中的命令。如果你的组织不在 GCP US 区域，请将 `LANGSMITH_ENDPOINT` 设置为 [Base URL](/langsmith/tool-gateway-api-ref#base-url) 中你所在区域的 URL。
+
+```bash
+export LANGSMITH_API_KEY="<your-personal-access-token>"
+export LANGSMITH_WORKSPACE_ID="<your-workspace-id>"
+export LANGSMITH_ENDPOINT="https://api.smith.langchain.com"
+```
+
+要检查你的密钥和工作区 ID 是否可用，请请求 MCP 服务器列表，并仅打印 HTTP 状态码：
+
+```bash
+curl -sS -o /dev/null -w "%{http_code}\n" \
+  "$LANGSMITH_ENDPOINT/v1/managed-tools/servers" \
+  -H "X-Api-Key: $LANGSMITH_API_KEY" \
+  -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID"
+```
+
+当设置可用时，该命令会打印 `200`。
+
+## Step 1. Add MCP servers
+
+为整个工作区一次性注册每个 MCP 服务器，并声明它需要的凭证类型。两个示例服务器（Linear 和 Notion）都使用 OAuth。
+
+<Tabs>
+  <Tab title="UI">
+    1. 在 [LangSmith](https://smith.langchain.com) 中，前往 **Tools** > **MCP servers**。
+    1. 确保选中 **You** 和 **Workspace** 选项。
+    1. 点击 **Add MCP server**。
+    1. 输入 `Linear` 作为名称，`https://mcp.linear.app/mcp` 作为 URL。
+    1. 选择 **OAuth**，然后点击 **Add server**。
+    1. 对 Notion 重复操作，URL 为 `https://mcp.notion.com/mcp`。
+
+    两个服务器都会以 **Not connected** 状态出现。
+  </Tab>
+  <Tab title="API">
+    将 Linear 和 Notion 注册为使用 OAuth 登录的工作区服务器。每个命令都会将新服务器的 ID 保存到环境变量中，供后续步骤使用：
+
+    ```bash
+    export LINEAR_SERVER_ID=$(curl -sS -X POST "$LANGSMITH_ENDPOINT/v1/managed-tools/servers" \
+      -H "X-Api-Key: $LANGSMITH_API_KEY" \
+      -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+      -H "Content-Type: application/json" \
+      -d '{"name": "Linear", "upstream_url": "https://mcp.linear.app/mcp", "scope": "workspace", "connection": {"type": "oauth"}}' \
+      | jq -r '.id')
+
+    export NOTION_SERVER_ID=$(curl -sS -X POST "$LANGSMITH_ENDPOINT/v1/managed-tools/servers" \
+      -H "X-Api-Key: $LANGSMITH_API_KEY" \
+      -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+      -H "Content-Type: application/json" \
+      -d '{"name": "Notion", "upstream_url": "https://mcp.notion.com/mcp", "scope": "workspace", "connection": {"type": "oauth"}}' \
+      | jq -r '.id')
+
+    echo "$LINEAR_SERVER_ID $NOTION_SERVER_ID"
+    ```
+
+    最后一行会打印两个 ID。如果任一输出为 `null`，请去掉 `| jq` 行运行该 `curl` 命令以查看错误。
+  </Tab>
+</Tabs>
+
+<Tip>
+服务器名称和 URL 在工作区中必须唯一。如果其他人已将 Linear 或 Notion 添加为工作区服务器，你将无法再次添加它们。要独立完成本快速入门，请改为将两个服务器添加为个人服务器。在 UI 中选择 **Personal** 代替 **Workspace**，或在 API 中发送 `"scope": "personal"`。
+</Tip>
+
+## Step 2. Connect your accounts
+
+每个服务只需登录一次。Tool Gateway 会存储你的令牌，并将它们附加到之后每一次以你身份执行的调用。使用你的 API 密钥的 MCP 客户端发出的调用会以你的身份执行。
+
+<Tabs>
+  <Tab title="UI">
+    1. 在 **Tools** > **MCP servers** 中，点击 Linear 所在行的 **Connect**。
+    1. 在打开的浏览器标签页中，在 Linear 中批准访问。LangSmith 页面应确认身份验证成功。
+    1. 对 Notion 重复操作。
+
+    两个服务器现在都显示 **Connected** 状态。
+  </Tab>
+  <Tab title="API">
+    启动 Linear 连接，并打印登录链接：
+
+    ```bash
+    curl -sS -X POST "$LANGSMITH_ENDPOINT/v1/managed-tools/kits/me/connections/$LINEAR_SERVER_ID" \
+      -H "X-Api-Key: $LANGSMITH_API_KEY" \
+      -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+      | jq -r '.verification_url'
+    ```
+
+    打开链接并批准访问。然后等待 LangSmith 页面确认身份验证成功。使用 `$NOTION_SERVER_ID` 重复操作。如果命令没有输出，说明你已经连接。
+  </Tab>
+</Tabs>
+
+## Step 3. Create a tool kit
+
+工具包是一组精选工具，来自任意数量的服务器，Tool Gateway 通过一个 MCP URL 将其提供给 agent。
+
+<Tabs>
+  <Tab title="UI">
+    1. 前往 **Tools** > **Tool kits**。
+    1. 选中 **Workspace** 选项，然后点击 **Create tool kit**。
+    1. 输入 `Quickstart kit` 作为名称，并将可使用范围设置为 **Workspace**。如果你在第 1 步添加了个人服务器，请改为选择 **Personal**。
+    1. 在工具选择器中，按服务器筛选，并选择 Linear 的 `list_issues` 和 `save_issue`，以及 Notion 的 `notion-search`。
+    1. 点击 **Review tool selection**，然后点击 **Create tool kit**。
+    1. 打开你创建的工具包以查看它。
+
+    该工具包的面板会列出 agents 看到的工具，并显示该工具包的 MCP URL。工具包 ID 是该 URL 中 `/kits/` 与 `/mcp` 之间的 UUID。请保存它以供下一步使用：
+
+    ```bash
+    export KIT_ID="<kit-id>"
+    ```
+  </Tab>
+  <Tab title="API">
+    创建工具包，并保存其 ID：
+
+    ```bash
+    export KIT_ID=$(curl -sS -X POST "$LANGSMITH_ENDPOINT/v1/managed-tools/kits" \
+      -H "X-Api-Key: $LANGSMITH_API_KEY" \
+      -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"name\": \"Quickstart kit\",
+        \"scope\": \"workspace\",
+        \"tools\": [
+          {\"server_id\": \"$LINEAR_SERVER_ID\", \"tool_name\": \"list_issues\"},
+          {\"server_id\": \"$LINEAR_SERVER_ID\", \"tool_name\": \"save_issue\"},
+          {\"server_id\": \"$NOTION_SERVER_ID\", \"tool_name\": \"notion-search\"}
+        ]
+      }" \
+      | jq -r '.id')
+
+    echo "$KIT_ID"
+    ```
+
+    如果你在第 1 步添加了个人服务器，请将 `"scope"` 改为 `"personal"`。如果命令打印 `null`，请去掉 `| jq` 行运行以查看错误。
+  </Tab>
+</Tabs>
+
+工作区中的所有用户都可以查看和使用工作区工具包。具有[自定义角色](/langsmith/rbac)的用户还需要拥有查看和调用 MCP 服务器的权限。工具包名称在工作区中必须唯一。如果 `Quickstart kit` 已被占用，请选择其他名称。
+
+<Tip>
+Agents 看到的每个工具都会带有服务器名称作为前缀，例如 `linear_list_issues`、`linear_save_issue` 和 `notion_notion-search`。关于工具命名和其他工具包设置，请参见[创建工具包](/langsmith/tool-gateway-tool-kits)。
+</Tip>
+
+## Step 4. Call tools from an MCP client
+
+工具包是一个标准的 Streamable HTTP MCP 端点。你的 agent 或编码助手作为 MCP 客户端连接到它。客户端会发送你的 LangSmith API 密钥，Tool Gateway 会将你存储的 Linear 和 Notion 令牌附加到每次调用。
+
+<Tabs>
+  <Tab title="Claude Code">
+    将工具包添加到 Claude Code，并在 `X-Api-Key` 请求头中放入你的 API 密钥：
+
+    ```bash
+    claude mcp add --transport http quickstart-kit \
+      "$LANGSMITH_ENDPOINT/v1/managed-tools/kits/$KIT_ID/mcp" \
+      --header "X-Api-Key: $LANGSMITH_API_KEY"
+    ```
+
+    运行 `claude mcp list`，确认 `quickstart-kit` 显示为已连接。然后启动 Claude Code，让它搜索 Notion 中的某个主题，或列出你的 Linear issues。每次调用都会以你的账户在相应服务上运行。
+
+    **Tools** > **Tool kits** 中的工具包面板会显示此命令，并填入你的工具包 URL。它还会显示 Cursor 和 Managed Deep Agents 的设置。其他客户端请参见[连接 MCP 客户端](/langsmith/tool-gateway-clients)。
+  </Tab>
+  <Tab title="HTTP">
+    向工具包的 MCP 端点发送 JSON-RPC 请求。在协议 `2026-07-28` 上（如本例所示），请发送 `Mcp-Method` 请求头；对于 `tools/call`，还需发送带有工具名称的 `Mcp-Name`。缺少任一请求头的请求会返回 `400`。`2025-06-18` 上的请求则两者都不发送；请参见[调用工具](/langsmith/tool-gateway-call-tools#send-an-mcp-request)。
+
+    ```bash
+    curl -sS -X POST "$LANGSMITH_ENDPOINT/v1/managed-tools/kits/$KIT_ID/mcp" \
+      -H "X-Api-Key: $LANGSMITH_API_KEY" \
+      -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+      -H "Content-Type: application/json" \
+      -H "Accept: application/json, text/event-stream" \
+      -H "MCP-Protocol-Version: 2026-07-28" \
+      -H "Mcp-Method: tools/call" \
+      -H "Mcp-Name: notion_notion-search" \
+      -d '{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "notion_notion-search",
+          "arguments": {"query": "onboarding"},
+          "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+          }
+        }
+      }'
+    ```
+
+    响应的 `result.content` 包含 Notion 的搜索结果，原样传递。有关原始请求的更多信息，请参见[调用工具](/langsmith/tool-gateway-call-tools)。
+  </Tab>
+</Tabs>
+
+## 下一步
+
+现在，你应该拥有一个 MCP URL，它提供来自两个服务的工具，每次调用都使用你自己的账户，而客户端中不需要任何认证代码。
+
+测试完成后，请删除你添加的工具包和服务器，以免后续测试者遇到错误。
+
+<Warning>
+删除服务器会删除其所有已连接的账户。如果你添加的是工作区服务器，它们会对工作区中的所有人消失。只有在没有其他人使用它们时才删除。
+</Warning>
+
+<Tabs>
+  <Tab title="UI">
+    1. 如果你已将工具包添加到 Claude Code，请使用 `claude mcp remove quickstart-kit` 移除它。
+    1. 前往 **Tools** > **Tool kits**，打开 `Quickstart kit`。点击 **Delete**，然后确认。
+    1. 前往 **Tools** > **MCP servers**。打开 Linear 行中的操作菜单，并删除该服务器（假设这只是测试）。
+    1. 对 Notion 重复操作。
+  </Tab>
+  <Tab title="API">
+    如果你已将工具包添加到 Claude Code，请移除它：
+
+    ```bash
+    claude mcp remove quickstart-kit
+    ```
+
+    删除工具包，然后删除两个服务器（如果它们仅用于测试）：
+
+    ```bash
+    curl -sS -X DELETE "$LANGSMITH_ENDPOINT/v1/managed-tools/kits/$KIT_ID" \
+      -H "X-Api-Key: $LANGSMITH_API_KEY" \
+      -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID"
+
+    for SERVER_ID in "$LINEAR_SERVER_ID" "$NOTION_SERVER_ID"; do
+      curl -sS -X DELETE "$LANGSMITH_ENDPOINT/v1/managed-tools/servers/$SERVER_ID" \
+        -H "X-Api-Key: $LANGSMITH_API_KEY" \
+        -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID"
+    done
+    ```
+
+    每个请求成功时都会返回 `204`，响应体为空。
+  </Tab>
+</Tabs>
+
+要在此设置基础上继续构建：
+
+1. [添加更多服务器](/langsmith/tool-gateway-servers)，或启用内置服务器。
+1. [为每个 agent 提供一个工具包](/langsmith/tool-gateway-tool-kits)，其中仅包含它需要的工具。
+1. [让每个用户或 agent 连接自己的账户](/langsmith/tool-gateway-connect-accounts)，并[选择每次调用使用谁的凭证](/langsmith/tool-gateway-identity)。
+1. [设置策略](/langsmith/tool-gateway-policies)并[记录 traces](/langsmith/tool-gateway-traces)，以便控制和审查每次工具调用。

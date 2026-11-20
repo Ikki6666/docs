@@ -1,0 +1,191 @@
+---
+title: 以用户和 agent 的身份调用
+sidebarTitle: 以用户和 agent 的身份调用
+description: 为每次 Tool Gateway 调用选择使用谁的凭证，让 agent 能以每个最终用户的身份、以自己的身份，或使用共享 profile 凭证来调用工具。
+---
+
+import ToolGatewayBetaNote from '/snippets/langsmith/tool-gateway-beta-note.mdx';
+
+<ToolGatewayBetaNote />
+
+调用方发送给 [Tool Gateway](/langsmith/tool-gateway) 的凭证，决定了每次工具调用使用谁已连接的账户。服务于众多最终用户的产品，可以以每个用户的身份调用工具，使用该用户自己的账户。在无人登录的情况下运行的 agent，可以用自己的凭证或共享 profile 来调用工具。关于这一层如何与其他两层身份验证配合，请参阅 [Tool Gateway 的工作原理](/langsmith/tool-gateway-how-it-works#three-layers-of-authentication)。
+
+本页介绍调用方一侧：每次请求需要发送什么。要连接用户、agent 或 profile 调用时所用的账户，请参阅[连接账户](/langsmith/tool-gateway-connect-accounts)。
+
+## 选择凭证
+
+| 凭证 | 适用场景 | 调用使用谁的账户 | 可访问范围 |
+|------------|-------------|------------------------------|-------------------|
+| [个人访问令牌](#call-as-yourself) | 你从 Claude Code、Cursor 或脚本中调用工具 | 你自己的 | 管理 API 和 MCP 调用 |
+| LangSmith 会话 | 你在 LangSmith UI 中使用 Tool Gateway | 你自己的 | 管理 API 和 MCP 调用 |
+| [服务密钥和用户的身份提供商令牌](#send-a-user-token-with-a-service-key) | 多用户后端代表其已登录用户行事 | 最终用户的 | 列出服务器和 MCP 调用 |
+| [服务密钥和 `X-LangSmith-Identity`](#name-the-user-from-your-backend) | 后端自行指定用户 | 所指定用户的 | 列出服务器和 MCP 调用 |
+| [仅身份提供商令牌](#send-only-a-user-token) | 用户或应用使用你公司的身份调用，不带 LangSmith 密钥 | 最终用户的 | 仅 MCP 调用 |
+| [绑定到 agent 环境的 API 密钥](#call-as-an-agent) | 已部署的 agent 以自身身份调用工具 | 该 agent 的 | 列出服务器和 MCP 调用 |
+| [服务密钥和 `X-LangSmith-Profile`](#call-with-a-profile) | agent、作业或部署在无人登录的情况下运行 | 该 profile 的 | 列出服务器和 MCP 调用 |
+
+服务密钥可以列出服务器并调用工具，但不能创建服务器或工具包，也不能为其他所有者连接凭证。这些操作请使用个人访问令牌。关于密钥类型之间的区别，请参阅 [API 密钥](/langsmith/administration-overview#api-keys)。
+
+每次调用只以一个身份行事。如果请求指定了多个身份，例如同时携带 `X-LangSmith-Profile` 和 `X-LangSmith-Identity`，或同时携带最终用户的令牌，则会被拒绝并返回 `400`。
+
+## 以你自己的身份调用
+
+要使用你自己已连接的账户调用工具，请在 `X-Api-Key` 中发送你的个人访问令牌。无需其他请求头。[快速入门](/langsmith/tool-gateway-quickstart)和 [MCP 客户端](/langsmith/tool-gateway-clients)就是这样调用 Tool Gateway 的。
+
+```http
+X-Api-Key: <personal-access-token>
+X-Tenant-Id: <workspace-id>
+```
+
+个人访问令牌始终以其所有者的身份行事。对于以用户身份通过身份验证的请求，Tool Gateway 会忽略 `X-LangSmith-Identity`。
+
+## 以最终用户的身份调用
+
+如果你的产品要为众多最终用户调用工具，可以让每次调用都以该用户的身份运行，并使用该用户已连接的账户。请从三种模式中选择一种。其中两种使用来自你公司身份提供商（例如 Okta 或 Microsoft Entra ID）的访问令牌。这两种都需要工作区管理员先[关联身份提供商](#link-your-identity-provider)。
+
+代表最终用户行事的服务密钥需要 `workspaces:credentials:use` 或 `agent-auth-credentials:use` 权限。工作区管理员角色和[部署运行时密钥](/langsmith/agent-environments)都带有其中之一。不具备这两种权限的密钥会收到 `403`。
+
+用户首次调用其尚未连接的服务器时，该调用不会执行，而是返回一个登录链接。把该链接传给用户，待其连接后重试调用。请参阅[当调用方是用户时](/langsmith/tool-gateway-call-tools#when-the-caller-is-a-user)。
+
+### 关联身份提供商
+
+关联身份提供商后，Tool Gateway 就能接受该提供商签发的访问令牌，并把每个令牌匹配到它所指定的用户。一个工作区只能关联一个身份提供商。
+
+关联身份提供商需要 `workspaces:integrations:manage` 权限，以及个人访问令牌或 LangSmith 会话，不能用服务密钥。
+
+要关联身份提供商：
+
+1. 进入 **Tools**，然后点击 **Configure OIDC**。
+1. 在 **Identity provider** 对话框中，选择一个已有的提供商并点击 **Link**，或添加一个新的提供商：
+    - **Display name**：提供商的名称，例如 `Okta`。
+    - **Slug**：一个简短的标识符，例如 `okta`。
+    - **Issuer**：你的提供商的 issuer URL。Tool Gateway 会用它与每个令牌的 `iss` claim 进行匹配。
+    - **Audience**：你的提供商为其签发令牌的 audience。
+1. 点击 **Add and link**。
+
+要移除关联，请打开同一个对话框并取消关联该提供商。来自该提供商的令牌会在下一次调用时停止生效。
+
+### 同时发送用户令牌和服务密钥
+
+此模式适用于为众多用户提供服务的后端。在你的后端上保留一个服务密钥，绝不要放在浏览器中，并在请求中一并发送每个最终用户的访问令牌。Tool Gateway 会使用已关联的身份提供商验证该令牌，调用将以该令牌指定的用户身份运行。
+
+```bash
+curl -sS -X POST "$LANGSMITH_ENDPOINT/v1/managed-tools/kits/<kit-id>/mcp" \
+  -H "X-Api-Key: <service-key>" \
+  -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+  -H "Authorization: Bearer <user-access-token>" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/list",
+    "params": {
+      "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+      }
+    }
+  }'
+```
+
+只发送一个 `Authorization` 请求头。如果令牌不是由已关联的提供商签发，或已经过期，则返回 `401`。不要在同一请求中发送 `X-LangSmith-Identity`。
+
+### 从后端指定用户
+
+如果你的后端已经知道用户是谁，请发送服务密钥，并在 `X-LangSmith-Identity` 请求头中指定该用户。当你的用户不通过可关联的身份提供商登录时，请使用此模式。
+
+```http
+X-Api-Key: <service-key>
+X-Tenant-Id: <workspace-id>
+X-LangSmith-Identity: <provider>:<user-id>
+```
+
+该值的格式为 `provider:user-id`，例如 `gtm:user-123`，也可以是 [Agent Auth](/langsmith/agent-auth) 中用户的主体 ID。每个不同的值都是一个独立的用户，拥有各自已连接的账户。
+
+<Warning>
+Tool Gateway 会按原样信任 `X-LangSmith-Identity` 的值。任何持有服务密钥的调用方都可以冒充任意用户。只应从你控制的后端发送该请求头，绝不要把服务密钥暴露给浏览器或最终用户。
+</Warning>
+
+### 只发送用户令牌
+
+用户或应用可以只使用该用户的访问令牌、不带任何 LangSmith 密钥来调用工具包或服务器。把该令牌作为请求唯一的凭证发送：
+
+```http
+Authorization: Bearer <user-access-token>
+```
+
+此模式有以下限制：
+
+- 它只适用于对工具包或服务器端点发起 MCP 调用，不适用于管理 API。
+- 它不适用于 [me 工具包](/langsmith/tool-gateway-tool-kits#use-the-me-kit)，因为 me 工具包不属于任何单一工作区。
+- 对内置服务器端点的调用还必须发送 `X-Tenant-Id`，这样 Tool Gateway 才知道要检查哪个工作区的身份提供商。
+
+<Warning>
+仅通过身份提供商令牌完成身份验证的调用方，可以访问工作区中的任何服务器或工具包。通过工具包访问时，它只能访问该工具包包含的工具。请通过控制身份提供商向哪些用户和应用签发令牌来管理访问，并使用[策略](/langsmith/tool-gateway-policies)限制这些调用方可以调用哪些工具。
+</Warning>
+
+## 以 agent 的身份调用
+
+已部署的 agent 可以以自身身份调用工具，使用管理员为其 [agent 环境](/langsmith/agent-environments)连接的凭证。发送绑定到该 agent 环境的 API 密钥。Tool Gateway 能识别该密钥并使用该 agent 的凭证，无需额外请求头。
+
+```http
+X-Api-Key: <agent-environment-api-key>
+X-Tenant-Id: <workspace-id>
+```
+
+该密钥还需要 `workspaces:credentials:use` 或 `agent-auth-credentials:use` 权限。
+
+要将密钥绑定到 agent 环境：
+
+1. 在 agent 的概览页上，点击设置图标，然后选择 **API keys**。
+1. 在该环境下，从 **Add a service key…** 中选择一个现有服务密钥，或点击 **Create key** 创建并绑定一个服务密钥。创建密钥还需要 `organization:pats:create` 权限。
+
+绑定密钥需要 `workspaces:manage-keys` 权限，以及该 agent 环境的 tracing 项目上的 `projects:update` 权限。一个密钥一次只能属于一个 agent 环境。**API keys** 选项仅对[从 LangSmith 外部进行 tracing 的 agent](/langsmith/create-an-agent#name-an-agent-traced-from-outside-langsmith)显示。由 LangSmith 部署的 agent 无需绑定：其部署运行时使用的 API 密钥已经属于它的 agent 环境。
+
+由于每个 agent 环境都持有自己的凭证，agent 的开发环境和生产环境可以用不同的账户调用同一个服务器。要连接该 agent 的凭证，请参阅[为 agent 连接账户](/langsmith/tool-gateway-connect-accounts#connect-an-account-for-an-agent)。
+
+agent 无法自行连接账户，因为没有人可以完成登录。调用该 agent 尚未连接的服务器会返回 `409`，必须由工作区管理员来连接。
+
+如果携带 agent 密钥的请求还发送了 `X-LangSmith-Profile` 或指定了最终用户，则使用该身份，而不使用 agent 的身份。
+
+## 使用 profile 调用
+
+[profile](/langsmith/tool-gateway-connect-accounts#connect-an-account-for-a-profile) 是一组具名凭证，由工作区管理员一次性连接。对于在无人登录的情况下运行的 agent、定时作业或部署，请使用 profile。例如，夜间运行的报表 agent，以及使用共享 GitHub 账户工作的编码 agent。
+
+在 `X-LangSmith-Profile` 请求头中添加 profile 的 ID：
+
+```http
+X-Api-Key: <service-key>
+X-Tenant-Id: <workspace-id>
+X-LangSmith-Profile: <profile-id>
+```
+
+要从 UI 复制该请求头，请在 **Tools** > **MCP servers** 上将 **Connected as** 设为 **Profile**，选择该 profile，然后点击 **Copy profile header**。要使用 API 列出 profile ID，请发送 `GET /v1/managed-tools/profiles`。
+
+使用 profile 需要 `workspaces:credentials:use` 或 `agent-auth-credentials:use` 权限。工作区管理员、具有工作区管理员角色的服务密钥以及部署运行时密钥都符合要求。其他密钥会收到 `403`。
+
+profile 只能用于工作区工具包和工作区服务器，不能用于个人项。调用该 profile 尚未连接的服务器会返回 `409`，必须由工作区管理员来连接。
+
+## 排查身份错误
+
+下表中的错误源于请求指定身份的方式。其他错误请参阅[错误](/langsmith/tool-gateway-call-tools#errors)。
+
+| 状态码 | 原因 | 处理方法 |
+|--------|-------|------------|
+| `400` | 请求指定了多个身份，例如同时指定 profile 和用户，或同时使用用户令牌和 `X-LangSmith-Identity`。 | 只发送 `X-LangSmith-Profile`、`X-LangSmith-Identity` 或用户令牌中的一种。 |
+| `400` | `X-LangSmith-Identity` 不是 `provider:user-id` 或主体 ID，或者 `X-LangSmith-Profile` 不是 profile ID。 | 修正请求头的值。 |
+| `401` | 用户的访问令牌已过期、格式错误，或并非来自已关联的身份提供商。 | 发送一个来自[已关联到该工作区](#link-your-identity-provider)的提供商的当前有效令牌。 |
+| `403` | 服务密钥未发送用户身份，或者该密钥缺少 `workspaces:credentials:use` 或 `agent-auth-credentials:use` 权限。 | 指定用户，或使用具有上述权限之一的密钥。 |
+| `404` | 该 profile 在此工作区中不存在。 | 使用 `GET /v1/managed-tools/profiles` 检查 ID。 |
+| `409` | 该 agent 或 profile 没有调用所需服务器的凭证。 | 请工作区管理员[连接](/langsmith/tool-gateway-connect-accounts)。 |
+
+## 另请参阅
+
+- [连接账户](/langsmith/tool-gateway-connect-accounts)
+- [通过 Tool Gateway 调用工具](/langsmith/tool-gateway-call-tools)
+- [Tool Gateway 的工作原理](/langsmith/tool-gateway-how-it-works)
+- [设置策略](/langsmith/tool-gateway-policies)
+- [agent 环境](/langsmith/agent-environments)

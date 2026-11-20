@@ -1,0 +1,246 @@
+---
+title: 为检索切分文档
+sidebarTitle: 切分文档
+description: "在 LangChain 中为 RAG 选择切分策略，包括递归切分和基于 token 的切分、结构感知切分和语义切分、small-to-big 检索以及块元数据。"
+---
+
+切分会在嵌入和索引之前将源文档拆分成更小的片段。块的边界决定了检索器能返回什么：混合多个主题的块会稀释其 embedding，而把一个想法拆到两个片段中的块则会让模型看不到上下文。切分是 [RAG](/oss/deepagents/retrieval) 质量最大的影响因素之一，也是最不显而易见的调优点之一。
+
+本指南介绍如何选择并调优切分策略。每种切分器的具体机制，请参见[文本切分器集成](/oss/integrations/splitters)。示例假设 `docs` 是已加载的 @[Document] 对象列表，如 [使用 Deep Agents 的 RAG](/oss/deepagents/rag) 中所示。
+
+<Tip>
+切分选择是经验性的。使用 [LangSmith](https://smith.langchain.com) 对其进行追踪和评分：[RAG 评估教程](/langsmith/evaluate-rag-tutorial) 展示了如何在数据集上衡量检索和回答质量，这样你可以比较不同策略，而不是凭猜测。
+</Tip>
+
+## 平衡块大小与重叠
+
+块大小在精确度与上下文之间做权衡，并不存在通用的最佳值。它取决于你的文档、embedding 模型以及你预期的问题。
+
+- **小块**会产出聚焦的 embedding 和精确匹配，但单个块可能缺少模型回答所需的周围上下文。
+- **大块**每个块携带更多上下文，但它们的 embedding 会把多个主题混在一起，这使它们更难匹配，并且每个检索到的块会消耗更多 token。
+
+块重叠会在相邻块之间重复一部分文本，这样在边界处被拆分的想法至少仍能在一个块中完整出现。常见的起始点是块大小的 10% 到 20% 的重叠。
+
+| 如果检索 | 请调整 |
+|--------------|--------|
+| 返回缺少上下文而无法回答的片段 | 增大块大小或重叠 |
+| 返回被无关文本填充的长块 | 减小块大小 |
+| 把相关想法切分到两个块中 | 增大重叠，或按结构切分 |
+
+请将这些视为起点，并通过[评估你的切分](#evaluate-your-chunking)来确认。
+
+## 从递归字符切分开始
+
+从 @[RecursiveCharacterTextSplitter] 开始。它按降序的分隔符列表（段落，然后句子，然后单词）进行切分，只要语义相关的文本能装入目标大小，就会保持在一起。这是通用文本的推荐默认选择。
+
+:::python
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,  # target chunk size (characters)
+    chunk_overlap=200,  # overlap between adjacent chunks (characters)
+)
+chunks = splitter.split_documents(docs)
+```
+:::
+
+:::js
+```typescript
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+
+const splitter = new RecursiveCharacterTextSplitter({
+  chunkSize: 1000, // target chunk size (characters)
+  chunkOverlap: 200, // overlap between adjacent chunks (characters)
+});
+const chunks = await splitter.splitDocuments(docs);
+```
+:::
+
+## 按 token 确定块大小
+
+字符数只是对真正重要指标的近似替代：embedding 模型有 token 上限，并按 token 计费。按 token 确定块大小可以让每个块都在模型上限内，并使成本可预测。当块必须适配特定模型，或你想直接控制 token 成本时，请使用基于 token 的切分器。
+
+:::python
+`RecursiveCharacterTextSplitter.from_tiktoken_encoder` 会保留递归分隔符策略，并以 token 而不是字符来度量块大小：
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+    encoding_name="cl100k_base",
+    chunk_size=256,  # target chunk size (tokens)
+    chunk_overlap=32,  # overlap (tokens)
+)
+chunks = splitter.split_documents(docs)
+```
+:::
+
+:::js
+`TokenTextSplitter` 直接在 token 窗口上切分。它不使用 `RecursiveCharacterTextSplitter` 在基于字符切分时所用的递归分隔符列表：
+
+```typescript
+import { TokenTextSplitter } from "@langchain/textsplitters";
+
+const splitter = new TokenTextSplitter({
+  encodingName: "cl100k_base",
+  chunkSize: 256, // target chunk size (tokens)
+  chunkOverlap: 32, // overlap (tokens)
+});
+const chunks = await splitter.splitDocuments(docs);
+```
+:::
+
+<Note>
+`cl100k_base` 编码是若干 OpenAI 模型使用的 tokenizer。其他 provider 的 tokenization 方式不同，因此 token 计数在不同模型之间是近似的。当精确上限很重要时，请选择与你的 embedding 模型匹配的编码。有关更多按 token 切分的选项，请参见[按 token 切分](/oss/integrations/splitters/split_by_token)。
+</Note>
+
+## 按文档结构切分
+
+当文档具有结构时，例如 Markdown、HTML 或源代码，请沿该结构进行切分。结构边界会把相关内容保持在一起，并让你可以把结构本身捕获为元数据。
+
+:::python
+Markdown 文件按标题组织。[`MarkdownHeaderTextSplitter`](/oss/integrations/splitters/markdown_header_metadata_splitter) 会按你指定的标题切分，并将每个标题记录到块的元数据中，之后你可以用这些元数据来[过滤检索](/oss/integrations/vectorstores#metadata-filtering)。按标题切分得到的是完整章节，因此当某个章节可能超过你的目标块大小时，请接着使用基于大小的切分器：
+
+```python
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
+
+headers_to_split_on = [
+    ("#", "Header 1"),
+    ("##", "Header 2"),
+    ("###", "Header 3"),
+]
+markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on)
+header_chunks = markdown_splitter.split_text(markdown_text)
+# Each chunk's metadata includes the headers that contain it.
+
+size_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+)
+chunks = size_splitter.split_documents(header_chunks)
+```
+
+使用 `from_language` 按源代码自身的边界（函数、类和块）切分源代码：
+
+```python
+from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter.from_language(
+    language=Language.PYTHON,
+    chunk_size=500,
+    chunk_overlap=0,
+)
+chunks = splitter.create_documents([source_code])
+```
+
+有关 HTML 和 JSON 切分器，请参见[文本切分器集成](/oss/integrations/splitters)。
+:::
+
+:::js
+使用 `fromLanguage` 按源代码自身的边界（函数、类和块）切分源代码：
+
+```typescript
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+
+const splitter = RecursiveCharacterTextSplitter.fromLanguage("js", {
+  chunkSize: 500,
+  chunkOverlap: 0,
+});
+const chunks = await splitter.createDocuments([sourceCode]);
+```
+
+有关 Markdown 和其他结构感知切分器，请参见[文本切分器集成](/oss/integrations/splitters)。
+:::
+
+## 按语义切分
+
+语义切分把边界放在主题发生转变的位置，而不是固定的长度处。它会比较相邻句子的 embedding，当它们的相似度下降时开始一个新块，这会为缺乏清晰结构的普通文本产出更连贯的块。代价是成本：它在切分的同时还要嵌入文档。
+
+:::python
+`SemanticChunker` 位于已停止维护的 [`langchain-experimental`](https://pypi.org/project/langchain-experimental/) 包中。对于新工作，请优先使用递归切分或结构感知切分。只有当固定大小切分会割裂想法，而结构感知切分又不适用时，才考虑语义切分，并将结果视为实验性的。
+:::
+
+:::js
+语义切分仅通过已停止维护的 `langchain-experimental` 包在 Python 中提供。在 TypeScript 中，请优先使用递归切分或结构感知切分。
+:::
+
+## 检索比嵌入更多的上下文
+
+小块能精确匹配，但可能缺少模型回答所需的周围上下文。small-to-big 模式将这两件事分开：嵌入并索引小块以获得准确匹配，然后向模型返回包含匹配块的更大段落。
+
+要实现该模式，请在每个小块的元数据中存储对父段落的引用。检索之后，查找并返回父段落，而不是匹配到的块。
+
+:::python
+`ParentDocumentRetriever` 辅助类实现了该模式，位于 [`langchain-classic`](https://pypi.org/project/langchain-classic/) 包中。
+:::
+
+:::js
+`ParentDocumentRetriever` 辅助类实现了该模式，位于 [`@langchain/classic`](https://www.npmjs.com/package/@langchain/classic) 包中。
+:::
+
+## 为块附加元数据
+
+每个块上的元数据可在检索时支持过滤和引用。请携带来源、章节以及块的位置，以便限定搜索范围并为答案标注出处。
+
+:::python
+设置 `add_start_index=True` 可记录每个块在源文档中的起始位置。源 `Document` 的元数据会传递到其各个块，你也可以添加自定义字段：
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    add_start_index=True,  # record each chunk's start offset in metadata
+)
+chunks = splitter.split_documents(docs)
+# chunks[0].metadata includes "start_index" plus any metadata from the source document.
+```
+
+结构感知切分器会添加自己的元数据，例如包含每个块的 Markdown 标题。请使用这些字段来[过滤检索](/oss/integrations/vectorstores#metadata-filtering)。
+:::
+
+:::js
+每个源 `Document` 的元数据都会传递到其各个块。在切分之前向源文档添加自定义字段，以便每个块都继承它们：
+
+```typescript
+import { Document } from "@langchain/core/documents";
+
+const docs = [
+  new Document({
+    pageContent: text,
+    metadata: { source: "handbook.md", section: "onboarding" },
+  }),
+];
+const chunks = await splitter.splitDocuments(docs);
+// Each chunk keeps the source and section metadata for filtering.
+```
+:::
+
+## 选择策略
+
+让策略与文档类型相匹配，然后通过度量来调优大小和重叠。
+
+| 文档类型 | 策略 |
+|---------------|----------|
+| 没有清晰结构的普通文本 | [递归字符切分](#start-with-recursive-character-splitting)，或[语义切分](#chunk-by-meaning) |
+| Markdown 或 HTML | [按文档结构切分](#split-on-document-structure)，并将标题保留为元数据 |
+| 源代码 | [语言感知切分](#split-on-document-structure) |
+| 需要周围上下文的匹配 | [检索比嵌入更多的上下文](#retrieve-more-context-than-you-embed) |
+| 严格的模型 token 上限或成本约束 | [按 token 确定块大小](#size-chunks-by-tokens) |
+
+## 评估你的切分
+
+没有任何切分策略在抽象层面是正确的；正确的策略是能为你的查询检索到正确上下文的策略。改变块大小、重叠和策略，重新索引，然后在固定数据集上比较检索和回答质量。请参见[评估 RAG 应用](/langsmith/evaluate-rag-tutorial)来设置数据集和评估器。
+
+## 另请参阅
+
+- [检索](/oss/deepagents/retrieval)：概念与 RAG 架构
+- [提升检索质量](/oss/langchain/retrieval-optimization)：元数据过滤器、混合搜索、MMR 和重排
+- [使用 Deep Agents 的 RAG](/oss/deepagents/rag)：加载、索引和查询文档
+- [文本切分器集成](/oss/integrations/splitters)：切分器的完整目录
+- [评估 RAG 应用](/langsmith/evaluate-rag-tutorial)：衡量检索和回答质量

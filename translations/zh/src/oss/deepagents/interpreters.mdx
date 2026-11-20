@@ -11,6 +11,7 @@ import InterpretersPtcCallEvalJs from '/snippets/code-samples/interpreters-ptc-c
 import InterpretersEnablePtcPy from '/snippets/code-samples/interpreters-enable-ptc-py.mdx';
 import InterpretersEnablePtcJs from '/snippets/code-samples/interpreters-enable-ptc-js.mdx';
 import InterpretersPtcParallelEvalJs from '/snippets/code-samples/interpreters-ptc-parallel-eval-js.mdx';
+import InterpretersEnableFsPy from '/snippets/code-samples/interpreters-enable-fs-py.mdx';
 import InterpretersTaskFanoutEvalJs from '/snippets/code-samples/interpreters-task-fanout-eval-js.mdx';
 import InterpretersPersistenceDefaultPy from '/snippets/code-samples/interpreters-persistence-default-py.mdx';
 import InterpretersPersistenceCheckpointerPy from '/snippets/code-samples/interpreters-persistence-checkpointer-py.mdx';
@@ -126,12 +127,19 @@ agent 可以写出这样的代码：
 
 代码运行在 [**QuickJS**](https://github.com/quickjs-ng/quickjs) 上，这是一个轻量级 JavaScript runtime。默认情况下，解释器代码不能访问主机文件系统、网络、shell、包管理器或时钟。它可以计算、保存状态，并写入 `console.log`、`console.warn` 或 `console.error`，除此之外什么也不能做。
 
-有两个显式桥接会扩展它的能力：
+显式的桥接会扩展它的能力：
 
 - **工具**，通过 [程序化工具调用（PTC）](#programmatic-tool-calling-ptc)。你可以把要允许的工具作为 async 函数放到 `tools` namespace 里。这些工具可以是 agent 自己的工具，也可以是你单独定义后传入的工具。
 - **Subagent**，通过 [动态 subagent](/oss/deepagents/dynamic-subagents)。当 agent 配置了 subagent 时，解释器会暴露 `task()` global，用来从代码中派发它们。
 
-程序化工具调用默认关闭，直到你[启用它](#enable-ptc)。只要 agent 有 subagent，`task()` 的 subagent 派发默认就会开启；你也可以把它关掉。除此之外，没有任何东西会跨越 QuickJS 边界。
+程序化工具调用默认关闭，直到你[启用它](#enable-ptc)。只要 agent 有 subagent，`task()` 的 subagent 派发默认就会开启；你也可以把它关掉。
+
+:::python
+第三种桥接是[文件](#files-fs)，它让解释器代码可以基于 agent 的 backend 选择启用一个 `fs` global。除此之外，没有任何东西会跨越 QuickJS 边界。
+:::
+:::js
+除此之外，没有任何东西会跨越 QuickJS 边界。
+:::
 
 ## 程序化工具调用（PTC）
 
@@ -167,6 +175,49 @@ middleware 会把每个允许调用的工具暴露成 `tools` 下的 async 函�
 :::js
 <Warning>
     当前 PTC 调用是通过 interpreter bridge 执行的，不会走正常的 tool calling 路径。因此，`interruptOn` 审批流程不会对每一次由 PTC 触发的 tool call 单独生效。
+</Warning>
+:::
+
+:::python
+## 文件（`fs`）
+
+`fs` 选项会基于 agent 的 [backend](/oss/deepagents/backends)，为解释器代码提供一个 Node 风格的 `fs` global，它访问的文件与内置文件系统工具看到的是同一批。代码可以读取多个文件、处理它们并写回结果，而无需为每个文件调用一次工具。
+
+<Note>
+    `fs` 需要 `langchain-quickjs>=0.4.0`。
+</Note>
+
+设置 `fs=True` 可使用 `create_deep_agent` 为其文件工具提供的 backend：
+
+<InterpretersEnableFsPy />
+
+使用其他 agent factory（例如 `create_agent`）时，请直接传入 backend：`CodeInterpreterMiddleware(fs=backend)`。一个设置了 `fs=True` 的 middleware 实例无法服务使用不同 backend 的多个 agent，因此请为每个这类 agent 创建单独的 middleware。
+
+`fs` 函数是异步的并返回 promise，与 Node 的 `fs/promises` 一样。`fs.promises` 暴露相同的函数：
+
+- **`fs.readFile(path)`**：以字符串形式返回整个文件。
+- **`fs.writeFile(path, text)`**：创建或替换文件，并创建父目录。
+- **`fs.readdir(dir)`**：列出一个目录中的条目名称。
+- **`fs.access(path)`**：路径存在时 resolve，否则以 `ENOENT` reject。
+- **`fs.rm(path, { recursive, force })`**：删除路径。删除目录需要 `recursive: true`，`force: true` 会忽略不存在的路径。
+
+下面这个示例会汇总目录中的所有报告，并把摘要写回 backend：
+
+```js
+const names = await fs.readdir("/reports");
+const totals = {};
+for (const name of names) {
+  const { region, revenue } = JSON.parse(await fs.readFile(`/reports/${name}`));
+  totals[region] = (totals[region] ?? 0) + revenue;
+}
+await fs.writeFile("/summary/totals.json", JSON.stringify(totals));
+totals;
+```
+
+`fs` 只读写 UTF-8 文本。调用失败时会抛出带有 `code` 的 Node 错误，例如 `ENOENT`、`EISDIR` 或 `EACCES`。`readFileSync` 这类同步函数，以及 `stat`、`glob`、`mkdir` 和 `appendFile`，都会抛出 `ERR_METHOD_NOT_IMPLEMENTED`，并且 `require` 不可用。对于解释器 `memory_limit` 而言过大的文件，会以 `MarshalError` 结束该次 `eval` 调用。
+
+<Warning>
+    `fs` 会直接调用 backend，而不是调用文件系统工具，因此[权限](/oss/deepagents/permissions)和 `interrupt_on` 审批不适用于它。解释器代码可以读取、写入和删除 backend 能够访问的任何内容。对于 `virtual_mode=False` 的 `FilesystemBackend` 或本地 shell backend 而言，那就是宿主文件系统。对于依赖文件系统权限或审批的 agent，请保持 `fs` 未设置；只有在你信任相关用途，或使用限定在 agent 可修改文件范围内的 backend 时，才启用它。
 </Warning>
 :::
 
@@ -230,7 +281,7 @@ snapshot 保留的是 interpreter memory，不是外部世界的副作用。如�
 | 顶层 `await` | 是 | 在 interpreter 代码中使用 promises |
 | `console.log`、`warn`、`error` 捕获 | 是 | 设为 `capture_console=False` 关闭 |
 | Agent 工具 | 否 | 添加 PTC allowlist |
-| 文件系统访问 | 否 | 通过 PTC allowlist 添加 [内置文件系统工具](/oss/deepagents/overview#virtual-filesystem-access) |
+| 文件系统访问 | 否 | 设置 [`fs`](#files-fs)，或通过 PTC allowlist 添加 [内置文件系统工具](/oss/deepagents/overview#virtual-filesystem-access) |
 | 网络访问 | 否 | 通过 PTC 暴露某个特定网络工具 |
 | 实时时钟或日期时间访问 | 否 | 如果需要，暴露一个显式的时间工具 |
 | shell 命令、包安装、测试、操作系统级执行 | 否 | 使用 [sandbox backend](/oss/deepagents/sandboxes) |
@@ -256,7 +307,7 @@ snapshot 保留的是 interpreter memory，不是外部世界的副作用。如�
 
     sandbox 运行在宿主进程内的 [wasmtime](https://wasmtime.dev/) 上，因此 wasmtime 漏洞是逃出 sandbox 的最后一条路径。请保持 `wasmtime` 更新。对于存在敌对多租户的工作负载，还应将 agent 运行在隔离的 worker process 或容器中。详情请参阅 `quickjs-rs` 的 [Security guide](https://github.com/langchain-ai/quickjs-rs#security)。
 
-    sandbox 包含的是引擎，而不是你赋予它的能力。interpreter 代码可以调用桥接进来的每一个工具，因此请把 PTC allowlist 保持得足够窄。
+    sandbox 包含的是引擎，而不是你赋予它的能力。interpreter 代码可以调用桥接进来的每一个工具，并且在启用 `fs` 时，还能访问 backend 能触及的每一个文件，因此请把 PTC allowlist 保持得足够窄，并只在代码需要文件时才设置 `fs`。
 </Note>
 :::
 
@@ -283,6 +334,7 @@ snapshot 保留的是 interpreter memory，不是外部世界的副作用。如�
 | `ptc` | `None` | 以 `tools.*` 形式暴露在 interpreter 内部的工具名称或 `BaseTool` 实例 allowlist。省略则禁用。参见[启用 PTC](#enable-ptc)。 |
 | `max_ptc_calls` | `256` | 每次 `eval` 允许的最大 `tools.*` 调用次数。仅在可信环境中设为 `None`。参见[程序化工具调用（PTC）](#programmatic-tool-calling-ptc)和[安全性](#security)。 |
 | `subagents` | `True` | 当 agent 有 subagent 时暴露内置的 `task()` global。设为 `False` 则要求通过普通的 `task` 工具进行派发。参见[动态 subagent](#dynamic-subagents)。 |
+| `fs` | `None` | 为解释器代码提供基于 backend 的 Node 风格 `fs` global。`True` 表示使用 `create_deep_agent` 的 backend。参见[文件（`fs`）](#files-fs)。 |
 | `mode` | `"thread"` | 控制 interpreter 持久化：`"thread"`（跨轮次）、`"turn"`（单轮内）或 `"call"`（每次 `eval` 使用全新的 REPL）。参见[持久化](#persistence)。 |
 | `max_snapshot_bytes` | `None` | 丢弃大于该字节限制的 snapshot。默认为 `memory_limit`。参见[持久化](#persistence)。 |
 :::

@@ -1,0 +1,191 @@
+---
+title: 设置 Tool Gateway 策略
+sidebarTitle: 策略
+description: 阻止 Tool Gateway 工具调用，或在调用运行前要求审批，并了解策略生效时调用方会看到什么。
+---
+
+import ToolGatewayBetaNote from '/snippets/langsmith/tool-gateway-beta-note.mdx';
+
+<ToolGatewayBetaNote />
+
+策略是 [Tool Gateway](/langsmith/tool-gateway) 在每次工具调用时检查的规则。它按调用方是谁以及调用哪个工具来匹配调用，并选择阻止这些调用，或要求调用方在每次调用运行前予以批准。可以使用策略阻止 agent 调用会写入、删除或发送数据的工具，或在这类调用发生前增加一个确认步骤。
+
+策略控制调用方可以调用什么。[工具包](/langsmith/tool-gateway-tool-kits)只控制 agent 能看到哪些工具。因此，不要依赖工具包来限制访问。请参阅[工具包负责筛选，策略负责执行](/langsmith/tool-gateway-how-it-works#tool-kits-curate-policies-enforce)。
+
+查看策略需要 `organization:read` 权限。创建、更改或删除策略需要个人访问令牌或 LangSmith 会话（不能用服务密钥），并具备以下角色之一：
+
+- **Organization Admin**：管理组织中的每个策略，包括适用于所有工作区的策略。
+- **Workspace Admin**：只管理限定于其登录的工作区或 `X-Tenant-Id` 请求头所指定工作区的策略。Workspace Admin 不能让某个策略适用于所有工作区，也不能把策略移动到其他工作区。
+
+关于这些角色，请参阅[基于角色的访问控制](/langsmith/rbac)。
+
+## 策略的工作方式
+
+每个策略都有以下两种效果之一：
+
+| 效果（UI） | `effect`（API） | 匹配的调用会怎样 |
+|-------------|----------------|---------------------------------|
+| **Block** | `FORBID` | 调用不会运行。 |
+| **Ask for approval** | `REQUIRE_APPROVAL` | 只有在调用方于其 MCP 客户端中批准后，调用才会运行。 |
+
+Tool Gateway 在每次调用时应用以下规则：
+
+- **默认允许**：没有策略匹配的调用会运行。
+- **阻止优先**：如果调用同时匹配阻止策略和审批策略，则该调用会被阻止。
+- **所有端点**：策略适用于通过工具包、me 工具包以及单个服务器端点发起的调用。在[搜索模式](/langsmith/tool-gateway-clients)下，策略适用于 `call_tool` 所运行的那个工具。
+- **组织或工作区**：策略可应用于组织中的每个工作区，或应用于你选择的一个工作区。
+- **立即生效**：创建、更改、关闭或删除策略会在下一次调用时生效。
+
+策略检查的是调用，而不是工具列表。被阻止的工具仍会出现在工具包列出的工具中。
+
+agent 可以使用绑定到其 [agent 环境](/langsmith/agent-environments)的 API 密钥调用。此时 Tool Gateway 会检查针对该密钥的策略和针对该 agent 的策略。其中任一方阻止，调用就会被阻止。策略只能限制调用，因此针对 agent 的策略绝不会解除针对密钥的阻止。
+
+## 创建策略
+
+以下示例要求在任何人使用[快速入门](/langsmith/tool-gateway-quickstart)中的 `save_issue` 工具创建 Linear 议题之前获得批准。
+
+<Tabs>
+  <Tab title="UI">
+    1. 进入 **Tools** > **Policies**，然后点击 **Create policy**。
+    1. 输入 **Name**，例如 `approve-linear-issues`，并可选填 **Description**。如果将描述留空，LangSmith 会使用策略的摘要。
+    1. 在 **When a call matches** 下，选择 **Ask for approval**。若要改为阻止匹配的调用，请选择 **Block**。
+    1. 在 **Workspaces** 下，保留 **All workspaces**，或选择一个工作区。Workspace Admin 只能选择当前工作区。
+    1. 在 **Applies to** 下，选择 **Everyone**，或选择一类调用方并挑选具体调用方。请参阅[选择策略适用于谁](#choose-who-a-policy-applies-to)。
+    1. （可选）在 **Except** 下，挑选该策略不应适用的调用方。
+    1. 在 **Tools** 下，搜索并选择 Linear 的 `save_issue`。你也可以选择某个服务器上的所有工具，或选择 **All tools**。
+    1. 点击 **Create policy**。
+
+    工具选择器会列出当前工作区中的服务器。要选择其他工作区的服务器，请先切换到该工作区。
+
+    新策略默认处于开启状态。**Policies** 标签页会列出每个策略，并带有 **On** 或 **Off** 开关。
+  </Tab>
+  <Tab title="API">
+    发送 `POST /v1/agent-policies`。策略 API 不在 `/v1/managed-tools/` 下。本页的 API 示例使用[快速入门](/langsmith/tool-gateway-quickstart)中的环境变量。
+
+    ```bash
+    curl -sS -X POST "$LANGSMITH_ENDPOINT/v1/agent-policies" \
+      -H "X-Api-Key: $LANGSMITH_API_KEY" \
+      -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "name": "approve-linear-issues",
+        "description": "Approve each Linear issue before it is created",
+        "effect": "REQUIRE_APPROVAL",
+        "workspace_id": "<workspace-id>",
+        "scope": {
+          "principals": [{"type": "*", "id": "*"}],
+          "actions": ["<linear-server-id>_save_issue"]
+        }
+      }'
+    ```
+
+    该请求返回 `201` 和该策略，其中包含其 `id`。
+
+    - **`name`**：必填。请参阅[策略名称和限制](#policy-names-and-limits)。
+    - **`description`**：在 API 中为必填，最多 1,024 个字符。
+    - **`effect`**：`FORBID` 或 `REQUIRE_APPROVAL`。
+    - **`workspace_id`**：策略适用的工作区。省略该项可将策略应用于组织中的每个工作区。
+    - **`scope.principals`**：策略适用的调用方。请参阅[选择策略适用于谁](#choose-who-a-policy-applies-to)。
+    - **`scope.except_principals`**：（可选）策略不适用的调用方。
+    - **`scope.actions`**：策略适用的工具。请参阅[选择策略适用于哪些工具](#choose-which-tools-a-policy-applies-to)。
+    - **`is_enabled`**：（可选）设为 `false` 可创建处于关闭状态的策略。默认为 `true`。
+  </Tab>
+</Tabs>
+
+### 选择策略适用于谁
+
+`scope.principals` 和 `scope.except_principals` 中的每个条目都是一个包含 `type` 和 `id` 的对象。使用 `"*"` 作为 `id`，可匹配该类型的所有调用方。
+
+| 适用于（UI） | API 条目 | 匹配的调用 |
+|-----------------|-----------|---------------|
+| **Everyone** | `{"type": "*", "id": "*"}` | 来自任何调用方。必须是 `principals` 中唯一的条目。 |
+| **Users** | `{"type": "User", "id": "<user-id>"}` | 用户使用自己的个人访问令牌或 LangSmith 会话发起的调用。 |
+| **User groups** | `{"type": "Team", "id": "<user-group-id>"}` | 来自[用户组](/langsmith/user-groups)成员的调用。 |
+| **Service keys** | `{"type": "ServiceKey", "id": "<api-key-id>"}` | 服务密钥发起的调用。 |
+| **Agents** | `{"type": "AgentIdentity", "id": "<agent-environment-id>"}` | agent 使用绑定到该 [agent 环境](/langsmith/agent-environments)的 API 密钥发起的调用。 |
+| 仅 API | `{"type": "Role", "id": "<role-id>"}` | 来自其工作区角色为该角色的用户的调用，直接或通过用户组。 |
+| 仅 API | `{"type": "FleetAgent", "id": "<assistant-id>"}` | [Fleet](/langsmith/fleet/index) agent 发起的调用。 |
+
+对于 **Users**、**Service keys** 和 **Agents**，可将 `id` 设为 `"*"` 以匹配该类型的所有调用方。UI 中将这些显示为 **All users**、**All service keys** 和 **All agents**。用户组和角色必须指定一个 ID。
+
+当你的组织使用用户组时，UI 中会显示 **User groups**。**Except** 接受相同的调用方，但 **Everyone** 除外。
+
+### 选择策略适用于哪些工具
+
+`scope.actions` 中的每个条目都通过工具所在的服务器以及它在该服务器上的名称来指定工具：
+
+| 工具 | API 条目 |
+|-------|-----------|
+| 你添加的服务器上的一个工具 | `<server-id>_<tool-name>`，例如 `<linear-server-id>_save_issue` |
+| 你添加的服务器上的所有工具 | `<server-id>_*` |
+| 内置服务器上的一个工具 | `langsmith_<key>_<tool-name>`，例如 `langsmith_parallel_parallel_web_search` |
+| 内置服务器上的所有工具 | `langsmith_<key>_*` |
+| 所有服务器上的所有工具 | `*`，作为唯一的条目 |
+
+<Note>
+策略使用你添加的服务器的 ID 来指定该服务器，而不是使用工具包中作为工具前缀的服务器名称。例如，工具包会列出 `linear_save_issue`，但策略条目是 `<linear-server-id>_save_issue`。要查找服务器的 ID，请使用 `GET /v1/managed-tools/servers` 列出服务器。
+</Note>
+
+策略可以指定任何服务器上的工具，包括尚未被任何工具包包含的服务器。一旦调用方能够访问该工具，策略就会生效。
+
+### 策略名称和限制
+
+- **Name**：1 到 63 个小写字母、数字或连字符。必须以字母开头、以字母或数字结尾，并在组织中唯一。名称重复会返回 `409`。
+- **调用方和工具**：`principals`、`except_principals` 和 `actions` 各最多 100 个条目。
+- **策略**：最多 1,000 个适用于所有工作区的策略，外加每个工作区最多 100 个限定于该工作区的策略。超过任一限制创建策略会返回 `422`。
+
+## 调用方会看到什么
+
+- **Block**：调用返回 `403`，并带有 `"code": "tool_call_blocked"`。
+- **Ask for approval**：支持表单征询（form elicitation）的 MCP 客户端会向调用方显示审批表单。表单会列出该工具、其服务器、要求审批的策略以及该调用的参数。如果调用方接受，调用就会运行。如果调用方拒绝，调用会返回工具错误且不会运行。无法显示表单的客户端会收到 `403`。
+
+由调用方批准该调用，而不是由单独的审核人批准。审批会在每次调用运行前进行确认，但不会把调用转交给管理员。在无人值守情况下运行的 agent 无法批准调用。要阻止这类 agent 调用某个工具，请使用阻止策略。
+
+关于响应内容以及调用方如何处理，请参阅[批准工具调用](/langsmith/tool-gateway-call-tools#approve-a-tool-call)。
+
+## 关闭、编辑或删除策略
+
+### 开启或关闭策略
+
+处于关闭状态的策略仍会保留，但不会应用于任何调用。
+
+- **UI**：在 **Tools** > **Policies** 上，使用该策略的 **On** 开关。
+- **API**：发送 `PATCH /v1/agent-policies/<policy-id>`。`is_enabled` 是 `PATCH` 唯一接受的字段。
+
+    ```bash
+    curl -sS -X PATCH "$LANGSMITH_ENDPOINT/v1/agent-policies/<policy-id>" \
+      -H "X-Api-Key: $LANGSMITH_API_KEY" \
+      -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID" \
+      -H "Content-Type: application/json" \
+      -d '{"is_enabled": false}'
+    ```
+
+### 编辑策略
+
+- **UI**：在 **Tools** > **Policies** 上，点击该策略的编辑操作，进行修改，然后点击 **Save**。
+- **API**：发送 `PUT /v1/agent-policies/<policy-id>`，携带完整的策略，格式与创建时相同。`PUT` 会替换所有字段并保留策略的 ID。如果省略 `is_enabled`，策略会开启。
+
+### 删除策略
+
+- **UI**：在 **Tools** > **Policies** 上，点击该策略的删除操作，然后确认。
+- **API**：
+
+    ```bash
+    curl -sS -X DELETE "$LANGSMITH_ENDPOINT/v1/agent-policies/<policy-id>" \
+      -H "X-Api-Key: $LANGSMITH_API_KEY" \
+      -H "X-Tenant-Id: $LANGSMITH_WORKSPACE_ID"
+    ```
+
+    该请求返回 `204`，即使策略已被删除也是如此。
+
+要查找策略的 ID，请使用 `GET /v1/agent-policies` 列出策略。响应中的 `items` 最多包含 20 个策略。设置 `page_size` 可最多返回 100 个，并把响应中的 `next_cursor` 作为 `cursor` 传入以获取下一页。
+
+创建、更改和删除策略都会记录在组织的审计日志中。请参阅 [Traces 与审计日志](/langsmith/tool-gateway-traces)。
+
+## 另请参阅
+
+- [批准工具调用](/langsmith/tool-gateway-call-tools#approve-a-tool-call)
+- [Tool Gateway 的工作原理](/langsmith/tool-gateway-how-it-works)
+- [以用户和 agent 的身份调用](/langsmith/tool-gateway-identity)
+- [Traces 与审计日志](/langsmith/tool-gateway-traces)
+- [基于角色的访问控制](/langsmith/rbac)
