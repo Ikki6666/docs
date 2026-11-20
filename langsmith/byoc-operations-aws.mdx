@@ -1,20 +1,30 @@
 ---
 title: BYOC 运维
 sidebarTitle: 运维
-description: LangChain 如何升级、修补和维护 LangSmith BYOC data plane，以及维护何时需要安排计划窗口。
+description: LangChain 如何运维 LangSmith BYOC data plane、哪些操作由你在自己的 AWS 账户中管理，以及 break-glass 访问如何运作。
 icon: "tool"
 ---
 
 预置完成后，LangChain 会运维你的 data plane，包括升级、扩缩容、监控和安全修补。大多数维护都是非中断性的，不需要你执行任何操作。
 
-## 自动扩缩容
+运维操作分为三组：
+
+- **[由 LangChain 管理的运维](#langchain-managed-operations)**：由 LangChain 为你执行的扩缩容、升级和维护。
+- **[由客户管理的运维](#customer-managed-operations)**：由你自己配置的 data plane 设置、可观测性、跨账户访问和审计。
+- **[Break-glass 访问](#break-glass-access)**：当故障排查需要时，你授予某位 LangChain 工程师的临时访问权限。
+
+## 由 LangChain 管理的运维
+
+LangChain 会在每个 data plane 上执行以下操作，你无需执行任何操作。如需更改某些默认值（例如高可用性或实例规格），请联系 LangChain 团队。
+
+### 自动扩缩容
 
 LangChain 会随负载变化对你的 data plane 进行扩缩，因此你无需手动设置容量或调优：
 
 - **无状态 LangSmith 服务**：通过 horizontal pod autoscaler 进行水平扩缩，并由 Karpenter 随 pod 需求变化预置和移除节点容量。
 - **数据库**：RDS 和 ElastiCache 的容量设置与扩缩由 LangChain 负责。
 
-## 高可用性
+### 高可用性
 
 data plane 默认按高可用性预置。部署会横跨你所在 region 的多个可用区，RDS 和 ElastiCache 以 Multi-AZ 模式运行并支持自动故障转移。
 
@@ -22,11 +32,11 @@ data plane 默认按高可用性预置。部署会横跨你所在 region 的多�
 如果要在没有高可用性的情况下运行 data plane，请联系 LangChain 团队。
 </Note>
 
-## 实例规格
+### 实例规格
 
 data plane 的数据库和 node group 默认按默认实例规格预置。如果要在更小的实例上运行 data plane，请联系 LangChain 团队。
 
-## LangSmith 升级
+### LangSmith 升级
 
 LangChain 每天都会升级你 data plane 中的 LangSmith 版本。升级以滚动方式进行，逐个副本替换，因此不会出现整个服务停机。
 
@@ -35,41 +45,136 @@ LangChain 每天都会升级你 data plane 中的 LangSmith 版本。升级以�
 - **Horizontal pod autoscaling**：LangSmith 服务运行多个副本，副本数由 horizontal pod autoscaler 决定，因此 pod 会一次被替换几个，其余副本继续处理流量。
 - **Pod disruption budget**：pod disruption budget 限制一个服务同时不可用的副本数量，因此无论是滚动更新还是节点排空，都不会让服务低于保持可用所需的容量。
 
-## 支持服务的升级
+### 支持服务的升级
 
 Istio 和 KEDA 等后台服务会按固定节奏升级。仍在运行 ClickHouse 的 data planes 还会收到 ClickHouse operator 升级。这些升级是非侵入式的，预计不会造成服务中断。
 
-## Kubernetes 集群升级
+### Kubernetes 集群升级
 
-承载你 data plane 的 EKS 集群需要定期升级，以维持安全性、兼容性并获得新功能。LangChain 会主动执行这些升级，赶在 AWS 支持终止日期之前完成，并与你协调升级窗口。
+承载你 data plane 的 EKS 集群需要定期升级，以维持安全性、兼容性并获得新功能。LangChain 会主动执行这些升级，赶在 AWS 支持终止日期之前，在 data plane 的[维护窗口](#maintenance-window)内完成。
 
 集群升级分为两类：
 
 - **Control plane 升级**：覆盖 Kubernetes API server 以及由 AWS 一并管理的组件。这些升级对你的工作负载是透明的，不会重启 pod。
 - **Node group 升级**：以 make-before-break 语义逐个节点滚动。新节点在更新后的版本上预置，pod 迁移到新节点，旧节点在迁移完成后被终止。pod disruption budget 适用于节点排空过程，因此每个服务都保持可用，但在单个 pod 重启时你可能会看到短暂的连接重置。不会丢失数据。
 
-## 维护窗口
+## 由客户管理的运维
 
-任何可能导致停机的维护或升级（例如重启 RDS 或 ElastiCache）都会在计划维护窗口内进行，该窗口由 LangChain 提前与你协调确定。
+以下操作由你自己配置，可通过 LangSmith UI 和 API 或在你自己的 AWS 账户中完成。
 
-## 可观测性
+### data plane 设置
+
+要编辑 data plane 的设置：
+
+1. 前往 **Settings > Data Planes**。
+2. 找到你的 data plane，然后选择 **Settings**。
+3. 打开要更改的设置对应的标签页，然后保存。
+
+你也可以使用[更新 data plane 设置](/langsmith/smith-api/data_planes/update-data-plane-settings) endpoint。
+
+#### 维护窗口
+
+维护窗口是 LangChain 在你的 data plane 上执行操作的时间段，例如 EKS 版本升级和 RDS 数据库升级。任何可能导致停机的维护（例如重启 RDS 或 ElastiCache）都会在此窗口内进行。
+
+- 该窗口每周一次，持续 2 小时。所有时间均为 UTC。
+- 在 **Maintenance** 标签页上选择日期和开始时间。
+- 默认为星期日 07:00–09:00 UTC（`sun:07:00-sun:09:00`）。
+
+#### TTL 保留
+
+data plane 的 TTL 设置定义了其 traces 的默认保留期。这些值是默认值，而不是上限。如果某个 workspace 选择了某种[延长时长](/langsmith/usage-and-billing#retention-periods)，则会保留该时长，即使它长于 data plane 的 long-lived TTL 也是如此。blob 存储桶会为每个保留期设置一条 S3 生命周期规则，因此 trace payload 会按照与其 trace 相同的计划删除。
+
+在 **TTL retention** 标签页上配置 TTL 保留：
+
+- **Enable TTL retention**：默认开启。
+- **Short-lived TTL (days)**：base traces 的默认保留期。默认为 14 天。
+- **Long-lived TTL (days)**：extended traces 的默认保留期。默认为 400 天。该值必须大于或等于 short-lived TTL。
+
+每个值都必须是大于 0 的整数。通过 API 时，请发送 `ttl.short_days` 和 `ttl.long_days`。
+
+#### Ingress 允许列表
+
+在 **Ingress** 标签页上，你可以限制负载均衡器接受哪些源 IP 范围。最多可添加 50 个 IPv4 CIDR 范围。随后负载均衡器仅接受来自这些范围的 443 端口流量。
+
+- **空列表**：负载均衡器允许所有来源。
+- **私有负载均衡器**：始终允许 data plane VPC CIDR。
+
+<Warning>
+- 通过 API 更新会替换整个列表。请包含所有你想保留的范围，否则负载均衡器将停止接受来自你遗漏范围的流量。
+- 不要在 AWS 中直接编辑 Network Load Balancer 安全组。LangSmith 会按固定节奏对账 data plane，并回滚对受管资源所做的任何手动更改。
+</Warning>
+
+### 可观测性
 
 你可以在集群中部署可观测性工具（例如 Datadog agent 或 OpenTelemetry collector）以及你自己的安全监控 agent，前提是它们不会干扰 LangSmith 工作负载。
 
 LangSmith 服务发出日志、指标和 traces 的方式与自托管时相同，因此适用相同的配置。参见[将 LangSmith 遥测数据导出到你的可观测性 backend](/langsmith/export-backend)。
 
-## 故障排查
+### 跨账户访问
 
-LangChain 团队没有对你数据的长期访问权限，只能管理你 data plane 的基础设施。当故障排查需要访问数据时，有两条路径：
+私有 BYOC data plane 会将其负载均衡器暴露在你的 data plane VPC 内部。位于不同 AWS 账户中的应用程序在没有显式跨账户网络路径的情况下无法访问它。
 
-- **由你执行查询**：你自己运行查询，并在与 LangChain 共享之前验证和清理输出。
-- **Break-glass 访问（紧急访问）**：你将某位特定工程师加入允许名单来执行该操作。你可以随时撤销该访问权限。
+使用方网络与 data plane VPC 之间的任何私有网络路径都可行。LangChain 不要求特定方法。常见选项包括：
+
+- AWS PrivateLink
+- VPC 对等连接
+- 中转网关
+- VPN
 
 <Note>
-如果需要 break-glass 访问，LangChain 团队会主动联系你并提供操作说明。
+LangChain 预置了[两条 PrivateLink 连接](/langsmith/byoc-architecture-aws#connectivity)，用于承载 LangChain control plane 与你 data plane 之间的流量。对于来自你自己网络的应用程序流量，不存在由 LangChain 管理的 endpoint service 或网络路径。该路径由你自己创建和管理。
 </Note>
 
-## 审计
+无论 VPC 由 LangChain 创建还是由你自行提供，以下步骤均适用。要管理 VPC 本身（其子网、路由、网关和 endpoint），请改用[在 AWS 上自带 VPC](/langsmith/byoc-byovpc-aws)。
+
+#### 允许使用方源范围
+
+如果你[限制了负载均衡器的源 IP 范围](#ingress-allowlist)，请将每个使用方网络的 CIDR 范围添加到该列表。私有负载均衡器始终允许 data plane VPC CIDR，但不会允许使用方范围。如果没有这些范围，负载均衡器会丢弃使用方流量。
+
+#### 使用 AWS PrivateLink 连接
+
+在 data plane 账户中创建 endpoint service：
+
+1. 确定用于 data plane ingress 的 Network Load Balancer（NLB）。请在你的 data plane 账户和 region 中，从 AWS EC2 控制台的 **Load Balancers** 下找到它。其名称以 `-sm-istio` 结尾。
+2. 创建由该 NLB 支持的 **VPC endpoint service**。根据你的安全策略，将接受模式设置为 **auto** 或 **manual**。
+3. 将每个使用方 AWS 账户添加为允许为该服务创建 interface endpoint 的 **principal**。
+4. 记录 endpoint service 名称（例如 `com.amazonaws.vpce.us-east-1.vpce-svc-xxxxxxxxxxxxxxxxx`）。
+
+<Warning>
+不要修改 NLB 本身。LangSmith 会按固定节奏对账 data plane，并回滚对受管资源所做的任何手动更改。如果 ingress 模式或子网发生变化，LangChain 会与你协调任何 NLB 更新。
+</Warning>
+
+连接每个使用方账户：
+
+1. 在应用程序所在的 VPC 中，为上一步的 endpoint service 名称创建 **VPC interface endpoint**。
+2. 在 **Settings > Data Planes** 下显示的 API URL 中找到 data plane 主机名。
+3. 为该主机名创建 **私有 Route 53 托管区域**，并将其与使用方 VPC 关联。
+4. 在该托管区域中添加别名或 CNAME 记录，将主机名指向 interface endpoint 的 DNS 名称。
+
+你的应用程序使用标准 data plane API URL，无需任何更改。DNS 会将其解析为使用方 VPC 中的 interface endpoint。
+
+#### 使用 VPC 对等连接、中转网关或 VPN 连接
+
+将使用方 VPC 与 data plane VPC 对等连接：
+
+1. 在 data plane 账户中，创建从 data plane VPC 到使用方 VPC 的对等连接请求。
+2. 在使用方账户中接受该请求。
+3. 在两个 VPC 中都添加路由，使发往对方 CIDR 范围的流量经过对等连接。
+4. 更新任何需要允许对等范围的网络 ACL 或安全组。
+
+要使用中转网关，请将两个 VPC 都挂载到共享的中转网关，并配置路由表，使每个 VPC 都能访问对方。
+
+要使用 VPN，请将 VPN 挂载到 data plane VPC，或挂载到与其相连的中转网关，并添加路由，使使用方网络能够访问 data plane VPC CIDR 范围。
+
+这些选项会路由流量，但不承载 DNS。data plane 主机名仅在 data plane VPC 内部可解析。要在每个使用方 VPC 中配置 DNS：
+
+1. 为 data plane 主机名创建私有 Route 53 托管区域。
+2. 将该托管区域与使用方 VPC 关联。
+3. 添加别名或 CNAME 记录，将主机名指向 data plane 负载均衡器的 DNS 名称。
+
+对于 AWS 之外的使用方网络，请将 data plane 主机名的 DNS 查询转发到 data plane VPC 中的 Route 53 Resolver inbound endpoint。
+
+### 审计
 
 - **LangSmith 审计日志**：对 data plane 资源的操作会记录在 data plane 中，并可在你的 data plane endpoint 访问。Control plane 操作（例如创建用户）则在 control plane 中审计。有关如何访问两者，请参阅[审计日志](/langsmith/audit-logs)。
 - **EKS 审计日志**：发送到你账户中的 CloudWatch，因此你可以监控执行过的命令。
@@ -77,9 +182,140 @@ LangChain 团队没有对你数据的长期访问权限，只能管理你 data p
 
 针对这些日志设置告警是你的责任。
 
+## Break-glass 访问
+
+LangChain 团队没有对你数据的长期访问权限，只能管理你 data plane 的基础设施。当故障排查需要访问数据时，有两条路径：
+
+- **由你执行查询**：你自己运行查询。然后验证和清理输出，再与 LangChain 共享。
+- **Break-glass 访问（紧急访问）**：你授予某位特定的 LangChain 工程师执行该操作的临时访问权限。你可以随时撤销该访问权限。
+
+### 授予访问权限
+
+Break-glass 访问使用由 [`langsmith-byoc-role` Terraform 模块](https://github.com/langchain-ai/terraform/tree/main/modules/byoc/aws/langsmith-byoc-role)在你账户中创建的 `LangSmithBYOCBreakGlass` IAM 角色。该角色的信任策略默认为 `Effect: Deny`。
+
+该角色在 IAM 层仅具有 `eks:DescribeCluster` 权限。Kubernetes 级别的访问通过你为 break-glass 角色在每个目标集群和 region 中创建的 EKS access entry 单独控制。共有三种访问级别：
+
+| 级别 | EKS access policy 或 group | 用途 |
+| ----- | ------------------------- | --- |
+| 只读 | `AmazonEKSAdminViewPolicy` | 在不做任何更改的情况下检查集群状态 |
+| 集群管理 | `langsmith-cluster-management` Kubernetes group | 在事件期间管理 LangSmith 工作负载 |
+| 完整集群管理员 | `AmazonEKSClusterAdminPolicy` | 关键事件或数据访问时的最后手段 |
+
+当 LangChain 工程师需要访问权限时，会向你发送：
+
+- 其 AWS IAM Identity Center 用户 ID。
+- 其 LangChain 电子邮件地址。
+- 所请求的访问级别。
+- 目标集群名称和 AWS region。
+
+授予访问权限：
+
+1. 在你的 `langsmith-byoc-role` 模块中设置以下输入并应用：
+
+    ```hcl
+    allow_break_glass_access = true
+
+    break_glass_identitystore_user_ids = [
+      "<langchain-identity-store-user-id>",
+    ]
+
+    break_glass_source_identities = [
+      "<langchain-engineer-email>",
+    ]
+    ```
+
+    Identity Store 用户 ID 确保只有指定工程师的凭证可以代入该角色。源身份电子邮件可提高 CloudTrail 审计记录的可读性。
+
+1. 将该模块的 `break_glass_role_arn` 输出分享给 LangChain 工程师。
+
+1. 为目标集群设置以下值：
+
+    ```bash
+    export ROLE_ARN="arn:aws:iam::<customer-account-id>:role/LangSmithBYOCBreakGlass"
+    export CLUSTER="<deployment>-smith-eks"
+    export REGION="<cluster-region>"
+    ```
+
+1. 为所请求的访问级别创建 EKS access entry。每个 principal 在每个集群中只能创建一个 access entry。
+
+    <CodeGroup>
+
+    ```bash Read-only
+    aws eks create-access-entry \
+      --region "$REGION" \
+      --cluster-name "$CLUSTER" \
+      --principal-arn "$ROLE_ARN" \
+      --type STANDARD
+
+    aws eks associate-access-policy \
+      --region "$REGION" \
+      --cluster-name "$CLUSTER" \
+      --principal-arn "$ROLE_ARN" \
+      --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminViewPolicy \
+      --access-scope type=cluster
+    ```
+
+    ```bash Cluster management
+    aws eks create-access-entry \
+      --region "$REGION" \
+      --cluster-name "$CLUSTER" \
+      --principal-arn "$ROLE_ARN" \
+      --type STANDARD \
+      --kubernetes-groups langsmith-cluster-management
+    ```
+
+    ```bash Full cluster admin
+    aws eks create-access-entry \
+      --region "$REGION" \
+      --cluster-name "$CLUSTER" \
+      --principal-arn "$ROLE_ARN" \
+      --type STANDARD
+
+    aws eks associate-access-policy \
+      --region "$REGION" \
+      --cluster-name "$CLUSTER" \
+      --principal-arn "$ROLE_ARN" \
+      --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+      --access-scope type=cluster
+    ```
+
+    </CodeGroup>
+
+授予符合问题需要的最低级别。相关活动会出现在 CloudTrail 以及你账户中 CloudWatch 的 EKS 审计日志中。
+
+### 撤销访问权限
+
+一旦工程师不再需要访问权限，请立即撤销。请按顺序执行以下步骤：先禁用信任可以防止工程师在你撤销活动会话后再启动新会话。
+
+撤销访问权限：
+
+1. 设置 `allow_break_glass_access = false`，移除 Identity Store 用户 ID 和源身份，然后应用：
+
+    ```hcl
+    allow_break_glass_access = false
+
+    break_glass_identitystore_user_ids = []
+    break_glass_source_identities      = []
+    ```
+
+    这会阻止对 `LangSmithBYOCBreakGlass` 角色的新 `sts:AssumeRole` 调用。
+
+1. 在创建过 EKS access entry 的每个集群中删除该 access entry：
+
+    ```bash
+    aws eks delete-access-entry \
+      --region "$REGION" \
+      --cluster-name "$CLUSTER" \
+      --principal-arn "$ROLE_ARN"
+    ```
+
+1. 在 IAM 控制台中，前往 **Roles** > **LangSmithBYOCBreakGlass** > **Revoke sessions**，然后选择 **Revoke active sessions**。现有会话在过期前仍然有效，因此撤销它们会立即关闭访问。
+
 ## 另请参阅
 
 - [BYOC 架构](/langsmith/byoc-architecture-aws)
+- [AWS 上的 BYOC 入门](/langsmith/byoc-onboarding-aws)
+- [在 AWS 上自带 VPC](/langsmith/byoc-byovpc-aws)
 - [BYOC 使用](/langsmith/byoc-usage)
 
 ---

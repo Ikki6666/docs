@@ -116,6 +116,50 @@ HPA 的键是 `minReplicas` 和 `maxReplicas`；KEDA 的对应键是 `minReplica
 - 如果 traces 无法足够快地从 Redis 中被处理，增加 ingest queue 服务的 pod 副本数。
 - 如果发现当前 Redis 实例接近资源上限，使用更大的 Redis cache。这也可能是写入请求耗时过长的原因。
 
+### 对 ingestion 队列进行分区
+
+默认情况下，所有 traces 都在一个名为 `ingestion` 的 Redis 队列中等待。在 Redis Cluster 上，该队列只位于一个 shard 上，这可能会限制 ingestion 吞吐量。分区会把该队列拆分到多个 shard 上。
+
+<Note>
+在单 shard 的 Redis 部署上，分区不会带来任何好处。这是一种分散负载的措施，仅在 Redis Cluster 上有效。
+</Note>
+
+有两个环境变量控制分区。两者的默认值都是 `1`：
+
+- `GO_INGESTION_QUEUE_PARTITIONS`：服务将新 traces 分散到的分区数量。
+- `GO_INGESTION_WORKER_PARTITIONS`：ingest queue worker 读取的分区数量。
+
+在 `commonEnv` 下设置两者：
+
+```yaml
+commonEnv:
+  - name: GO_INGESTION_WORKER_PARTITIONS
+    value: "4"
+  - name: GO_INGESTION_QUEUE_PARTITIONS
+    value: "4"
+```
+
+只有一个分区时，traces 使用 `ingestion` 队列。分区更多时，在 LangSmith v0.18.0 及更高版本中，它们使用 `ingestion-0` 到 `ingestion-3`，然后使用 `ingestion-fur-4`、`ingestion-qg-5`，依此类推。Worker 也会继续读取 `ingestion`，因此在分区之前排队的任务仍会被处理。
+
+LangSmith 最多支持 250 个分区，但你不太可能需要这么多。作为起点，当 ingestion 接近每秒 10,000 次 runs 且你的 Redis Cluster 已经拥有超过 4 个 shard 时，可以增加到 4 个分区。
+
+请按顺序更改变量，因为没有任何 worker 读取的分区中的任务永远不会被处理：
+
+- **要添加分区：** 提高 `GO_INGESTION_WORKER_PARTITIONS` 并部署，然后将 `GO_INGESTION_QUEUE_PARTITIONS` 提高到相同的值并部署。
+- **要移除分区：** 降低 `GO_INGESTION_QUEUE_PARTITIONS` 并部署。等到被移除的分区没有 pending、active、retry 或 scheduled 任务后，再降低 `GO_INGESTION_WORKER_PARTITIONS`。
+
+要检查被移除的分区是否为空，请对每个分区运行以下命令。将你的连接选项添加到 `redis-cli`，在 Redis Cluster 上还要加上 `-c`。该示例检查从 6 减少到 4 时被移除的分区：
+
+```bash
+for q in ingestion-fur-4 ingestion-qg-5; do
+  echo "$q pending=$(redis-cli LLEN "asynq:{$q}:pending") active=$(redis-cli LLEN "asynq:{$q}:active") retry=$(redis-cli ZCARD "asynq:{$q}:retry") scheduled=$(redis-cli ZCARD "asynq:{$q}:scheduled")"
+done
+```
+
+当每个被移除分区的四项计数都为 `0` 时，即可继续。
+
+要检查分区情况，请查看 queue worker 在启动时写入的 `asynq worker queue configuration` 日志行。它会列出该 worker 读取的队列。
+
 ## Trace 查询（读路径）
 
 会给读路径带来负载的常见使用场景包括：
