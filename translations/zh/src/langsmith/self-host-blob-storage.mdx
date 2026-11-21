@@ -1,12 +1,11 @@
 ---
-title: 启用 blob storage
-sidebarTitle: 启用 blob storage
+title: 配置 blob storage
+sidebarTitle: 配置 blob storage
 ---
 
-默认情况下，LangSmith 会将 run 的输入、输出、错误、manifests、extras 和 events 存储在 ClickHouse 中。如果你愿意，也可以改为将这些信息存储到 blob storage，这样会带来几个明显的好处。对于生产部署，为了获得最佳效果，**强烈**建议使用 blob storage，它具有以下优势：
+LangSmith 将 run 的输入、输出、错误、manifests、extras、events 和附件存储在 blob storage 中。自 LangSmith v0.18 起，blob storage 是必需的。缺少 blob storage 时，自托管 API 和队列 worker 无法启动。
 
-1. 在高 trace 环境中，输入、输出、错误、manifests、extras 和 events 可能会让数据库体积迅速膨胀。
-2. 如果使用 LangSmith Managed ClickHouse，你可能希望将敏感信息保存在你自己的环境中的 blob storage 里。为了解决这一点，LangSmith 支持将 run 的输入、输出、错误、manifests、extras、events 和附件存储到外部 blob storage 系统中。
+如果你没有配置自己的存储，LangSmith Helm chart 会在你的集群中部署并使用兼容 S3 的对象存储 [RustFS](https://rustfs.com)。RustFS 运行在单个 pod 中，使用一个持久卷，容量取决于该卷的大小，且不提供复制。生产环境请使用你自己的 blob storage，例如 Amazon S3、Google Cloud Storage 或 Azure Blob Storage。如果你使用 [LangSmith Managed ClickHouse](/langsmith/langsmith-managed-clickhouse)，这样也能将敏感 run 数据保存在你控制的存储中。
 
 <Tip>
 **如需按云平台分别配置**，请选择你的平台：
@@ -18,7 +17,48 @@ sidebarTitle: 启用 blob storage
 完整的云平台专属配置与架构指南，请参见 [AWS](/langsmith/aws-self-hosted)、[GCP](/langsmith/gcp-self-hosted) 或 [Azure](/langsmith/azure-self-hosted)。
 </Tip>
 
+<a id="upgrade-to-v0-18"></a>
+
+## 升级到 v0.18
+
+升级到 LangSmith v0.18 时，当前 blob storage 配置决定升级行为。
+
+- **已配置 bucket 或容器**。如果设置了 `config.blobStorage.bucketName`（S3 或 GCS）或 `config.blobStorage.azureStorageContainerName`（Azure），LangSmith 会继续使用该存储，无需更改 Helm values。
+- **未配置 blob storage**。Helm chart 会部署 RustFS，LangSmith 将 blob 存储在那里。如果要使用自己的存储，请在升级前完成配置。参见[配置](#configuration)。
+- **设置了 `config.blobStorage.enabled`**。Helm chart 已移除此设置，请从 Helm values 中删除它。设置 `enabled: false` 会导致 Helm chart 部署失败。
+- **`engine` 为 `GCS` 或 `Azure`，且未配置 bucket 或容器**。Helm chart 部署会失败，RustFS 不会部署。请设置 bucket 或容器。
+
+如果部署 LangSmith 时没有使用 Helm chart，请在升级前配置 blob storage。服务读取与 Helm chart 相同的 `BLOB_STORAGE_ENGINE`、`S3_BUCKET_NAME` 和 `AZURE_STORAGE_CONTAINER_NAME` 设置。
+
+<a id="use-the-bundled-rustfs"></a>
+
+## 使用内置 RustFS
+
+当 `config.blobStorage.external.enabled` 为 `false`，且未设置 `bucketName` 和 `azureStorageContainerName` 时，Helm chart 会部署 RustFS。它会创建一个名为 `langsmith` 的 bucket，并配置 LangSmith 服务使用该 bucket。内置 RustFS 适用于开发和评估环境。
+
+在 Helm values 的 `rustfs` 下进行配置。
+
+- **卷大小**。`rustfs.statefulSet.persistence.size` 设置持久卷大小，默认为 `50Gi`。使用 `storageClassName` 选择存储类。如果未启用持久化，RustFS pod 重启后，已存储的 trace 将丢失。
+- **凭据**。访问密钥为 `langsmith`。如果 `rustfs.secretKey` 为空，Helm chart 会保留之前安装时的 secret key，或从 `config.apiKeySalt` 派生一个密钥，确保每次渲染都使用同一密钥。要指定密钥，请设置 `rustfs.secretKey`，或将 `rustfs.existingSecretName` 设置为包含 `access_key` 和 `secret_key` 的 Kubernetes secret。
+- **安全上下文**。RustFS 以用户和组 `10001` 运行，并通过 `fsGroup: 10001` 获得卷的写入权限。对于会分配用户 ID 的平台，例如使用 `restricted-v2` 安全上下文约束的 OpenShift，请将 `rustfs.statefulSet.podSecurityContext` 下的 `runAsUser`、`runAsGroup` 和 `fsGroup` 设为 `null`。
+
+```yaml Helm
+rustfs:
+  statefulSet:
+    persistence:
+      size: 100Gi
+      storageClassName: "your-storage-class"
+```
+
+<Note>
+如果使用 `config.existingSecretName`，并像 Argo CD 一样在没有集群访问权限的情况下渲染 Helm chart，Helm values 中就没有 `config.apiKeySalt`。此时请设置 `rustfs.secretKey` 或 `rustfs.existingSecretName`，否则每次渲染都会生成新的随机 secret key。
+</Note>
+
+RustFS 支持只读根文件系统。在 `rustfs.statefulSet.securityContext` 和 `rustfs.bucketJob.securityContext` 中设置 `readOnlyRootFilesystem: true`。
+
 ## 要求
+
+使用自己的 blob storage 时，需要满足以下要求。
 
 <Note>
 Azure blob storage 从 Helm chart `0.8.9` 及以上版本可用。[删除 trace 项目](/langsmith/observability-concepts#data-retention) 从 Helm chart `0.10.43` 开始在 Azure 中受支持。
@@ -166,7 +206,8 @@ config:
     ```yaml
     config:
       blobStorage:
-        enabled: true
+        external:
+          enabled: true
         engine: "S3"
         bucketName: "langsmith"
         apiURL: "https://br-cool-darkness-a1b2c3d4.storage.c-1.us-east-2.aws.neon.tech"
@@ -188,14 +229,17 @@ Neon 不会执行 lifecycle rule，因此在启用 [TTL](#ttl-configuration) 之
 
 默认情况下，LangSmith 仍然会把用于搜索的 tokens 存储在 ClickHouse 中。如果你使用的是 LangSmith Managed Clickhouse，你可能希望禁用这个功能，以避免将潜在敏感信息发送到 ClickHouse。你可以在 blob storage 配置中关闭它。
 
+<a id="configuration"></a>
+
 ## 配置
 
-创建好 bucket 并获得所需凭据后，就可以配置 LangSmith 使用你的 blob storage 系统。
+创建 bucket 并获取所需凭据后，配置 LangSmith 使用你的 blob storage 系统。设置 `external.enabled: true`，使 Helm chart 跳过 RustFS 部署。
 
 ```yaml Helm
 config:
   blobStorage:
-    enabled: true
+    external:
+      enabled: true # Use your own storage instead of the bundled RustFS
     engine: "S3" # Or "GCS" or "Azure". This is case-sensitive.
     chSearchEnabled: true # Set to false if you want to disable CH search (Recommended for LangSmith Managed Clickhouse)
     bucketName: "your-bucket-name"
