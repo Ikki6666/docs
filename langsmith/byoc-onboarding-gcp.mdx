@@ -57,7 +57,7 @@ provider "google" {
 }
 
 module "langsmith_byoc_service_account" {
-  source = "github.com/langchain-ai/terraform//modules/byoc/gcp/langsmith-byoc-service-account?ref=v0.17.80"
+  source = "github.com/langchain-ai/terraform//modules/byoc/gcp/langsmith-byoc-service-account?ref=v0.17.103"
 
   project_id                 = "<project-id>"
   crossplane_service_account = "byoc-crossplane@langchain-prod.iam.gserviceaccount.com"
@@ -69,7 +69,7 @@ output "provisioner_service_account" {
 }
 ```
 
-LangSmith 要求使用 v0.17.80 或更高版本的 module。如果你应用了更早的版本，请在 v0.17.80 或更高版本上重新应用该 module。
+LangSmith 要求使用 v0.17.90 或更高版本的 module，以便 provisioner 创建 [Private Google Access](/langsmith/byoc-networking-gcp#private-google-access) 路由。使用更早版本时，data plane 仍可进入就绪状态，但 Google API 流量会解析到公有地址，并遵循你的 VPC 路由。如果你已应用更早的版本，请使用 v0.17.90 或更高版本重新应用该 module。
 
 如果你要自行创建 data plane 的 service accounts 及其项目角色，请在项目中创建 data plane 之前设置 `byo_iam = true`。此时 provisioner 无法创建 service accounts 或更改项目 IAM 策略。如果项目中存放了不属于 LangSmith 的资源，请设置它。创建 data plane 时，请将 `byoiam_enabled` 设置为 `true`。更多信息，请参阅[自带 IAM](/langsmith/byoc-architecture-gcp#bring-your-own-iam)。
 
@@ -102,10 +102,11 @@ curl -X POST https://api.smith.langchain.com/orgs/current/data-planes \
 | `region` | data plane 的 GCP region。GCP 上的 BYOC 可以在任意 GCP region 中运行。如果你需要的 region 尚未启用，请联系 LangChain 团队添加。 |
 | `gcp_project_id` | 来自[第 2 步](#step-2-run-the-terraform-module)的项目。 |
 | `provisioner_service_account` | Terraform 输出 `provisioner_service_account`。它必须位于该项目中。 |
-| `vpc_cidr` | LangSmith 创建的 VPC 的地址范围。从 `/16` 到 `/18` 的私有 RFC 1918 范围。它不得与 GKE pod 和 service 使用的 `192.168.0.0/17` 重叠。 |
+| `vpc_cidr` | LangSmith 创建的 VPC 地址范围，为 `/16` 到 `/18` 的私有 RFC 1918 范围。`/16` 或 `/17` 可容纳所有地址范围，包括 GKE pod。使用 `/18` 时，VPC 不得与 GKE pod 使用的 `192.168.0.0/18` 重叠。参见[地址范围](/langsmith/byoc-networking-gcp#address-ranges)。 |
 | `public_load_balancer` | `true` 表示公有 endpoint。`false`（默认值）表示内部 endpoint。参见[选择公有或内部 endpoint](#choose-a-public-or-internal-endpoint)。 |
 | `byoiam_enabled` | 可选。如果你使用 `byo_iam = true` 应用了该 module，则为 `true`。 |
 | `sandboxes_enabled` | 可选。`true` 表示在 data plane 中部署 [LangSmith sandboxes](/langsmith/sandboxes)。默认为 `false`。 |
+| `mtu_bytes` | （可选）VPC 的 MTU，取值范围为 1300 到 8896。将其设为 MTU 较小的对等中心 VPC 或互连网络的值，例如 1440。默认采用 GCP 的默认值 1460。参见 [MTU](/langsmith/byoc-networking-gcp#mtu)。 |
 
 API 返回 `202`，并附带 data plane 的 `id`、`api_url` 和 `status`。在接受请求之前，LangSmith 会检查它能否模拟 provisioner，以及 provisioner 是否位于该项目中并带有你的 external ID。如果检查失败，响应中会指出问题。参见[排查创建错误](#troubleshoot-create-errors)。
 
@@ -134,9 +135,9 @@ data plane URL 就是 data plane 的 `api_url`：`https://<data plane ID 的前 
 你可以在创建 data plane 时选择 endpoint 类型：
 
 - **公有**：用户可以从互联网访问 data plane。
-- **内部**（默认）：ingress 位于内部 load balancer 上，主机名仅在 data plane VPC 内解析。将你的网络连接到该 VPC，例如通过 VPC peering 或 Cloud VPN，并确保主机名可从你的网络解析。
+- **内部**（默认）：ingress 位于内部 load balancer 上，主机名仅在 data plane VPC 内解析。将你的网络连接到该 VPC，例如通过 VPC peering 或 Cloud VPN，并确保主机名可从你的网络解析。参见[连接你的网络](/langsmith/byoc-networking-gcp#connect-your-network)。
 
-data plane 的出站流量通过 Cloud NAT 以静态 IP 地址发出，因此你可以将 data plane 加入允许列表。
+data plane 的出站流量通过 Cloud NAT 以静态 IP 地址发出，因此你可以将 data plane 加入允许列表。有关 data plane 需要访问的目的地，请参阅[出站流量](/langsmith/byoc-networking-gcp#outbound-traffic)。
 
 ### 更改 data plane 设置
 
@@ -176,7 +177,7 @@ GKE 节点会在 GKE `REGULAR` release channel 上自动升级。
 | `organization_external_id_missing` | 409 | 你的组织尚未设置 BYOC。 | 联系 LangChain 团队。 |
 | `data_plane_name_taken` | 409 | 你的组织中已有使用该名称的 data plane。 | 选择另一个 `name`。 |
 
-字段校验失败的请求（例如 region 未启用，或 `vpc_cidr` 与 GKE 地址范围重叠）会返回 `400`，并附带字段名和原因。
+字段校验失败的请求会返回 `400`，并附带字段名和原因。例如，region 未启用、`/18` 的 `vpc_cidr` 与 GKE pod 地址范围重叠，或 `mtu_bytes` 超出取值范围。
 
 ## 删除 data plane
 
@@ -212,6 +213,7 @@ LangSmith 之后不会删除它们，`terraform destroy` 也不会。当你不�
 ## 另请参阅
 
 - [GCP 上的 BYOC 架构](/langsmith/byoc-architecture-gcp)
+- [GCP 上的 BYOC 网络](/langsmith/byoc-networking-gcp)
 - [BYOC 概览](/langsmith/byoc)
 - [BYOC 使用](/langsmith/byoc-usage)
 

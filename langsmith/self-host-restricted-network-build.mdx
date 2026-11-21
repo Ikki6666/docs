@@ -33,6 +33,18 @@ pip、uv、uv 的 Python 下载以及镜像构建各自读取自己的设置。�
 
 pip 和 uv 各自需要自己的 CA 设置，详见[配置 pip](#配置-pip) 和[配置 uv](#配置-uv)。
 
+<a id="provide-the-python-interpreter"></a>
+
+## 提供 Python 解释器
+
+Agent Server 镜像自带 Python 解释器。build machine 只需要 Python 3.10 或更高版本来运行 pip、uv 和 LangGraph CLI。请从 OS 仓库安装 Python，例如在 RHEL 系列发行版上执行以下命令。
+
+```bash
+sudo dnf install python3.12
+```
+
+有些发行版将 `venv` 作为单独的 OS 包提供，例如 Debian 和 Ubuntu 上的 `python3-venv`。安装 uv 时需要 `venv`，请一并安装。如果 OS 仓库不提供受支持的 Python 版本，请参阅 uv 的 [Installing Python](https://docs.astral.sh/uv/guides/install-python/) 指南。
+
 ## 配置 pip
 
 在 pip 配置文件中设置一次 index。在每条命令中通过 `--index-url` 传入长 URL 很容易出错，两个标志之间缺少空格会产生误导性的 `404`。
@@ -54,9 +66,7 @@ cert = <CA_BUNDLE_PATH>
 
 从内部 index 将 uv 安装为 Python 包。uv 安装脚本（`curl ... | sh`）在受限网络中无法使用，因为它会从 `releases.astral.sh` 或 GitHub 下载 uv 二进制文件。
 
-PyPI 将 uv 作为包含该二进制文件的 wheel 托管。在某些发行版上，`venv` 作为单独的 OS 包提供，例如 Debian 和 Ubuntu 上的 `python3-venv`。
-
-将 uv 安装到它自己的 virtual environment 中，以免影响系统 Python。然后将这些二进制文件链接到你的 `PATH`：
+PyPI 将 uv 作为包含该二进制文件的 wheel 托管。将 uv 安装到独立的虚拟环境中，以免影响系统 Python。然后将这些二进制文件链接到你的 `PATH`：
 
 ```bash
 python3 -m venv ~/.local/share/uv-bootstrap
@@ -84,23 +94,13 @@ export UV_PYTHON_DOWNLOADS=never
 
 - **`UV_DEFAULT_INDEX`**：替换 pypi.org 作为默认 index。
 - **`UV_SYSTEM_CERTS`**：从操作系统信任存储加载证书，其中包含内部 CA。默认情况下，uv 只信任其捆绑的根证书。
-- **`UV_PYTHON_DOWNLOADS`**：阻止 uv 下载 Python。[提供 Python 解释器](#提供-python-解释器)说明了原因。
+- **`UV_PYTHON_DOWNLOADS`**：禁止 uv 下载 Python，使它使用 `PATH` 上的解释器。如果没有此设置，uv 会尝试从 GitHub 下载缺失的解释器。在受限网络中，请求重试三次后失败。
 
 <Note>
 `UV_SYSTEM_CERTS` 需要 uv 0.11.0 或更高版本。更早的版本使用 `UV_NATIVE_TLS=true`，后续版本仍然接受它，但会给出弃用警告。
 </Note>
 
 要只信任内部 CA，请使用 `SSL_CERT_FILE=<CA_BUNDLE_PATH>` 代替 `UV_SYSTEM_CERTS`。`SSL_CERT_FILE` 会同时替换 uv 捆绑的根证书和操作系统信任存储。关于所有设置，请参阅 uv 的[环境变量参考](https://docs.astral.sh/uv/reference/environment/)。
-
-## 提供 Python 解释器
-
-Agent Server 镜像自带 Python。build machine 只需要 Python 3.10 或更高版本来运行 pip、uv 和 LangGraph CLI。请从 OS 仓库安装它，例如在 RHEL 系列发行版上：
-
-```bash
-sudo dnf install python3.12
-```
-
-uv 会在 `PATH` 上查找解释器。请保留 `UV_PYTHON_DOWNLOADS=never`：没有它，uv 会尝试从 GitHub 下载缺失的解释器，并在没有明确错误的情况下反复重试。如果 OS 仓库不提供受支持的版本，请参阅 uv 的 [Installing Python](https://docs.astral.sh/uv/guides/install-python/) 指南。
 
 ## 构建 Agent Server 镜像
 
@@ -158,7 +158,7 @@ uv 会在 `PATH` 上查找解释器。请保留 `UV_PYTHON_DOWNLOADS=never`：�
     - **`base_image`**：镜像同步后的 Agent Server image，不带 tag。CLI 会追加一个根据 `python_version` 构建的 tag，并在你设置时加上 `api_version` 或 `image_distro`。使用上述配置，构建会拉取 `<DOCKER_REGISTRY>/langchain/langgraph-api:3.12`，因此该 tag 必须存在于 registry 中。
     - **`dockerfile_lines`**：CLI 在 `FROM` 之后插入的行。`COPY` 和 `RUN` 行会将内部 CA 追加到镜像的系统 CA bundle，同时保留公共根证书。两个 `ARG` 行会应用于构建中的每个安装步骤，包括从 `uv.lock` 文件进行的安装。`SSL_CERT_FILE` 将 uv 指向系统 bundle（uv 原本会忽略它），`UV_DEFAULT_INDEX` 将 uv 指向内部 index。`ARG` 值在 `docker history` 中可见，因此不要把凭据放入 `<PYPI_INDEX_URL>`。
 
-    如果 index 使用来自公共 CA 的证书，请省略 `COPY`、`RUN` 和 `SSL_CERT_FILE` 行。
+    如果 index 使用来自公共 CA 的证书，请省略 `COPY`、`RUN` 和 `SSL_CERT_FILE` 行。如果 agent 在运行时调用内部 HTTPS 服务，请参阅[在运行时信任内部 CA](#trust-the-internal-ca-at-runtime)。
 
 1. 构建镜像：
 
@@ -209,6 +209,15 @@ uv 会在 `PATH` 上查找解释器。请保留 `UV_PYTHON_DOWNLOADS=never`：�
     ```bash
     langgraph build -t my-agent
     ```
+
+<a id="trust-the-internal-ca-at-runtime"></a>
+
+### 在运行时信任内部 CA
+
+`ARG` 值仅在镜像构建期间生效。如果 agent 在运行时调用内部 HTTPS 服务，请用 `ENV` 声明 CA 设置，使运行中的 agent 信任内部 CA。
+
+- **Python**。将 `SSL_CERT_FILE` 所在行的 `ARG` 改为 `ENV`。基于 `httpx` 的客户端会读取此设置。如果 agent 使用 `requests`，还需添加 `"ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"`，因为 `requests` 不读取 `SSL_CERT_FILE`。
+- **JavaScript**。将 `NODE_EXTRA_CA_CERTS` 所在行的 `ARG` 改为 `ENV`。
 
 关于每个 `langgraph.json` 键，请参阅 [LangGraph CLI 配置文件](/langsmith/cli#configuration-file)的参考文档。
 
@@ -291,7 +300,7 @@ error: No interpreter found for Python 3.99 in managed installations or search p
 
 ```bash
 langgraph dockerfile Dockerfile
-grep -E '^(FROM|COPY|RUN cat|ARG)' Dockerfile
+grep -E '^(FROM|COPY|RUN cat|ARG|ENV (SSL_CERT_FILE|REQUESTS_CA_BUNDLE|NODE_EXTRA_CA_CERTS))' Dockerfile
 ```
 
 对于 Python 项目：
@@ -313,7 +322,7 @@ ARG NODE_EXTRA_CA_CERTS=/etc/ssl/certs/internal-ca.pem
 ARG NPM_CONFIG_REGISTRY=<NPM_REGISTRY_URL>
 ```
 
-`FROM` 必须指明内部 registry，且 `dockerfile_lines` 中的每一行都必须存在。
+`FROM` 必须指明内部 registry，且 `dockerfile_lines` 中的每一行都必须存在。如果你已将 CA 相关行改成 `ENV`，以便[在运行时信任内部 CA](#trust-the-internal-ca-at-runtime)，对应行应以 `ENV` 开头。
 
 ## 后续步骤
 

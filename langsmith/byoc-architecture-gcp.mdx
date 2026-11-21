@@ -29,7 +29,7 @@ GCP 上的 BYOC 处于 [beta](/langsmith/release-stages) 阶段。资源和权�
 
 LangSmith 会在你的 GCP 项目中创建以下内容：
 
-- **网络**：一个带有 GKE 子网的 VPC、具有静态出口 IP 地址的 Cloud NAT，以及私有服务访问。
+- **网络**：一个带有 GKE 子网的 VPC、具有静态出口 IP 地址的 Cloud NAT、私有服务访问，以及让 Google API 流量使用 [Private Google Access](/langsmith/byoc-networking-gcp#private-google-access) 的路由和私有 DNS 区域。
 - **GKE**：区域级私有 GKE Standard 集群，启用 Workload Identity 和屏蔽节点。
 - **Cloud SQL for PostgreSQL**：一个 instance 用于 LangSmith，另一个用于 SmithDB metastore。仅使用私有 IP、高可用性、TLS 和 IAM 数据库登录，因此不存在数据库密码。
 - **Memorystore for Redis Cluster**：TLS 和 IAM 身份验证，通过 Private Service Connect 访问。
@@ -60,16 +60,7 @@ GCP data planes 在 [SmithDB](/langsmith/self-host-smithdb) 中存储和查询 t
 
 ## 网络
 
-所有子网都来自你选择的 `vpc_cidr`，范围为 `/16` 到 `/18`。所有子网都启用 Private Google Access。
-
-| 范围 | 大小 | 用途 |
-|-------|------|-----|
-| GKE 子网 | 前 `/20` | GKE 节点。Pod 使用次要范围 `192.168.0.0/18`，服务使用 `192.168.64.0/18`。 |
-| Endpoints 子网 | `/24` | 用于 Memorystore 的 Private Service Connect endpoints。 |
-| Control plane endpoint 子网 | `/24` | 指向 `us-central1` 中 LangSmith control plane 的 Private Service Connect endpoint。 |
-| 私有服务访问 | `/20` | 与 Google 服务对等连接，以获取 Cloud SQL 私有 IP。 |
-
-该 VPC 是一个带有自定义子网的区域级 VPC。Cloud NAT 使用一个静态外部 IP 地址，因此你可以将 data plane 加入允许列表，并且只记录错误日志。
+LangSmith 为 data plane 创建一个区域级 VPC，使用你选择的 `vpc_cidr` 划分自定义子网。Cloud NAT 为 VPC 提供一个静态出口 IP 地址。Private Service Connect 承载发往 control plane 的流量，Private Google Access 承载发往 Google API 和 Artifact Registry 的流量。有关地址范围、MTU、网络连接、DNS 与 ingress 以及 data plane 所需的出站流量，请参阅 [GCP 上的 BYOC 网络](/langsmith/byoc-networking-gcp)。
 
 ## 存储
 
@@ -107,23 +98,6 @@ GCP data planes 在 [SmithDB](/langsmith/self-host-smithdb) 中存储和查询 t
 - **Istio**：base、istiod 和 ingress gateway。
 - **Postgres 设置任务**：创建数据库和 IAM 数据库用户，并授予其数据库所有者角色。它不保存密码。
 
-## DNS 与 ingress
-
-- **主机名**：`<first 8 characters of the data plane ID>.gcp.langchain-byoc.com`。LangChain 拥有父区域。
-- **公共区域**：你项目中用于该主机名的公共 Cloud DNS 区域，由 LangChain 从父区域委派。
-- **公共 endpoint**：外部直通 load balancer。该主机名可在互联网上解析。
-- **内部 endpoint**（默认）：GKE 子网中的内部直通 load balancer，具有全局访问权限。地址记录位于私有区域中，仅在 data plane VPC 内可见，因此私有地址永远不会公开。公共区域仍用于委派和证书质询。
-- **TLS**：Let's Encrypt 证书。HTTP 会重定向到 HTTPS。
-- **网关加固**：网关在路由前规范化路径，拒绝超过 100 MiB 的请求体，限制每个 gateway pod 的请求数，并拒绝 `TRACE`、`TRACK` 和 `CONNECT`。
-- **Control plane 路径**：登录等路径会通过 Private Service Connect 转发到 control plane。
-
-## Private Service Connect
-
-- LangChain 在 `us-central1` 中发布一个 service attachment。LangSmith 会在 data plane 预置过程中自动将你的项目添加到其接受列表。无需手动将项目加入允许列表。
-- Data plane 创建该 endpoint：control plane endpoint 子网中的一个内部地址，以及指向 service attachment 的转发规则。其他 region 中的 data planes 通过全局访问到达该 endpoint。
-- 一个用于 `us-central1.p.api.smith.langchain.com` 的私有 DNS 区域，仅在 data plane VPC 内可见，指向该 endpoint。
-- Private Service Connect 仅承载从 data plane 到 control plane 的流量。Control plane 通过 GKE 基于 DNS 的 endpoint 到达集群。
-
 ## 访问与权限
 
 ### Terraform module 资源
@@ -135,7 +109,7 @@ GCP data planes 在 [SmithDB](/langsmith/self-host-smithdb) 中存储和查询 t
 | `langsmith-byoc-provisioner` 服务账号 | LangSmith 用于预置的服务账号。其描述是你的 external ID。 |
 | provisioner 上的 Token Creator | 允许 `byoc-crossplane@langchain-prod.iam.gserviceaccount.com` 模拟该 provisioner。不信任任何其他 LangChain 标识。 |
 | `langsmithByocProvisioner` 自定义角色 | 在项目上绑定的权限，用于创建、更新和删除名称条件无法限制的 data plane 资源。 |
-| `langsmithByocNamed<Kind>` 自定义角色 | 每种资源类型一个角色：Cloud SQL instances、GKE clusters、networks、subnets、Cloud Routers、addresses、forwarding rules、Memorystore for Redis clusters、service connection policies、Cloud Storage 和 Secret Manager。每个角色都按资源名称绑定 IAM 条件，因此 provisioner 只能创建、更改和删除名称以 `langsmith-` 开头的资源，以及 ID 以 `ls-` 开头的 secrets。 |
+| `langsmithByocNamed<Kind>` 自定义角色 | 每种资源类型一个角色：Cloud SQL instances、GKE clusters、networks、subnets、路由、Cloud Routers、网络防火墙政策（v0.17.91 或更高版本）、addresses、forwarding rules、Memorystore for Redis clusters、service connection policies、Cloud Storage 和 Secret Manager。每个角色都按资源名称绑定 IAM 条件，因此 provisioner 只能创建、更改和删除名称以 `langsmith-` 开头的资源，以及 ID 以 `ls-` 开头的 secrets。 |
 | `managed_by: langsmith` 标签 | 一个项目标签。provisioner 只能将其绑定到名称以 `langsmith-` 开头的 GKE cluster 和 Cloud SQL instance。 |
 | control plane 的 `roles/container.admin` | 授予 `byoc-crossplane@langchain-prod.iam.gserviceaccount.com`，条件是集群带有 `managed_by: langsmith` 标签。它覆盖 GKE API 和 Kubernetes API。 |
 | `langsmithByocClusterConnect` 自定义角色 | 为 control plane 服务账号提供 `container.clusters.connect`，仅限名称以 `langsmith-` 开头的集群。基于 DNS 的 endpoint 会在不检查集群标签的情况下校验该权限。连接本身不会获得集群内的任何访问权限。 |
@@ -207,6 +181,7 @@ Crossplane 会为每个 data plane 的每一类工作负载创建一个 Google �
 ## 下一步
 
 - [GCP 上的 BYOC 入门](/langsmith/byoc-onboarding-gcp)
+- [GCP 上的 BYOC 网络](/langsmith/byoc-networking-gcp)
 - [BYOC 概览](/langsmith/byoc)
 - [BYOC 共享责任模型](/langsmith/byoc-shared-responsibility)
 

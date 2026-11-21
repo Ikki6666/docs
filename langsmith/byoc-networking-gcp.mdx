@@ -1,0 +1,123 @@
+---
+title: GCP 上的 BYOC 网络
+sidebarTitle: Networking
+description: 了解 LangSmith BYOC 在你的 GCP 项目中创建的网络、如何连接你的网络，以及哪些流量会离开 data plane。
+icon: "network"
+---
+
+LangSmith 在你的 GCP 项目中为每个 BYOC data plane 创建一个 VPC。本页介绍 VPC 的地址范围、如何连接你的网络，以及哪些流量留在 Google 网络内、哪些需要互联网访问。有关 LangSmith 部署的其他资源，请参阅 [GCP 上的 BYOC 架构](/langsmith/byoc-architecture-gcp)。
+
+<Note>
+GCP 上的 BYOC 处于 [beta](/langsmith/release-stages) 阶段。网络配置可能随版本变化。本页列出当前默认值。
+</Note>
+
+<a id="address-ranges"></a>
+
+## 地址范围
+
+所有子网都来自你选择的 `vpc_cidr`，范围为 `/16` 到 `/18`。所有子网都启用 Private Google Access。
+
+| 范围 | 大小 | 用途 |
+|-------|------|-----|
+| GKE 子网 | 第一个 `/20` | GKE 节点。 |
+| Endpoint 子网 | `/24` | Memorystore 的 Private Service Connect endpoint。 |
+| Control plane endpoint 子网 | `/24` | 连接 `us-central1` 中 LangSmith control plane 的 Private Service Connect endpoint。 |
+| 私有服务访问 | `/20` | 与 Google 服务对等连接，以使用 Cloud SQL 私有 IP。 |
+| GKE pod | `/18` | GKE 子网的次要地址范围，取私有服务访问范围之后的第一个 `/18`。 |
+
+`/18` VPC 没有足够的空间容纳 pod 地址范围，因此 pod 使用 `192.168.0.0/18`，VPC 地址范围不得与其重叠。使用 `/17` 或 `/16`，可将所有地址范围都保留在 VPC 内。
+
+GKE 为 Service 分配 Google 管理的 `34.118.224.0/20` 地址范围，无需占用 VPC 地址空间。此范围仅在集群内使用，不会通过 VPC 对等连接导出。旧版 data plane 仍使用 `192.168.0.0/18` 作为 pod 地址范围，使用 `192.168.64.0/18` 作为 Service 地址范围。
+
+这是一个带自定义子网的区域级 VPC。Cloud NAT 使用一个静态外部 IP 地址。你可以将此地址加入允许列表，以接收来自 data plane 的流量。Cloud NAT 仅记录错误日志。
+
+<a id="connect-your-network"></a>
+
+## 连接你的网络
+
+data plane 默认使用内部 endpoint，由 GKE 子网内启用全局访问的内部直通负载均衡器提供。已连接网络中任意 region 的客户端均可访问该 endpoint。在[创建 data plane](/langsmith/byoc-onboarding-gcp#choose-a-public-or-internal-endpoint)时选择公有或内部 endpoint。
+
+访问内部 endpoint 需要完成以下操作。
+
+- **将你的网络连接到 data plane VPC**，例如使用 VPC 对等连接或 Cloud VPN。对等连接会交换子网路由，包括 GKE pod 的地址范围。请选择与现有网络地址不重叠的 `vpc_cidr`。如果使用 `/18` VPC，你的网络也不得与 `192.168.0.0/18` 重叠。
+- **让你的网络能够解析主机名**。地址记录位于仅对 data plane VPC 可见的私有 DNS 区域中，因此私有地址不会公开发布。
+
+如果连接的网络使用较小的 MTU，请调整 VPC 的 [MTU](#mtu) 与之匹配。如果该网络向 data plane VPC 导出默认路由，Google API 流量仍使用 [Private Google Access](#private-google-access)，其余出站流量遵循导入的路由。
+
+## MTU
+
+VPC 使用 GCP 的默认 MTU，即 1460 字节。如果要将 VPC 连接到 MTU 较小的网络，例如 MTU 为 1440 字节的中心 VPC 或互连网络，请在创建 data plane 时设置 `mtu_bytes`。LangSmith 接受 1300 到 8896 的值。
+
+## Private Service Connect
+
+- LangChain 在 `us-central1` 发布 service attachment。LangSmith 在预置 data plane 时自动将你的项目加入其接受列表。
+- data plane 创建 endpoint，包括 control plane endpoint 子网中的内部地址和指向 service attachment 的转发规则。其他 region 的 data plane 通过全局访问连接该 endpoint。
+- 仅对 data plane VPC 可见的私有 DNS 区域 `us-central1.p.api.smith.langchain.com` 指向该 endpoint。
+- Private Service Connect 仅承载从 data plane 到 control plane 的流量。control plane 通过 GKE 基于 DNS 的 endpoint 访问集群。
+
+## Private Google Access
+
+data plane 通过 `private.googleapis.com` 访问 Google API。流量保留在 Google 网络内，无需依赖 VPC 默认路由。LangSmith 在 data plane VPC 中创建以下资源。
+
+- **路由**。为 `199.36.153.8/30`（`private.googleapis.com`）和 `34.126.0.0/18`（部分 Google API 的直接连接地址）配置路由，均以默认互联网网关为下一跳。路由名称以 `langsmith-` 开头。
+- **私有 DNS 区域**。`googleapis.com`、`pkg.dev` 和 `gcr.io` 解析到 `private.googleapis.com`。`rep.googleapis.com` 区域使 `aiplatform.us-central1.rep.googleapis.com` 等区域级 endpoint 仍解析到其公有地址。这些 DNS 区域仅对 data plane VPC 可见。
+
+这些路由比默认路由更具体，也优先于从对等网络导入的默认路由。因此，访问 Secret Manager、Cloud Storage、Workload Identity、Cloud Logging 以及从 Artifact Registry 拉取镜像的流量均不经过对等网络。VPC 对等连接不会交换下一跳是默认互联网网关的路由，因此对等网络不会获得这些路由，其 DNS 解析也不变。
+
+<a id="dns-and-ingress"></a>
+
+## DNS 与 ingress
+
+- **主机名**。`<first 8 characters of the data plane ID>.gcp.langchain-byoc.com`。LangChain 拥有父区域。
+- **公共区域**。LangChain 从父区域将主机名委派给你项目中的公共 Cloud DNS 区域。
+- **公有 endpoint**。采用外部直通负载均衡器。主机名可在互联网上解析。
+- **内部 endpoint**（默认）。采用 GKE 子网内启用全局访问的内部直通负载均衡器。地址记录位于仅对 data plane VPC 可见的私有 DNS 区域中，因此私有地址不会公开发布。公共区域仍用于委派和证书验证。
+- **TLS**。使用 Let's Encrypt 证书。HTTP 请求重定向到 HTTPS。
+- **网关加固**。网关在路由前规范化路径，拒绝大于 100 MiB 的请求体，限制每个网关 pod 的请求数，并拒绝 `TRACE`、`TRACK` 和 `CONNECT`。
+- **Control plane 路径**。登录等路径通过 Private Service Connect 转发到 control plane。
+
+<a id="container-images"></a>
+
+## 容器镜像
+
+LangSmith 及其附加组件通过 Private Google Access 从 LangChain 的 Artifact Registry 仓库 `us-docker.pkg.dev/langchain-artifacts/langsmith-byoc` 拉取镜像。附加组件包括 cert-manager、trust-manager、External Secrets、Istio 和 KEDA。它们不会从 Docker Hub、Quay 或 GitHub Container Registry 拉取镜像。
+
+<a id="outbound-traffic"></a>
+
+## 出站流量
+
+以下流量无需互联网访问。
+
+- **Control plane**。使用 Private Service Connect。
+- **Google API 和镜像**。使用 Private Google Access。
+- **Cloud SQL 和 Memorystore**。使用私有 IP 和 Private Service Connect。
+
+其余出站流量均沿 VPC 的默认路由发出。默认使用 Cloud NAT。如果你从自己的网络导入了默认路由，则使用该网络。如果该网络会过滤流量，请允许访问以下目的地。
+
+| 功能 | 目的地 |
+|---------|--------------|
+| 模型提供商 | 你的 workspace 使用的 LLM 提供商，例如 `api.openai.com`、`api.anthropic.com`、Azure OpenAI（`<resource>.openai.azure.com`）、Amazon Bedrock（`bedrock-runtime.<region>.amazonaws.com`）或自定义 base URL。对于 Vertex AI（包括 Vertex AI 上的 Gemini），只需允许其区域级 `aiplatform.<region>.rep.googleapis.com` endpoint。Gemini Developer API（`generativelanguage.googleapis.com`）通过 Private Google Access 访问，无需添加条目。 |
+| 证书 | 通过 TCP 443 访问 `acme-v02.api.letsencrypt.org`，并通过 TCP 和 UDP 53 向 `1.1.1.1` 和 `8.8.8.8` 发起 DNS 查询，检查 DNS-01 记录是否已传播。 |
+| 从 GitHub 构建部署 | `github.com`、`api.github.com`、`codeload.github.com`、`pypi.org`、`files.pythonhosted.org`、`registry.npmjs.org`，以及项目使用的任何软件包索引或 Git 主机。 |
+| Agent 和沙箱代码 | 代码调用的工具、API 和软件包索引。 |
+| Webhook、告警、MCP 服务器和集成 | 你配置的 URL，例如 `events.pagerduty.com` 或 `slack.com`。 |
+
+如果你的网络执行 TLS 检查，请将这些目的地排除在检查范围之外。data plane 的工作负载不信任你的检查 CA。
+
+<a id="see-also"></a>
+
+## 另请参阅
+
+- [GCP 上的 BYOC 架构](/langsmith/byoc-architecture-gcp)
+- [GCP 上的 BYOC 入门](/langsmith/byoc-onboarding-gcp)
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/byoc-networking-gcp.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>
