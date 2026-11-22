@@ -1,0 +1,76 @@
+---
+title: LangSmith v0.18 中有哪些变化
+sidebarTitle: v0.18 中的 agent 迁移
+description: 自托管 LangSmith v0.18 如何把现有 tracing project 迁移到 agent 和 environment、迁移时间线，以及各 workspace 中的变化。
+---
+
+自托管 LangSmith v0.18 改为按 [agent](/langsmith/agent-registry#agent) 组织每个 workspace，而不再按 tracing project 组织。每个 agent 把其 traces 划分到一组固定的 [environments](/langsmith/agent-environments) 中：**Production**、**Staging**、**Development** 和 **Local**。每条 trace 都会记录产生它的 agent 以及它运行所在的 environment，因此 alerts、dashboards 和 evaluators 可以只针对一个 environment，无需额外筛选。升级现有安装时，LangSmith 会自动把 tracing projects 迁移到 agents。
+
+本页面向自托管安装的管理员。升级操作本身请参阅[升级安装](/langsmith/self-host-upgrades)。v0.18 或更高版本的新安装会直接以 agents 起步，因此无需迁移。
+
+## 升级之前
+
+<Warning>
+迁移无法撤销。迁移运行后，不要降级到迁移之前的 LangSmith 版本。如果降级，旧版本创建的 tracing projects 可能永远无法迁移到 agents。
+</Warning>
+
+- **一次升级一个主版本**：先升级到最新的 0.17 chart，再升级到 0.18。请参阅[升级安装](/langsmith/self-host-upgrades)。
+- **未启用身份验证的安装**：如果安装既未启用 basic auth 也未启用 SSO，LangSmith 不会迁移它。升级后，其 workspace 会保留 tracing-project 体验。要将其迁移到 agents，请配置 [basic auth](/langsmith/self-host-basic-auth) 或 [SSO](/langsmith/self-host-sso)，随后 LangSmith 会运行迁移。
+
+## 迁移如何运行
+
+Helm chart 值 `config.agentMigration.enabled` 控制迁移，默认值为 `true`。它不需要额外的基础设施或权限。迁移所需时间取决于安装中的 workspace 和 tracing project 数量。
+
+1. 升级后的服务启动约 10 分钟后，迁移会自动开始。重启不会重置这段延迟。
+1. LangSmith 会分别迁移每个 workspace。某个 workspace 自身的迁移完成后，它会立即切换到 agents，无需等待安装中的其他 workspace。
+1. 迁移处于活动状态期间，LangSmith 会检查已迁移的 workspace 中在其迁移后创建的 tracing projects，并将这些项目也迁移。
+1. 连续 24 小时没有新的 tracing project 需要迁移后，迁移会停止。后续升级不会再次运行迁移。
+
+迁移期间 tracing 始终可用。在所属 workspace 完成迁移之前，用户仍会看到 tracing-project 体验。
+
+要暂停迁移，请把 `enabled` 值设为 `false`：
+
+```yaml
+config:
+  agentMigration:
+    enabled: false
+```
+
+使用 `helm upgrade` 应用更改，该命令会重启读取此设置的 LangSmith pods。要恢复迁移，请把该值改回 `true`。迁移会从停止处继续。暂停不会结束迁移。恢复后，只有当完整检查发现没有剩余内容需要迁移，且此前 24 小时内没有发生迁移工作（包括暂停期间的时间）时，迁移才会永久停止。
+
+## 检查 workspace 是否已迁移
+
+已迁移的 workspace 会在顶部栏中显示 [agent 切换器](/langsmith/navigate-agents)，左上角的控件会变成显示 workspace 名称的 workspace 切换器。尚未迁移的 workspace 仍会显示 tracing-project 体验。
+
+## tracing projects 如何映射到 agents
+
+LangSmith 不会重新摄取、移动或重命名你的 traces。每个 tracing project 都会保留其 ID、名称和历史记录：
+
+- **每个 tracing project 对应一个 agent**：每个 tracing project 都会变成独立的 agent，并带有一个 **Production** environment。该 environment 就是原来的 tracing project。迁移不会创建 **Staging**、**Development** 或 **Local** environments。
+- **不按名称合并**：名为 `checkout`、`checkout-prod` 和 `checkout-staging` 的 tracing projects 会变成三个独立的 agents，而不是一个带三个 environments 的 agent。
+- **Agent identifier**：LangSmith 根据 project 名称派生 identifier，将其转换为小写字母、数字和连字符。当某个 [deployment](/langsmith/deploy-overview) 拥有该 tracing project 时，identifier 和 display name 改为来自 deployment 的名称。如果 identifier 已被占用，或者某个 tracing project 已使用该 agent 将来某个 environment 所需的名称（例如为 `checkout` 所需的 `checkout-staging`），LangSmith 会追加一个连字符和八位数字，例如 `checkout-12345678`。要查找 agent 的最终 identifier，请在 [Agent Registry](/langsmith/agent-registry) 中打开它。
+- **保持原样的 projects**：LangSmith 不会把 experiments、LangSmith 为其自身功能创建的 projects，或属于 preview deployments 的 tracing projects 转换为 agents。
+
+你之后新增的 environment 会获得一个 tracing project，名称由 agent identifier、一个连字符和 environment 组成。例如，identifier 为 `billing` 的 agent 会把 staging traces 放在 `billing-staging` 中。迁移后创建的 tracing project（例如由把 traces 发送到新 project 名称的代码创建）会变成带有 **Production** environment 的新 agent。
+
+## 每个 workspace 中的变化
+
+你的 traces、datasets、prompts 和 experiments 仍是相同的记录。按名称向现有 tracing project 发送 traces 的代码会继续正常工作，因为该项目现在是该 agent 的 **Production** environment。请参阅[配置需要 project 名称的集成](/langsmith/create-an-agent#use-an-environment-project)。
+
+workspace 迁移后，LangSmith 的以下部分改为按 agent 和 environment 划分范围，而不再按 tracing project：
+
+- **Traces**：归组到某个 agent 及其某个 environment 下，而不是归组到你命名的 tracing project 下。
+- **预构建 dashboards**：为每个 agent environment 生成，而不是为命名的 project 生成。请参阅 [Dashboards](/langsmith/dashboards)。
+- **Alerts**：适用于 agent 的某个 environment。请参阅 [Alerts](/langsmith/alerts)。
+- **Evaluators**：附加到 environment。请参阅[管理 evaluators](/langsmith/evaluators)。
+- **Datasets**：附加到一个或多个 agents，而不是附加到 project，且不附加到任何 environment，因此一个 dataset 可以服务于多个 agents。请参阅[在 UI 中创建和管理 datasets](/langsmith/manage-datasets-in-application)。
+- **Navigation**：顶部栏新增 agent 切换器，可在 agent 列表和单个 agent 的 Overview 之间切换。请参阅 [Navigate agents](/langsmith/navigate-agents)。
+
+## 继续阅读
+
+- [Agent Registry](/langsmith/agent-registry)
+- [Agent environments](/langsmith/agent-environments)
+- [Navigate agents](/langsmith/navigate-agents)
+- [Create an agent](/langsmith/create-an-agent)
+- [Self-hosted changelog](/langsmith/self-hosted-changelog)
+- [Administration overview](/langsmith/administration-overview#agents)

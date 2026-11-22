@@ -14,7 +14,7 @@ sidebarTitle: 多轮 evaluators
 2. Semantic Outcome：实际发生了什么，任务是否成功。
 3. Trajectory：对话是如何展开的，包括工具调用轨迹。
 
-<Note> 运行多轮在线 evals 会自动将 thread 中的每条 trace 升级为[extended data retention](/langsmith/usage-and-billing#data-retention-auto-upgrades)。这会影响 trace 计费，但能确保符合评估条件的 traces（通常也是最值得分析的那些）被保留下来以供调查。 </Note>
+<Note>多轮在线 evaluators 默认可能会延长 trace 保留期限。你可以在配置 evaluator 时选择退出延长，使 traces 保持 agent environment 的默认保留层级。如果另一项操作明确延长了保留期限，或该 environment 已使用延长保留期限，traces 仍会升级。有关退出延长的分步说明，请参阅[管理 evaluator trace 保留期限](/langsmith/evaluators#manage-evaluator-trace-retention)。详情请参阅[数据保留自动升级](/langsmith/usage-and-billing#data-retention-auto-upgrades)。</Note>
 
 ## 工作原理
 
@@ -30,7 +30,7 @@ sidebarTitle: 多轮 evaluators
 
 ## 前置条件
 
-- 你的 tracing project 或 agent environment 必须使用了 [threads](/langsmith/threads)。
+- 你的 agent environment 必须使用 [threads](/langsmith/threads)。
 - Thread 中每条 trace 的顶层 inputs 和 outputs 都必须包含一个 `messages` 键，其值为消息列表。我们支持 [LangChain](/langsmith/log-llm-trace#messages-format)、[OpenAI Chat Completions](https://platform.openai.com/docs/api-reference/chat/create) 和 [Anthropic Messages](https://platform.claude.com/docs/en/api/messages) 格式的消息。
     - 如果每条 trace 的顶层 inputs 和 outputs 只包含对话中的最新消息，LangSmith 会自动把各轮消息合并成一个 thread。
     - 如果每条 trace 的顶层 inputs 和 outputs 已包含完整对话历史，LangSmith 会直接使用它。
@@ -43,39 +43,48 @@ sidebarTitle: 多轮 evaluators
 
 ## 配置
 
-1. 进入 **Tracing** 页面，并选择一个 tracing project 或 agent environment。
-2. 点击 **Evaluators** 标签页，然后点击 **+ Evaluator**。在 **Create from scratch** 下选择 **LLM-as-a-Judge Evaluator**。在 **Source** 下选择 **Threads**。
-3. **命名 evaluator**。
-4. 应用 **Filters** 或 **Sampling Rate**。<br />
-使用 filters 或 sampling 控制 evaluator 成本。例如，只评估轮次数少于 *N* 的 threads，或对所有 threads 抽样 10%。
-5. **配置空闲时间**。
+要创建多轮在线 evaluator：
 
-    第一次配置 thread-level evaluator 时，你可以定义 idle time，也就是 thread 中最后一条 trace 之后，要等待多久才视为对话完成并进入评估。这个值应反映应用中用户交互的典型长度。空闲时间默认为 10 分钟，且不能设置为低于 2 分钟。
-    <Note>
-    空闲时间是项目级设置。它作用于项目中每个 thread-level evaluator，以及条目类型为 **Threads** 的每条[自动化规则](/langsmith/rules#set-the-thread-idle-time)。
-    </Note>
-    <Tip>
-    首次测试 evaluator 时，可以先用较短的 idle time，这样能更快看到结果，但需以 2 分钟为下限。验证通过后，再将其调大到符合实际用户交互长度的值。
-    </Tip>
-6. **配置模型。**<br />
-选择 evaluator 使用的 provider 和 model。由于 threads 往往较长，因此应选择上下文窗口更大的模型，以避免触发限制。例如，OpenAI 的 GPT-5.4 mini 或 Gemini 2.5 Flash 都是不错的选择，因为它们都具备 1M+ token 的上下文窗口。
+1. 选择你的 agent，转到 **Tracing**，然后选择 environment。
+2. 点击 **Online Evaluators** 标签页，然后点击 **+ Evaluator**，并在 **Create from scratch** 下选择 **LLM-as-a-Judge Evaluator**。
+3. 命名你的 evaluator。
+4. 在 **Trigger On** 下选择 **Threads**。
+5. 应用 **Filters** 或 **Sampling Rate**。使用 filters 或 sampling 控制 evaluator 成本。例如，只评估轮次数少于 *N* 的 threads，或对所有 threads 抽样 10%。
+6. 配置其余设置：
+    - [检查空闲时间](#check-the-idle-time)
+    - [选择模型](#configure-your-model)
+    - [编写 LLM-as-a-judge prompt](#configure-your-llm-as-a-judge-prompt)
+    - [设置 feedback](#set-up-your-feedback-configuration)
+7. 点击 **Create**。Evaluator 会出现在 **Online Evaluators** 标签页中。对于此后新建的任何 threads，一旦空闲时间过去，即可测试该 evaluator。
 
-7. **配置你的 LLM-as-a-judge prompt。**<br />
-定义希望评估的内容。该 prompt 将用于评估整个 thread。你还可以通过 `all_messages` 变量配置要传给 evaluator 的对话内容部分，以控制其接收的数据：
-    - All messages：以 OpenAI chat 格式的 JSON 消息对象列表（`{"role": ..., "content": ...}`）传入完整对话，每条消息都会渲染成带缩进的 JSON，并用空行分隔。
-    - Human and AI pairs：只传入 user 和 assistant 消息，格式为 `<user>...</user>` 与 `<assistant>...</assistant>`，不包含 system messages、tool calls 或其他角色。
-    - First human and last AI：只传入第一条用户消息和最后一条 assistant 回复。
+### 检查空闲时间
 
-9. **设置 feedback 配置。**<br />
-配置 feedback key 的名称、希望收集的 feedback 格式，并可选启用对 feedback 的 reasoning。
+在 **Advanced** 下，**Thread Idle Time** 显示该 environment 的空闲时间：thread 中最后一条 trace 之后，要等待多久才视为完成并可供评估。该值应反映应用中用户交互的预期时长。空闲时间默认为 10 分钟，不能设置为低于 2 分钟。
+<Note>
+空闲时间在 agent environment 上设置。它适用于该 environment 上的每个 thread-level evaluator，以及条目类型为 **Threads** 的每条[自动化规则](/langsmith/rules#set-the-thread-idle-time)。如需更改，请点击该值旁边的 **Edit tracing settings** <Icon icon="settings"/> 图标，或前往该 environment 的 **Tracing** 页面。
+</Note>
+<Tip>
+首次测试 evaluator 时，使用较短的 idle time，以便快速看到结果，但不得低于 2 分钟。验证后，再将其提高到与用户交互预期时长一致。
+</Tip>
+
+### 配置模型
+
+选择 evaluator 使用的 provider 和 model。Threads 往往较长，因此应使用上下文窗口较大的模型来避免触发限制。例如，OpenAI 的 GPT-5.4 mini 和 Gemini 2.5 Flash 都具有 1M+ token 的上下文窗口。
+
+### 配置 LLM-as-a-judge prompt
+
+定义要评估的内容。Evaluator 会将该 prompt 应用于 thread。你还可以配置组装后的对话中由 `all_messages` 变量传给 evaluator 的部分：
+- All messages：以 OpenAI chat 格式的 JSON 消息对象列表（`{"role": ..., "content": ...}`）传入完整对话，每条消息都会渲染成带缩进的 JSON，并用空行分隔。
+- Human and AI pairs：只传入 user 和 assistant 消息，格式为 `<user>...</user>` 与 `<assistant>...</assistant>`，不包含 system messages、tool calls 或其他角色。
+- First human and last AI：只传入第一条用户消息和最后一条 assistant 回复。
+
+### 设置 feedback 配置
+
+配置 feedback key 的名称、要收集的 feedback 格式，并可选启用对 feedback 的 reasoning。
 
 <Warning>
 为 thread-level evaluator 和 run-level evaluator 使用同一个 feedback key **并不可取**，因为很难区分两者的结果。
 </Warning>
-
-8. **保存 evaluator。**
-
-保存后，evaluator 会出现在 **Evaluators** 标签页中。对新建 thread 而言，一旦 idle time 过去，就可以开始测试该 evaluator。
 
 ## 评估 trajectory
 
@@ -97,17 +106,17 @@ sidebarTitle: 多轮 evaluators
 关于每个变量解析到的消息结构，请参见 [Thread message variables](/langsmith/prompt-template-format#thread-message-variables)。
 
 <Warning>
-trajectory 通常比其他任何视图都大，因为它同时涵盖 root runs 和 child runs。请按照[配置](#configuration)第 6 步中的说明，选择上下文窗口较大的模型，并预期每次评估会消耗更多 token。
+trajectory 通常比其他任何视图都大，因为它同时涵盖 root runs 和 child runs。请按照[配置模型](#configure-your-model)中的说明，选择上下文窗口较大的模型，并预期每次评估会消耗更多 token。
 </Warning>
 
 ### 使用 trajectory 变量
 
 按照上文的[配置](#configuration)步骤操作，其中有两处变化：
 
-1. 在 **Source** 下选择 **Threads**。该变量只在针对 tracing project 运行的 evaluator 上可用，不支持针对 dataset 运行。
+1. 在 **Trigger On** 下选择 **Threads**。该变量只在 agent environment 上运行的 evaluator 中可用，不支持针对 dataset 运行的 evaluator。
 2. 在 prompt 中引用 `{{trajectory}}`，并将该变量映射到 `trajectory` source。变量必须命名为 `trajectory`：指向该 source 的其他名称的变量会被拒绝。种子默认 prompt 和映射已经这样做了，因此新建的 evaluator 在这里无需任何更改。
 
-在 **Runs** 和 **Threads** 之间切换 **Source** 时，只有在你尚未编辑默认 prompt 的情况下，默认 prompt 才会被重新播种。一旦你编辑了 prompt，就会保留你的版本，由你自己映射变量。
+在 **Runs** 和 **Threads** 之间切换 **Trigger On** 时，只有在你尚未编辑默认 prompt 的情况下，默认 prompt 才会被重新播种。一旦你编辑了 prompt，就会保留你的版本，由你自己映射变量。
 
 `{{trajectory}}` 不能与 `{{all_messages}}`、`{{human_ai_pairs}}` 或 `{{first_human_last_ai}}` 同时出现。一旦你映射了 trajectory source，变量 source 下拉菜单中的其他 source 就会被禁用；而一旦你映射了其他 source，trajectory source 就会被禁用。无论哪种情况，下拉菜单都会说明 trajectory 变量与非 trajectory 变量不能一起使用。保存混用两者的 evaluator 时也会以同样的方式失败。
 
@@ -125,7 +134,7 @@ Evaluator 完成后，LangSmith 会将 feedback 写入 thread 中最近的一个
 
 - **Filters**：限制 evaluator 在哪些 threads 上运行。
 - **Sampling rate**：按比例评估符合你的 filters 的 threads。
-- **Idle time**：项目级 thread idle time，作用于项目中的每个 thread-level evaluator。
+- **Idle time**：agent environment 的 thread idle time，作用于该 environment 上的每个 thread-level evaluator。
 
 以下选项不可用，包含其中任何一项的配置都会被拒绝：
 
@@ -147,9 +156,9 @@ trajectory 不是 run，因此任何读取 run-level 字段的选项都不可用
 ## 故障排查
 
 **检查 evaluator 状态** <br />
-可以进入 tracing project 或 agent environment 内的 **Evaluators** 标签页，点击所创建 evaluator 的 **Logs** 按钮，查看其运行历史，从而确认 evaluator 上次运行的时间。
+如需检查 evaluator 上次运行的时间，请在 **Tracing** 页面打开该 agent environment 的 **Online Evaluators** 标签页，然后在你 evaluator 所在行中点击 **Logs**，查看其运行历史。
 
 **检查发送给 evaluator 的数据** <br />
-进入 tracing project 或 agent environment 内的 **Evaluators** 标签页，点击所创建的 evaluator，然后进入 **Traces** 标签页，即可检查发送给 evaluator 的数据。只有为 evaluator [开启 tracing](/langsmith/evaluators#trace-evaluator-runs) 后，该标签页才会显示 traces。新建的 evaluator 默认关闭 tracing。
+如需检查发送给 evaluator 的数据，请在 **Tracing** 页面打开该 agent environment 的 **Online Evaluators** 标签页，点击你的 evaluator，然后点击 **Traces** 标签页。只有为 evaluator [开启 tracing](/langsmith/evaluators#trace-evaluator-runs) 后，该标签页才会显示 traces。新建的 evaluator 默认关闭 tracing。
 
 在该标签页中，可以看到传给 LLM-as-a-judge evaluator 的输入。如果消息没有被正确传入，那么在 inputs 中会看到空值。这通常是因为消息未采用[预期格式之一](/langsmith/online-evaluations-multi-turn#prerequisites)。
