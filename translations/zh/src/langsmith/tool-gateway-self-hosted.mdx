@@ -1,0 +1,283 @@
+---
+title: 启用 Tool Gateway
+sidebarTitle: 启用 Tool Gateway
+description: 使用 Helm chart 在自托管 LangSmith 安装上启用 Tool Gateway，连接 MCP 服务器，并可选择启用内置工具。
+---
+
+Tool Gateway 让 agents 可以通过 LangSmith 调用 MCP 工具。LangSmith 会存储每个用户用于这些工具的凭证，并在每次调用时应用你的 agent 策略。
+
+本指南介绍如何使用 Helm chart 在自托管 Kubernetes 安装上启用它。SaaS 版本请参见 [Tool Gateway](/langsmith/tool-gateway)。
+
+<Note>
+启用 Tool Gateway 需要 Helm chart 版本 0.18.0-rc.87 或更高版本。
+</Note>
+
+## 启用 Tool Gateway
+
+<Steps>
+
+<Step title="设置主机名" icon="settings">
+
+Tool Gateway 在 `platform-backend` 服务中运行。该 chart 会为安装中的每个组织启用它。UI 中没有单独的启用步骤。
+
+将 `config.hostname` 设置为安装的 HTTPS 主机名。该 chart 会根据它构建 OAuth 回调 URL。
+
+```yaml
+config:
+  hostname: "langsmith.example.com"
+```
+
+该 chart 通过现有前端将 `/api/v1/agent-auth/`、`/api/v1/managed-tools/` 和 `/api/v1/agent-policies` 路由到 `platform-backend`。无需单独的 Ingress。
+
+</Step>
+
+<Step title="（可选）允许访问你网络中的 MCP 服务器" icon="shield">
+
+默认情况下，`platform-backend` 会阻止解析到私有 IP 地址的 MCP 服务器 URL。要连接在你网络内部运行的 MCP 服务器，请将以下内容添加到 Helm values：
+
+```yaml
+platformBackend:
+  deployment:
+    extraEnv:
+      - name: SSRF_ALLOW_PRIVATE_IPS_MCP_SERVERS
+        value: "true"
+```
+
+LangSmith 仍要求使用 HTTPS URL，并且仍会阻止云元数据端点、localhost 和 `*.svc.cluster.local` 主机名。
+
+</Step>
+
+<Step title="应用并验证" icon="rocket">
+
+使用 chart 版本 0.18.0-rc.87 或更高版本应用该 chart。其他说明请参见[升级安装](/langsmith/self-host-upgrades)。
+
+```bash
+helm upgrade --install langsmith langchain/langsmith \
+  --version <chart-version> \
+  -f values.yaml --timeout=20m
+```
+
+在 LangSmith UI 中，前往 **Tools**，添加一个 MCP 服务器，然后连接到它。
+
+</Step>
+
+</Steps>
+
+## 查找回调 URL
+
+当用户将账户连接到使用 OAuth 的 MCP 服务器时，提供商会让浏览器返回到此 URL。请将它作为重定向 URL，添加到为 Tool Gateway 注册的每个 OAuth 应用。
+
+```txt
+https://<your-hostname>/api/v1/agent-auth/oauth/callback
+```
+
+如果设置了 `config.basePath`，该 URL 将变为 `https://<your-hostname>/<basePath>/api/v1/agent-auth/oauth/callback`。
+
+## 启用内置工具（可选）
+
+Gmail、Outlook 和 Slack 等内置工具在内置工具服务器上运行。该 chart 默认部署它，因此无需启用 Fleet。每个启用的提供商都需要一个 OAuth 应用。
+
+### 开始之前
+
+- **已启用工具服务器**：保持 `fleetToolServer.enabled: true`（这是默认值）。如果将其设置为 `false`，**Tools** 页面不会列出任何内置工具。
+- **提供商访问权限**：有权为每个提供商创建 OAuth 应用；对于需要管理员审批的提供商，还需取得管理员审批。
+
+每个应用只需为安装配置一次。所有组织和工作区都针对同一提供商共用同一个应用。每个用户的连接和令牌保留在其各自的工作区中。
+
+Tavily 和 Exa 等使用 API 密钥的内置工具无需部署配置。每个工作区都在 **Settings** > **Workspace secrets** 下添加自己的密钥。
+
+<Warning>
+如果你还运行 Fleet，Tool Gateway 回调 URL 与 Fleet OAuth 回调 `/host-oauth-callback/<provider-id>` 不同。如果你已经配置了 Fleet OAuth 提供商，请将 [Tool Gateway 回调 URL](#find-your-callback-url) 作为附加重定向 URL 添加到每个应用。
+</Warning>
+
+### 创建 OAuth 应用
+
+只为你启用的提供商创建应用。每个应用都必须允许 Tool Gateway 请求的权限范围。如果应用不允许请求的某项权限范围，提供商会拒绝该同意请求。
+
+<Tabs>
+
+<Tab title="Google">
+
+涵盖 Gmail、Calendar、Drive、Docs、Sheets、Slides、Meet 和 BigQuery。
+
+1. 在 Google Cloud 控制台中，打开 **APIs & Services** > **Credentials**，并创建类型为 **Web application** 的 **OAuth client ID**。
+2. 在 **Authorized redirect URIs** 下，添加你的[回调 URL](#find-your-callback-url)。
+3. 在 **Enabled APIs & services** 下，启用所用工具对应的 API。
+4. 在 OAuth 同意屏幕上，添加以下权限范围：
+
+   `openid`, `.../auth/userinfo.email`, `.../auth/userinfo.profile`, `.../auth/gmail.modify`, `.../auth/calendar.events`, `.../auth/calendar.freebusy`, `.../auth/calendar.calendarlist.readonly`, `.../auth/drive`, `.../auth/drive.file`, `.../auth/documents`, `.../auth/spreadsheets`, `.../auth/presentations`, `.../auth/meetings.space.created`, `.../auth/meetings.space.readonly`, `.../auth/bigquery`
+
+5. 将同意屏幕设置为 **Internal**（适用于一个 Google Workspace 组织），或将其发布。在 **Testing** 模式下，只有列出的测试用户可以连接，且其访问权限会在七天后失效。
+6. 复制 **Client ID** 和 **Client secret**。
+
+如果访问在七天后停止，说明同意屏幕处于 **Testing** 模式。请将其设置为 **Internal** 或发布它，然后重新连接。
+
+</Tab>
+
+<Tab title="Microsoft">
+
+涵盖 Outlook、Teams、SharePoint、OneDrive、Word、Excel 和 PowerPoint。
+
+1. 在 Microsoft Entra 管理中心，打开 **App registrations**，然后选择 **New registration**。
+2. 在 **Supported account types** 下，选择多租户选项。Tool Gateway 通过 `common` 端点让用户登录，而单租户应用会拒绝该端点。
+3. 在 **Redirect URI** 下，选择 **Web**，然后输入你的[回调 URL](#find-your-callback-url)。
+4. 打开 **API permissions**，添加以下 Microsoft Graph **delegated** 权限：
+
+   `User.Read`, `Mail.ReadWrite`, `Mail.Send`, `Mail.ReadWrite.Shared`, `Mail.Send.Shared`, `Calendars.ReadBasic`, `Calendars.ReadWrite`, `Calendars.ReadWrite.Shared`, `Files.ReadWrite`, `Files.ReadWrite.All`, `Sites.ReadWrite.All`, `Team.ReadBasic.All`, `Channel.Create`, `Channel.ReadBasic.All`, `ChannelMessage.Read.All`, `ChannelMessage.Send`, `Chat.Create`, `Chat.ReadWrite`
+
+   Tool Gateway 还会请求 `openid`、`profile`、`email` 和 `offline_access`。
+5. 如果你的租户要求，请选择 **Grant admin consent**。
+6. 打开 **Certificates & secrets** 并创建客户端密钥。复制密钥的 **Value**（而不是 **Secret ID**），以及 **Application (client) ID**。
+
+如果登录失败并显示 `AADSTS50194`，说明该应用为单租户。请将 **Supported account types** 改为多租户选项。
+
+</Tab>
+
+<Tab title="Slack">
+
+1. 打开 [Your Apps](https://api.slack.com/apps)，选择 **Create New App** > **From scratch**。
+2. 打开 **OAuth & Permissions**，在 **Redirect URLs** 下添加你的[回调 URL](#find-your-callback-url)。
+3. 在 **Bot Token Scopes** 下，添加：
+
+   `channels:history`, `channels:read`, `chat:write`, `files:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `users:read`, `users:read.email`
+
+4. 保持令牌轮换处于禁用状态。
+5. 打开 **Basic Information** > **App Credentials**，复制 **Client ID** 和 **Client Secret**。请使用 Client ID，而不是 App ID。
+
+</Tab>
+
+<Tab title="Linear">
+
+1. 在 Linear 中，打开 **Settings** > **API** > **Applications**，并创建一个 OAuth 应用。
+2. 将你的[回调 URL](#find-your-callback-url)添加为回调 URL。
+3. 复制 **Client ID** 和 **Client secret**。Tool Gateway 会请求 `read` 和 `write` 权限范围。
+
+</Tab>
+
+<Tab title="LinkedIn">
+
+1. 在 [LinkedIn Developer Portal](https://www.linkedin.com/developers/apps) 中创建一个应用。
+2. 在 **Auth** 标签页中，将你的[回调 URL](#find-your-callback-url)添加到 **Authorized redirect URLs** 下。
+3. 在 **Products** 标签页中，添加可授予 `openid`、`profile`、`email` 和 `w_member_social` 的产品。
+4. 复制 **Client ID** 和 **Client Secret**。
+
+</Tab>
+
+<Tab title="Salesforce">
+
+1. 在 Salesforce Setup 中，创建一个启用 OAuth 的 **External Client App**。
+2. 将你的[回调 URL](#find-your-callback-url)添加为回调 URL。
+3. 添加 OAuth 权限范围 **Manage user data via APIs (api)** 和 **Perform requests at any time (refresh_token, offline_access)**。
+4. 保持 **Require Secret for Web Server Flow** 处于启用状态。
+5. 复制 **Consumer Key** 和 **Consumer Secret**。新应用最多可能需要 30 分钟才能使用。
+
+Tool Gateway 通过 `login.salesforce.com` 让用户登录。不支持需要使用 `test.salesforce.com` 的 sandbox 组织。
+
+</Tab>
+
+<Tab title="GitHub">
+
+GitHub 使用 GitHub App，而不是 OAuth 应用。
+
+1. 在组织的 **Developer settings** 中创建 GitHub App。
+2. 在 **Callback URL** 下，添加你的[回调 URL](#find-your-callback-url)。
+3. 在 **Repository permissions** 下，为 **Contents**、**Issues** 和 **Pull requests** 授予读写权限，为 **Metadata** 授予读取权限。在 **Account permissions** 下，为 **Email addresses** 授予读取权限。
+4. 复制 **Client ID** 并生成 **Client secret**。
+5. 生成随机的 state 签名密钥，例如使用 `openssl rand -hex 32`。
+
+</Tab>
+
+</Tabs>
+
+### 将凭证添加到 Helm values
+
+`platform-backend` 从以下环境变量读取每个应用的凭证。请为每个启用的提供商设置这两个变量。如果任一值为空，该提供商将保持不可用，**Connect** 会显示其未配置。
+
+| 提供商 | Client ID 变量 | Client secret 变量 |
+| --- | --- | --- |
+| Google | `GOOGLE_OAUTH_CLIENT_ID` | `GOOGLE_OAUTH_CLIENT_SECRET` |
+| Microsoft | `MICROSOFT_OAUTH_CLIENT_ID` | `MICROSOFT_OAUTH_CLIENT_SECRET` |
+| Slack | `SLACK_OAUTH_CLIENT_ID` | `SLACK_OAUTH_CLIENT_SECRET` |
+| Linear | `LINEAR_OAUTH_CLIENT_ID` | `LINEAR_OAUTH_CLIENT_SECRET` |
+| LinkedIn | `LINKEDIN_OAUTH_CLIENT_ID` | `LINKEDIN_OAUTH_CLIENT_SECRET` |
+| Salesforce | `SALESFORCE_OAUTH_CLIENT_ID` | `SALESFORCE_OAUTH_CLIENT_SECRET` |
+| GitHub | `FLEET_GITHUB_APP_CLIENT_ID` | `FLEET_GITHUB_APP_CLIENT_SECRET` |
+
+GitHub 还需要 `FLEET_GITHUB_APP_STATE_JWT_SECRET`。如果没有它，`platform-backend` 会记录错误，并且不会注册 GitHub App 的回调和 webhook 路由。
+
+1. 在 LangSmith namespace 中创建 Kubernetes Secret。只包含已启用的提供商，并确保该文件不纳入版本控制。
+
+   ```yaml
+   apiVersion: v1
+   kind: Secret
+   metadata:
+     name: tool-gateway-oauth-apps
+     namespace: "<your-langsmith-namespace>"
+   type: Opaque
+   stringData:
+     google-client-id: "<your-google-client-id>"
+     google-client-secret: "<your-google-client-secret>"
+     slack-client-id: "<your-slack-client-id>"
+     slack-client-secret: "<your-slack-client-secret>"
+   ```
+
+   ```bash
+   kubectl apply -f tool-gateway-oauth-apps.yaml
+   ```
+
+2. 为每个提供商向 `platformBackend.deployment.extraEnv` 添加一对条目。保留现有条目。
+
+   ```yaml
+   platformBackend:
+     deployment:
+       extraEnv:
+         - name: GOOGLE_OAUTH_CLIENT_ID
+           valueFrom:
+             secretKeyRef:
+               name: tool-gateway-oauth-apps
+               key: google-client-id
+         - name: GOOGLE_OAUTH_CLIENT_SECRET
+           valueFrom:
+             secretKeyRef:
+               name: tool-gateway-oauth-apps
+               key: google-client-secret
+         # Repeat for each provider that you enable.
+   ```
+
+   不要通过 `extraEnv` 添加 `MANAGED_TOOLS_EMBEDDED`、`LANGSMITH_SIGNING_JWKS`、`API_KEY_SALT` 或 `AGENT_BUILDER_ENCRYPTION_KEY`。该 chart 已经设置这些变量，名称重复会导致 Helm 渲染失败。
+
+3. 应用该 chart。如果之后只更改 Secret，请重启 `platform-backend`。如果你的 Helm release 名称不同，请将 `langsmith` 替换为该名称：
+
+   ```bash
+   kubectl rollout restart deploy/langsmith-platform-backend
+   ```
+
+4. 在 LangSmith UI 中，前往 **Tools**，选择一个内置工具，点击 **Connect**，然后完成同意屏幕。
+
+### 允许网络访问
+
+- **`platform-backend`**：出站 HTTPS 访问每个提供商的令牌端点，例如 `oauth2.googleapis.com`、`login.microsoftonline.com`、`slack.com`、`api.linear.app`、`www.linkedin.com`、`login.salesforce.com` 和 `github.com`。
+- **内置工具服务器**：出站 HTTPS 访问工具所调用的提供商 API，例如 `gmail.googleapis.com`、`graph.microsoft.com` 和 `slack.com`。
+- **浏览器**：访问每个提供商的登录页面和你的回调 URL。
+
+如果你的集群通过代理路由出站流量，请为内置工具服务器设置 `fleet.egressProxy.url`。对于 `platform-backend`，请将 `HTTPS_PROXY` 和 `NO_PROXY` 添加到 `platformBackend.deployment.extraEnv`，并在 `NO_PROXY` 中包含集群的内部域名以及 Postgres、Redis 和 ClickHouse 主机。请参见[配置 egress](/langsmith/self-host-egress)。
+
+## 故障排查
+
+- **Tools 页面中未列出任何内置工具**：检查 `fleetToolServer.enabled` 是否为 `true`，`langsmith-fleet-tool-server` pod 是否处于 `Running` 状态，以及 chart 版本是否为 0.18.0-rc.87 或更高版本。
+- **为内部 URL 添加 MCP 服务器失败**：使用不是 `*.svc.cluster.local` 主机名的 HTTPS URL，并在 `platform-backend` 上设置 `SSRF_ALLOW_PRIVATE_IPS_MCP_SERVERS`。请参见[启用 Tool Gateway](#enable-the-gateway)。
+- **Connect 中显示提供商未配置**：为该提供商设置这两个变量。检查 Secret 的键和 namespace，然后重启 `platform-backend`。
+- **提供商报告重定向不匹配**：应用中的重定向 URL 必须与你的[回调 URL](#find-your-callback-url)完全一致，包括协议、主机、基础路径和路径。
+- **升级后 `platform-backend` 无法启动**：检查 Secret 是否存在，并包含 `extraEnv` 引用的每个键。
+
+## 安全说明
+
+- LangSmith 使用 `API_KEY_SALT` 加密存储的用户令牌。用户连接账户后，请勿更改它。请参见[使用现有 secret](/langsmith/self-host-using-an-existing-secret)。
+- 将 OAuth 应用密钥存储在 Kubernetes Secret 中，并使用 `secretKeyRef` 引用它们。不要将密钥值直接放入 Helm values 文件。
+- `SSRF_ALLOW_PRIVATE_IPS_MCP_SERVERS` 允许工作区管理员添加位于私有 IP 地址上的 MCP 服务器。仅在用户需要内部 MCP 服务器时启用它。
+
+## 下一步
+
+- [Tool Gateway](/langsmith/tool-gateway)：了解 agents 如何通过 Tool Gateway 调用工具。
+- [启用 Fleet](/langsmith/enable-self-hosted-fleet)：构建并运行使用 Tool Gateway 的 agents。
+- [配置环境变量](/langsmith/self-host-environment-variables)：查看该 chart 设置的每个变量。

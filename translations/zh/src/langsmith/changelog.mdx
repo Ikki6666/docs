@@ -15,6 +15,172 @@ rss: true
 如果你使用的是 self-hosted LangSmith，请参阅 [self-hosted changelog](/langsmith/self-hosted-changelog) 获取更新。
 </Info>
 
+<Update label="November 16-23, 2026" rss={{ title: "2026-11-16 - LangSmith Cloud update" }}>
+
+## Highlights
+
+- **Sandbox volumes、批量删除与 CLI 选项**：Sandbox volumes（beta）和 LangSmith-login service URLs 现在可用于每个 workspace，包括 self-hosted 和 BYOC deployments。你可以创建、列出、克隆和删除 volumes，在一次请求中删除多个 sandboxes，并通过 `langsmith sandboxes` CLI 和 SDKs 对照 workspace 限额检查用量。CLI 还为文件新增了 `cp` 和 `ls`，新增 `--preserve-memory-on-stop` 以在停止后保留正在运行的进程，以及 `snapshot capture --include-memory`，让新的 sandboxes 从保存的 memory 恢复。[了解更多](/langsmith/sandbox-cli)。
+- **Advanced code evaluators 默认可用**：Advanced code evaluators 现在默认可用，因此你无需选择启用即可创建和运行它们。在 BYOC 和 self-hosted LangSmith 上，只要启用了 Sandboxes，它们就可用，`SANDBOX_FEATURE_ENABLED` 设置控制 self-hosted 安装上的此功能。未启用 Sandboxes 的 deployments 不会显示 advanced evaluator 控件，也不接受创建 advanced evaluators，并且 BYOC 的 `codeEvaluatorV2Enabled` 选择加入字段已弃用并被忽略。[了解更多](/langsmith/advanced-code-evaluators)。
+- **User Groups 更名已完成**：User Groups 现在在 permissions、gateway traces 和 gateway policies 中使用同一套名称。`organization:user-groups:*` 和 `workspaces:user-groups:*` permissions 取代了 `teams` permissions，gateway traces 会携带 `gateway.user_group_ids`，spend chart 会读取该字段。这是一项破坏性变更，因此请更新发送 `X-LangSmith-Team-Tags` header 或 `ls_team:` tags 的 clients、使用 `team_id` matcher 的 gateway policies、使用 `teams:*` permissions 的自定义 roles，以及基于 `gateway.team_ids` 的已保存 trace filters，因为这些都不再有效。[了解更多](/langsmith/user-groups)。
+- **Replica 关闭后 runs 会恢复**：当 replica 关闭时，Postgres 上的 Agent Server 会在 step 边界将进行中的 runs 交回队列。有 checkpoint 的 threads 随后会在另一个 worker 上恢复，而不是以错误结束。Agent Server 现在随 LangGraph 1.2.20 发布，恢复已排空的 runs 需要 LangGraph 1.2.15 或更高版本。[了解更多](/langsmith/scalability-and-resilience)。
+
+## Deployment
+
+- 你的 deployments 现在会在 client 发送 `Accept-Encoding` header 时使用 brotli 或 gzip 压缩 JSON 响应，因此 `GET /threads/{thread_id}/state` 和 `GET /threads/{thread_id}/history` 的大型响应会小得多。来自 `/runs/stream` 的流式响应不会被压缩。
+- Cloud SQL deployments 现在会在 Monitoring 标签页中显示 Postgres Out-of-Memory Restarts 图表，并且当 Postgres 在最近 24 小时内内存耗尽时，deployment 页面会发出警告。如果可以调整数据库大小，警告中会包含 Change database size 按钮。
+- 你现在可以使用 personal key 或 service key 创建 agent environment，因此 `mda dev` 会为你的 agent 创建本地 environment，而不是回退到普通的 `<agent>-local` project。该 key 需要 project 创建权限。Tracing keys 无法创建 environments。
+- 当你的 deployment 设置 priority callback 时，Deployment metrics 现在会为 Workers 部分包含按 priority 的图表：**Longest Wait to Start by Priority**、**Runs Ready to Start by Priority** 和 **Running Runs by Priority**，每个 priority 级别对应一条线。没有 priority callback 的 deployments 不会看到变化。
+- 当 tool call 需要审批时，Studio 的默认 chat 现在会显示 approve、edit 和 reject 卡片，而不是原始 JSON 编辑器。提议的文件写入和替换会以 diff 形式显示在这些卡片中，编辑后的参数会在你发送前接受检查。
+- Cloud deployments 不再返回 deployable secrets。对 **deployable secrets** 和旧版 `secrets` 路由的请求现在会为 Cloud deployments 返回 404，而由 listener 管理的 deployments 继续正常工作。
+- Revision 表单不再显示已存储的 secret 值。保存 revision 会为任何未改动的 secret 保留已存储的值。
+- GCP data planes 现在从 Artifact Registry 的 `us-docker.pkg.dev/langchain-artifacts/langsmith-byoc` 拉取其 add-on images（cert-manager、External Secrets、Istio、KEDA 和 Cloud SQL setup Jobs），因此你的 firewall allowlist 只需包含 Google endpoints、LangSmith control plane、Let's Encrypt 和你的 LLM providers。现有 data planes 会在下一次 reconcile 时采用新 registry，已完成的 setup Jobs 不会重新运行。
+- GCP data planes 的默认拒绝（deny-by-default）egress firewall 现已可用。在 **LangsmithGcp** 上将 `spec.network.egressFirewall.enabled` 设为 `true`，即可仅允许内部 ranges、Google APIs、你的 `allowedCidrs`，以及到你的 `allowedDomains` 的 HTTPS，其他所有出站流量都会被拒绝并记录日志。启用它需要 `privateGoogleApis`，并且在 provider release 能够创建 policy association 之前，需要打过补丁的 compute provider image（`gcpProviders.computeRuntimeImage`）。
+- 现在在 self-hosted 安装或 BYOC data plane 上创建 deployment 时，你可以选择 Kubernetes namespace。列表仅显示管理员为你的 workspace 允许的 namespaces，且 namespace 在创建后无法更改。
+- Agent Server images 现在通过 `EXPOSE` 声明端口 8000，因此读取 image 已声明端口的工具（例如 sandbox snapshots）可以找到服务器端口。运行 `docker run -P` 或 Compose `publish_all` 现在会发布端口 8000。
+- AWS、Azure 和 GCP 的 Workload identity 现在使用你 deployment 的 pod token，因此你的 deployment 不再发送 API key 来获取 cloud tokens。如果 Agent Auth 拒绝该 pod token，deployment 会继续使用其 API key。
+- 你现在可以在创建 GCP data plane 时设置可选的 VPC network MTU，例如 1440，以匹配 peered hub 或 interconnect。将该字段留空可保留 GCP 的默认值 1460。现有 data planes 会保留其当前 MTU。更改 MTU 只有在 node pools 滚动后才会在 nodes 上生效。
+- 新的私有 AWS data planes 的内部 ingress load balancer 现在仅接受来自 VPC 及其 node subnets 的流量，而不是来自任意地址。现有 data planes 保留当前规则，位于 peered VPCs、Transit Gateway 或 VPN 中的调用方需要列入 **allowedSourceRanges**。
+- 新的 GCP data planes 会从你的 network CIDR 中划分 GKE pod range，并为 Services 分配 Google 的托管 range，因此到你的私有 ranges 的 pod 流量会保留你的地址空间；现有 data planes 保持不变。
+- GCP dedicated deployments 的 Cloud SQL backups 现在会保留在 instance 所在区域，例如 `us-central1` 或 `northamerica-northeast1`，而不是 `us` 或 `eu` multi-region。新 instances 会自动使用该区域，现有 backups 会在过期前保留在原始位置。
+- 新的 BYOC data planes 会从其 cloud 的最新稳定 template snapshot 启动。如果你的 cloud 尚无稳定 snapshot，创建会在预配前返回 503 错误。
+- Deployment builds 和 CLI builds 现在可在使用 `byoIam` 的 AWS、Azure 和 GCP data planes 上工作。在开启 builds 之前，请应用 BYOC Terraform module 的 `deployment_builds` 设置。
+- Agent Server 现在有一个 `GET /threads/{thread_id}/transcript` endpoint，会返回 thread 的对话，按 turn 分页，最新在前。每一页都包含一个 `position`，你可以用它重放较新的 stream events。`limit`、`format`、`cursor` 或 `position` 无效的请求会返回 422，而不再位于 thread 活动分支上的 cursor 会返回 410。
+- Multi-process deployments 现在会在 Prometheus 中暴露一个公开的 `lg_api_run_success_counter_total` metric，用于统计成功完成的 runs，因此你可以对照 SLA 跟踪 run 成功率。
+- 当同一个 environment variable 名称出现多次时，创建 deployment 和 revision 的请求现在会返回 400 错误，错误会列出重复的名称。此前，最后一个值会静默替换前面的值。将 .env 文件粘贴到 variables 表单现在会更新同名的现有行，而不是添加重复项。
+- Scale to zero 现在可在使用 `byoIam` 的 AWS 和 GCP data planes 上工作，因此你可以使用自己的 IAM 设置启用 `langsmith.scaleToZero`。在 GCP 上，请先在 BYOC Terraform module 中应用 `scale_to_zero`，然后再启用它。
+- Managed Deep Agents 现在对所有拥有 LangSmith Agent Server 访问权限的 organization 可用。你无需单独的 entitlement 即可部署 Managed Deep Agents。
+- Managed Deep Agents 的 sandbox options 现在可以按 run 解析：`defineSandbox` / `define_sandbox` 上的 `resolve` 函数会选择每个 run 的 sandbox 大小和 proxy，或返回 `null` 让该 run 没有 sandbox，因此编译一次的 graph 仍可为每个 run 调整 sandbox 大小。
+- 当 data content block 的 MIME type 列在 Agent Server 的 `A2A_ALLOWED_DATA_MIME_TYPES` 设置中时，agents 现在可以在 A2A 响应中以 DataParts 返回类型化 JSON。具有所列 MIME types 的 data blocks 会在最终响应、streamed artifacts、input-required messages 和 history 中保留其 metadata。将 `A2A_ALLOWED_DATA_MIME_TYPES` 设为以逗号分隔的 MIME types 列表；默认值为空。
+- 你现在可以从 create modal 创建 DEV tier 的 AWS data plane。DEV 使用更小的单 AZ 数据库和单个 Redis node，可降低成本，但不具备高可用性。
+- Managed Deep Agents apps 现在会在 GitHub、Linear 和 Slack 投递通过验证后立即响应，早于你的 `on_event` handler 运行，因此缓慢的 handler 不再导致投递超时。开启 `allow_bot_triggers` 且 `trigger_mode` 设为 `all` 的 Slack apps 现在会收到其 channels 中的每条 bot message，无论是否被提及，因此其 handlers 应决定要响应哪些 bots。
+
+## Prompts and playground
+
+- **Playground** 和 evaluators 中的 Databricks model selector 现在会为 Claude、GPT、Gemini、Llama、GPT OSS 和 DeepSeek 建议 endpoints。可用性取决于你的 workspace，你仍然可以输入任何自定义 endpoint 名称。
+- Playground 和 LLM Gateway 现在为 OpenAI 提供 `gpt-6.2-sol` 和 `gpt-6.2-astra`，并为 Google Gemini 和 Vertex AI 提供 `gemini-4-carbon`、`gemini-4-argon`、`gemini-4-neon` 和 `gemini-4-hydrogen`。新的 LLM Gateway fallback chains 会以 `gpt-6.2-sol` 开头，新的 Google Gemini 和 Vertex AI model selectors 默认使用 `gemini-4-neon`。
+- Playground prompts 不再从文件预览中运行脚本：存储的文件内容现在仅以沙盒化的 image、audio、JSON、CSV 或 PDF 预览显示，其他文件来源会显示为带文件名的 text card。
+
+## Administration
+
+- Free 和 Developer workspaces 现在会在 Agent Overview 页面看到用量条，显示他们本月已使用其套餐包含的 5k 条 traces 中的多少。用量达到 80% 后，可关闭的 banner 会取代该用量条，并提供 **Unlock more traces** 按钮。
+- Settings 现在在 unified workspaces 中使用 agent environment 术语，包括 Usage Configuration、data retention、evaluator spend limits、Engine usage、granular usage grouping 和 webhook filters。Classic workspaces 保留 project 措辞。API 字段和导出保持不变。
+- workspace secrets 列表 endpoint 现在会分页返回结果，并提供指向下一页的 `next_cursor` token。使用 `page_size` 设置每页最多 100 个 secrets，并传入 `cursor` 获取下一页。该 endpoint 位于 `GET /api/v2/workspaces/current/secrets`。
+- 你现在可以让 LangSmith Chat 或任何 MCP client 列出、创建、更新、删除和测试 alert rules。Slack alert 触发时还会在按钮上方以 context line 显示每条 rule 的 description。
+- BYOC data plane agents 使用的 org-wide service key 现在不能再被删除或更改角色。尝试操作会返回 409 错误，说明该 key 由 LangSmith 为 data plane 管理。
+- 已弃用的 API usage report 现在会列出调用 deprecated endpoints 的 custom apps，包括每个 app 的名称和最后编辑者，并且 banner 现在会标明其 7 天窗口。
+- 你的 user group modal 现在会显示每个成员的成员关系来源、各 tab 中可见的计数，以及大型 user groups 的分页成员列表，member、workspace 和 access policy 列表使用相同的表格布局。
+- 当 `langsmith` CLI 的输出被管道传输或重定向时，它现在默认打印 JSON，因此 scripts 和 agents 不再需要 `--format json`。在 CLI 1.0.0 之前，管道输出仍保持 pretty，CLI 会在 stderr 上发出警告；请传入 `--format pretty` 或 `--format json` 以明确选择。
+- Agent Auth 现在会为托管的 LangSmith GitHub App 签发 installation tokens，每个 token 都携带该 installation 授予 App 的每一项 permission。该 connection 上的 sessions 需要 `github_user_credential_id` 指向用户的 `langsmith-github` credential，并且除非 GitHub 向该用户账号显示该 installation，否则 Agent Auth 会以 403 拒绝该 session。
+- 当你连接到 LangSmith MCP server 时，MCP clients 现在会显示 LangSmith 图标。该 server 还支持 `2026-07-28` protocol version 和 `server/discover`，来自其他 origins 的 browser clients 必须列在你的 `CORS_ALLOWED_ORIGINS` 设置中。
+- Organization Secrets 现在有独立的菜单项，并提供单独的 Workspace secrets 和 Browser secrets 视图。Usage Limits 拆分为 Organization、Workspaces、Projects 和 Users 视图，Data Retention 现在有自己的页面和菜单项。
+- 你现在可以在 OAuth consent screen 上选择 **Switch account**，以退出登录并改用其他账号登录，即使当前账号无法访问该 app 所需的 organization。你的 authorization request 会被保留，因此登录后可以返回该 app。
+- Insights 现在要求每个 Vertex model 都绑定 Vertex AI credentials。依赖 worker 自身 Google identity 的 model 会被拒绝，self-hosted ADC endpoints 必须是 googleapis.com。通过 Google GenAI、Anthropic 和 LangChain wrappers 使用 Vertex AI 的 models 也涵盖在内。
+- 当数字适合时，LangSmith Chat 现在会在回复下方以原生 Slack chart 或 table 作答。随时间变化的趋势会以 charts 呈现，需要比较或查找的确切数字会以 tables 呈现。
+- 禁用的 agent environment 现在会停止其 agent：新的 agent access tokens 会以 `agent_disabled` 被拒绝，LLM Gateway、Managed Tools 和 Tool Gateway 会以 403 `agent_disabled` 拒绝其 API keys、access tokens 和 Fleet calls。再次启用该 environment 会恢复访问。
+- API keys 现在会在一个列表中显示 personal、service 和 tracing keys。使用新的 Type、Created by 和 Workspace filters 缩小列表范围，CSV 导出会包含显示的所有 keys。
+- membership picker 中的 role 列表现在会先按显示名称的字母顺序、再按创建时间排序。roles API 现在接受可选的 `sort_by` 和 `sort_order` 参数，因此你可以为 role 列表选择字段和方向。没有 `sort_by` 的请求会像以前一样按相同顺序返回 roles。
+- Linear apps 现在通过 client credentials 获取其 tokens，因此 workspace admin 不再需要批准安装。Agent Auth 会为你续订 token，现有 apps 保留它们已在使用的 approval flow。
+- **Usage Dashboard** 现在会在每个图表进入视图时独立加载，因此缓慢或失败的图表不再阻塞其他图表。日期范围选择器默认最近六个月，用于设置图表和 CSV 导出的时间段，你选择的 category 和日期会保留在 URL 中。
+- 使用 LangSmith MCP server 的 agents 现在可以通过 `report_feedback` tool 向 LangSmith 团队报告 bugs、缺失能力和可用性问题。只会发送消息和可选的 `category`，不会收集任何本地文件、environment variables 或 traces。
+- 开启 `LLM_AUTH_PROXY_FORWARD_IDP_TOKEN` 后，在 **Evaluate Mode** 中从 **Playground** 运行的 experiments 不再接收你的 IdP token。Fleet agents 仍会接收。
+- Agent Auth 现在允许 workspaces 拥有 apps，因此你可以在 workspace 级别为每个 provider 注册多个 apps。每个 app 的 installations 会连同其 provider account ID 一起列出，你可以移除 installation 及其 token。
+- Agent Server 现在会为每个托管的 MCP tool call 记录一条 trace，因此你可以查看 agents 使用了哪些 tools 以及原因。每次调用可选的原因会被记录，来自同一 session 的调用会归入单个 thread。
+- 你现在可以通过 SDKs 在一次请求中列出 workspace 的 resource tag keys 及其 values。该调用只需要 workspaces:read 权限，你可以按 resource type 过滤结果。SDKs 中也提供 tag keys 和 tag values 的完整创建、读取、更新和删除支持。
+- self-hosted license 以及 cloud plan 或 contract 的到期警告现在会在到期前两周显示在页面顶部 banner 中，而不再仅显示在 Notifications 中。你的 Notifications 列表不再显示这些到期警告。
+
+## Sandboxes
+
+- Attribution headers 现在可在 sandbox 创建和编辑表单中使用。将公开的 `X-` headers（例如 `X-Agent-ID`）添加到 proxy 处理的每个 HTTP(S) 请求中，与特定于 destination 的 credentials 并列。字面值会由 API 返回并发送到每个被代理的 destination，因此请避免使用敏感值。
+- Sandbox command logs 和 network logs 现在可在每个 workspace 中使用。打开 sandbox 即可查看其 command history 和 network activity，包括用于查看 sandbox 发送或接收的流量的 Network view。
+- 你现在可以在 Python 和 JavaScript SDKs 中创建 sandbox 时传入 `tag_value_ids`。限定到某个 tag 的 cloud identity 可以使用它，因为该 tag 在创建 sandbox 时已固定。
+- 你现在可以使用 Go SDK 的 `client.Sandboxes.Snapshots.NewFromDockerfile` 方法和 `langsmith sandboxes snapshot build` 命令从本地 Dockerfile 构建 sandbox snapshot。构建会在临时 sandbox 中运行，并跳过被 `.dockerignore` 排除的文件，因此不需要本地 Docker。
+- Tunnel connectors 现在会使用你 profile 中由 `langsmith auth login` 产生的 OAuth 登录来运行，因此 `langsmith tunnel connect` 不再需要 API key。connector 会在运行期间刷新 token，因此长时间运行的 tunnels 在 token 过期后仍可继续工作。
+
+## Engine
+
+- Engine 现在会根据一条显示具体且可操作失败的 trace 提交 issue，并链接显示该问题的其他每条 trace。Board priorities 决定 Engine 查看的位置并限制 severity 上限：不在这些优先级范围内的 finding 会被评为 medium 或 low，除非它是 PII 或 secret exposure、guardrail bypass 或 destructive operation，并且扫描会说明何时降低了某项 severity。
+- Taskset 和 simulation runs 现在会检查其 secrets 通过 URL 指定的每个 deployment 的访问权限，因此只有在你可以更新每个 deployment 时才能启动 run。如果该检查无法完成，run 会拒绝启动，runner 只会启动你有权访问的 deployments。
+- 托管的 MCP server 现在可以通过 `query_run_stats` 返回 project 中每个 run 的总量、错误计数和延迟，通过 `update_evaluator` 更新 evaluators，并通过 `update_issue` 更新 Engine issue 的状态和优先级。它还会通过 `list_engine_goals` 和 `get_engine_goal` 读取 Engine goals。
+- agent 可以访问任意公共主机的 tasks 现在会在启动时被拒绝。在 `[environment]` 中将 `network_mode` 设为 `allowlist`，并在 `allowed_hosts` 中列出该 task 需要的主机。
+- Simulation runs 现在接受 `context.agent_revision`，因此 run 可以在确切的 40 字符 commit 上构建 agent，而不是默认分支的 head。固定的 run 每次都会检出自己的 commit，即使该 thread 已有 sandbox。Runs 还可以通过 `context.context_sources` 指定最多 10 个 datasets，为其 tasks 提供初始数据。
+- Engine 现在会监视其 GitLab fix merge requests 上的 CI，方式与监视 GitHub fix pull requests 相同。当 pipeline 失败时，Engine 会使用失败 job 的名称、stage、失败原因及其日志末尾来修订 fix。
+- Engine settings 现在会在带分组导航的居中 modal 中打开，因此你可以在各 section 之间跳转而无需滚动整个页面。Agent overview 会显示可展开的预览，滚动时 Edit、Save 和 Cancel 会固定在顶部。
+- Engine 现在会对照最近一天的 runs 重新检查已合并的 fix 是否解决了其 issue，因此未能保持的 fix 不再让 issue 保持打开。当 issue 在 fix 合并后关闭并再次打开时，issue charts 还会隐藏未能保持的 fix 的 fix marker。
+
+## Tracing
+
+- 错误以 `ParentCommand`、`GraphDelegate`、`GraphBubbleUp` 或 `NodeInterrupt` 开头的 runs 现在会在 tracing ingest 中显示为 **interrupted** 而不是 **error**。
+- 你现在可以按自定义 metadata keys、tags 和 user groups 对 Coding Agent Overview 进行分组和过滤。在按 user group 分组的 cost 和 activity charts 中，未归属任何 user group 的 runs 会显示为 **Unclassified**。
+- Audio attachments 现在会在 trace 页面的内联播放器中打开，带有 play、pause、skip、mute 和 speed 控件。包含 audio 的 traces 还会在 single-trace tree 中 root span 下方显示同一播放器，并且在 tree 和 waterfall 视图之间切换时会保留播放位置。
+- Insights configs 和 reports 现在接受 v2 filters，因此你保存的 Insights configs 和 reports 可以使用与 Runs API 相同的 filter 语法。引用 `run_count` 或 `thread_idle_seconds` 等 group-level fields 的 filters 会在你保存 config 或创建 report 时被拒绝。
+- 首次访问 Tracing 时，页面现在会打开有 traces 的最高 environment，依次检查 Production、Staging、Development，然后是 Local。
+- 超过每次操作内存限制的 queries 现在会返回 `422` 而不是 `429`，并会提示在重试前缩小时间范围或简化 query。其他 resource-limit 错误仍会返回 `429`。
+- Full tree 现在可用于开启分页的已过滤 trace trees。它会保留已加载的页面，在真实 parent 下显示匹配项，并为这些匹配项加载缺失的 parents。当中间 runs 未加载时，trace tree 行还会显示 Load parents 操作。
+- `get_coding_agent_report` MCP tool 现在会报告 coding agent 在最长两周的窗口内的 pull requests、cost、threads 和 turns。它还会返回 merge rate 和每个已合并 pull request 的 cost，并可按 LangSmith user、Git user、repo 或 harness 对结果分组。
+- 你可以通过向 `tracing_context` 传入 `inherit_parent_tags_and_metadata=False`，在 parent run 下嵌套 runs 而不将 parent 的 tags 和 metadata 复制到它们上面。该选项适用于 block 内创建的每个 run，包括 child runs。复制默认保持开启，因此现有代码行为不变。
+- Thread aggregate stats 现在接受 `stride` 参数，会以 `buckets` 中的 time series 形式返回 statistics，每个 bucket 一个条目并按升序排列，包括空 buckets。`thread_feedback_stats` 字段现在会在 thread aggregate stats 响应中返回，因此拥有 thread-level feedback 的 projects 会显示该 feedback。
+- OTLP traces 现在会将通用 span attributes 以 `otel.span.` 前缀存储在 run metadata 中，例如 `otel.span.http.route`，无需任何配置。Self-hosted deployments 可以将 `OTEL_PASSTHROUGH_TO_METADATA_ENABLED` 设为 `false` 来关闭此功能。
+
+## Evaluators
+
+- Trajectory rules 现在接受 trace 和 tree filters，并且可以使用 V2 filters。你的 trajectory rules 可以使用与其他 rule types 相同的 trace 和 tree filter 表达式来选择 runs。
+- **langsmith evaluators rule list** 现在接受 `--limit`/`-n`、`--cursor`、`--name-contains` 和 `--type project|dataset`，因此你可以分页浏览 evaluator rules，并按名称或目标过滤它们。传入 `--cursor` 会在 JSON 输出中返回 `rules` 和 `cursors.next`。
+- 在托管的 AWS、GCP 和 Azure deployments 上，以及在使用 LangSmith storage configuration 的 BYOC 和 self-hosted deployments 上，run rule 结果数据现在会在写入 30 天后自动删除。
+- 创建带 backfill 的 rule 现在会在响应中返回 `backfill_id` 和 `backfill_status`，backfill 日志会列出每个 unit，而不再只列出前五个。文档现在说明 TypeSafe 和 OpenAI Decisions evaluators 不接受 `schema` 字段，这些 evaluators 的 schema 来自其问题。
+
+## Feedback
+
+- Feedback evidence 现在会出现在 threads 和 traces 的 **Messages** 视图中：在 feedback tag 上选择 **Show evidence**，即可逐步查看 evidence 指向的每条 message，匹配的文字会高亮显示。
+- Agents 现在可以通过托管的 MCP server 审查 annotation queue items。审查会向该 item 的 run 添加 feedback，并将该 item 标记为已完成。
+- Feedback 现在仅针对强制 feedback configs 进行校验，因此你未设为强制的 feedback config 不再拒绝超出其范围的 scores。你的 feedback keys 还可以有第二个 feedback config，例如用于 annotation queue 的 config，除非该 key 已有强制 config。
+- Annotation queues 现在在 queue 列表中有一个 **Overview** 按钮，因此你可以直接打开 queue 的 Overview 页面。Overview 页面的返回箭头会将你带回保留排序和过滤条件的 queue 列表；如果你是从审核视图打开它，则会返回该视图。
+
+## Gateway
+
+- 即使代码硬编码 provider URL 或跳过 SDK，来自你的 agents 的 model calls 也会到达 LangSmith gateway。OpenAI、Anthropic、Gemini、Vertex AI、Mistral、Groq、Fireworks 和 xAI 会使用其 gateway routes 以及你 workspace 的 provider key。OpenRouter 和 Together 使用 custom provider routes，需要具有该名称的 custom model profile，且其 base URL 是 provider 的 OpenAI-compatible URL。
+- 你可以使用 `me` 作为 kit ID 调用 MCP endpoint，列出并调用你可以使用的每个 MCP server，包括 workspace servers、personal servers 和已启用的 built-ins，而无需保存 kit。已保存的 kits 还会在 `GET /kits/{kit_id}/connections` 报告每个 server 的 connection status，MCP Apps UIs 现在会通过 tool kits 渲染。
+- Fleet agents 上的 policies 现在会应用于 personal agents 和 general-purpose agent，而不仅是 shared agents。Role 和 user group rules 也会应用于 Fleet calls，因此 "every Fleet agent except group X" 不再阻止 group X 的成员。
+- Gateway fallback routing 现在默认避开处于 cooldown 的 models。将 `GATEWAY_COOLDOWN_LEARN_ENABLED` 和 `GATEWAY_COOLDOWN_ENFORCE_ENABLED` 设为 `false` 可关闭任一行为。
+- 当 Provider API 设为 Responses 时，已保存的 Azure OpenAI configs 现在会调用 Responses API，因此 Claude Code 可与较新的 Azure models 配合使用，这些 models 会拒绝在 Chat Completions 上带 reasoning effort 的 function tools。gateway 还会在 POST /azure/v1/embeddings 提供 embeddings，这些请求会以 token usage 出现在 traces 中。
+- Playground 现在可以通过 `X-LangSmith-Provider-Key` header 为单个请求发送你自己的 provider API key。对于 OpenAI、Anthropic、Groq、xAI 和 DeepSeek routes，gateway 会使用该 key 而不是 workspace secret。来自其他调用方的请求，或在其他 routes 上携带该 header 的请求，会返回 400 或 403 错误。
+- 内置和 personal MCP servers 的 "Available in this workspace" 开关现在对所有 workspace 可用，包括 self-hosted deployments。关闭某个 server 即可阻止其 tool calls，并可在 **Tools** > **Servers** 下查看其 Off 状态和其他成员的 personal servers。
+- 非管理员成员和 workspace admins 现在在 **Tools** > **Policies** 和 agent policies API 中只能看到 organization-wide agent policies 以及自己 workspace 的 policies。Organization admins 仍可看到所有 policies。按 ID 请求另一个 workspace 的 policy 会返回 `404`。
+- Terraform 中的 managed tool servers 现在接受 `logo_path` 属性，因此你可以使用最大 1 MiB、2048 x 2048 像素的 PNG 或 JPEG 文件设置 server logo。更改文件会就地更新 logo，而不会替换 server。
+
+## Datasets and experiments
+
+- 你现在可以将 `upload_runs` 传给 `evaluate()` 和 `aevaluate()`，以选择将哪些 runs 上传到 LangSmith。传入 callable 可按 example 决定，summary scores 仍覆盖每个 run。
+- LangSmith MCP server 现在使用 `page_size` 和 `cursor` 对 `list_datasets`、`list_projects`、`list_experiments` 和 `list_prompt_commits` 分页，因此 agents 可以列出每个结果。`create_examples` 可以通过 `use_source_run_io` 复制 run 的 inputs 和 outputs，当 `order` 为 `desc` 时，`get_thread_history` 会以最新在前的顺序读取长 thread。
+
+## Fixes and improvements
+
+<Accordion title="Show all fixes">
+
+- Vercel AI SDK LLM steps 的 traces 现在会显示首 token 时间，此前缺失该信息。
+- 使用 **GET /api/v1/runs/rules** 过滤 run rules 现在会应用你提供的每个 filter，因此你只会获得同时匹配 `dataset_id`、`session_id`、`name_contains`、`id` 和 `evaluator_id` 所有条件的 rules。
+- 保存的 memory 无法在当前 CPU 上加载的 sandboxes 现在会从其磁盘启动而不是失败，因此在 Intel host 上挂起的 sandbox 可以在 AMD host 上正常重启。
+- 开启 **Use AI Gateway** 的已保存 Databricks model configurations 现在可在 Playground 和 evaluators 中工作。请求会到达 MLflow AI Gateway route，并使用你保存的 token 进行认证。
+- 使用 `model` 字段保存的 Bedrock Converse 和 ChatBedrock configs 现在会在 Playground 中打开，并保留其 model 和 ARN。此前，model 会被默认值覆盖。
+- 当 agent 有多个 environments 时，Alerts 标签页现在会显示来自每个 environment 的 alerts，而不是什么都不显示。
+- 对于在没有 ClickHouse 的情况下从 SmithDB 读取的 tenants，当前请求之外 runs 上的 feedback 现在可以正常工作。Feedback 创建和 multipart ingestion 会先在 SmithDB 中查找 run coordinates，因此当 ClickHouse 关闭时，它们不再失败或排队。
+- Home、onboarding 和 agent overview 现在会在请求失败时显示带 **Try again** 按钮的错误状态，而不是误导性的空状态或永远不停止的 spinner。
+- 你的首次 SAML 登录现在会立即显示你的 organizations 和 tenants，因此你不再需要退出并重新登录才能看到 organization access。
+- 当 run 流式传输 messages 时，LangSmith Chat 不再因 `TypeError` 崩溃，因此包含多个 tool calls 的 turns 会完整渲染。
+- 当请求失败时，Billing 和 Trace Usage Limits 页面现在会显示带有 **Try again** 按钮的 "Couldn't load" 消息，而不是 "Organization not found" 或 "Unlimited" spend limits。
+- 在另一个请求正在写入的 thread 上创建 run 现在会在锁清除后成功，而不是以 500 错误失败。如果该 thread 在全部三次尝试期间都保持锁定，你的请求会返回 503 错误，且不会保存任何 run。
+- 当 X 以 invalid_request 错误拒绝 refresh token 时，Agent Auth 现在会要求你重新连接。你的 MCP calls 会返回带有 verification_url 的 428，而不是永久性的 502。
+- 当你的 subscription 无法在某个区域创建默认的 Standard_D2s_v6 时，你的 BYOC Azure data plane 现在会使用另一个 2 vCPU、8 GiB 的 VM size 创建其 AKS system pool。创建 data plane 不再因该 VM size 的错误而失败。
+- 修复了 sandboxes 在恢复时因 `SandboxUnavailableError: not ready after 30s` 而挂起的问题。恢复的 sandboxes 现在会完成启动。
+- 修复了一个错误，该错误会导致 **Chat** 无法读取带有 GitHub pull request event 的 issues。这些 issues 现在可以加载，其 pull request 链接和状态更新也会正确显示。
+- AWS、Azure 和 GCP agents 的 workload identity tokens 现在可以成功签发。当未配置 agent access tokens 时，对你的 token endpoint 的请求不再返回 404。
+- 对于包含带有 LangChain 序列化 inputs 的 ChatAnthropic runs 的 traces，Trace Messages 视图不再以 500 错误失败。这些 traces 的 Messages 现在可以加载。
+- BYOC data planes 上的 `langgraphjs deploy --remote` 现在可以构建和部署，而不会在拉取 base image 时因 403 错误失败。
+- 在 AWS 和 GCP 上的 BYOC data planes 进行 rollouts 或 node consolidation 期间，UI 请求不再因连接断开而失败。
+
+</Accordion>
+
+</Update>
+
 <Update label="November 9-16, 2026" rss={{ title: "2026-11-09 - LangSmith Cloud update" }}>
 
 ## Highlights
