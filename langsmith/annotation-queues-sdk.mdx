@@ -11,7 +11,7 @@ tag: "SDK"
 </Callout>
 
 <Note>
-如果你想在 [LangSmith UI](https://smith.langchain.com?utm_source=docs&utm_medium=cta&utm_campaign=langsmith-signup&utm_content=langsmith-annotation-queues-sdk) 里审查单个 run 时，直接写自由形式的验收标准，请参阅[使用 assertions](/langsmith/assertions)。
+如需审查 [LangSmith Engine](/langsmith/engine) 针对反复出现的问题提出的自由形式验收标准，请参阅[使用 assertions](/langsmith/assertions)。
 </Note>
 
 ## 反馈层级
@@ -19,7 +19,7 @@ tag: "SDK"
 LangSmith 对结构化人工反馈采用三层架构：
 
 1. **反馈配置（Feedback configs）**：组织范围内的反馈 key 定义，用来建立评估指标 schema。例如，你可以把 “accuracy” 定义成 0–1 的连续分数，或把 “correctness” 定义成 pass/fail 的分类选择。这些配置可以在组织内所有标注队列中复用。
-1. **标注队列 rubric items**：队列级别的分配，用于决定标注者在审查某个队列中的[runs](/langsmith/observability-concepts#runs)时，必须填写哪些反馈项。每个 rubric item 都可以带有自定义描述、具体分值说明，以及该项是必填还是可选。
+1. **标注队列 rubric items**：队列级别的分配，用于决定标注者在审查某个队列中的[runs](/langsmith/observability-concepts#runs)时，必须填写哪些反馈项。每个 rubric item 都可以带有自定义描述、具体分值说明、该项是必填还是可选，以及根据前面的回答显示或要求该项的条件。
 1. **反馈（Feedback）**：标注者针对具体[runs](/langsmith/observability-concepts#runs)提交的实际分数和数值。这些就是根据你定义好的 schema 收集到的真实评估数据。更多信息请参阅[LangSmith 中的反馈](/langsmith/observability-concepts#feedback)。
 
 ## 反馈配置
@@ -152,6 +152,40 @@ await client.updateFeedbackConfig("accuracy", {
 ```
 </CodeGroup>
 
+传入 `feedback_config` 会替换整个配置，包括其 category 列表。要让多选配置保持多选，请在新配置中包含 `allows_multiple_categories`。
+
+#### 添加或移除 categories {#add-or-remove-categories}
+
+如果 category 列表很大，不想每次重发整份列表，可以用 `add_feedback_categories` 和 `remove_feedback_categories` 单独添加或移除 categories。这两种方法都会保留配置中的其他 categories 及其 `allows_multiple_categories` 设置：
+
+<Note>
+这些方法要求 Python 版 `langsmith>=0.15.0` 或 TypeScript 版 `langsmith>=0.12.0`。自托管 LangSmith 需要 v0.18 或更高版本。早期版本会忽略该更改，并原样返回配置。
+</Note>
+
+<CodeGroup>
+```python Python
+# Add categories. Values and labels must not match existing ones.
+client.add_feedback_categories(
+    "topics",
+    [{"value": 3, "label": "warranty"}],
+)
+
+# Remove categories by value, not label.
+client.remove_feedback_categories("topics", [2])
+```
+```typescript TypeScript
+// Add categories. Values and labels must not match existing ones.
+await client.addFeedbackCategories("topics", [
+  { value: 3, label: "warranty" },
+]);
+
+// Remove categories by value, not label.
+await client.removeFeedbackCategories("topics", [2]);
+```
+</CodeGroup>
+
+移除 category 不会改变已经使用该值写入的反馈。categorical 配置必须至少保留两个 categories，因此如果移除后少于两个，就会返回 422 错误。
+
 ### 删除反馈配置
 
 使用 [`delete_feedback_config`](https://reference.langchain.com/python/langsmith/client/Client/delete_feedback_config) 从组织中删除某个反馈配置。这个操作是软删除，只会将该配置标记为已删除，而不会真正从系统中彻底移除。如果之后需要，你仍然可以用同一个 key 重新创建配置：
@@ -276,6 +310,98 @@ await client.updateAnnotationQueue(queue.id, {
 });
 ```
 </CodeGroup>
+
+如果更新时省略了某个 item 的 `required_if` 或 `visible_if`，该 item 会保留当前条件。要清除条件，请传入 `None`（Python）或 `null`（TypeScript）。
+
+### 为 rubric items 添加条件 {#add-conditions-to-rubric-items}
+
+条件可以让某个 rubric item 依赖前序 items 的回答，这样标注者只会在适用时看到后续问题。每个 rubric item 都接受两个可选的条件字段：
+
+- **`required_if`**：始终显示该 item，并且仅在条件成立时才必填。
+- **`visible_if`**：在条件成立前隐藏该 item。一旦显示，就遵循 `is_required`。
+
+<Note>
+Rubric item 条件要求 Python 版 `langsmith>=0.15.0` 或 TypeScript 版 `langsmith>=0.12.0`。
+</Note>
+
+每个条件对象都包含一个取值为 `"all"` 或 `"any"` 的 `join`，以及一组 `rules`。每条 rule 都指定同一 rubric 中前序 item 的 `key`、一个 `op`，以及要匹配的 category `values`：
+
+- **`is`**：前序 item 的回答等于所给的那个值。
+- **`is_one_of`**：前序 item 的回答是所给值中的任意一个。
+- **`is_empty`**：前序 item 没有回答。不接受任何值。
+- **`is_not_empty`**：前序 item 有回答。不接受任何值。
+
+Rule 中的值指的是 category 的值，而不是 label。对于多选 item，只要任一已选 category 匹配，`is` 和 `is_one_of` 就成立。
+
+下面的示例仅在标注者将响应标记为失败时，才要求提供失败原因：
+
+<CodeGroup>
+```python Python
+client.update_annotation_queue(
+    queue.id,
+    rubric_items=[
+        {"feedback_key": "correctness", "is_required": True},
+        {
+            "feedback_key": "failure_reason",
+            "description": "Why did the response fail?",
+            "is_required": True,
+            "visible_if": {
+                "join": "all",
+                "rules": [{"key": "correctness", "op": "is", "values": [0]}],
+            },
+        },
+    ],
+)
+```
+```typescript TypeScript
+await client.updateAnnotationQueue(queue.id, {
+  rubricItems: [
+    { feedback_key: "correctness", is_required: true },
+    {
+      feedback_key: "failure_reason",
+      description: "Why did the response fail?",
+      is_required: true,
+      visible_if: {
+        join: "all",
+        rules: [{ key: "correctness", op: "is", values: [0] }],
+      },
+    },
+  ],
+});
+```
+</CodeGroup>
+
+一条 rule 只能引用 rubric 中排在其前面的 item。引用后面的 item 或该 item 自身的 rule 会返回 422 错误。LangSmith 会存储条件，并由审核视图应用这些条件。直接写入反馈时，API 不会强制执行这些条件。
+
+### 将 rubric 复制到另一个队列 {#copy-a-rubric-to-another-queue}
+
+`read_annotation_queue` 会按顺序返回队列的 rubric items，每个 item 都包含其使用的反馈配置。要复制 rubric，请将这些 items 原样传给另一个队列的 `rubric_items`：
+
+<Note>
+读取带有反馈配置的 rubric items 需要 Python 版 `langsmith>=0.15.0` 或 TypeScript 版 `langsmith>=0.12.0`。
+</Note>
+
+<CodeGroup>
+```python Python
+source = client.read_annotation_queue(source_queue_id)
+
+client.update_annotation_queue(
+    target_queue_id,
+    rubric_instructions=source.rubric_instructions,
+    rubric_items=source.rubric_items,
+)
+```
+```typescript TypeScript
+const source = await client.readAnnotationQueue(sourceQueueId);
+
+await client.updateAnnotationQueue(targetQueueId, {
+  rubricInstructions: source.rubric_instructions,
+  rubricItems: source.rubric_items,
+});
+```
+</CodeGroup>
+
+由于更新会替换完整的 rubric item 列表，因此该更新会替换目标队列的 rubric。若要保留目标队列现有的 items，请在更新前合并两个列表。
 
 ## 将 runs 和 threads 添加到队列
 
@@ -523,6 +649,49 @@ await client.createFeedbackConfig({
 
 第一个例子是典型的 pass/fail 二元配置。第二个例子是一个包含三种情感类别的多分类配置。即便是分类反馈，这些数值也能用于后续聚合分析。
 
+#### 允许多选 {#allow-multiple-selections}
+
+设置 `allows_multiple_categories` 可以让标注者为单个 item 选择多个 categories。它适用于多标签分类体系，例如为一通对话涉及的每个主题打标签。该标志默认为 `false`，且仅适用于 categorical 配置：
+
+<Note>
+`allows_multiple_categories` 要求 Python 版 `langsmith>=0.15.0` 或 TypeScript 版 `langsmith>=0.12.0`。
+</Note>
+
+<CodeGroup>
+```python Python
+client.create_feedback_config(
+    "topics",
+    feedback_config={
+        "type": "categorical",
+        "categories": [
+            {"value": 0, "label": "billing"},
+            {"value": 1, "label": "shipping"},
+            {"value": 2, "label": "returns"},
+        ],
+        "allows_multiple_categories": True,
+    },
+)
+```
+```typescript TypeScript
+await client.createFeedbackConfig({
+  feedbackKey: "topics",
+  feedbackConfig: {
+    type: "categorical",
+    categories: [
+      { value: 0, label: "billing" },
+      { value: 1, label: "shipping" },
+      { value: 2, label: "returns" },
+    ],
+    allows_multiple_categories: true,
+  },
+});
+```
+</CodeGroup>
+
+当标注者在审核窗格中选择多个 categories 时，LangSmith 会把每个选择分别保存为该配置 key 下的一条反馈记录，其中 category label 作为 `value`，category value 作为 `score`。取消选择会删除对应记录。要使用 SDK 写入多选答案，请为每个 category 创建一条反馈记录。
+
+复合评估器不能包含多选 key，因为同一个 run 在该 key 下可能有多个分数。
+
 ### Freeform
 
 Freeform 配置允许标注者输入开放式文本反馈，没有任何预定义结构或限制。它没有 `min`、`max` 或 `categories` 这些字段，标注者可以填写任意内容。
@@ -571,6 +740,14 @@ await client.createFeedbackConfig({
 | `score_descriptions` | `Record<string, string>` | 特定分值的说明标签（continuous）。 |
 | `value_descriptions` | `Record<string, string>` | 特定分类值的说明标签（categorical）。 |
 | `is_required` | `boolean` | 提交前是否必须完成该项，默认值为 false。 |
+| `required_if` | `object` | 前序 items 上的条件。仅当条件成立时，该项才必填。请参阅[为 rubric items 添加条件](#add-conditions-to-rubric-items)。 |
+| `visible_if` | `object` | 前序 items 上的条件。在条件成立前隐藏该项。请参阅[为 rubric items 添加条件](#add-conditions-to-rubric-items)。 |
+
+### 反馈配置字段
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `allows_multiple_categories` | `boolean` | 仅适用于 categorical。标注者是否可以选择多个 categories。默认值为 false。 |
 
 ---
 
