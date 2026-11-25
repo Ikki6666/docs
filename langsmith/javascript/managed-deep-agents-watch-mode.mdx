@@ -1,0 +1,166 @@
+---
+title: 构建 Slack 监视 agent
+sidebarTitle: 监视模式
+description: 构建一个读取 channel 中每条消息并决定何时回复的 Slack agent。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/javascript/langsmith/managed-deep-agents-public-beta-note.mdx';
+
+监视模式让 [连接到 Slack 的 agent](/langsmith/javascript/managed-deep-agents-channels-slack) 无需等待 mention 即可读取 channel 消息。agent 会根据上下文决定回复还是保持静默。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+
+
+<Note>
+本 TypeScript 示例需要 `managed-deepagents` 0.10.4 或更高版本，以及匹配的 `mda` CLI。
+</Note>
+
+
+<img
+  className="block dark:hidden"
+  src="/langsmith/images/managed-deep-agents-watch-mode-light.png"
+  alt="模拟 Slack #ops-deploys channel：Watch Agent 对闲聊保持静默，在收到部署消息后静默安排一次 15 分钟后的检查，并在 thread 中发布一条延迟检查回复。"
+/>
+
+<img
+  className="hidden dark:block"
+  src="/langsmith/images/managed-deep-agents-watch-mode-dark.png"
+  alt="模拟 Slack #ops-deploys channel：Watch Agent 对闲聊保持静默，在收到部署消息后静默安排一次 15 分钟后的检查，并在 thread 中发布一条延迟检查回复。"
+/>
+
+## 配置 Slack channel
+
+从一个已有 [Slack channel](/langsmith/javascript/managed-deep-agents-channels-slack#add-a-slack-channel) 的项目开始，并更新其声明：
+
+
+
+```ts channels/slack.ts
+import { channels } from "managed-deepagents";
+
+export const channel = channels.slack({
+  triggerMode: "all",
+  reactions: false,
+  status: false,
+});
+```
+
+
+bot 所在 channel 中的每条消息都会启动一次 run，每次 run 都会产生用量。关闭 reactions 和工作状态后，agent 选择不回复时就不会在 channel 中留下任何动静。
+
+## 编写 instructions
+
+在 `instructions.md` 中添加：
+
+```markdown instructions.md
+# Slack watch agent
+
+Answer direct questions and mentions. For other messages, reply only when you
+can add something useful. Otherwise, respond with exactly [quiet].
+```
+
+如果回复内容恰好是 `[quiet]`，则不会发布任何内容。
+
+[部署该 agent](/langsmith/javascript/managed-deep-agents-deploy) 并将其邀请到某个 channel。发送一条无需回复的消息和一条 mention 该 agent 的消息，然后确认只有 mention 得到回复。
+
+## 添加跟进检查
+
+要让 agent 稍后跟进，请添加一个 [自定义 tool](/langsmith/javascript/managed-deep-agents-tools)，用于在当前 thread 中安排一次性 [检查](/langsmith/javascript/managed-deep-agents-schedules#create-schedules-at-runtime)。
+
+使用 `managed-deepagents` 0.10.4 时，请使用 npm：pnpm 可能会解析出不兼容的 LangChain 版本。安装该 tool 的依赖项：
+
+```bash
+npm install langchain zod
+```
+
+
+
+
+```ts tools/watch.ts
+import { tool } from "langchain";
+import type { ManagedDeepAgentRuntime } from "managed-deepagents";
+import { z } from "zod";
+
+export const scheduleCheckIn = tool(
+  async ({ prompt, minutes }, runtime) => {
+    const managedRuntime = runtime as typeof runtime &
+      Pick<ManagedDeepAgentRuntime, "thread" | "schedules">;
+    const origin = managedRuntime.thread?.origin;
+    if (!origin || origin.channel.provider !== "slack") {
+      return "A Slack conversation is required to schedule a check-in.";
+    }
+    if (minutes < 2 || minutes > 1440) {
+      return "Choose a delay between 2 and 1440 minutes.";
+    }
+    const item = await managedRuntime.schedules!.create({
+      owner: { type: "agent" },
+      at: new Date(Date.now() + minutes * 60_000),
+      newThread: false,
+      prompt,
+    });
+    return `Scheduled check-in ${item.id}.`;
+  },
+  {
+    name: "schedule_check_in",
+    description: "Schedule one check-in in the current conversation, 2 to 1440 minutes from now.",
+    schema: z.object({
+      prompt: z.string(),
+      minutes: z.number().int(),
+    }),
+  },
+);
+```
+
+
+注册该 tool：
+
+
+
+```ts agent.ts
+import { defineDeepAgent } from "managed-deepagents";
+
+import { scheduleCheckIn } from "./tools/watch";
+
+export const agent = defineDeepAgent({
+  name: "watch-agent",
+  model: "openai:gpt-6.1-sol",
+  tools: [scheduleCheckIn],
+});
+```
+
+
+在 `instructions.md` 中添加：
+
+```markdown instructions.md
+When work is ongoing and a later check could help, call schedule_check_in.
+When a check-in runs, reply only if there is something new; otherwise respond
+with exactly [quiet].
+```
+
+例如，如果有人说一项修复正在逐步上线，agent 可以安排 15 分钟后的检查。检查以 agent 身份运行，并且只能看到已投递到其 thread 的消息。
+
+## 扩展该模式
+
+
+
+- 在 run 开始前筛选消息：在 `channels.slack(...)` 的 `onEvent` `"message"` handler 中返回 `null`，以减少繁忙 channel 中的用量。
+
+- 添加一个 Slack history [tool](/langsmith/javascript/managed-deep-agents-tools)，让检查可以读取 thread 中的最新回复。
+- 要让 thread 跨多次检查保持跟踪，可让每次检查安排下一次检查，并在完成时提供用于[列出和删除](/langsmith/javascript/managed-deep-agents-schedules#manage-schedules)待处理检查的 tools。
+
+## 另请参阅
+
+- [Slack](/langsmith/javascript/managed-deep-agents-channels-slack)：设置 Slack app 并配置 channel 触发条件。
+- [Schedules](/langsmith/javascript/managed-deep-agents-schedules)：创建和管理 runtime schedules。
+- [Instructions](/langsmith/javascript/managed-deep-agents-instructions)：配置 agent 的行为。
+
+---
+
+<div className="source-links">
+<Callout icon="terminal-2">
+    [Connect these docs](/use-these-docs) to your agent of choice via MCP for real-time answers.
+</Callout>
+<Callout icon="edit">
+    [Edit this page on GitHub](https://github.com/langchain-ai/docs/edit/main/src/langsmith/managed-deep-agents-watch-mode.mdx) or [file an issue](https://github.com/langchain-ai/docs/issues/new/choose).
+</Callout>
+</div>

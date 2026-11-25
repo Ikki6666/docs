@@ -23,7 +23,7 @@ Direct model access 是 [LangChain 和 Deep Agents](#配置-langchain-和-deep-a
 | Baseten | `/baseten` |
 | Fireworks | `/fireworks` |
 | Google Gemini | `/gemini` |
-| Gemini Enterprise Agent Platform | `/vertex` |
+| Gemini Enterprise Agent Platform (Vertex AI) | `/vertex` |
 | OpenAI | `/openai` |
 | ScaleDown | `/scaledown` |
 | TypeSafe | `/typesafe` |
@@ -91,6 +91,119 @@ print(message.content[0].text)
 </CodeGroup>
 
 Direct path 使用 provider 的原生模型名称，不带 provider 前缀。
+
+## 创建 embeddings
+
+gateway 会通过各 provider 的直接路径把 embeddings 请求路由到 OpenAI、Azure Foundry 和 Gemini Enterprise Agent Platform。使用这些路径，可以像其他 gateway 请求一样，借助相同的工作区凭证、策略和 tracing 生成向量。[标准 endpoint](/langsmith/llm-gateway-api-formats) 不接受 embeddings 请求。
+
+在发送请求之前，先配置 provider 的[工作区凭证](/langsmith/llm-gateway-provider-authentication#add-a-provider-key)。请使用你的 LangSmith API key 向 gateway 进行认证，而不是 provider key。示例使用美国 Cloud 主机名。如需使用其他区域，请将其替换为你的[区域 gateway](/langsmith/llm-gateway-how-it-works#use-a-regional-gateway)主机名。
+
+| Provider | Embeddings endpoint | 请求格式 |
+| --- | --- | --- |
+| OpenAI | `POST /openai/v1/embeddings` | `model` 和 `input`。 |
+| Azure Foundry | `POST /azure/v1/embeddings` | `model`（deployment 名称）和 `input`。 |
+| Gemini Enterprise Agent Platform | `POST /vertex/v1/publishers/google/models/{model}:embedContent` | `content.parts`。 |
+| Gemini Enterprise Agent Platform | `POST /vertex/v1/publishers/google/models/{model}:batchEmbedContents` | `requests`，每个请求包含 `content.parts`。 |
+| Gemini Enterprise Agent Platform | `POST /vertex/v1/publishers/google/models/{model}:predict` | `instances`，每个实例包含 `content`。仅支持 `gemini-embedding-*` 模型。 |
+
+### 调用 OpenAI 或 Azure Foundry
+
+对于 OpenAI，请把 `model` 设置为不带 `openai/` 前缀的 embedding 模型 ID。对于 Azure Foundry，请使用[已配置的 Foundry 资源](/langsmith/llm-gateway-provider-authentication#configure-azure-foundry)上的 deployment 名称，而不是底层模型 ID。
+
+<CodeGroup>
+
+```bash OpenAI
+curl https://gateway.smith.langchain.com/openai/v1/embeddings \
+  --header "Authorization: Bearer $LANGSMITH_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "model": "text-embedding-3-small",
+    "input": "The quick brown fox"
+  }'
+```
+
+```bash Azure Foundry
+curl https://gateway.smith.langchain.com/azure/v1/embeddings \
+  --header "Authorization: Bearer $LANGSMITH_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "model": "<deployment-name>",
+    "input": "The quick brown fox"
+  }'
+```
+
+</CodeGroup>
+
+两个 endpoint 都返回 provider 的 OpenAI 格式 embeddings 响应，向量位于 `data[].embedding`。
+
+### 调用 Gemini Enterprise Agent Platform
+
+Gemini Enterprise Agent Platform 使用 Google 原生的请求和响应格式。
+
+表中的短路径使用你的 [Gemini Enterprise Agent Platform 凭证和工作区 secrets](/langsmith/llm-gateway-provider-authentication#configure-gemini-enterprise-agent-platform) 中的 project 和 location。你也可以在路径中指定它们：`/vertex/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}`。gateway 在 `v1beta` 和 `v1beta1` 下也接受相同的路径形式。
+
+<CodeGroup>
+
+```bash Single embedding
+curl https://gateway.smith.langchain.com/vertex/v1/publishers/google/models/gemini-embedding-2:embedContent \
+  --header "Authorization: Bearer $LANGSMITH_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "content": {"parts": [{"text": "The quick brown fox"}]}
+  }'
+```
+
+```bash Batch embeddings
+curl https://gateway.smith.langchain.com/vertex/v1/publishers/google/models/gemini-embedding-2:batchEmbedContents \
+  --header "Authorization: Bearer $LANGSMITH_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "requests": [
+      {"content": {"parts": [{"text": "Name 5 colors"}]}},
+      {"content": {"parts": [{"text": "Name 5 animals"}]}}
+    ]
+  }'
+```
+
+```bash Predict embeddings
+curl "https://gateway.smith.langchain.com/vertex/v1/projects/<project-id>/locations/us-central1/publishers/google/models/gemini-embedding-001:predict" \
+  --header "Authorization: Bearer $LANGSMITH_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "instances": [{"content": "The quick brown fox"}]
+  }'
+```
+
+</CodeGroup>
+
+将 `:predict` 示例中的 `<project-id>` 替换为你的 Google Cloud project ID。选择一个模型可用的 location。`:predict` 路由只接受以 `gemini-embedding-` 开头的模型 ID。其他模型（包括 `text-embedding-*`、`text-multilingual-embedding-*` 和 `multimodalembedding@001`）会返回 `501`。
+
+从 `embedContent` 的 `embedding.values`、`batchEmbedContents` 的 `embeddings[].values`，以及 `predict` 的 `predictions[].embeddings.values` 中读取向量。
+
+### 使用 LangChain embeddings
+
+使用直接 gateway base URL 和你的 LangSmith API key 显式配置 [OpenAIEmbeddings](/oss/python/integrations/embeddings/openai)：
+
+```python
+import os
+
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    base_url="https://gateway.smith.langchain.com/openai/v1",
+    api_key=os.environ["LANGSMITH_API_KEY"],
+)
+vector = embeddings.embed_query("The quick brown fox")
+```
+
+下一节中用于 chat models 的 `LANGSMITH_GATEWAY` 设置不能替代配置 embeddings client 的 base URL。
+
+### 跟踪用量并应用策略
+
+Embeddings 请求会经过 gateway 策略，并作为 LLM runs 出现在 [gateway traces](/langsmith/llm-gateway-traces) 中。Token 用量来自 provider 响应。Embeddings 请求不使用 [fallback 链](/langsmith/llm-gateway-fallbacks)。
+
+如果模型没有匹配的价格条目，请[添加模型价格](/langsmith/cost-tracking#create-a-new-or-modify-an-existing-model-price-entry)以跟踪 embedding 成本。
 
 ## 配置 LangChain 和 Deep Agents
 
