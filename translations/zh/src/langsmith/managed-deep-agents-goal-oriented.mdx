@@ -1,0 +1,186 @@
+---
+title: 长期推进目标
+sidebarTitle: 目标
+description: 让智能体自行判断工作何时需要跟进，并安排进度检查，直到工作完成。
+---
+
+import ManagedDeepAgentsPublicBetaNote from '/snippets/langsmith/managed-deep-agents-public-beta-note.mdx';
+
+有些工作无法在一轮内完成：合同等待签署，pull request 等待审核，或者公告尚未发布。目标导向的 agent 会立即完成力所能及的部分，然后在进展依赖外部事件时自行安排跟进检查。每次检查时，它都会推进工作，并在目标达成后停止 schedule。
+
+<ManagedDeepAgentsPublicBetaNote />
+
+:::python
+<Note>
+本 Python 示例需要 `managed-deepagents>=0.10.4` 以及匹配的 `mda` CLI。
+</Note>
+:::
+
+:::js
+<Note>
+本 TypeScript 示例需要 `managed-deepagents` 0.10.4 或更高版本，以及匹配的 `mda` CLI。
+</Note>
+:::
+
+<img
+  className="block dark:hidden"
+  src="/langsmith/images/managed-deep-agents-goals-light.png"
+  alt="模拟 #deals-ops 中的 Slack thread：Goal Agent 检查供应商合同，使用 check_progress 安排每日进度检查，发布周中更新，并在合同会签后调用 stop_checking。"
+/>
+
+<img
+  className="hidden dark:block"
+  src="/langsmith/images/managed-deep-agents-goals-dark.png"
+  alt="模拟 #deals-ops 中的 Slack thread：Goal Agent 检查供应商合同，使用 check_progress 安排每日进度检查，发布周中更新，并在合同会签后调用 stop_checking。"
+/>
+
+## 添加 schedule tools
+
+为 agent 提供两个 [tools](/langsmith/managed-deep-agents-tools)，用于封装 [runtime schedules](/langsmith/managed-deep-agents-schedules#create-schedules-at-runtime)。`check_progress` 会在当前 channel thread 中启动由 agent 拥有的定期检查，`stop_checking` 则会删除该检查：
+
+:::js
+使用 `managed-deepagents` 0.10.4 时，请使用 npm：pnpm 可能会解析出不兼容的 LangChain 版本。安装这些 tools 的依赖项：
+
+```bash
+npm install langchain zod
+```
+:::
+
+:::python
+```python tools/goals.py
+from langchain.tools import tool
+from managed_deepagents import ManagedDeepAgentRuntime
+
+OWNER = {"type": "agent"}
+
+
+@tool
+async def check_progress(goal: str, cron: str, runtime: ManagedDeepAgentRuntime) -> str:
+    """Check back on unfinished work in this thread on a cron schedule, until you stop it."""
+    item = await runtime.schedules.create(
+        owner=OWNER,
+        cron=cron,
+        new_thread=False,
+        prompt=f"Check progress on this goal: {goal}",
+    )
+    return f"Checking progress with schedule {item['id']}."
+
+
+@tool
+async def stop_checking(schedule_id: str, runtime: ManagedDeepAgentRuntime) -> str:
+    """Stop checking progress on a goal that is met or abandoned."""
+    await runtime.schedules.delete(schedule_id, owner=OWNER)
+    return f"Stopped schedule {schedule_id}."
+```
+:::
+
+:::js
+```ts tools/goals.ts
+import { tool } from "langchain";
+import type { ManagedDeepAgentRuntime } from "managed-deepagents";
+import { z } from "zod";
+
+const owner = { type: "agent" } as const;
+
+export const checkProgress = tool(
+  async ({ goal, cron }, runtime) => {
+    const { schedules } = runtime as typeof runtime & Pick<ManagedDeepAgentRuntime, "schedules">;
+    const item = await schedules!.create({
+      owner,
+      cron,
+      newThread: false,
+      prompt: `Check progress on this goal: ${goal}`,
+    });
+    return `Checking progress with schedule ${item.id}.`;
+  },
+  {
+    name: "check_progress",
+    description: "Check back on unfinished work in this thread on a cron schedule, until you stop it.",
+    schema: z.object({ goal: z.string(), cron: z.string() }),
+  },
+);
+
+export const stopChecking = tool(
+  async ({ scheduleId }, runtime) => {
+    const { schedules } = runtime as typeof runtime & Pick<ManagedDeepAgentRuntime, "schedules">;
+    await schedules!.delete(scheduleId, { owner });
+    return `Stopped schedule ${scheduleId}.`;
+  },
+  {
+    name: "stop_checking",
+    description: "Stop checking progress on a goal that is met or abandoned.",
+    schema: z.object({ scheduleId: z.string() }),
+  },
+);
+```
+:::
+
+将这两个 tools 与 quickstart 的 model 和 web search tool 一起注册：
+
+:::python
+```python agent.py
+from managed_deepagents import define_deep_agent
+
+from tools.goals import check_progress, stop_checking
+
+agent = define_deep_agent(
+    name="goal-agent",
+    model="openai:gpt-6.1-sol",
+    tools=[{"type": "web_search"}, check_progress, stop_checking],
+)
+```
+:::
+
+:::js
+```ts agent.ts
+import { defineDeepAgent, type DefineDeepAgentConfig } from "managed-deepagents";
+
+import { checkProgress, stopChecking } from "./tools/goals";
+
+export const agent = defineDeepAgent({
+  name: "goal-agent",
+  model: "openai:gpt-6.1-sol",
+  tools: [
+    { type: "web_search_preview" },
+    checkProgress,
+    stopChecking,
+  ] as DefineDeepAgentConfig["tools"],
+});
+```
+:::
+
+## 编写 instructions
+
+使用 `instructions.md` 告诉 agent 何时自行安排跟进，并根据你的工作流调整示例和检查频率：
+
+```markdown instructions.md
+## Follow through
+
+Finish every request in the current turn when possible. If the work depends on
+something outside your control, such as an approval, review, or publication,
+define what "done" looks like and pick a check interval. Call check_progress
+and end your turn instead of waiting.
+
+On each check, inspect the current state with your tools rather than assuming.
+Move the work forward if you can; otherwise, note who needs to act. When the
+goal is met or blocked permanently, report the outcome and call stop_checking.
+```
+
+每次检查都在同一个 thread 中运行，并保留原始请求、之前的更新，以及 `stop_checking` 所需的 schedule ID。对于 Slack 会话，每次检查都会在同一个 Slack thread 中回复。
+
+## 试用
+
+从 [quickstart](/langsmith/managed-deep-agents-quickstart) agent 开始，你会得到可用于跟踪公开事件的 web search。添加一个 [Slack channel](/langsmith/managed-deep-agents-channels-slack)（使用同一 thread 的 agent-owned schedules 需要 channel），[部署该 agent](/langsmith/managed-deep-agents-deploy)，然后在 Slack 中提问：“告诉我 LangChain 何时发布下一个版本。”agent 会先搜索；如果版本尚未发布，就安排定期检查，并在版本出现后停止。能够立即回答的请求不会创建 schedule。
+
+## 扩展该模式
+
+- 为你的 tools 连接 [MCP servers](/langsmith/managed-deep-agents-mcp-connectors)（例如 GitHub、Linear 或 CRM），让 agent 可以跟踪“合并 pull request”或“签署合同”等目标，并在过程中提醒相关负责人。
+- 将每个目标保存到 [memory](/langsmith/managed-deep-agents-memory)，以便 agent 列出并报告所有未完成的目标。
+- 在 `check_progress` 中设置最小间隔，让成本可预测：每次检查都是一次 model run。
+- 清理已完成或已放弃的目标：agent-owned schedules 在所有会话中共享每个 agent 默认 20 个的限制（请参见 [Schedule 限制](/langsmith/managed-deep-agents-schedules#schedule-limits)）。
+
+## 另请参阅
+
+- [Schedules](/langsmith/managed-deep-agents-schedules)：创建和管理 runtime schedules。
+- [Tools](/langsmith/managed-deep-agents-tools)：编写自定义 tools。
+- [监视模式](/langsmith/managed-deep-agents-watch-mode)：从 Slack 安排一次性检查。
