@@ -8,6 +8,8 @@ import SandboxLifecycleFactoryThreadPy from '/snippets/python/deepagents-sandbox
 import SandboxLifecycleFactoryThreadTs from '/snippets/python/deepagents-sandbox-lifecycle-factory-thread-ts.mdx';
 import DeepagentsProductionInvokeJs from '/snippets/python/code-samples/deepagents-production-invoke-js.mdx';
 import DeepagentsProductionInvokePy from '/snippets/python/code-samples/deepagents-production-invoke-py.mdx';
+import DeepagentsProductionSandboxSyncJs from '/snippets/python/code-samples/deepagents-production-sandbox-sync-js.mdx';
+import DeepagentsProductionSandboxSyncPy from '/snippets/python/code-samples/deepagents-production-sandbox-sync-py.mdx';
 import DeployFrameworksPlatformsReference from '/snippets/python/langsmith/deploy-frameworks-platforms-reference.mdx';
 
 本指南涵盖了使用 SDK 将深度代理从本地原型转移到生产部署的注意事项。若要在无需管理基础设施的情况下运行生产环境中的代理，请改为从 [Managed Deep Agents](/langsmith/python/managed-deep-agents-overview) 开始，或[迁移到 Managed Deep Agents](/langsmith/python/managed-deep-agents-migrate)。本页其余部分介绍的是在你自行托管代理或运行自定义 [Agent Server](/langsmith/agent-server) 时，如何界定内存范围、配置执行环境、添加护栏以及连接前端。
@@ -457,85 +459,8 @@ async for chunk in client.runs.stream(
 有关特定于提供商的文件传输示例，请参阅[使用文件](/oss/python/deepagents/sandboxes#working-with-files)。有关提供程序设置、安全性和生命周期模式，请参阅完整的[沙箱指南](/oss/python/deepagents/sandboxes)。
 <Accordion title="Example: syncing skills and memories with custom middleware">
 Agent运行前需要将Agent需要执行的[Skill](/oss/python/deepagents/skills)脚本上传到沙箱中。您可能还想同步[memories](/oss/python/deepagents/memory)，以便代理可以在容器内读取和更新它们。使用 [custom middleware](/oss/python/langchain/middleware/custom) 和 `before_agent` 和 `after_agent` 钩子来跨沙箱边界移动文件：
-```python agent.py
-from deepagents import create_deep_agent
-from deepagents.backends import CompositeBackend, StoreBackend
-from deepagents.backends.langsmith import LangSmithSandbox
-from langchain.agents.middleware import AgentMiddleware, AgentState
-from langgraph.runtime import Runtime
-from langsmith.sandbox import SandboxClient
+<DeepagentsProductionSandboxSyncPy />
 
-
-def _safe_filename(key: str) -> str:
-    """Reject keys that contain path traversal or glob characters."""
-    name = key.split("/")[-1]
-    if ".." in name or any(c in name for c in ("*", "?")):
-        raise ValueError(f"Invalid key: {key}")
-    return name
-
-
-class SandboxSyncMiddleware(AgentMiddleware):
-    """Sync skills and memories between the store and the sandbox."""
-
-    def __init__(self, backend: CompositeBackend):
-        super().__init__()
-        self.backend = backend
-
-    async def abefore_agent(self, state: AgentState, runtime: Runtime) -> None:
-        """Upload skill scripts and memories into the sandbox."""
-        user_id = runtime.server_info.user.identity  # [!code highlight]
-        store = runtime.store
-        files = []
-        for item in await store.asearch(("skills", user_id)):
-            name = _safe_filename(item.key)
-            files.append((f"/skills/{name}", item.value["content"].encode()))
-        for item in await store.asearch(("memories", user_id)):
-            name = _safe_filename(item.key)
-            files.append((f"/memories/{name}", item.value["content"].encode()))
-        if files:
-            await self.backend.upload_files(files)
-
-    async def aafter_agent(self, state: AgentState, runtime: Runtime) -> None:
-        """Sync updated memories back to the store."""
-        user_id = runtime.server_info.user.identity  # [!code highlight]
-        store = runtime.store
-        items = await store.asearch(("memories", user_id))
-        results = await self.backend.download_files(
-            [f"/memories/{item.key}" for item in items]
-        )
-        for result in results:
-            if result.content is not None:
-                await store.aput(
-                    ("memories", user_id),
-                    result.path.split("/")[-1],
-                    {"content": result.content.decode()},
-                )
-
-
-client = SandboxClient()
-ls_sandbox = client.create_sandbox()
-
-
-backend = CompositeBackend(
-    default=LangSmithSandbox(sandbox=ls_sandbox),
-    routes={
-        "/skills/": StoreBackend(
-            rt,
-            namespace=lambda rt: ("skills", rt.server_info.user.identity),  # [!code highlight]
-        ),
-        "/memories/": StoreBackend(
-            rt,
-            namespace=lambda rt: ("memories", rt.server_info.user.identity),  # [!code highlight]
-        ),
-    },
-)
-
-agent = create_deep_agent(
-    model="google_genai:gemini-4-hydrogen",
-    backend=backend,
-    middleware=[SandboxSyncMiddleware(backend)],
-)
-```
 
 
 
