@@ -1,0 +1,253 @@
+---
+title: 推荐的 SmithDB 告警
+sidebarTitle: Recommended alerts
+description: 在采用 SmithDB 的自托管 LangSmith 上，用于检测 run 丢失、写入失败、查询失败或缓慢，以及 compaction 落后的告警。
+---
+
+本页列出要在你的监控平台中为自托管 SmithDB 创建的告警。LangSmith 不会替你创建这些告警。它们检测生产环境中影响最大的问题：run 丢失、写入失败、查询失败或缓慢，以及 compaction 落后。
+
+使用[仪表板](/langsmith/self-host-observability-dashboards)检查系统。使用这些告警判断何时需要检查系统。每项告警都会给出指标及要在监控平台中设置的条件。关于每个指标衡量的内容，请参见[必备 SmithDB 指标](/langsmith/self-host-smithdb-metrics)。
+
+每项告警都有一个严重程度：
+
+- **紧急**：run 正在丢失，或用户当前遇到问题。任何时间都应响应。
+- **非紧急**：性能下降。应在一个工作日内响应。
+
+大多数告警都有警告阈值和严重阈值。严重程度适用于严重阈值。警告阈值针对同一问题提供早期信号。
+
+## 告警摘要 {#alert-summary}
+
+| 告警 | 严重程度 | 触发条件 |
+|---|---|---|
+| [1. run 丢失](#1-runs-are-lost) | 紧急 | run 任务在最后一次尝试时失败，或 Redis 驱逐某个键。 |
+| [2. feedback 丢失](#2-feedback-is-lost) | 紧急 | 一个 feedback 任务在最后一次尝试时失败。 |
+| [3. 摄取积压持续过久](#3-the-ingestion-backlog-gets-old) | 紧急 | 最旧的 pending 任务已超过 30 分钟，或超过 1,000 个任务等待重试。 |
+| [4. Redis 几乎已满](#4-redis-is-almost-full) | 紧急 | Redis 内存超过其限制的 90%。 |
+| [5. 写入失败](#5-writes-fail) | 紧急 | 15 分钟内超过 5% 的写入失败。 |
+| [6. 查询失败](#6-queries-fail) | 紧急 | 15 分钟内对某个池的查询有超过 10% 失败。 |
+| [7. metastore 饱和](#7-the-metastore-is-saturated) | 紧急 | 连接数超过 90%、CPU 超过 80%，或存储几乎已满。 |
+| [8. 写入缓慢](#8-writes-are-slow) | 非紧急 | 15 分钟内写入耗时（中位数）超过 2 秒。 |
+| [9. 查询缓慢](#9-queries-are-slow) | 非紧急 | 15 分钟内某个池的 p95 延迟超过 20 秒。 |
+| [10. compaction 落后](#10-compaction-falls-behind) | 非紧急 | 超过 1,000 个 job 持续等待 2 小时。 |
+| [11. compaction 停止或失败](#11-compaction-stops-or-fails) | 非紧急 | job 在等待，但 30 分钟内没有 job 运行，或某一类 job 大多数失败。 |
+| [12. 某个组件没有 pod](#12-a-component-has-no-pods) | 紧急 | 某个 SmithDB 组件连续 10 分钟没有可用 pod。 |
+| [13. pod 经常重启](#13-pods-restart-often) | 非紧急 | SmithDB pod 或 ingest queue pod 在 30 分钟内重启 3 次或更多。 |
+| [14. SmithDB panic](#14-smithdb-panics) | 非紧急 | 15 分钟内某个组件发生超过 3 次 panic。 |
+
+## 创建告警之前 {#before-you-create-the-alerts}
+
+收集 SmithDB、LangSmith 摄取和基础设施指标，以及 SmithDB 日志。请参见[配置 SmithDB observability](/langsmith/self-host-smithdb-observability)。
+
+本页使用 SmithDB 和 LangSmith 暴露的指标和标签名称。你的监控平台可能会更改这些名称：
+
+- **前缀**：采集配置可以为 SmithDB 指标添加前缀，例如 `smithdb.`。只有 SmithDB 指标会获得此前缀。以 `langsmith_` 开头的指标保持原名。
+- **后缀**：直方图的请求计数可能以 `_count` 或 `.count` 结尾。以 `_total` 结尾的计数器可能改为以 `.count` 结尾，例如 `langsmith_ingest_task_failures.count`。
+- **标签值**：监控平台可能将标签值改为小写，例如将 `/query.QueryService/` 改为 `/query.queryservice/`。请使用平台显示的值。
+
+在每种条件中，只选择你的安装中的 pod，例如按 Kubernetes namespace 选择。如果同一个 namespace 名称存在于多个集群中，还要选择集群。
+
+某些条件适用于每个 SmithDB Deployment 或 pod。要选择它们，请匹配包含 `smithdb` 的名称，而不是仅以它开头的名称。Helm chart 会在 `smithdb` 前面添加 release 名称，例如 `langsmith-smithdb-query`。
+
+每种条件都有一个时间窗口。对于计数，或根据计数计算出的百分比，请使用该窗口内的总量。对于其他值，条件会说明应使用窗口内的哪个值，例如最大值或平均值。某些条件要求窗口内每个值都满足。
+
+本页的阈值是起始值。百分比（告警 5、6 和 11）在大多数安装上相近。计数（例如告警 10）取决于你的数据量。
+
+## 摄取告警 {#alerts-for-ingestion}
+
+LangSmith platform backend 会把每个新 run 放入 Redis。随后 ingest queue worker 会把 run 写入 SmithDB。默认情况下，LangSmith 在 6 小时后删除 Redis 中的 run 数据。Helm 值 `config.settings.redisRunsExpirySeconds` 设置这一时长。本节中的告警确保 run 在此时间内到达 SmithDB。
+
+### 1. run 丢失 {#1-runs-are-lost}
+
+<Badge color="red">紧急</Badge>
+
+**检测内容**：LangSmith 接受了它并未存储的 run。告警 1 和 2 是仅在数据丢失后才触发的告警。其他所有告警都在数据丢失前触发。有两种原因：
+
+- run 任务在最后一次尝试时失败。其 run 会丢失。
+- Redis 内存不足并驱逐了键。这可能造成数据丢失，因为 Redis 还保存不是 run 的键。驱逐是 run 丢失最接近的预警。
+
+**条件**：此告警有两个条件。请为每个条件各创建一个告警。失败计数仅在首次失败后才会出现，因此当指标缺失时不要触发告警。
+
+- 最后一次尝试失败：对于 run 任务，当带有 `attempt="12"` 的 [`langsmith_ingest_task_failures_total`](/langsmith/self-host-smithdb-metrics#langsmith_ingest_task_failures_total) 在 15 分钟内增加时，设为严重。run 任务带有 `task` 标签 `persist_run_or_parent`、`persist_batched_runs`、`upgrade_batched_runs` 或 `otel_rootless_topology`。LangSmith 会将这些任务重试 12 次。第一次尝试的 `attempt="0"`，因此 `attempt="12"` 是最后一次尝试。
+- 驱逐：当 Redis 被驱逐的键（`INFO stats` 中的 `evicted_keys`）在 5 分钟内增加时，设为严重。
+
+如果 Redis 驱逐键，请增加其内存。如果 run 任务在最后一次尝试时失败，说明写入 SmithDB 已失败约 2.5 小时。要查明原因，请参见[写入 SmithDB 失败或缓慢](/langsmith/self-host-smithdb-common-issues#writes-to-smithdb-fail-or-are-slow)。
+
+### 2. feedback 丢失 {#2-feedback-is-lost}
+
+<Badge color="red">紧急</Badge>
+
+**检测内容**：LangSmith 接受了它并未存储的 feedback。一个 feedback 任务在最后一次尝试时失败，其 feedback 会丢失。尝试次数取决于 feedback 任务的类型。
+
+**条件**：当以下某类任务的 [`langsmith_ingest_task_failures_total`](/langsmith/self-host-smithdb-metrics#langsmith_ingest_task_failures_total) 在 15 分钟内增加时，设为严重：
+
+- `task="persist_batched_feedbacks"` 且 `attempt="12"`。
+- `task="smithdb_feedback_mutation"` 或 `task="coalesced_smithdb_feedbacks"` 且 `attempt="25"`。
+
+当 feedback 对应的 run 尚未摄取时，`persist_batched_feedbacks` 不会计入失败。如果它因这个原因在最后一次尝试时失败，feedback 会丢失，但失败计数不会增加。因此，还要为带有 `attempt="11"` 的 `task="persist_batched_feedbacks"` 创建一个警告。该次尝试失败往往是此任务丢失 feedback 前的最后一个信号。
+
+失败计数仅在首次失败后才会出现，因此当指标缺失时不要触发告警。
+
+feedback 写入在 query pod 上运行；如果启用了 mutations 服务，则在 mutations 服务上运行。要查明原因，请参见[一类查询负载拖慢其他查询](/langsmith/self-host-smithdb-common-issues#one-kind-of-query-load-slows-down-other-queries)。
+
+### 3. 摄取积压持续过久 {#3-the-ingestion-backlog-gets-old}
+
+<Badge color="red">紧急</Badge>
+
+**检测内容**：run 在 Redis 中等待过久才到达 SmithDB。新 trace 在 UI 中延迟出现，run 也越发接近 LangSmith 删除它们的时间。
+
+最旧 pending 任务的存在时长是摄取无法跟上的第一个信号。但每次重试后，该时长都会重新开始计算，因此即使写入失败、run 逐渐接近删除时间，它仍可能保持较低。重试计数可以检测这种情况，包括未到达 SmithDB 的失败，例如代理阻止连接。该时长并不显示 LangSmith 删除 run 之前还剩多少时间。不要等到它接近 6 小时。
+
+**条件**：此告警有两个条件。请为每个条件各创建一个告警：
+
+- pending 时长：对 `queue` 标签以 `ingestion` 开头的队列，使用 [`langsmith_asynq_queue_latency_seconds`](/langsmith/self-host-smithdb-metrics#langsmith_asynq_queue_latency_seconds)。取这些队列中的最大值。警告：超过 600 秒（10 分钟）。严重：超过 1,800 秒（30 分钟）。窗口：10 分钟。使用窗口内的最大值。
+- 重试次数：[`langsmith_asynq_ingestion_queue_retry`](/langsmith/self-host-smithdb-metrics#langsmith_asynq_ingestion_queue_retry)。每个 pod 报告相同的值，因此取所有 pod 中的最大值。警告：超过 100。严重：超过 1,000。窗口：30 分钟。窗口内每个值都必须高于阈值。
+
+要查明原因，请参见[LangSmith 摄取落后](/langsmith/self-host-smithdb-common-issues#find-the-cause-of-the-backlog)。
+
+### 4. Redis 几乎已满 {#4-redis-is-almost-full}
+
+<Badge color="red">紧急</Badge>
+
+**检测内容**：Redis 内存接近 `maxmemory`。Redis 保存摄取队列和 6 小时的 run 数据，因此积压会将其填满。达到限制时会发生什么取决于 `maxmemory-policy`。使用 `volatile-lru` 时，Redis 会驱逐带过期时间的键，例如 run 数据，run 可能丢失（告警 [1](#1-runs-are-lost)）。使用 `noeviction` 时，Redis 会改为拒绝新的写入，摄取会失败，但 `evicted_keys` 不会增加。此告警会在仍有时间增加内存时触发。
+
+**条件**：按节点计算 Redis 已用内存占 `maxmemory` 的百分比。托管 Redis 服务通常直接报告此百分比。警告：超过 80%。严重：超过 90%。窗口：10 分钟。使用窗口内的最大值。
+
+要查明原因，请参见[LangSmith 摄取落后](/langsmith/self-host-smithdb-common-issues#find-the-cause-of-the-backlog)。如果没有积压，请增加 Redis 的内存。
+
+## 写入和查询告警 {#alerts-for-writes-and-queries}
+
+SmithDB 摄取会把 run 作为 segment 写入 object storage。它会在 metastore（一个 PostgreSQL 数据库）中记录每个 segment 的元数据。查询池为 UI、API 和 automation 读取 segment。查询池是 query 服务或[专用查询服务](/langsmith/self-host-smithdb-scale#dedicated-query-services)，例如 stats query。每个池都是独立的 Deployment，并独立扩缩。更多信息请参见[SmithDB 如何处理数据](/langsmith/self-host-smithdb-data-paths)。
+
+### 5. 写入失败 {#5-writes-fail}
+
+<Badge color="red">紧急</Badge>
+
+**检测内容**：从 ingest queue worker 到 SmithDB 的写入失败。LangSmith 会从 Redis 重试失败的写入，因此它们首先导致重试，随后导致 run 丢失。通常，失败的写入少于 0.1%。错误率持续存在意味着 SmithDB 无法让数据持久化。
+
+**条件**：对名称包含 `smithdb-ingestion` 的 Deployment，使用 [ingestion pod 上的 `server_requests_duration`](/langsmith/self-host-smithdb-metrics#server_requests_duration-on-ingestion-pods) 的请求计数。只统计 `type="grpc"` 且 `path` 以 `/ingestion.IngestionService/` 开头的请求。`status` 标签是 gRPC code，其中 `0` 表示成功。计算其他 `status` 的请求占所有请求的百分比。窗口：15 分钟。
+
+- 警告：超过 1%。
+- 严重：超过 5%，且失败请求数至少为 50。最小计数可避免在流量较少时触发告警。
+
+要查明原因，请参见[写入 SmithDB 失败或缓慢](/langsmith/self-host-smithdb-common-issues#writes-to-smithdb-fail-or-are-slow)。
+
+### 6. 查询失败 {#6-queries-fail}
+
+<Badge color="red">紧急</Badge>
+
+**检测内容**：对 SmithDB 查询池的请求失败、超时，或被 SmithDB 拒绝。用户会在 trace、run 和项目统计中看到错误或空白页面，automation 也会失败。此条件应用于每个池，以显示哪类负载失败。
+
+**条件**：使用 [query pod 上的 `server_requests_duration`](/langsmith/self-host-smithdb-metrics#server_requests_duration-on-query-pods) 的请求计数，其中 `path` 以 `/query.QueryService/` 开头。对每个 Deployment，计算失败请求占所有请求的百分比。警告：超过 5%。严重：超过 10%。窗口：15 分钟。
+
+以下 `status` 值表示失败：`4`（超时）、`8`（被拒绝）、`2`、`13` 和 `error`（内部错误）、`14`（不可用）、`15`（数据丢失），以及 `timeout`（服务器超时）。不要计入 `1` 和 `cancelled`，它们通常表示用户关闭了页面。也不要计入客户端错误，例如 `3`（无效参数）。
+
+在流量较少的安装中，少量失败也可能占很大百分比。如果告警状态切换过于频繁，请添加最小计数，如告警 [5](#5-writes-fail) 中所述。
+
+要查明原因，请参见[查询缓慢或失败](/langsmith/self-host-smithdb-common-issues#find-the-cause-of-slow-or-failed-queries)。
+
+### 7. metastore 饱和 {#7-the-metastore-is-saturated}
+
+<Badge color="red">紧急</Badge>
+
+**检测内容**：SmithDB metastore（PostgreSQL）没有足够的连接、CPU 或存储。metastore 缓慢会同时拖慢摄取、查询和 compaction。当没有更多连接或存储时，写入会失败。
+
+**条件**：此告警有三个条件。请从数据库监控或云提供商处为每个条件各创建一个告警：
+
+- 已使用连接数占 `max_connections` 的百分比。警告：超过 80%。严重：超过 90%。窗口：5 分钟。使用窗口内的最大值。
+- CPU 使用率。警告：超过 60%。严重：超过 80%。窗口：15 分钟。使用窗口内的平均值。
+- 已用存储。严重：超过 85%。窗口：30 分钟。使用窗口内的最大值。如果你的提供商只报告可用存储，请使用窗口内的最小值，并根据卷大小设置阈值，例如可用空间少于 10 GiB。如果 Aurora 和 AlloyDB 的存储会自动增加，请勿使用此条件。
+
+要查明原因，请参见[metastore 容量耗尽](/langsmith/self-host-smithdb-common-issues#the-metastore-runs-out-of-capacity)。
+
+### 8. 写入缓慢 {#8-writes-are-slow}
+
+<Badge color="orange">非紧急</Badge>
+
+**检测内容**：SmithDB 摄取存储新 run 所需的时间超过平时。batch 延迟是指从 run 到达 SmithDB 摄取，到 SmithDB 将它们写入 object storage 并在 metastore 中记录 segment 元数据之间的时间。它包含一段短暂等待，因为 SmithDB 会先收集 run 再写入。中位数约为 0.5 到 0.7 秒是健康的。
+
+此告警是告警 [3](#3-the-ingestion-backlog-gets-old) 和 [5](#5-writes-fail) 的早期预警。写入缓慢时，ingest queue worker 会等待，Redis 积压会增加，随后写入会失败。
+
+**条件**：[`ingest_batch_latency`](/langsmith/self-host-smithdb-metrics#ingest_batch_latency) 的中位数（p50）。警告：超过 1.6 秒。严重：超过 2 秒。窗口：15 分钟。使用窗口内的平均值。
+
+要查明原因，请参见[写入 SmithDB 失败或缓慢](/langsmith/self-host-smithdb-common-issues#writes-to-smithdb-fail-or-are-slow)。
+
+### 9. 查询缓慢 {#9-queries-are-slow}
+
+<Badge color="orange">非紧急</Badge>
+
+**检测内容**：对查询池的请求缓慢。UI 页面加载缓慢，更多请求会超时。通常查询会先变慢，然后才失败（告警 [6](#6-queries-fail)）。原因往往是延迟的后台工作，通常是 compaction，而这类问题在早期更容易纠正。
+
+**条件**：对每个 Deployment，使用 [query pod 上的 `server_requests_duration`](/langsmith/self-host-smithdb-metrics#server_requests_duration-on-query-pods) 的 p95。使用 `path` 以 `/query.QueryService/` 开头的请求，但排除 feedback 写入和删除（`/query.QueryService/IngestFeedback` 和 `/query.QueryService/DeleteRuns`）。警告：超过 10 秒。严重：超过 20 秒。窗口：15 分钟。使用窗口内的平均值。
+
+要查明原因，请参见[查询缓慢或失败](/langsmith/self-host-smithdb-common-issues#find-the-cause-of-slow-or-failed-queries)。
+
+## compaction 告警 {#alerts-for-compaction}
+
+compaction 会把摄取中产生的许多小 segment 合并成数量更少、更大的 segment。它还会应用删除和保留策略。compaction 落后时，每个查询都必须读取更多 segment。
+
+### 10. compaction 落后 {#10-compaction-falls-behind}
+
+<Badge color="orange">非紧急</Badge>
+
+**检测内容**：许多 compaction job 会长时间等待。worker 完成的工作少于 compaction scheduler 规划的工作。短时高峰是正常的，例如在大量删除之后。持续数小时的积压会让查询每天变慢，随后导致查询失败。它还会增加存储用量。
+
+**条件**：对所有 job 类型求和，`status="pending"` 的 [`compaction_queue_job_count`](/langsmith/self-host-smithdb-metrics#compaction_queue_job_count)。严重：超过 1,000 个 job。先使用这个值，然后将其设为你日常峰值的 3 到 5 倍。窗口：2 小时。窗口内每个值都必须高于阈值。
+
+如果 compaction worker 已达到最大 replica 数量，请提高最大值。要查明原因，请参见[compaction 延迟](/langsmith/self-host-smithdb-common-issues#find-the-cause-of-late-compaction)。
+
+### 11. compaction 停止或失败 {#11-compaction-stops-or-fails}
+
+<Badge color="orange">非紧急</Badge>
+
+**检测内容**：某一类或所有 job 类型的 compaction 都没有进展。告警 [10](#10-compaction-falls-behind) 仅在出现大量积压后才触发。此告警可以及早检测完全停止。当某一类 job 反复失败时，其 job 对于 worker 的内存来说往往过大。
+
+**条件**：此告警有两个条件。请为每个条件各创建一个告警：
+
+- 停止：当 `status="pending"` 的 [`compaction_queue_job_count`](/langsmith/self-host-smithdb-metrics#compaction_queue_job_count) 大于 0，且所有 worker 的 [`compaction_worker_running_tasks`](/langsmith/self-host-smithdb-metrics#compaction_worker_running_tasks) 总和为 0 时，设为严重。如果没有 worker 报告正在运行的任务，请使用 0。窗口：30 分钟。窗口内每个值都必须同时满足两者。
+- 失败：对每个以 `_compaction` 结尾的 `job_kind`，计算 `status="failure"` 的 [`compaction_job_completion`](/langsmith/self-host-smithdb-metrics#compaction_job_completion) 计数占所有 job 计数的百分比。警告：超过 20%。严重：超过 50%。窗口：1 小时。单次失败是正常的。在健康安装上，每类 job 的失败率低于 2%。
+
+要查明原因，请参见[compaction 延迟](/langsmith/self-host-smithdb-common-issues#find-the-cause-of-late-compaction)。
+
+## SmithDB pod 告警 {#alerts-for-smithdb-pods}
+
+每个 SmithDB 组件（例如摄取或查询）都作为独立的 Deployment 运行。这些告警检测没有可用 pod 的组件、重启的 pod，以及 SmithDB 中的内部错误。告警 13 还覆盖 ingest queue pod，因为它们会把所有 run 写入 SmithDB。
+
+### 12. 某个组件没有 pod {#12-a-component-has-no-pods}
+
+<Badge color="red">紧急</Badge>
+
+**检测内容**：某个 SmithDB Deployment 没有可用 pod。可能原因包括：其 pod 崩溃、Kubernetes 无法调度它们、它们未通过就绪检查，或该 Deployment 有 0 个副本。没有 pod 的组件不会发送指标，因此使用其指标的告警不会触发。例如，没有 query pod 时，告警 6 和 9 收不到数据。没有 compaction scheduler 时，告警 10 和 11 收不到数据。
+
+**条件**：来自 Kubernetes 的每个 SmithDB Deployment 的可用副本数。严重：少于 1。窗口：10 分钟。窗口内每个值都必须低于阈值。指标缺失时也要触发告警。排除你特意缩容到 0 个副本的每个 Deployment。例如，如果你将 SmithDB 迁移作为 Deployment 而不是 Job 运行，请排除名称包含 `smithdb-migration` 的 Deployment。
+
+要查明原因，请参见[SmithDB pod 不健康](/langsmith/self-host-smithdb-common-issues#smithdb-pods-are-not-healthy)。
+
+### 13. pod 经常重启 {#13-pods-restart-often}
+
+<Badge color="orange">非紧急</Badge>
+
+**检测内容**：某个 SmithDB pod 或 ingest queue pod 多次重启。通常是因为 pod 使用的内存超过其限制（OOM kill）。重启会停止正在进行的工作：写入、查询和 compaction job。重启往往是组件容量过小的第一个信号。
+
+**条件**：来自 Kubernetes 的每个 SmithDB pod 和每个 ingest queue pod 的容器重启计数增量。按名称包含 `ingest-queue` 的 Deployment 选择 ingest queue pod。只统计增量，这样 Kubernetes 替换的 pod 不会掩盖新的重启。排除与告警 [12](#12-a-component-has-no-pods) 相同的 Deployment。警告：1 次重启。严重：3 次或更多重启。窗口：30 分钟。
+
+要查明原因，请参见[SmithDB pod 不健康](/langsmith/self-host-smithdb-common-issues#smithdb-pods-are-not-healthy)。
+
+### 14. SmithDB panic {#14-smithdb-panics}
+
+<Badge color="orange">非紧急</Badge>
+
+**检测内容**：某个 SmithDB 组件发生意外的内部错误（panic）。panic 始终是缺陷。根据发生位置的不同，请求会失败、后台任务会停止，或 pod 会重启。如果 pod 没有重启，指标不会显示 panic。因此，此告警使用 SmithDB 日志而不是指标，并且只有在这些日志到达时才有效。
+
+**条件**：对每个 SmithDB Deployment，匹配含有 `backtrace` 字段或包含 `thread panicked` 的 SmithDB 日志行。JSON 日志有 `backtrace` 字段。纯文本日志包含该文本。不要统计消息为 `Runtime dropped task without completing it` 的行。此消息发生在同一 pod 的另一个失败之后，因此告警会把该失败计数两次。警告：1 次 panic。严重：超过 3 次 panic。窗口：15 分钟。
+
+要查看对同一组件中用户的影响，请检查告警 [5](#5-writes-fail)、[6](#6-queries-fail) 和 [13](#13-pods-restart-often)。
+
+## 另请参阅 {#see-also}
+
+- [诊断常见 SmithDB 问题](/langsmith/self-host-smithdb-common-issues)：如何查找告警或已报告问题的原因，以及要更改什么。
+- [必备 SmithDB 指标](/langsmith/self-host-smithdb-metrics)：每个指标衡量什么，以及如何查询。
+- [使用 Datadog 或 Grafana 监控自托管 LangSmith](/langsmith/self-host-observability-dashboards)：仪表板及如何采集其数据。
+- [配置 SmithDB observability](/langsmith/self-host-smithdb-observability)：指标、日志和 trace。
+- [SmithDB 如何处理数据](/langsmith/self-host-smithdb-data-paths)：写入、读取、删除和 compaction 路径。
+- [按规模配置 SmithDB](/langsmith/self-host-smithdb-scale)：层级、autoscaling、专用查询服务和 metastore 容量。
+- [故障排查 SmithDB](/langsmith/self-host-smithdb-troubleshooting)：基础设施问题，以及联系支持前需要收集的信息。

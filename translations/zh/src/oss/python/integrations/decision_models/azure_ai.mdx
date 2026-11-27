@@ -1,0 +1,135 @@
+---
+title: "Microsoft Foundry Decisions 集成"
+sidebarTitle: "Microsoft Foundry Decisions"
+description: "使用 LangChain Python 集成 AzureAIMicrosoftDecisionsClassifier 和 AzureAIOpenAIApiDecisionsClassifier 决策模型。"
+integration:
+  name: Microsoft Foundry Decisions
+  pypi: langchain-azure-ai
+---
+
+Microsoft Foundry 在 `langchain-azure-ai>=1.4.1` 中提供两个 LangChain 决策模型适配器，它们实现 LangChain 共享的 `BaseDecisionModel` 接口（`Runnable[ClassifierRequest, ClassifierResponse]`）：
+
+| 模型 | 适配器 | API 路径 |
+| --- | --- | --- |
+| 兼容的 Microsoft Decision 模型（例如 `Microsoft-Decision-1` 和 `Microsoft-Decision-1.1`） | `AzureAIMicrosoftDecisionsClassifier` | `/providers/microsoft/v1/systemone` |
+| 支持 Decisions API 的 Azure OpenAI 模型（例如 `gpt-6-luna`） | `AzureAIOpenAIApiDecisionsClassifier` | `/openai/v1/decisions` |
+
+两个适配器都会回答来自 `langchain_core.decisions` 的具名 `Noul`、`Choice` 和 `Score` 问题（这些类型也从 `langchain_azure_ai.decisions` 重新导出），并在 `nouls`、`choices`、`scores` 和 `answers` 上返回结构化答案。两个适配器都不支持 `Box` 问题。
+
+<Note>
+`AzureAIOpenAIApiDecisionsClassifier` 扩展了来自 `langchain-openai>=1.8.0` 的 beta 版 [`OpenAIClassifier`](/oss/integrations/decision_models/openai_classifier)，并在构造时发出 `ExperimentalWarning`。
+</Note>
+
+## 设置
+
+安装 `langchain-azure-ai` 1.4.1 或更高版本：
+
+<CodeGroup>
+```bash pip
+pip install -U "langchain-azure-ai>=1.4.1"
+```
+
+```bash uv
+uv add "langchain-azure-ai>=1.4.1"
+```
+</CodeGroup>
+
+将 `AZURE_AI_PROJECT_ENDPOINT`（或 `FOUNDRY_PROJECT_ENDPOINT`）设置为 Microsoft Foundry 项目 URL，并使用 Microsoft Entra ID 进行身份验证（本地开发时运行 `az login`）。请将 Foundry 部署名称（而不是底层模型名称）作为 `model` 传入。
+
+## 快速开始
+
+<Tabs>
+    <Tab title="Microsoft Decision 模型">
+        ```python
+        import os
+
+        from langchain_azure_ai.decisions import (
+            AzureAIMicrosoftDecisionsClassifier,
+            Choice,
+            Noul,
+            Score,
+        )
+
+        decisions = AzureAIMicrosoftDecisionsClassifier(
+            project_endpoint=os.environ["AZURE_AI_PROJECT_ENDPOINT"],
+            model="your-microsoft-decision-deployment",
+        )
+
+        result = decisions.invoke(
+            {
+                "state": {"ticket": "I was charged twice for this order."},
+                "questions": {
+                    "refund": Noul(instructions="Is a refund requested?"),
+                    "team": Choice(
+                        instructions="Which team should handle this ticket?",
+                        criteria={
+                            "billing": "Payments and refunds.",
+                            "support": "Other requests.",
+                        },
+                    ),
+                    "urgency": Score(
+                        instructions="How urgent is this request?",
+                        criteria=["Low.", "Medium.", "High."],
+                    ),
+                },
+            }
+        )
+
+        print(result.nouls["refund"].noul)
+        print(result.choices["team"].choice, result.choices["team"].confidence)
+        print(result.scores["urgency"].score)
+        ```
+    </Tab>
+    <Tab title="Azure OpenAI Decisions API">
+        ```python
+        import os
+
+        from langchain_azure_ai.decisions import (
+            AzureAIOpenAIApiDecisionsClassifier,
+            Noul,
+        )
+
+        decisions = AzureAIOpenAIApiDecisionsClassifier(
+            project_endpoint=os.environ["AZURE_AI_PROJECT_ENDPOINT"],
+            model="your-decisions-deployment",
+        )
+
+        result = decisions.invoke(
+            {
+                "state": "Please refund the duplicate charge.",
+                "questions": {
+                    "refund": Noul(instructions="Is a refund requested?"),
+                },
+            }
+        )
+
+        print(result.nouls["refund"].noul)
+        ```
+    </Tab>
+</Tabs>
+
+## 适配器差异
+
+### Microsoft Decision
+
+`AzureAIMicrosoftDecisionsClassifier` 通过 `/providers/microsoft/v1/systemone` 调用兼容的 Microsoft Decision 部署。
+
+- **输入**：接受文本字符串、JSON 对象和 JSON 数组。它不会转换 LangChain 消息，也不会发送图像资源。
+- **端点**：接受 `project_endpoint`（默认依次为 `AZURE_AI_PROJECT_ENDPOINT` 和 `FOUNDRY_PROJECT_ENDPOINT`），或通过 `endpoint` 传入的直接 Foundry 资源 URL。
+- **身份验证**：默认使用 `DefaultAzureCredential()`。使用 API key 身份验证时，请将 API key 字符串或 `AzureKeyCredential` 作为 `credential` 传入。仅支持异步操作的凭据需要配合 `ainvoke` 或 `abatch` 使用。
+
+### Azure OpenAI Decisions
+
+`AzureAIOpenAIApiDecisionsClassifier` 扩展了 [`OpenAIClassifier`](/oss/integrations/decision_models/openai_classifier)，并调用 `/openai/v1/decisions`。
+
+- **输入**：接受字符串、JSON 对象和数组，以及根级 LangChain 消息（包括受支持的图像）。嵌套在 JSON `state` 中的媒体会被丢弃，并给出警告。如果 API 拒绝了任何一个问题，就会针对整个请求抛出 `ModelRefusalError`。
+- **端点**：接受 `project_endpoint`（会派生 `<resource>/openai/v1`），或接受以 `/openai/v1` 结尾的直接资源 `endpoint`（回退到 `AZURE_AI_OPENAI_ENDPOINT`，然后再回退到附加了 `/openai/v1` 的 `AZURE_OPENAI_ENDPOINT`）。
+- **身份验证**：`project_endpoint` 需要 Microsoft Entra token 凭据，并默认使用 `DefaultAzureCredential()`。使用 API key 身份验证时，请传入以 `/openai/v1` 结尾的直接资源 `endpoint` 和 `credential`（或设置 `AZURE_OPENAI_API_KEY`）。
+- **兼容性别名**：`AzureAIOpenAIApiDecisions` 仍可作为 `AzureAIOpenAIApiDecisionsClassifier` 的别名使用。
+
+## 另请参阅
+
+- [Microsoft Decision 模型指南](https://learn.microsoft.com/azure/foundry/foundry-models/how-to/use-foundry-models-microsoft-decision)
+- [Azure OpenAI Decisions API 指南](https://learn.microsoft.com/azure/foundry/openai/how-to/decisions)
+- [`langchain-azure` 中的 Foundry Decision Models 参考](https://github.com/langchain-ai/langchain-azure/blob/main/libs/azure-ai/docs/model/decisions.md)
+- [`OpenAIClassifier` 集成](/oss/integrations/decision_models/openai_classifier)
